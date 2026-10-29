@@ -141,11 +141,11 @@
 - **影响**：与 DF-005 同类，但攻击面更宽：只要按 Enter 进详情就触发。
 - **修复**：所有外部来源字段（`project` / `sessionId` / `reason` / `needs` / `suggestedReply` / `jobDetail` / `hostState`）统一过 `sanitize()`；`buildDraft()` 出口也净化（它的产物会进剪贴板）。
 
-### DF-014 [open] App 层仍无直接测试
+### DF-014 [partial] App 层仍无直接测试
 
 - **发现于**：TUI 锐评与验收 r2/r3
 - **位置**：`oversight-tui.mjs` 的 `App` 类（约 340 行）
-- **现状**：55 条测试覆盖纯函数与 `main()`，但键位路由（4 种 mode × 13 个键）、滚动窗口、窄屏拆列、详情滚动边界均无覆盖。r3 的两个阻断都出在这一层。
+- **现状（2026-10-30 更新）**：58 条测试。已导出 `detailLines` 并加 3 条测试，覆盖全字段 OSC payload、2/7 截断比例、blocked 的 needs/suggestedReply。**仍未覆盖**：键位路由（4 种 mode × 13 个键）、滚动窗口、窄屏拆列、详情滚动边界。r3 的两个阻断都出在这一层。
 - **建议**：把 `detailLines` / `helpPanel` / `buildDraftPanel` / `listRow` 导出为纯函数并加测试，比拆文件更值。
 
 _（新增条目追加在此行上方）_
