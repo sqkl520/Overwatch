@@ -10,6 +10,7 @@
  */
 
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join, relative, extname } from 'node:path';
 
 const ROOT = process.cwd();
@@ -236,6 +237,25 @@ function checkCapabilityDisclosure() {
   }
 }
 
+// ── 检查 7：脚本必须能被 Node 解析 ────────────────────────────────────
+
+/** 硬门不覆盖「脚本能不能跑」是一个真实漏洞：
+ *  曾把 `const WINDOW = ;` 写进 scan-sessions.mjs，整个文件不可解析，
+ *  但 check-structure 照样返回「全部通过」。语法检查必须进硬门。 */
+function checkSyntax() {
+  const dir = join(ROOT, 'scripts');
+  if (!existsSync(dir)) return;
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith('.mjs') && !f.endsWith('.js')) continue;
+    const p = join(dir, f);
+    const r = spawnSync(process.execPath, ['--check', p], { encoding: 'utf8' });
+    if (r.status !== 0) {
+      const first = (r.stderr || '').split('\n').find((l) => l.includes('Error')) || '语法错误';
+      fail(rel(p), `无法被 Node 解析：${first.trim().slice(0, 120)}`);
+    }
+  }
+}
+
 // ── 运行 ──────────────────────────────────────────────────────────────
 
 console.log('check-structure · 仓库结构硬门\n');
@@ -246,6 +266,7 @@ checkGitignoreSanity();
 checkAgents();
 checkEmptyDirs();
 checkCapabilityDisclosure();
+checkSyntax();
 
 if (violations.length) {
   console.log(`✗ ${violations.length} 项违规：\n`);

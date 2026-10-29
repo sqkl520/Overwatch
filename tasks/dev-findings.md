@@ -92,6 +92,30 @@
 - **证据**：3220 个 jsonl 中 **1190 个**在 `subagents/workflows/<wf-id>/` 下。会话 `3068431b` 报 `sub=28`，实际远多于此。
 - **修复**：新增递归 `collectSubagentFiles()`；同时输出 `subagentsTotal` 与 `subagentsTruncated`，终端显示为 `30/272~` 而非骗人的 `30`。
 
+### DF-009 [fixed] 硬门不检查脚本能否被 Node 解析
+
+- **发现于**：同类工具调研 run
+- **位置**：`check-structure.mjs`
+- **证据**：把 `const WINDOW = 20;` 改成 `const WINDOW = ;`，整个 `scan-sessions.mjs` 不可解析，`node --check` 报 `SyntaxError`，但 `check-structure.mjs` 仍然输出「✓ 结构检查全部通过」exit 0。
+- **影响**：硬门声称「结构有问题就红」，但脚本根本无法运行时它照样绿。写代码时一次手滑就能让唯一的自动化检查失效。
+- **修复**：新增 `checkSyntax()`，对 `scripts/*.mjs|js` 逐个跑 `node --check`。负向测试确认注入语法错误后 exit 1。
+
+### DF-010 [fixed] `--recalibrate` 后的第二处：预算结论被真实数据推翻
+
+- **发现于**：同类工具调研 run
+- **位置**：`docs/adr/0001-config-only.md` §代价·4、`docs/spec/state-model.md` §7
+- **证据**：`~/.claude/jobs/<id>/state.json` 含真实 `tokens` 字段，实测 `3475667`、`2731240`、`1330604`、`965387`。
+- **影响**：ADR 断言「预算只能估算，必须标 `est:`」——对后台作业是错的。用估算值替代已有的精确值会让状态行显得比实际更不可信。
+- **修复**：两处文档改为「前台交互会话需估算并标 `est:`；能关联 job 的会话显示真实 tokens」。
+
+### DF-011 [open] 接力草稿的原料已部分由宿主提供
+
+- **发现于**：同类工具调研 run
+- **位置**：`docs/spec/relay-protocol.md`、`oversight-relay` agent
+- **证据**：blocked 会话的 `state.json` 含 `needs`（「要我现在就把用户实测单交给你，还是你先看这四份测试报告？」）与 `suggestedReply`（「把实测单发给我」）。
+- **影响**：Relay Agent 不必从零生成草稿，而是**补全 + 结构化**宿主已有的半成品，成本显著降低。
+- **建议**：改 `relay-protocol.md` §5，把 `needs`/`suggestedReply` 列为 relay 的一等输入。
+
 ### DF-008 [open] `MAX_SUBAGENTS = 30` 截断派生树
 
 - **发现于**：红队 run
@@ -99,11 +123,5 @@
 - **证据**：单会话实测有 272 个子 agent transcript。截断后 `maxDepth`、`tree_gain` 都建立在残缺的树上。
 - **现状**：已通过 `subagentsTruncated` 显式暴露，不再静默。是否提高上限待定（会显著增加扫描耗时）。
 - **建议归属**：性能与正确性的权衡，需要实测不同上限下的耗时曲线。
-
-- **发现于**：验收 run r1（未覆盖项）
-- **位置**：`docs/adr/0002-honest-degradation.md`、`docs/spec/state-model.md` §3.5
-- **原始问题**：ADR 中 tool_use 与间隔数曾被读成「写反」。复核后确认未写反，但数字已随会话增长过期。
-- **现状**：已于 2026-10-30 重算并同步为 **2021 个 transcript / 239,549 次 tool_use / 237,567 个间隔 / 63.1% / 9.72% / p99=1444s**，三处文档一致。规格中「`--recalibrate` 可重算」的表述已删除，改为「换环境应重估」。
-- **仍开放**：权重重估没有可执行路径（见 DF-003）。
 
 _（新增条目追加在此行上方）_

@@ -427,6 +427,12 @@ function readJobs() {
         linkScanPath: o.linkScanPath ?? null,
         sessionId: (o.linkScanPath || '').match(/([0-9a-f-]{36})\.jsonl$/)?.[1] ?? null,
         updatedAt: o.updatedAt ?? null,
+        // 宿主持有真实 token 计数（不是估算）。ADR-0001 曾断言「预算只能 est:」，
+        // 对后台作业这条不成立——实测有 3,475,667 这样的绝对值。
+        tokens: typeof o.tokens === 'number' ? o.tokens : null,
+        // blocked 会话直接给出「在等什么」与「建议怎么回」，接力草稿不必凭空生成
+        needs: typeof o.needs === 'string' ? o.needs : null,
+        suggestedReply: typeof o.suggestedReply === 'string' ? o.suggestedReply : null,
       });
     } catch { /* 跳过坏文件 */ }
   }
@@ -509,6 +515,9 @@ function main(argv) {
         liveness: verdict.liveness ?? (threshold ? 'reconstructed' : 'insufficient-sample'),
         hostState: hostState ?? null,
         jobDetail: job?.detail ?? null,
+        tokens: job?.tokens ?? null,
+        needs: job?.needs ?? null,
+        suggestedReply: job?.suggestedReply ?? null,
         badLines: scanned.badLines,
       });
     }
@@ -558,12 +567,18 @@ function printHuman(results, live, days) {
       ? `${r.subagents}/${r.subagentsTotal}~`
       : String(r.subagents);
     const bad = r.badLines > 0 ? ` BAD=${r.badLines}` : '';
+    const tok = r.tokens ? ` tok=${(r.tokens / 1000).toFixed(0)}k` : '';
     console.log(
       `[${r.state.padEnd(9)}] ${noun(r.project).slice(0, 24).padEnd(26)} ` +
       `calls=${String(r.calls).padStart(5)} sub=${sub.padStart(7)} ` +
       `depth=${r.maxDepth} novelty=${nov.padEnd(4)} hb=${hb.padEnd(11)} idle=${fmtDur(r.idleSec).padEnd(5)} ` +
-      `${r.reason}${bad}`
+      `${r.reason}${tok}${bad}`
     );
+    // blocked 会话宿主已给出「在等什么」，直接显示，不让用户去翻
+    if (r.needs) {
+      console.log(`            等待输入：${r.needs.slice(0, 100)}`);
+      if (r.suggestedReply) console.log(`            建议回复：${r.suggestedReply.slice(0, 80)}`);
+    }
   }
 
   const counts = {};
