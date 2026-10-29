@@ -124,4 +124,28 @@
 - **现状**：已通过 `subagentsTruncated` 显式暴露，不再静默。是否提高上限待定（会显著增加扫描耗时）。
 - **建议归属**：性能与正确性的权衡，需要实测不同上限下的耗时曲线。
 
+### DF-012 [fixed] 非 TTY 分支因契约变更整段失效
+
+- **发现于**：TUI 验收 r3
+- **位置**：`oversight-tui.mjs` 的 `main()` 非 TTY 分支
+- **证据**：`defaultScan` 从返回 Promise 改成 `{ promise, cancel }` 后，`main()` 仍写 `const { data, warning } = await scan(...)`——await 一个对象得到它自己，`data` 恒为 `undefined`。实测 `node scripts/oversight-tui.mjs | cat` 输出 `扫描失败：undefined`，stdout 0 字节，exit 1。
+- **影响**：文档写明的 `| cat` 与 `--plain` 两种用法全部不可用；ST1-AC7 从「降级正常」变成「根本没有输出」。
+- **同类前科**：r1 的 `charWidth` 也是改一半的调用点。两次都是「改了函数契约，漏了一个调用方」。
+- **修复**：改为 `const job = scan(...); await job.promise;`；`printPlain` 增加可注入的 `sink` 参数（此前硬写 `process.stdout`，导致测试无法观测）。
+
+### DF-013 [fixed] `sessionId` / `project` / `hostState` 未净化，OSC 52 仍可穿透
+
+- **发现于**：TUI 验收 r3
+- **位置**：`oversight-tui.mjs` 的 `detailLines()`、`listRow()`、详情头、`printPlain()`
+- **证据**：假数据 `sessionId: 'sid\x1b]52;c;eA==\x07end'` 进入详情后，终端收到完整的 OSC 52 序列。`sessionId` 来自 `scan-sessions.mjs` 的 `entry.replace(/\.jsonl$/,'')`——即 transcript 文件名，外部可控。`project` 在 24 列内装得下 13 字节的短 payload。
+- **影响**：与 DF-005 同类，但攻击面更宽：只要按 Enter 进详情就触发。
+- **修复**：所有外部来源字段（`project` / `sessionId` / `reason` / `needs` / `suggestedReply` / `jobDetail` / `hostState`）统一过 `sanitize()`；`buildDraft()` 出口也净化（它的产物会进剪贴板）。
+
+### DF-014 [open] App 层仍无直接测试
+
+- **发现于**：TUI 锐评与验收 r2/r3
+- **位置**：`oversight-tui.mjs` 的 `App` 类（约 340 行）
+- **现状**：55 条测试覆盖纯函数与 `main()`，但键位路由（4 种 mode × 13 个键）、滚动窗口、窄屏拆列、详情滚动边界均无覆盖。r3 的两个阻断都出在这一层。
+- **建议**：把 `detailLines` / `helpPanel` / `buildDraftPanel` / `listRow` 导出为纯函数并加测试，比拆文件更值。
+
 _（新增条目追加在此行上方）_
