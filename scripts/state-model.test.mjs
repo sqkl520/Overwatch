@@ -236,3 +236,28 @@ test('宿主权威失败信号不被休眠闸门降级', () => {
   assert.equal(v.state, 'FAILED', '宿主说 failed 就是 failed，不管多久以前');
   assert.equal(v.reason, 'host-reported-failed');
 });
+
+// ── 宿主 blocked 态（DF-006 引入） ────────────────────────────────────
+
+test('宿主报 blocked 时单独成态，不混进 EXPLORING', () => {
+  const calls = [];
+  for (let i = 0; i < 30; i++) calls.push(callAt(`cat f${i}.txt`, now - (30 - i) * 1000));
+  const gaps = calls.slice(1).map((c, i) => c.ts - calls[i].ts);
+  const v = judgeState({ calls, gapsMs: gaps, sessionState: 'blocked' });
+  assert.equal(v.state, 'BLOCKED', '在等输入的会话不能显示成还在探索');
+  assert.equal(v.reason, 'host-reported-blocked');
+});
+
+test('blocked 优先于休眠：等输入 2 小时仍是 BLOCKED', () => {
+  const t0 = now - 120 * 3600_000;
+  const calls = [];
+  for (let i = 0; i < 30; i++) calls.push(callAt('ls', t0 + i * 400_000));
+  const gaps = calls.slice(1).map((c, i) => c.ts - calls[i].ts);
+  const v = judgeState({ calls, gapsMs: gaps, sessionState: 'blocked' });
+  assert.equal(v.state, 'BLOCKED');
+});
+
+test('failed 优先于 blocked（同时存在时以失败为准）', () => {
+  const calls = [callAt('ls', now)];
+  assert.equal(judgeState({ calls, gapsMs: [], sessionState: 'failed' }).state, 'FAILED');
+});

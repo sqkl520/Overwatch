@@ -18,8 +18,7 @@
  */
 
 import { readFileSync, readdirSync, existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
-import { join, basename } from 'node:path';
-import { homedir } from 'node:os';
+import { join, basename } from 'node:path';import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 
 // ── 常量（与 docs/spec/state-model.md 一一对应）────────────────────────
@@ -171,6 +170,10 @@ export function judgeState({ sessionState, calls, gapsMs, now: nowMs }) {
   // 0. 宿主权威失败信号优先于一切推断
   if (sessionState === 'failed') return { state: 'FAILED', reason: 'host-reported-failed' };
 
+  // 0.5 宿主报 blocked：在等输入（权限确认 / API 恢复 / sandbox），不是失败也不是探索。
+  //     必须单独成态：按 EXPLORING 处理会让用户以为它还在干活。
+  if (sessionState === 'blocked') return { state: 'BLOCKED', reason: 'host-reported-blocked' };
+
   // 1. 休眠：长时间无活动，既不是探索也不是失败，只是结束了。
   //    必须排在 host-failed 之后——宿主明确报过 failed 的，不该被时间冲淡。
   if (lastCall && idleMs > DORMANT_MS) {
@@ -218,7 +221,10 @@ export function judgeState({ sessionState, calls, gapsMs, now: nowMs }) {
 
 // ── transcript 解析 ───────────────────────────────────────────────────
 
-/** 从一条 jsonl 记录里抽出 tool_use 调用 */
+/** 从一条 jsonl 记录里抽出 tool_use 调用。
+ *  返回 { calls, badLines } —— badLines 是解析失败的行数，
+ *  不能挂在数组属性上（会被 slice()/展开丢掉的），见 tasks/dev-findings.md DF-005。
+ */
 function extractCalls(records) {
   const calls = [];
   for (const rec of records) {
@@ -238,13 +244,16 @@ function extractCalls(records) {
   return calls;
 }
 
+/** 解析 jsonl。返回 { records, badLines } —— 坏行数必须随数据一起传递，
+ *  不能挂在数组属性上（tailRecords 的 slice 会把它丢掉）。见 DF-005。 */
 function parseJsonl(path) {
-  if (!existsSync(path)) return [];
+  const empty = { records: [], badLines: 0 };
+  if (!existsSync(path)) return empty;
   let raw;
   try {
     const size = statSync(path).size;
     if (size > MAX_READ_BYTES) {
-      // 真正从尾部按偏移读，而不是先整读再切片：实测单文件可达 197MB
+      // 真正从尾部按偏移读，而不是先整读再切片：实测单文件可达 59MB
       const buf = Buffer.allocUnsafe(MAX_READ_BYTES);
       const fd = openSync(path, 'r');
       try {
@@ -258,20 +267,37 @@ function parseJsonl(path) {
     } else {
       raw = readFileSync(path, 'utf8');
     }
-  } catch { return []; }
-  const out = [];
-  let bad = 0;
+  } catch { return empty; }
+  const records = [];
+  let badLines = 0;
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
-    try { out.push(JSON.parse(line)); } catch { bad++; }
+    try { records.push(JSON.parse(line)); } catch { badLines++; }
   }
-  if (bad) out.badLines = bad;
-  return out;
+  return { records, badLines };
 }
 
 /** 只保留末尾 n 条记录，避免为判定一个窗口而解析整个会话 */
 function tailRecords(records, n) {
   return records.length > n ? records.slice(-n) : records;
+}
+
+/** 递归收集子 agent transcript：直接子文件 + subagents/workflows 下的嵌套。
+ *  实测 3220 个 jsonl 中有 1190 个在 workflows/<wf-id>/ 里，只扫直接子文件会漏掉 37%。 */
+function collectSubagentFiles(subDir) {
+  const out = [];
+  if (!existsSync(subDir)) return out;
+  for (const f of readdirSync(subDir, { withFileTypes: true })) {
+    const full = join(subDir, f.name);
+    if (f.isDirectory()) {
+      out.push(...collectSubagentFiles(full));
+    } else if (f.name.endsWith('.jsonl')) {
+      let mtime = 0;
+      try { mtime = statSync(full).mtimeMs; } catch { /* 忽略不可读 */ }
+      out.push({ path: full, name: f.name, mtime });
+    }
+  }
+  return out;
 }
 
 function gapsOf(calls) {
@@ -290,42 +316,47 @@ function scanSessionDir(dir) {
   const mainPath = files.find((p) => existsSync(p));
   if (!mainPath) return null;
 
-  const mainRecs = tailRecords(parseJsonl(mainPath), MAX_CALLS_PER_SESSION * 3);
+  const mainParsed = parseJsonl(mainPath);
+  const mainRecs = tailRecords(mainParsed.records, MAX_CALLS_PER_SESSION * 3);
   const mainCalls = extractCalls(mainRecs);
+  let badLines = mainParsed.badLines;
 
   // 子 agent：每个独立 transcript，.meta.json 回指父会话。
-  // 实测最坏会话有 199 个，全量解析 4 秒；按 mtime 取最近若干个即可判定派生树活性。
+  // 递归收集以覆盖 subagents/workflows/wf_*/ 这一层（实测占总 transcript 的 37%）。
   const children = [];
-  if (existsSync(subDir)) {
-    const candidates = [];
-    for (const f of readdirSync(subDir)) {
-      if (!f.endsWith('.jsonl')) continue;
-      let mtime = 0;
-      try { mtime = statSync(join(subDir, f)).mtimeMs; } catch { /* 忽略不可读 */ }
-      candidates.push({ f, mtime });
-    }
-    candidates.sort((a, b) => b.mtime - a.mtime);
-    for (const { f } of candidates.slice(0, MAX_SUBAGENTS)) {
-      const agentId = f.replace(/\.jsonl$/, '');
-      const recs = tailRecords(parseJsonl(join(subDir, f)), MAX_CALLS_PER_SESSION);
-      const metaPath = join(subDir, agentId + '.meta.json');
-      let meta = {};
-      try { meta = JSON.parse(readFileSync(metaPath, 'utf8')); } catch { /* 无 meta 不致命 */ }
-      children.push({
-        agentId,
-        agentType: meta.agentType ?? null,
-        spawnDepth: meta.spawnDepth ?? null,
-        parentToolUseId: meta.toolUseId ?? null,
-        calls: extractCalls(recs),
-      });
-    }
+  const candidates = collectSubagentFiles(subDir);
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  const truncated = Math.max(0, candidates.length - MAX_SUBAGENTS);
+  for (const cand of candidates.slice(0, MAX_SUBAGENTS)) {
+    const agentId = cand.name.replace(/\.jsonl$/, '');
+    const parsed = parseJsonl(cand.path);
+    badLines += parsed.badLines;
+    const metaPath = cand.path.replace(/\.jsonl$/, '.meta.json');
+    let meta = {};
+    try { meta = JSON.parse(readFileSync(metaPath, 'utf8')); } catch { /* 无 meta 不致命 */ }
+    children.push({
+      agentId,
+      agentType: meta.agentType ?? null,
+      spawnDepth: meta.spawnDepth ?? null,
+      parentToolUseId: meta.toolUseId ?? null,
+      calls: extractCalls(tailRecords(parsed.records, MAX_CALLS_PER_SESSION)),
+    });
   }
 
   const allCalls = [...mainCalls];
   for (const c of children) allCalls.push(...c.calls);
   allCalls.sort((a, b) => a.ts - b.ts);
 
-  return { mainPath, mainCalls, children, allCalls, gaps: gapsOf(allCalls) };
+  return {
+    mainPath,
+    mainCalls,
+    children,
+    allCalls,
+    gaps: gapsOf(allCalls),
+    badLines,
+    subagentTotal: candidates.length,
+    subagentTruncated: truncated,
+  };
 }
 
 // ── 主流程 ────────────────────────────────────────────────────────────
@@ -371,6 +402,37 @@ function readLiveSessions() {
   return out;
 }
 
+/** 读 ~/.claude/jobs/<job-id>/state.json —— 这是唯一带 failed / blocked 的数据源。
+ *
+ *  三个数据源互不一致（实测）：
+ *    jobs/           12 条：done=9 failed=1 blocked=2   ← 唯一有 failed/blocked
+ *    claude agents   10 条：blocked=2，其余 state 为空
+ *    sessions/        8 条：只有 busy/idle
+ *  只读 sessions/ 会让 failed 与 blocked 完全不可见。见 DF-006。
+ */
+function readJobs() {
+  const dir = join(homedir(), '.claude', 'jobs');
+  if (!existsSync(dir)) return [];
+  const out = [];
+  for (const jobId of readdirSync(dir)) {
+    const p = join(dir, jobId, 'state.json');
+    if (!existsSync(p)) continue;
+    try {
+      const o = JSON.parse(readFileSync(p, 'utf8'));
+      out.push({
+        jobId,
+        state: o.state ?? null,          // done / failed / blocked / running
+        detail: o.detail ?? null,
+        tempo: o.tempo ?? null,
+        linkScanPath: o.linkScanPath ?? null,
+        sessionId: (o.linkScanPath || '').match(/([0-9a-f-]{36})\.jsonl$/)?.[1] ?? null,
+        updatedAt: o.updatedAt ?? null,
+      });
+    } catch { /* 跳过坏文件 */ }
+  }
+  return out;
+}
+
 function main(argv) {
   const args = new Set(argv);
   const json = args.has('--json');
@@ -391,6 +453,8 @@ function main(argv) {
 
   const cutoff = Date.now() - days * 86_400_000;
   const results = [];
+  const jobs = readJobs();
+  const jobBySession = new Map(jobs.filter((j) => j.sessionId).map((j) => [j.sessionId, j]));
 
   for (const projectDir of readdirSync(root)) {
     const projectPath = join(root, projectDir);
@@ -409,8 +473,14 @@ function main(argv) {
       const scanned = scanSessionDir(join(projectPath, sessionId));
       if (!scanned || !scanned.allCalls.length) continue;
 
+      // 宿主权威状态：jobs 里的 failed/blocked 必须传进去，否则那个分支永远是死的
+      const job = jobBySession.get(sessionId);
+      const hostState = job?.state === 'failed' ? 'failed'
+        : job?.state === 'blocked' ? 'blocked'
+          : undefined;
+
       const verdict = judgeState({
-        sessionState: undefined,
+        sessionState: hostState,
         calls: scanned.allCalls,
         gapsMs: scanned.gaps,
       });
@@ -427,6 +497,8 @@ function main(argv) {
         idleSec: Math.round((Date.now() - lastCall.ts) / 1000),
         calls: scanned.allCalls.length,
         subagents: scanned.children.length,
+        subagentsTotal: scanned.subagentTotal,
+        subagentsTruncated: scanned.subagentTruncated,
         maxDepth: scanned.children.reduce((m, c) => Math.max(m, c.spawnDepth ?? 1), scanned.children.length ? 1 : 0),
         novelty: noveltyOf(recent),
         noveltyAll: noveltyOf(scanned.allCalls),
@@ -435,7 +507,9 @@ function main(argv) {
         state: verdict.state,
         reason: verdict.reason,
         liveness: verdict.liveness ?? (threshold ? 'reconstructed' : 'insufficient-sample'),
-        badLines: scanned.mainCalls.badLines ?? 0,
+        hostState: hostState ?? null,
+        jobDetail: job?.detail ?? null,
+        badLines: scanned.badLines,
       });
     }
   }
@@ -474,16 +548,21 @@ function printHuman(results, live, days) {
     console.log('');
   }
 
-  const order = ['FAILED', 'STALLED', 'PRODUCING', 'EXPLORING'];
+  const order = ['BLOCKED', 'FAILED', 'STALLED', 'PRODUCING', 'EXPLORING'];
   const sorted = [...results].sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state) || b.idleSec - a.idleSec);
   for (const r of sorted) {
     const nov = r.novelty === null ? 'null' : r.novelty.toFixed(2);
     const hb = r.hbThresholdSec ? `${r.lastGapSec}s/${r.hbThresholdSec}s` : 'n/a';
+    // 子 agent 被截断时明确标出，不许把不完整的树画成完整的
+    const sub = r.subagentsTruncated > 0
+      ? `${r.subagents}/${r.subagentsTotal}~`
+      : String(r.subagents);
+    const bad = r.badLines > 0 ? ` BAD=${r.badLines}` : '';
     console.log(
       `[${r.state.padEnd(9)}] ${noun(r.project).slice(0, 24).padEnd(26)} ` +
-      `calls=${String(r.calls).padStart(5)} sub=${String(r.subagents).padStart(2)} ` +
+      `calls=${String(r.calls).padStart(5)} sub=${sub.padStart(7)} ` +
       `depth=${r.maxDepth} novelty=${nov.padEnd(4)} hb=${hb.padEnd(11)} idle=${fmtDur(r.idleSec).padEnd(5)} ` +
-      `${r.reason}`
+      `${r.reason}${bad}`
     );
   }
 

@@ -55,7 +55,50 @@
 - **影响**：规格说「换环境应重估权重」，但没有可执行路径。
 - **建议归属**：独立小任务
 
-### DF-004 [triaged] `--recalibrate` 与规格、实现三者已对齐，但 DF-003 仍开放
+### DF-004 [triaged] ADR 数字已重算，但权重重估仍无执行路径
+
+- **发现于**：验收 run r1（未覆盖项）
+- **位置**：`docs/adr/0002-honest-degradation.md`、`docs/spec/state-model.md` §3.5
+- **原始问题**：ADR 中 tool_use 与间隔数曾被读成「写反」。复核后确认未写反，但数字已随会话增长过期。
+- **现状**：已于 2026-10-30 重算并同步为 **2021 个 transcript / 239,549 次 tool_use / 237,567 个间隔 / 63.1% / 9.72% / p99=1444s**，三处文档一致。规格中「`--recalibrate` 可重算」的表述已删除，改为「换环境应重估」。
+- **仍开放**：权重重估没有可执行路径（见 DF-003）。
+
+### DF-005 [fixed] `badLines` 恒为 `undefined`（挂在数组属性上，被 `slice` 丢掉）
+
+- **发现于**：红队 run（加前端调研时）
+- **位置**：`scan-sessions.mjs` 的 `parseJsonl` / `tailRecords` / `extractCalls`
+- **证据**：`out.badLines = bad` 把属性挂在数组上；`tailRecords` 用 `slice(-n)` 返回新数组，属性丢失；`extractCalls` 又返回另一个新数组。最终 `scanned.mainCalls.badLines` 永远是 `undefined`。
+- **影响**：前端若展示「坏行数 0」，那是一个恒假字段——正是 `output-format.md` 自己禁止的「外观像遥测、实际编造」。
+- **修复**：`parseJsonl` 改为返回 `{ records, badLines }`；逐层显式传递并累加子 agent 的坏行数。
+
+### DF-006 [fixed] `failed` / `blocked` 会话完全不可见（只读了三个数据源中的一个）
+
+- **发现于**：红队 run
+- **位置**：`readLiveSessions()` 只读 `~/.claude/sessions/*.json`
+- **证据（实测）**：
+  | 数据源 | 条目 | 状态取值 |
+  |---|---|---|
+  | `~/.claude/jobs/<id>/state.json` | 12 | done=9 **failed=1 blocked=2** |
+  | `claude agents --json` | 10 | **blocked=2**，其余 state 为空 |
+  | `~/.claude/sessions/*.json` | 8 | 只有 busy/idle |
+- **影响**：扫描结果 8 条，实际 12 条。1 个 failed、2 个 blocked 永远不显示。用户看着「全绿」，实际上有三个会话停着。**这是本库作为「监督之眼」的根基性缺陷。**
+- **修复**：新增 `readJobs()`，按 `linkScanPath` 里的 sessionId 建立映射，把 `failed`/`blocked` 传给 `judgeState`；新增 `BLOCKED` 态（等输入既不是失败也不是探索）。
+- **验证**：`--days 30` 输出 `BLOCKED=2 FAILED=1`，此前为 0。
+
+### DF-007 [fixed] 子 agent 只扫直接子文件，漏掉 `workflows/` 下的 37%
+
+- **发现于**：红队 run
+- **位置**：`scanSessionDir()` 只遍历 `subDir` 的直接文件
+- **证据**：3220 个 jsonl 中 **1190 个**在 `subagents/workflows/<wf-id>/` 下。会话 `3068431b` 报 `sub=28`，实际远多于此。
+- **修复**：新增递归 `collectSubagentFiles()`；同时输出 `subagentsTotal` 与 `subagentsTruncated`，终端显示为 `30/272~` 而非骗人的 `30`。
+
+### DF-008 [open] `MAX_SUBAGENTS = 30` 截断派生树
+
+- **发现于**：红队 run
+- **位置**：`scan-sessions.mjs` 的 `MAX_SUBAGENTS`
+- **证据**：单会话实测有 272 个子 agent transcript。截断后 `maxDepth`、`tree_gain` 都建立在残缺的树上。
+- **现状**：已通过 `subagentsTruncated` 显式暴露，不再静默。是否提高上限待定（会显著增加扫描耗时）。
+- **建议归属**：性能与正确性的权衡，需要实测不同上限下的耗时曲线。
 
 - **发现于**：验收 run r1（未覆盖项）
 - **位置**：`docs/adr/0002-honest-degradation.md`、`docs/spec/state-model.md` §3.5
