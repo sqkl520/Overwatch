@@ -124,7 +124,7 @@ export function wrapToWidth(text, width) {
     let line = '';
     let w = 0;
     for (const cp of paragraph) {
-      const cw = charWidth(cp);
+      const cw = displayWidth(cp);
       if (w + cw > max) {
         // 优先在最后一个空格处断行，避免把英文单词劈开
         const sp = line.lastIndexOf(' ');
