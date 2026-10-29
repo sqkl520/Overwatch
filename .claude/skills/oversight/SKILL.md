@@ -1,0 +1,91 @@
+---
+name: oversight
+description: OmniSight 调度入口。拆解 → 并行派发 → 冲突登记 → 验收 → 接力草稿。用户说「启动监控」「派编队」「跑一轮 Oversight」时使用。
+argument-hint: "[new | demo | status | relay <session-id>]"
+disable-model-invocation: true
+---
+
+# OmniSight 调度入口
+
+> 主线程只做三件事：**拆解、派发、汇总**。不亲自检索、分析、编码、写作。
+
+## 0. 先确认能力
+
+```bash
+node scripts/scan-sessions.mjs --days 3
+```
+
+若脚本报错，先修环境，不要继续。能力不可用时降级路径见 README 的「能力边界」。
+
+## 1. 首次运行：问 5 件事
+
+用户没回答就按默认执行，但必须声明「按默认执行」：
+
+| # | 问题 | 默认 |
+|---|---|---|
+| 1 | 监控范围 | 所有可见会话 |
+| 2 | 接力触发 | (b) 停滞 + (c) 重复失败 + (d) 手动 |
+| 3 | 接力口吻 | (b) 中性继续 |
+| 4 | 禁止操作 | 删除 / 外发 / 交易 / 权限变更 |
+| 5 | ADHD 友好输出 | 开 |
+
+## 2. Phase A：规划
+
+派 `oversight-planner`，输入原始需求 + P0 答案 + 台账。产出 `tasks/runs/<run-id>/task-graph.json`。
+
+**主线程审核拆解图**，确认没有「主线程自己顺手做了」的隐含任务，然后派发。
+
+## 3. Phase B：并行编队
+
+按拆解图并行派发。复杂任务至少 5 个 Agent，必须包含：
+
+- 执行 Agent ×N（`oversight-executor`）
+- 检索 Agent（`oversight-research`）
+- 批判 Agent（`oversight-critic`）
+- 红队 Agent（`oversight-redteam`）
+- 锐评 Agent（`oversight-review`）
+- 验收 Agent（`oversight-acceptor`）
+
+**独立性**：每个 Agent 只收到「原始任务 + 验收标准 + 产出形态声明」，不读同级输出。靠**不提供路径**实现，不靠 prompt 里写「请不要读」。
+
+## 4. Phase C：冲突登记
+
+所有 Agent 返回后，按「一致 / 分歧 / 互补」分类。
+
+- 实质分歧 → 派 `oversight-resolution` 裁决
+- **禁止主线程自己「感觉哪个对」**
+- 一致结论也要标注「N 个 Agent 同意」，并注明是否有人被要求找反面证据
+
+## 5. Phase E：验收与修复
+
+1. `oversight-acceptor` 对照预声明标准判定
+2. 不通过 → `oversight-repair` → **完整重新验收**（不是抽查）
+3. 最多 3 轮，仍不通过 → 提交失败报告，**不假装通过**
+
+## 6. Phase F：接力（手动）
+
+```bash
+node scripts/scan-sessions.mjs --json | node -e "
+  const d=JSON.parse(require('fs').readFileSync(0,'utf8'));
+  console.log(d.sessions.filter(s=>s.state==='STALLED'||s.state==='FAILED'));
+"
+```
+
+1. 派 `oversight-relay` 产出草稿
+2. 派 `oversight-safety` 过红线
+3. **主线程不写草稿、不判红线**
+4. 把通过的草稿交给用户复制
+
+## 7. 状态行
+
+每轮携带，由脚本渲染：
+
+```
+[阶段B · Agent#3 EXPLORING · reads=42/novelty=0.74/hb=14s · budget=est:31% · liveness=reconstructed]
+```
+
+**不手写数字**。算不出来的写 `unknown`。
+
+## 最小演示
+
+用户说「最小演示」时，只派 3 个 Agent：`oversight-executor` + `oversight-review` + `oversight-acceptor`，跑通一轮完整流程。

@@ -1,0 +1,22 @@
+# ── 本机私有：永远不进仓 ────────────────────────────────
+.claude/settings.local.json
+CLAUDE.local.md
+*.local.md
+local/
+
+# ── 运行台账：由主线程写入，可能含会话 ID 与本机路径 ──
+tasks/runs/
+!tasks/runs/.gitkeep
+
+# ── 生成物与临时物 ────────────────────────────────────
+node_modules/
+*.log
+tmp/
+.DS_Store
+Thumbs.db
+
+# ── 注意 ──────────────────────────────────────────────
+# 本文件刻意不包含 .claude/ 、rules/ 、docs/ 、tasks/ 。
+# 那些目录就是本仓库的产品本体。参考项目的 .gitignore 忽略它们是有意的
+# （那个项目只发布 src/），照抄过来会导致 git add -A 静默什么都不加。
+# 详见 docs/adr/0002-honest-degradation.md 与 scripts/check-structure.mjs。

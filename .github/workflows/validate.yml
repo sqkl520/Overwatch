@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 硬门：结构违规即失败
+      - name: Structure gate
+        run: node scripts/check-structure.mjs
+
+      # 硬门：四态判定回归测试
+      - name: State model tests
+        run: node --test scripts/state-model.test.mjs
+
+      # 建议门：脚本语法检查。存量未清零前不阻塞。
+      # 升级路径：全部通过后删掉 continue-on-error，改为硬门。
+      - name: Script syntax (advisory)
+        continue-on-error: true
+        run: |
+          for f in scripts/*.mjs; do
+            node --check "$f" || echo "::warning file=$f::语法检查失败"
+          done
+
+      # 建议门：死链检查。同样待存量清零后升级为硬门。
+      - name: Dead links (advisory)
+        continue-on-error: true
+        run: |
+          grep -rhoE '\]\((docs/[^)]+|templates/[^)]+|scripts/[^)]+)\)' README.md CLAUDE.md docs/ 2>/dev/null \
+            | sed -E 's/^\]\(//; s/\)$//' | sort -u | while read -r p; do
+              [ -e "$p" ] || echo "::warning::死链: $p"
+            done
