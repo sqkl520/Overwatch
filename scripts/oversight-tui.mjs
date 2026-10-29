@@ -194,14 +194,15 @@ function stateCounts(sessions) {
   return STATE_ORDER.filter((st) => counts.has(st)).map((st) => `${st}=${counts.get(st)}`).join(' ');
 }
 
-/** 组装接力草稿：suggestedReply 在前，needs 作为上下文。 */
+/** 组装接力草稿：suggestedReply 在前，needs 作为上下文。
+ *  出口统一净化：草稿会被复制进剪贴板并显示在终端，控制字符不能流出去。 */
 export function buildDraft(session) {
   const reply = typeof session?.suggestedReply === 'string' ? session.suggestedReply.trim() : '';
   const needs = typeof session?.needs === 'string' ? session.needs.trim() : '';
   if (!reply && !needs) return null;
   const parts = [];
-  if (reply) parts.push(reply);
-  if (needs) parts.push(`（目标会话正在等待：${needs}）`);
+  if (reply) parts.push(sanitize(reply));
+  if (needs) parts.push(`（目标会话正在等待：${sanitize(needs)}）`);
   return parts.join('\n\n');
 }
 
@@ -394,7 +395,7 @@ function listRow(session, cols, selected) {
   const showReason = cols >= 78;
 
   let line = marker + fitWidth(stateColumn(session), COL_STATE) + ' '
-    + fitWidth(projectLabel(session.project), COL_PROJECT);
+    + fitWidth(projectLabel(sanitize(session.project)), COL_PROJECT);
   if (showCalls) line += ' ' + fitWidth(`calls=${String(session.calls ?? 0).padStart(5)}`, COL_CALLS);
   if (showNov) line += ' ' + fitWidth(`nov=${fmtNovelty(session.novelty)}`, COL_NOV);
   if (showIdle) line += ' ' + fitWidth(`idle=${fmtDur(session.idleSec)}`, COL_IDLE);
@@ -459,11 +460,11 @@ function detailLines(session, cols, useColor) {
   const out = [];
   out.push(kv('项目', projectLabel(sanitize(session.project))));
   out.push(kv('目录', sanitize(session.project)));
-  out.push(kv('sessionId', session.sessionId));
+  out.push(kv('sessionId', sanitize(session.sessionId)));
   out.push(kv('state', `${glyphOf(session)} ${st}`));
   out.push(kv('reason', sanitize(session.reason)));
   out.push(kv('liveness', session.liveness));
-  out.push(kv('hostState', session.hostState ?? '—'));
+  out.push(kv('hostState', sanitize(session.hostState ?? '—')));
   if (session.jobDetail) out.push(kv('jobDetail', sanitize(session.jobDetail)));
   out.push(kv('calls', session.calls));
   out.push(kv('novelty', fmtNovelty(session.novelty)));
@@ -902,7 +903,7 @@ class App {
     this.detailScroll = Math.min(Math.max(0, this.detailScroll), maxScroll);
 
     const lines = [];
-    let head = `OmniSight · 详情 · ${projectLabel(session.project)}`;
+    let head = `OmniSight · 详情 · ${projectLabel(sanitize(session.project))}`;
     const scrollInfo = maxScroll > 0 ? `  ${this.detailScroll + 1}/${content.length}` : '';
     head = truncateToWidth(head, Math.max(10, cols - displayWidth(scrollInfo))) + scrollInfo;
     if (this.useColor) head = BOLD + stripSgr(head) + RESET;
@@ -979,7 +980,8 @@ function usage() {
 
 // ── 非 TTY 纯文本 ─────────────────────────────────────────────────────
 
-function printPlain(data, days) {
+/** 纯文本快照。sink 可注入，便于测试；默认写 process.stdout。 */
+export function printPlain(data, days, sink = process.stdout) {
   const sessions = [...(data.sessions ?? [])].sort((a, b) => {
     const ai = STATE_ORDER.indexOf(a.state);
     const bi = STATE_ORDER.indexOf(b.state);
@@ -997,7 +999,7 @@ function printPlain(data, days) {
   for (const s of sessions) {
     if (!s.needs && !s.suggestedReply) continue;
     out.push('');
-    out.push(`[${s.state}] ${projectLabel(sanitize(s.project))}  ${s.sessionId}`);
+    out.push(`[${s.state}] ${projectLabel(sanitize(s.project))}  ${sanitize(s.sessionId)}`);
     if (s.needs) out.push(`  等待输入：${sanitize(s.needs)}`);
     if (s.suggestedReply) out.push(`  建议回复：${sanitize(s.suggestedReply)}`);
   }
@@ -1005,7 +1007,7 @@ function printPlain(data, days) {
   out.push('');
   out.push(`汇总：${stateCounts(sessions) || '无会话'}`);
   out.push(`提示：${HINT_LIST}（交互模式需 TTY）`);
-  process.stdout.write(out.join('\n') + '\n');
+  sink.write(out.join('\n') + '\n');
 }
 
 // ── 入口 ──────────────────────────────────────────────────────────────
@@ -1029,13 +1031,17 @@ export async function main({
 
   const tty = Boolean(stdout.isTTY) && !opts.plain;
   if (!tty) {
-    const { data, warning } = await scan({ days: opts.days });
+    // defaultScan 返回 { promise, cancel }，不是 Promise。
+    // 这里曾经直接 await 了 job 对象，导致 data 恒为 undefined，
+    // | cat 与 --plain 全部输出「扫描失败：undefined」。见 DF-012。
+    const job = scan({ days: opts.days });
+    const { data, warning } = await job.promise;
     if (!data) {
       process.stderr.write(`扫描失败：${warning}\n`);
       process.exitCode = 1;
       return;
     }
-    printPlain(data, opts.days);
+    printPlain(data, opts.days, stdout);
     return;
   }
 

@@ -12,7 +12,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { wrapToWidth, truncateToWidth, parseArgs, parseKeys, sanitize } from './oversight-tui.mjs';
+import { wrapToWidth, truncateToWidth, parseArgs, parseKeys, sanitize, buildDraft } from './oversight-tui.mjs';
 import { displayWidth } from './tui-theme.mjs';
 
 // ── sanitize：外部来源字段必须净化 ────────────────────────────────────
@@ -140,7 +140,6 @@ test('parseKeys 识别 j/k/回车/q/?', () => {
 // ── 退出必须取消子进程 ────────────────────────────────────────────────
 
 test('扫描未返回时按 q 能立即退出，并调用 cancel', async () => {
-  // 实测反例：--days 30 时按 q 后进程要等 11.5 秒才退出，用户以为卡死。
   const { PassThrough } = await import('node:stream');
   const stdin = new PassThrough();
   stdin.isTTY = true; stdin.setRawMode = () => {};
@@ -164,4 +163,74 @@ test('扫描未返回时按 q 能立即退出，并调用 cancel', async () => {
 
   assert.ok(Date.now() - t0 < 3000, `退出耗时 ${Date.now() - t0}ms`);
   assert.equal(cancelled, true, 'close() 没有调用扫描的 cancel');
+});
+
+// ── 端到端：main() 的非 TTY 分支 ──────────────────────────────────────
+//
+// 这两个是 r3 验收发现的阻断的根因：52 条测试没有一条覆盖 main() 的
+// 非 TTY 分支，也没有一条端到端断言渲染输出不含 OSC。纯函数全绿掩盖了
+// 契约变更（defaultScan 从 Promise 变成 { promise, cancel }）造成的回归。
+
+/** 造一个符合 scan 契约的假 job */
+function fakeJob(session) {
+  return {
+    promise: Promise.resolve({ data: { sessions: [session] }, warning: null }),
+    cancel: () => {},
+  };
+}
+
+const baseSession = {
+  project: 'p', sessionId: 's', state: 'PRODUCING',
+  reason: 'r', needs: null, suggestedReply: null, jobDetail: null, hostState: null,
+  calls: 10, novelty: 0.5, idleSec: 5, liveness: 'reconstructed',
+  subagents: 0, subagentsTotal: 0, subagentsTruncated: 0, maxDepth: 0,
+  hbThresholdSec: 120, lastGapSec: 5,
+};
+
+async function renderPlain(session) {
+  const { PassThrough } = await import('node:stream');
+  const out = new PassThrough();
+  out.isTTY = false;
+  let buf = '';
+  out.write = (c) => { buf += String(c); return true; };
+  const { main } = await import('./oversight-tui.mjs');
+  await main({ argv: [], stdout: out, stdin: new PassThrough(), env: {}, scan: () => fakeJob(session) });
+  return buf;
+}
+
+test('main() 非 TTY 分支能产出输出（曾因契约变更整段失效）', async () => {
+  // 回归：defaultScan 改成 { promise, cancel } 后，main() 仍直接 await 了 job 对象，
+  // data 恒为 undefined，| cat 与 --plain 全部输出「扫描失败：undefined」。
+  const buf = await renderPlain({ ...baseSession });
+  assert.ok(buf.length > 0, '非 TTY 分支没有任何输出');
+  assert.ok(!buf.includes('扫描失败'), `非 TTY 分支报错：${buf.slice(0, 120)}`);
+  assert.ok(buf.includes('p'), '输出里没有项目名');
+});
+
+test('main() 非 TTY 输出不含任何 ANSI 序列（含 OSC 52）', async () => {
+  const E = String.fromCharCode(0x1b);
+  const B = String.fromCharCode(0x07);
+  const evil = E + ']52;c;eA==' + B;    // OSC 52：写系统剪贴板
+  const session = {
+    ...baseSession,
+    project: 'p' + evil + 'x',
+    sessionId: 's' + evil + 'x',
+    reason: 'r' + evil,
+    needs: 'n' + evil,
+    suggestedReply: 'g' + evil,
+    jobDetail: 'j' + evil,
+    hostState: 'h' + evil,
+  };
+  const buf = await renderPlain(session);
+  assert.ok(!buf.includes(E), '输出里含 ESC');
+  assert.ok(!buf.includes('52;c'), 'OSC 52 的正文残留（ESC 被剥但内容还在）');
+});
+
+test('buildDraft 净化 needs 与 suggestedReply', async () => {
+  const E = String.fromCharCode(0x1b);
+  const B = String.fromCharCode(0x07);
+  const evil = E + ']52;c;eA==' + B;
+  const d = buildDraft({ needs: 'n' + evil, suggestedReply: 's' + evil });
+  assert.ok(!d.includes(E), '草稿含 ESC');
+  assert.ok(!d.includes('52;c'), '草稿含 OSC 正文');
 });
