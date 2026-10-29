@@ -451,7 +451,7 @@ function statusLine(app, cols) {
   return truncateToWidth(text, cols);
 }
 
-function detailLines(session, cols, useColor) {
+export function detailLines(session, cols, useColor) {
   const st = stateOf(session);
   const c = (code, s) => (useColor ? code + s + RESET : s);
   const label = (name) => name + ' '.repeat(Math.max(0, 13 - displayWidth(name)));

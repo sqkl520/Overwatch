@@ -234,3 +234,51 @@ test('buildDraft 净化 needs 与 suggestedReply', async () => {
   assert.ok(!d.includes(E), '草稿含 ESC');
   assert.ok(!d.includes('52;c'), '草稿含 OSC 正文');
 });
+
+// ── 渲染函数直接测试（补 DF-014 的核心盲区）──────────────────────────
+//
+// 变异测试暴露过：把 sessionId 的 sanitize 去掉，20 条测试全绿——
+// 因为 sessionId 只在详情页出现，而此前没有任何测试进入详情页。
+
+test('detailLines 渲染全部字段，且不含任何 ESC 序列', async () => {
+  const E = String.fromCharCode(0x1b);
+  const B = String.fromCharCode(0x07);
+  const evil = E + ']52;c;eA==' + B;
+  const session = {
+    project: 'proj' + evil,
+    sessionId: 'sid' + evil,
+    reason: 'r' + evil,
+    needs: 'n' + evil,
+    suggestedReply: 'g' + evil,
+    jobDetail: 'j' + evil,
+    hostState: 'h' + evil,
+    state: 'BLOCKED', calls: 10, novelty: 0.5, noveltyAll: 0.5, idleSec: 5,
+    liveness: 'reconstructed', subagents: 2, subagentsTotal: 7, subagentsTruncated: 5,
+    maxDepth: 1, hbThresholdSec: 120, lastGapSec: 5, badLines: 0, tokens: 1000,
+  };
+  const { detailLines } = await import('./oversight-tui.mjs');
+  const text = detailLines(session, 100, false).join('\n');
+  assert.ok(!text.includes(E), 'detailLines 输出含 ESC');
+  assert.ok(!text.includes('52;c'), 'detailLines 输出含 OSC 正文');
+  // 净化不等于丢弃：可见部分必须还在
+  assert.ok(text.includes('proj'), 'project 被整段丢弃');
+  assert.ok(text.includes('sid'), 'sessionId 被整段丢弃');
+});
+
+test('detailLines 显示子 agent 完整比例', async () => {
+  const { detailLines } = await import('./oversight-tui.mjs');
+  const session = {
+    ...baseSession, state: 'PRODUCING',
+    subagents: 2, subagentsTotal: 7, subagentsTruncated: 5, maxDepth: 1,
+  };
+  const text = detailLines(session, 100, false).join('\n');
+  assert.ok(/2\s*\/\s*7/.test(text), `未显示完整比例: ${text.slice(0, 200)}`);
+});
+
+test('detailLines 在 blocked 会话上显示 needs 与 suggestedReply', async () => {
+  const { detailLines } = await import('./oversight-tui.mjs');
+  const session = { ...baseSession, state: 'BLOCKED', needs: '要不要继续', suggestedReply: '继续' };
+  const text = detailLines(session, 100, false).join('\n');
+  assert.ok(text.includes('要不要继续'), 'needs 未显示');
+  assert.ok(text.includes('继续'), 'suggestedReply 未显示');
+});
