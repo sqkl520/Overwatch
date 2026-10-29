@@ -256,6 +256,42 @@ function checkSyntax() {
   }
 }
 
+// ── 检查 8：脚本导出的模块必须能被 import ────────────────────────────
+
+/** `node --check` 只查语法，查不到「调用了一个不存在的函数」。
+ *  曾把 wrapToWidth 的循环变量改了一半，语法全绿、结构门全绿，
+ *  但按 ? 打开帮助就抛 ReferenceError。这里实际 import 一次，
+ *  并调用每个可导出的纯函数一遍——调得通才算过。 */
+function checkImportable() {
+  const dir = join(ROOT, 'scripts');
+  if (!existsSync(dir)) return;
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith('.mjs') || f.endsWith('.test.mjs')) continue;
+    if (f === 'check-structure.mjs') continue; // 自身会立刻执行 main，不参与此检查
+    const p = join(dir, f);
+    const probe = `
+      import(${JSON.stringify('file:///' + p.replace(/\\/g, '/'))})
+        .then((m) => {
+          const args = { parseArgs: [[]], parseKeys: ['j'], parseKeysWithRest: ['j'] };
+          for (const [k, v] of Object.entries(m)) {
+            if (typeof v !== 'function') continue;
+            if (!/^(wrap|truncate|parse|build|glyph|state|badge|pad|display)/.test(k)) continue;
+            try { v(...(args[k] ?? ['x', 1])); }
+            catch (e) { if (e instanceof ReferenceError) { console.error(k + ': ' + e.message); process.exit(1); } }
+          }
+        })
+        .catch((e) => { console.error('import: ' + e.message); process.exit(1); });`;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe], {
+      encoding: 'utf8',
+      timeout: 20000,
+    });
+    if (r.status !== 0) {
+      const msg = ((r.stderr || '').trim().split('\n').find((l) => l.trim()) || '未知错误').slice(0, 140);
+      fail(rel(p), `import 或调用导出函数时失败：${msg}`);
+    }
+  }
+}
+
 // ── 运行 ──────────────────────────────────────────────────────────────
 
 console.log('check-structure · 仓库结构硬门\n');
@@ -267,6 +303,7 @@ checkAgents();
 checkEmptyDirs();
 checkCapabilityDisclosure();
 checkSyntax();
+checkImportable();
 
 if (violations.length) {
   console.log(`✗ ${violations.length} 项违规：\n`);
