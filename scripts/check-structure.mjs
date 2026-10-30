@@ -269,15 +269,41 @@ function checkImportable() {
     if (!f.endsWith('.mjs') || f.endsWith('.test.mjs')) continue;
     if (f === 'check-structure.mjs') continue; // 自身会立刻执行 main，不参与此检查
     const p = join(dir, f);
+    // 调用每一个导出函数，除非它已知有副作用（会起进程 / 写终端 / 改文件）。
+    // 曾经用 /^(wrap|truncate|parse|build|...)/ 前缀过滤，只覆盖 9/23 个导出，
+    // sanitize / detailLines / judgeState 全被跳过 —— 门看着能挡，实际挡不住。
+    // 黑名单而非白名单：新加的纯函数默认会被探到，不需要记得去登记。
     const probe = `
+      const SIDE_EFFECTS = new Set([
+        'main', 'printPlain', 'copyToClipboard', 'run', 'exec', 'spawn',
+        'recalibrate', 'writeFile', 'commit',
+      ]);
       import(${JSON.stringify('file:///' + p.replace(/\\/g, '/'))})
-        .then((m) => {
-          const args = { parseArgs: [[]], parseKeys: ['j'], parseKeysWithRest: ['j'] };
+        .then(async (m) => {
+          const args = {
+            parseArgs: [[]], parseKeys: ['j'], parseKeysWithRest: ['j'],
+            judgeState: [{}], noveltyOf: [[]], signatureOf: ['Read', {}],
+            normalizeBash: ['x'], heartbeatThreshold: [[]], isPersistentChange: ['Bash', {}],
+            displayWidth: ['x'], padDisplay: ['x', 1], paint: ['x', 'red', false],
+            badge: ['PRODUCING', false], colorEnabled: [{ isTTY: false }],
+            stripAnsi: ['x'], sanitize: ['x'], truncateToWidth: ['x', 1],
+            wrapToWidth: ['x', 1], buildDraft: [{}], detailLines: [{}, 80, false],
+            stripLongStrings: ['x'], collectSubagentFiles: ['/nonexistent'],
+            stateCounts: [[]], listRow: [{}, 80, false, false],
+            columnHeaderLine: [80], listHeaderLine: [1, 80, []],
+            usage: [], fmtDur: [1], fmtNovelty: [0.5], projectLabel: ['a-b'],
+            glyphOf: [{}], stateOf: [{}],
+          };
           for (const [k, v] of Object.entries(m)) {
-            if (typeof v !== 'function') continue;
-            if (!/^(wrap|truncate|parse|build|glyph|state|badge|pad|display)/.test(k)) continue;
-            try { v(...(args[k] ?? ['x', 1])); }
-            catch (e) { if (e instanceof ReferenceError) { console.error(k + ': ' + e.message); process.exit(1); } }
+            if (typeof v !== 'function' || SIDE_EFFECTS.has(k)) continue;
+            const a = args[k] ?? [{}, 1, false];
+            try {
+              const r = v(...a);
+              // async 导出必须等待，否则 rejection 逃逸成未处理拒绝，误判为门失败
+              if (r && typeof r.then === 'function') await r.catch(() => {});
+            } catch (e) {
+              if (e instanceof ReferenceError) { console.error(k + ': ' + e.message); process.exit(1); }
+            }
           }
         })
         .catch((e) => { console.error('import: ' + e.message); process.exit(1); });`;
