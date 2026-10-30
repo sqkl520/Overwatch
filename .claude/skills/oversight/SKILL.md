@@ -67,14 +67,25 @@ node scripts/scan-sessions.mjs --days 3
 ```bash
 node scripts/scan-sessions.mjs --json | node -e "
   const d=JSON.parse(require('fs').readFileSync(0,'utf8'));
-  console.log(d.sessions.filter(s=>s.state==='STALLED'||s.state==='FAILED'));
+  console.log(d.sessions.filter(s=>s.state==='BLOCKED'||s.state==='STALLED'||s.state==='FAILED'));
 "
 ```
 
-1. 派 `oversight-relay` 产出草稿
+**先分路，再派发**（`docs/spec/relay-protocol.md` §5.1）：
+
+| 情况 | 怎么做 |
+|---|---|
+| `BLOCKED` 且有 `suggestedReply` | 宿主已给半成品。TUI 按 `c` 直接复制，**不必派 Agent** |
+| `BLOCKED` 只有 `needs` | 派 `oversight-relay`，把 `needs` 逐字给它 |
+| `STALLED` / `FAILED`（无 job 记录） | 派 `oversight-relay`，从 transcript 重建停滞点 |
+
+1. 派 `oversight-relay` 产出草稿（给它 `needs` / `suggestedReply` 原文，不要摘要）
 2. 派 `oversight-safety` 过红线
 3. **主线程不写草稿、不判红线**
 4. 把通过的草稿交给用户复制
+
+**注意 `needs` 的类型**：等 API 恢复的 `blocked` 没有 `suggestedReply`，催它重试是错的——
+正确动作是检查网关或换模型。见规格 §5.1 的两种误用。
 
 ## 7. 状态行
 

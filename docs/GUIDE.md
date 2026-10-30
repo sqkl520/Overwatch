@@ -28,7 +28,7 @@ liveness: reconstructed（事后重建，非实时上报）
   idle  Let's learn English!               可投递(带来源标注)
 
 [PRODUCING] Projects/Overwatch         calls=  988 sub=     13 depth=1 novelty=0.97 hb=0s/120s     idle=5s    persistent-change-in-window
-[EXPLORING] Projects/dsh/fcl/android   calls= 2554 sub=30/272~ depth=1 novelty=1.00 hb=0s/120s     idle=64.9h dormant
+[EXPLORING] Projects/dsh/fcl/android   calls= 5840 sub=100/272~ depth=1 novelty=1.00 hb=0s/120s     idle=67.5h dormant
 
 汇总：EXPLORING=16  PRODUCING=3
 ```
@@ -108,7 +108,7 @@ check-structure · 仓库结构硬门
 | `[PRODUCING]` | 五态之一，宽度固定，方便竖着扫 |
 | 项目名 | 目录名还原（`D--Projects-Overwatch` → `Projects/Overwatch`），超 24 列截断 |
 | `calls` | 扫到的工具调用总数，含子 agent。为控制耗时，每个文件只读末尾 4 MB；主 transcript 取末尾 1200 条记录，每个子 agent 取末尾 400 条 |
-| `sub` | 子 agent 数量，`30/272~` 见下 |
+| `sub` | 子 agent 数量，`100/272~` 见下 |
 | `depth` | 派生树最大层深 |
 | `novelty` | 轨迹新颖度 0–1：最近 20 次调用里「没见过的调用」的加权占比。1.00 = 全是新动作；连续三窗低于 0.20 判 `STALLED`。不足一窗为 `null` |
 | `hb` | 末次调用间隔 / 该会话的自适应阈值（秒）。`n/a` = 间隔样本不足 20 个 |
@@ -117,9 +117,11 @@ check-structure · 仓库结构硬门
 | `tok=3476k` | 真实 token 用量，见下 |
 | `BAD=n` | 有 n 行 transcript 解析失败。少量不影响判定；持续增长说明记录在损坏 |
 
-### `30/272~` 是什么意思
+### `100/272~` 是什么意思
 
-读作：**总共发现 272 个子 agent transcript，本次只展开了最近的 30 个，`~` 表示被截断。** 全量解析一个 272 子 agent 的会话要 4 秒，所以上限是 30（按修改时间取最近）。代价是 `depth` 与树活性建立在残缺的树上——所以显式标出来，而不是假装 30 就是全部。没截断时只显示一个数字，如 `sub=13`。
+读作：**总共发现 272 个子 agent transcript，本次只展开了最近的 100 个，`~` 表示被截断。** 上限按实测定的：12 个最坏会话上，cap=30 覆盖 23.7%、耗时 11.6s；cap=100 覆盖 72.8%、19.4s；cap=200 覆盖 92.7%、24.7s。本机 69 个有子 agent 的会话里 61 个在 100 以内，所以取 100 只让少数巨无霸变慢。
+
+代价是 `depth` 与树活性建立在采样的树上——所以显式标出来，而不是假装 100 就是全部。**但判定不受影响**：四态只需要「任一节点有增益 → 整棵树 EXPLORING」，采样已足够发现增益；覆盖率低损害的是详情页画不全。没截断时只显示一个数字，如 `sub=13`。
 
 ### `liveness stale=17 reconstructed=2` 怎么读
 
@@ -157,7 +159,7 @@ node scripts/oversight-tui.mjs --days 1 --interval 15 --plain
   心跳         末次 38s / 阈值 211s
   tokens       3475667
 
-派生树 · 层深 1 · 子 agent 30/31（已截断）
+派生树 · 层深 1 · 子 agent 100/128（已截断）
   │ ◇ 子 agent #1
   │ ◇ 子 agent #2
   │ ◇ 子 agent #3

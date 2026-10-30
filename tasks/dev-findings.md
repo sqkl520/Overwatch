@@ -108,21 +108,22 @@
 - **影响**：ADR 断言「预算只能估算，必须标 `est:`」——对后台作业是错的。用估算值替代已有的精确值会让状态行显得比实际更不可信。
 - **修复**：两处文档改为「前台交互会话需估算并标 `est:`；能关联 job 的会话显示真实 tokens」。
 
-### DF-011 [open] 接力草稿的原料已部分由宿主提供
+### DF-011 [fixed] 接力草稿的原料已部分由宿主提供
 
 - **发现于**：同类工具调研 run
 - **位置**：`docs/spec/relay-protocol.md`、`oversight-relay` agent
 - **证据**：blocked 会话的 `state.json` 含 `needs`（「要我现在就把用户实测单交给你，还是你先看这四份测试报告？」）与 `suggestedReply`（「把实测单发给我」）。
 - **影响**：Relay Agent 不必从零生成草稿，而是**补全 + 结构化**宿主已有的半成品，成本显著降低。
-- **建议**：改 `relay-protocol.md` §5，把 `needs`/`suggestedReply` 列为 relay 的一等输入。
+- **修复**：`relay-protocol.md` 新增 §5.1（原料表 + 三条分路 + 两种典型误用）与 §5.2（relay 的输入清单）；`oversight-relay` agent 增加「有 suggestedReply 时补全而非创作」与「无 suggestedReply 时按 needs 类型分三种正确动作」；`oversight/SKILL.md` 的 Phase F 改为先分路再派发。
 
-### DF-008 [open] `MAX_SUBAGENTS = 30` 截断派生树
+### DF-008 [fixed] `MAX_SUBAGENTS = 30` 截断派生树
 
 - **发现于**：红队 run
 - **位置**：`scan-sessions.mjs` 的 `MAX_SUBAGENTS`
 - **证据**：单会话实测有 272 个子 agent transcript。截断后 `maxDepth`、`tree_gain` 都建立在残缺的树上。
-- **现状**：已通过 `subagentsTruncated` 显式暴露，不再静默。是否提高上限待定（会显著增加扫描耗时）。
-- **建议归属**：性能与正确性的权衡，需要实测不同上限下的耗时曲线。
+- **决策依据（2026-10-30 实测）**：12 个最坏会话上量了耗时-覆盖曲线——cap=30 覆盖 23.7% / 11.6s；cap=50 覆盖 39.4% / 16.1s；**cap=100 覆盖 72.8% / 19.4s**；cap=200 覆盖 92.7% / 24.7s；cap=500 覆盖 99.7% / 41.9s。
+- **取 100 而非更高**：本机 69 个有子 agent 的会话里 61 个在 100 以内，只有 8 个超过。四态判定只需「任一节点有增益 → 整棵树 EXPLORING」，采样足以发现增益；覆盖率低损害的是详情页画不全，不是判定错误。
+- **修复**：上限提到 100，超出的仍由 `subagentsTruncated` 显式暴露；新增 `subagentsComplete` 布尔字段，让下游知道 maxDepth / novelty 是否建立在采样上。全量扫描从 11.6s 变为 17.4s。
 
 ### DF-012 [fixed] 非 TTY 分支因契约变更整段失效
 

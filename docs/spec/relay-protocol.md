@@ -100,20 +100,50 @@ npm test -- --grep "c"     ← 第三次 → 触发 (c)
 
 ```
 1. scan-sessions.mjs 判定触发条件
-2. 主线程派 relay Agent，输入：
-   - 目标会话的最后 N 条消息（不含 AI 推理）
-   - 原始需求摘要
-   - 停滞点（来自 scan 输出的 reason 字段）
-   - Q3 口径
-3. relay 产出草稿 → 写入 tasks/runs/<id>/relay-draft-<n>.md
-4. 主线程派 safety Agent，输入：草稿全文 + 红线清单
+2. 分两条路，取决于宿主是否已给出原料（见 §5.1）
+3. 草稿 → 写入 tasks/runs/<id>/relay-draft-<n>.md
+4. 派 safety Agent，输入：草稿全文 + 红线清单
 5. safety 判 ACCEPT / REJECT
-   - REJECT → 退回 relay 重写（最多 2 轮）
-6. 通过 → 主线程向用户展示草稿 + 复制按钮
+   - REJECT → 退回重写（最多 2 轮）
+6. 通过 → 向用户展示草稿，由用户复制发送
 7. 用户发送后，该会话在下一轮扫描中重新进入监控
 ```
 
 **主线程不得自己写草稿**（规格 §2.1）。也不得自己判红线。
+
+### 5.1 宿主已给的原料是一等输入
+
+后台作业的 `~/.claude/jobs/<job-id>/state.json` 里，`blocked` 会话会带两个字段：
+
+| 字段 | 内容 | 实测样例 |
+|---|---|---|
+| `needs` | 它在等什么 | 「要我现在就把用户实测单交给你，还是你先看这四份测试报告？」 |
+| `suggestedReply` | 宿主建议怎么回 | 「把实测单发给我」 |
+
+`scan-sessions.mjs` 已把两者透传到 JSON 与终端输出。**这改变了 relay 的工作性质**：
+
+不是「从零生成一条消息」，而是**补全 + 结构化宿主已有的半成品**。
+
+| 情况 | 草稿来源 | 谁来做 |
+|---|---|---|
+| `blocked` 且 `suggestedReply` 非空 | 直接用，必要时补「决策授权」 | TUI 按 `c` 即可，无需派 Agent |
+| `blocked` 只有 `needs` | 据 `needs` 写回复 | Relay Agent |
+| `STALLED` / `FAILED`（无 job 记录） | 从 transcript 重建停滞点 | Relay Agent |
+
+**但 `suggestedReply` 不一定对。** 它只解决「当前这个问句」，不解决「为什么会停在这里」。两种典型误用：
+
+1. **等 API 恢复的 `blocked` 没有 `suggestedReply`** —— 实测有一条 `needs` 是 `API unavailable — retry · API Error: 503 …`。这时正确动作是检查推理网关或换模型，不是催它重试。按 `c` 只能复制到「（目标会话正在等待：API unavailable…）」，需要人补一句真正的指令。
+2. **`suggestedReply` 可能把会话引向错误方向** —— 它是宿主基于当前上下文猜的，不掌握用户的整体意图。要改方向就自己改，别盲信。
+
+### 5.2 Relay Agent 的输入（派发时给这些）
+
+```
+- 目标会话的最后 N 条消息（不含 AI 推理文本）
+- 原始需求摘要
+- 停滞点（scan 输出的 reason 字段）
+- needs 与 suggestedReply（若有，逐字给出，不要摘要）
+- Q3 身份口径
+```
 
 ## 6. `host` 模式（未来）
 

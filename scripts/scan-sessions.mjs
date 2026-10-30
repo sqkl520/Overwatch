@@ -369,8 +369,21 @@ const MAX_READ_BYTES = 4 * 1024 * 1024;
  *  实测最坏的会话有 199 个子 agent transcript，全量解析要 4 秒；限流后 <100ms。 */
 const MAX_CALLS_PER_SESSION = 400;
 
-/** 单个会话最多展开多少个子 agent（按 mtime 取最近） */
-const MAX_SUBAGENTS = 30;
+/** 单个会话最多展开多少个子 agent（按 mtime 取最近）。
+ *
+ *  不是随手定的数。2026-10-30 在 12 个最坏会话（子 agent 数 518/272/199/188/
+ *  169/128/119/108/98/89/80/75）上实测的覆盖率与全量扫描耗时：
+ *
+ *    cap= 30  23.7%  11.6s      cap=100  72.8%  19.4s
+ *    cap= 50  39.4%  16.1s      cap=200  92.7%  24.7s
+ *    cap=500  99.7%  41.9s      cap=∞   100.0%  39.6s（12 会话单独计）
+ *
+ *  四态判定只需要「任一节点有增益 → 整棵树 EXPLORING」，窄采样已足够发现增益；
+ *  覆盖率低损害的是**详情页画不全**，不是判定错误。
+ *  本机 69 个有子 agent 的会话里，61 个在 100 以内，只有 8 个超过——取 100
+ *  只让少数巨无霸变慢。超过时由 subagentsTruncated 显式暴露，不静默。
+ */
+const MAX_SUBAGENTS = 100;
 
 function findTranscriptRoot() {
   const root = join(homedir(), '.claude', 'projects');
@@ -529,6 +542,8 @@ function main(argv) {
         subagents: scanned.children.length,
         subagentsTotal: scanned.subagentTotal,
         subagentsTruncated: scanned.subagentTruncated,
+        // 判定用的是采样还是全量：为 false 时 maxDepth / novelty 只反映被展开的那部分
+        subagentsComplete: scanned.subagentTruncated === 0,
         maxDepth: scanned.children.reduce((m, c) => Math.max(m, c.spawnDepth ?? 1), scanned.children.length ? 1 : 0),
         novelty: noveltyOf(recent),
         noveltyAll: noveltyOf(scanned.allCalls),
