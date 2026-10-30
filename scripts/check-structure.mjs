@@ -248,78 +248,128 @@ function checkCapabilityDisclosure() {
 function checkSyntax() {
   const dir = join(ROOT, 'scripts');
   if (!existsSync(dir)) return;
-  for (const f of readdirSync(dir)) {
-    if (!f.endsWith('.mjs') && !f.endsWith('.js')) continue;
-    const p = join(dir, f);
-    const r = spawnSync(process.execPath, ['--check', p], { encoding: 'utf8' });
-    if (r.status !== 0) {
-      const first = (r.stderr || '').split('\n').find((l) => l.includes('Error')) || '语法错误';
-      fail(rel(p), `无法被 Node 解析：${first.trim().slice(0, 120)}`);
-    }
+  const files = readdirSync(dir).filter((f) => f.endsWith('.mjs') || f.endsWith('.js'));
+  if (!files.length) return;
+
+  // `node --check` 一次可以接多个文件，一个进程查完（实测 6 个文件 1.5s，
+  // 而逐个 spawn 要 9s）。
+  // 曾试过在单进程里用 vm / new Function 复刻 --check，但 ESM 的 import/export
+  // 需要先剥壳，剥壳本身引入了三次转义 bug —— 不如把这件事交还给 node 自己。
+  const r = spawnSync(process.execPath, ['--check', ...files.map((f) => join(dir, f))], {
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  if (r.status !== 0) {
+    const lines = (r.stderr || '').split('\n');
+    const fileLine = lines.find((l) => l.includes('scripts')) || '';
+    const errLine = lines.find((l) => l.includes('Error')) || '语法错误';
+    fail(fileLine.trim() || 'scripts/', `无法被 Node 解析：${errLine.trim().slice(0, 140)}`);
   }
 }
 
 // ── 检查 8：脚本导出的模块必须能被 import ────────────────────────────
 
+/** 登记过的纯函数 → 调用参数（JSON 片段）。
+ *  只调用这里列出的导出。没登记 = 不调用，由 checkUnregisteredExports 列成提示。
+ *
+ *  演进史：前缀白名单（覆盖 9/23）→ 黑名单（新函数默认被调）→ 本版参数白名单。
+ *  黑名单的问题是 watch.mjs 的 startWatch 是常驻循环，被 {} 调中后门要等满 20s 超时，
+ *  而且真把 state.json 写进了用户的 %LOCALAPPDATA%。每加一个副作用函数就要补一次
+ *  黑名单，忘一次门就卡死。现在反过来：没登记就不调，登记这个动作本身就是一次审阅。 */
+const PROBE_ARGS = {
+  parseArgs: '[]', parseKeys: '"j"', parseKeysWithRest: '"j"',
+  judgeState: '{}', noveltyOf: '[]', signatureOf: '["Read", {}]',
+  normalizeBash: '"x"', heartbeatThreshold: '[]', isPersistentChange: '["Bash", {}]',
+  displayWidth: '"x"', padDisplay: '["x", 1]', paint: '["x", "red", false]',
+  badge: '["PRODUCING", false]', colorEnabled: '[{ isTTY: false }]',
+  stripAnsi: '"x"', sanitize: '"x"', truncateToWidth: '["x", 1]',
+  wrapToWidth: '["x", 1]', buildDraft: '[{}]', detailLines: '[{}, 80, false]',
+  stripLongStrings: '"x"', collectSubagentFiles: '["/nonexistent"]',
+  stateCounts: '[[]]', listRow: '[{}, 80, false, false]',
+  columnHeaderLine: '[80]', listHeaderLine: '[1, 80, []]',
+  usage: '[]', fmtDur: '[1]', fmtNovelty: '[0.5]', projectLabel: '["a-b"]',
+  glyphOf: '[{}]', stateOf: '[{}]',
+  reasonClass: '["novelty=0.1"]', dedupeKey: '["a", "STALLED", "novelty=0.1", "x"]',
+  emptyState: '[]', recordSent: '[{}, "sid", 0]',
+  diffProbe: '[{}, {}]', foldProbe: '[{}, {}]',
+  canNotify: '[{}, "sid", 0]', candidatesFromScan: '[[]]',
+  escapeXml: '"x"', sanitizeTag: '"x"', recalibrateWeights: '[{}]',
+  textOf: '[{}]', buildPayloadXml: '["t", "b", "g"]',
+  lastPermissionMode: '[]', parseAskAnswers: '""', relevanceOf: '["a", ["b"]]',
+  answerIsNegative: '""', findEarlierMatch: '["a", ["b"]]', classifyStop: '[{}]',
+};
+
+/** 需要临时目录的导出，参数由探针注入 `_sandbox` */
+const SANDBOX_ARGS = {
+  loadState: '[_sandbox]', saveState: '[_sandbox, {}]',
+  probeJobs: '[_sandbox]', probeMtime: '[_sandbox]',
+  createLogger: '[_sandbox]', defaultStateDir: '{}', defaultNotifyDir: '{}',
+};
+
 /** `node --check` 只查语法，查不到「调用了一个不存在的函数」。
  *  曾把 wrapToWidth 的循环变量改了一半，语法全绿、结构门全绿，
- *  但按 ? 打开帮助就抛 ReferenceError。这里实际 import 一次，
- *  并调用每个可导出的纯函数一遍——调得通才算过。 */
+ *  但按 ? 打开帮助就抛 ReferenceError。
+ *
+ *  性能：曾对每个文件起一个 node 进程（8 文件 × 1.5s ≈ 12s）。现在一个进程跑完，
+ *  单文件失败不影响其他文件。 */
 function checkImportable() {
   const dir = join(ROOT, 'scripts');
   if (!existsSync(dir)) return;
-  for (const f of readdirSync(dir)) {
-    if (!f.endsWith('.mjs') || f.endsWith('.test.mjs')) continue;
-    // CLI 脚本被 import 时会立刻执行副作用，且不导出函数——不参与此检查。
-    // 它们能不能跑由 checkSyntax() 与各自的调用点保证。
-    if (CLI_SCRIPTS.has(f)) continue;
-    const p = join(dir, f);
-    // 调用每一个导出函数，除非它已知有副作用（会起进程 / 写终端 / 改文件）。
-    // 曾经用 /^(wrap|truncate|parse|build|...)/ 前缀过滤，只覆盖 9/23 个导出，
-    // sanitize / detailLines / judgeState 全被跳过 —— 门看着能挡，实际挡不住。
-    // 黑名单而非白名单：新加的纯函数默认会被探到，不需要记得去登记。
-    const probe = `
-      const SIDE_EFFECTS = new Set([
-        'main', 'printPlain', 'copyToClipboard', 'run', 'exec', 'spawn',
-        'recalibrate', 'writeFile', 'commit',
-      ]);
-      import(${JSON.stringify('file:///' + p.replace(/\\/g, '/'))})
-        .then(async (m) => {
-          const args = {
-            parseArgs: [[]], parseKeys: ['j'], parseKeysWithRest: ['j'],
-            judgeState: [{}], noveltyOf: [[]], signatureOf: ['Read', {}],
-            normalizeBash: ['x'], heartbeatThreshold: [[]], isPersistentChange: ['Bash', {}],
-            displayWidth: ['x'], padDisplay: ['x', 1], paint: ['x', 'red', false],
-            badge: ['PRODUCING', false], colorEnabled: [{ isTTY: false }],
-            stripAnsi: ['x'], sanitize: ['x'], truncateToWidth: ['x', 1],
-            wrapToWidth: ['x', 1], buildDraft: [{}], detailLines: [{}, 80, false],
-            stripLongStrings: ['x'], collectSubagentFiles: ['/nonexistent'],
-            stateCounts: [[]], listRow: [{}, 80, false, false],
-            columnHeaderLine: [80], listHeaderLine: [1, 80, []],
-            usage: [], fmtDur: [1], fmtNovelty: [0.5], projectLabel: ['a-b'],
-            glyphOf: [{}], stateOf: [{}],
-          };
-          for (const [k, v] of Object.entries(m)) {
-            if (typeof v !== 'function' || SIDE_EFFECTS.has(k)) continue;
-            const a = args[k] ?? [{}, 1, false];
-            try {
-              const r = v(...a);
-              // async 导出必须等待，否则 rejection 逃逸成未处理拒绝，误判为门失败
-              if (r && typeof r.then === 'function') await r.catch(() => {});
-            } catch (e) {
-              if (e instanceof ReferenceError) { console.error(k + ': ' + e.message); process.exit(1); }
-            }
-          }
-        })
-        .catch((e) => { console.error('import: ' + e.message); process.exit(1); });`;
-    const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe], {
-      encoding: 'utf8',
-      timeout: 20000,
-    });
-    if (r.status !== 0) {
-      const msg = ((r.stderr || '').trim().split('\n').find((l) => l.trim()) || '未知错误').slice(0, 140);
-      fail(rel(p), `import 或调用导出函数时失败：${msg}`);
+
+  const files = readdirSync(dir)
+    .filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs') && !CLI_SCRIPTS.has(f));
+  if (!files.length) return;
+
+  const base = 'file:///' + dir.split('\\').join('/');
+  const script = [
+    'import { mkdtempSync, rmSync } from "node:fs";',
+    'import { join as _join } from "node:path";',
+    'import { tmpdir } from "node:os";',
+    'const _sandbox = mkdtempSync(_join(tmpdir(), "ow-gate-"));',
+    'process.env.OVERWATCH_STATE_DIR = _sandbox;',
+    'process.on("exit", () => { try { rmSync(_sandbox, { recursive: true, force: true }); } catch {} });',
+    `const PROBE_ARGS = ${JSON.stringify(PROBE_ARGS)};`,
+    `const SANDBOX_ARGS = ${JSON.stringify(SANDBOX_ARGS)};`,
+    `const FILES = ${JSON.stringify(files)};`,
+    `const DIR = ${JSON.stringify(base)};`,
+    'const failures = [];',
+    '// 并行 import：串行时每个 import 只花几十毫秒，但整轮仍受进程启动主导；',
+    '// 并行后 6 个模块合计 78ms，而不是 6 × 1.5s。',
+    'const MODS = await Promise.all(FILES.map((f) =>',
+    '  import(DIR + "/" + f).then((m) => [f, m]).catch((e) => [f, null, e.message])));',
+    'for (const [f, m, err] of MODS) {',
+    '  if (!m) { failures.push([f, "import: " + err]); continue; }',
+    '  let m2 = m;',
+    '  for (const [k, v] of Object.entries(m2)) {',
+    '    if (typeof v !== "function") continue;',
+    '    const src = PROBE_ARGS[k] !== undefined ? PROBE_ARGS[k] : SANDBOX_ARGS[k];',
+    '    if (src === undefined) continue;',
+    '    let a;',
+    '    try { a = JSON.parse("[" + src + "]"); } catch { continue; }',
+    '    try {',
+    '      const r = v(...a);',
+    '      if (r && typeof r.then === "function") await r.catch(() => {});',
+    '    } catch (e) {',
+    '      if (e instanceof ReferenceError) { failures.push([f, k + ": " + e.message]); break; }',
+    '    }',
+    '  }',
+    '}',
+    'if (failures.length) { console.error(JSON.stringify(failures)); process.exit(1); }',
+  ].join('\n');
+
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf8',
+    timeout: 45000,
+  });
+  if (r.status !== 0) {
+    let detail = '';
+    try {
+      const list = JSON.parse(String(r.stderr || '').trim().split('\n').pop());
+      detail = list.map(([f, msg]) => `${f} → ${msg}`).join('; ');
+    } catch {
+      detail = (String(r.stderr || '').trim().split('\n').find((l) => l.trim()) || '未知错误');
     }
+    fail('scripts/', `import 或调用导出函数时失败：${detail.slice(0, 220)}`);
   }
 }
 
@@ -351,6 +401,54 @@ function checkLinks() {
   }
 }
 
+/** 参数白名单的代价：新加的纯函数若忘了登记，就不会被探到。
+ *  这里把它变成可见的提示，而不是静默跳过——不阻塞（有些导出本来就是有副作用的），
+ *  但每次都会列出来，提醒去登记或确认它不需要登记。 */
+function checkUnregisteredExports() {
+  const dir = join(ROOT, 'scripts');
+  if (!existsSync(dir)) return;
+  const REGISTERED = new Set([
+    'parseArgs', 'parseKeys', 'parseKeysWithRest', 'judgeState', 'noveltyOf',
+    'signatureOf', 'normalizeBash', 'heartbeatThreshold', 'isPersistentChange',
+    'displayWidth', 'padDisplay', 'paint', 'badge', 'colorEnabled', 'stripAnsi',
+    'sanitize', 'truncateToWidth', 'wrapToWidth', 'buildDraft', 'detailLines',
+    'stripLongStrings', 'collectSubagentFiles', 'stateCounts', 'listRow',
+    'columnHeaderLine', 'listHeaderLine', 'usage', 'fmtDur', 'fmtNovelty',
+    'projectLabel', 'glyphOf', 'stateOf', 'reasonClass', 'dedupeKey',
+    'emptyState', 'loadState', 'saveState', 'recordSent', 'probeJobs',
+    'probeMtime', 'diffProbe', 'foldProbe', 'canNotify', 'candidatesFromScan',
+    'createLogger', 'defaultStateDir', 'escapeXml', 'sanitizeTag', 'textOf',
+    'buildPayloadXml', 'defaultNotifyDir', 'lastPermissionMode',
+    'parseAskAnswers', 'relevanceOf', 'answerIsNegative',
+    'findEarlierMatch', 'classifyStop',
+    'recalibrateWeights', 'NOTIFY_STATES', '__internals', 'STATES', 'DAY', 'HOUR', 'MINUTE', 'App', 'KINDS',
+  ]);
+  const INTENTIONALLY_PROBED_FREE = new Set([
+    'main', 'printPlain', 'copyToClipboard', 'startWatch', 'runTick',
+    'runScan', 'dispatchCandidates', 'sendNotification', 'isNotificationAvailable',
+    'NOTIFY_STATES', '__internals',
+  ]);
+
+  const files = readdirSync(dir).filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs') && !CLI_SCRIPTS.has(f));
+  if (!files.length) return;
+
+  // 一次性拿到所有文件的导出名：每个文件一个 import()，但只起一个 node 进程。
+  const mods = files.map((f) => JSON.stringify('file:///' + join(dir, f).split(String.fromCharCode(92)).join('/')));
+  const script =
+    'Promise.all([' + mods.join(',') + '].map((u) => import(u).then((m) => Object.keys(m)).catch(() => [])))' +
+    '.then((all) => console.log(JSON.stringify(all)))';
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 20000 });
+  if (r.status !== 0) return;
+  let all;
+  try { all = JSON.parse(String(r.stdout || '[]')); } catch { return; }
+  all.forEach((exportsList, i) => {
+    for (const k of exportsList) {
+      if (REGISTERED.has(k) || INTENTIONALLY_PROBED_FREE.has(k) || k === 'default') continue;
+      warn(rel(join(dir, files[i])), `导出 "${k}" 未登记 —— 它不会被 checkImportable 调用。若是纯函数，请加进参数表；若有副作用，请加进 INTENTIONALLY_PROBED_FREE`);
+    }
+  });
+}
+
 // ── 运行 ──────────────────────────────────────────────────────────────
 
 console.log('check-structure · 仓库结构硬门\n');
@@ -363,6 +461,7 @@ checkEmptyDirs();
 checkCapabilityDisclosure();
 checkSyntax();
 checkImportable();
+checkUnregisteredExports();
 checkLinks();
 
 if (violations.length) {
