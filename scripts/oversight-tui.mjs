@@ -594,7 +594,7 @@ function bottomBorder(width) {
 
 // ── 应用 ──────────────────────────────────────────────────────────────
 
-class App {
+export class App {
   constructor({ stdout, stdin, env, days, intervalSec, scan, useColor }) {
     this.stdout = stdout;
     this.stdin = stdin;
