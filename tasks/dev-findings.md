@@ -141,11 +141,13 @@
 - **影响**：与 DF-005 同类，但攻击面更宽：只要按 Enter 进详情就触发。
 - **修复**：所有外部来源字段（`project` / `sessionId` / `reason` / `needs` / `suggestedReply` / `jobDetail` / `hostState`）统一过 `sanitize()`；`buildDraft()` 出口也净化（它的产物会进剪贴板）。
 
-### DF-014 [partial] App 层仍无直接测试
+### DF-014 [fixed] App 层无直接测试（r3 两个阻断的共同盲区）
 
 - **发现于**：TUI 锐评与验收 r2/r3
 - **位置**：`oversight-tui.mjs` 的 `App` 类（约 340 行）
-- **现状（2026-10-30 更新）**：58 条测试。已导出 `detailLines` 并加 3 条测试，覆盖全字段 OSC payload、2/7 截断比例、blocked 的 needs/suggestedReply。**仍未覆盖**：键位路由（4 种 mode × 13 个键）、滚动窗口、窄屏拆列、详情滚动边界。r3 的两个阻断都出在这一层。
-- **建议**：把 `detailLines` / `helpPanel` / `buildDraftPanel` / `listRow` 导出为纯函数并加测试，比拆文件更值。
+- **现状（2026-10-30 定稿）**：`scripts/app-router.test.mjs` 20 条直接驱动 `App`——列表导航与边界、Enter/Esc 迁移、详情滚动含 pgup/pgdown、帮助面板按 prevMode 返回来源、q 与 ctrl-c 的区分、空数据不崩、100 与 20 列两档渲染冒烟。
+- **验证**：6 个变异（Esc 不重置滚动 / 帮助固定回列表 / move 去掉上下界 / pgdown 步长 / 空列表 Enter 不判空）全部被抓。
+- **仍未覆盖**：滚动窗口（`listOffset` 的跟随逻辑）、窄屏拆列的视觉正确性（只验证不崩）。
+- **已做**：`detailLines` 已导出并单独测试（见 oversight-tui.test.mjs）。
 
 _（新增条目追加在此行上方）_
