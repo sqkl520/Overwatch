@@ -33,11 +33,22 @@
  *   const r = classifyStop({ transcriptTail, earlierHumanMessages, jobsState });
  *
  * 输入（全部可选，缺省一律降级为 UNCLASSIFIABLE，绝不抛异常）：
- *   transcriptTail        [...]  最近的记录，已解析（顺序即落盘顺序）
+ *   transcriptTail        [...]  最近的记录，已解析（顺序即落盘顺序）。
+ *                                停止点 = 其中最后一条 assistant 记录；「下一句」= 它之后
+ *                                第一条非 tool_result 的 user 记录。调用方可以只传停止点
+ *                                那一段，但**不要**把后续 assistant 记录切掉后还指望
+ *                                第 1 步命中（那时「下一句」就不在输入里了）。
  *   earlierHumanMessages  [...]  会话中更早的真人消息文本
  *   jobsState             {...}  { state, needs, suggestedReply } | null
  *   permissionMode        ...    可选兜底；tail 里读不到时才用
  *                                （AC6 要求「取最后一条」，该逻辑在 lastPermissionMode）
+ *
+ * 【调用方注意】实测一个停止点有两类 stop_reason，不要只挑 end_turn：
+ *   - `end_turn`（5918 条 assistant 记录，按轮去重后 3968 个停止点）
+ *   - `tool_use`（124559 条）—— AskUserQuestion 与 ExitPlanMode 的停止点都在这一类里。
+ *     只回放 end_turn 会一个 ASKED_* / PLAN_SUBMITTED 都看不到。
+ *   另一条陷阱：同一轮会产生多条 assistant 记录（apiBlockIndex 0=thinking / 1=text），
+ *   **每条都带 stop_reason:'end_turn'**，直接数记录会把停止点虚增约 1.5 倍。
  */
 
 export const KINDS = Object.freeze([
