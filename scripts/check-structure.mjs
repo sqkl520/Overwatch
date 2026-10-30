@@ -11,7 +11,7 @@
 
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { join, relative, extname } from 'node:path';
+import { join, relative, extname, dirname, resolve } from 'node:path';
 
 const ROOT = process.cwd();
 const violations = [];
@@ -52,6 +52,9 @@ function walk(dir, out = []) {
 }
 
 const rel = (p) => relative(ROOT, p).replace(/\\/g, '/');
+
+/** 只作为 CLI 运行、不导出函数的脚本。它们被 import 会执行副作用。 */
+const CLI_SCRIPTS = new Set(['check-structure.mjs', 'check-links.mjs']);
 
 /** 解析 frontmatter：支持 YAML 多行块（| 与 >），否则多行 description 会被误判为空 */
 function parseFrontmatter(fm) {
@@ -267,7 +270,9 @@ function checkImportable() {
   if (!existsSync(dir)) return;
   for (const f of readdirSync(dir)) {
     if (!f.endsWith('.mjs') || f.endsWith('.test.mjs')) continue;
-    if (f === 'check-structure.mjs') continue; // 自身会立刻执行 main，不参与此检查
+    // CLI 脚本被 import 时会立刻执行副作用，且不导出函数——不参与此检查。
+    // 它们能不能跑由 checkSyntax() 与各自的调用点保证。
+    if (CLI_SCRIPTS.has(f)) continue;
     const p = join(dir, f);
     // 调用每一个导出函数，除非它已知有副作用（会起进程 / 写终端 / 改文件）。
     // 曾经用 /^(wrap|truncate|parse|build|...)/ 前缀过滤，只覆盖 9/23 个导出，
@@ -318,6 +323,34 @@ function checkImportable() {
   }
 }
 
+// ── 检查 9：文档相对链接 ──────────────────────────────────────────────
+
+/** 相对链接必须按其所在目录解析。曾用仓库根当基准，导致 `../adr/x.md`
+ *  这类正确链接被误报为断链，于是检查器只好退化成建议门。 */
+function checkLinks() {
+  const files = ['README.md', 'CLAUDE.md'].filter((f) => existsSync(join(ROOT, f)));
+  const walkMd = (d) => {
+    if (!existsSync(d)) return;
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) walkMd(p);
+      else if (e.name.endsWith('.md')) files.push(p);
+    }
+  };
+  walkMd(join(ROOT, 'docs'));
+
+  for (const f of files) {
+    let text;
+    try { text = readFileSync(f, 'utf8'); } catch { continue; }
+    const dir = dirname(f);
+    for (const m of text.matchAll(/\]\(([^)#\s]+\.md)(?:#[^)]*)?\)/g)) {
+      if (!existsSync(resolve(dir, m[1]))) {
+        fail(rel(f), `文档链接指向不存在的文件：${m[1]}`);
+      }
+    }
+  }
+}
+
 // ── 运行 ──────────────────────────────────────────────────────────────
 
 console.log('check-structure · 仓库结构硬门\n');
@@ -330,6 +363,7 @@ checkEmptyDirs();
 checkCapabilityDisclosure();
 checkSyntax();
 checkImportable();
+checkLinks();
 
 if (violations.length) {
   console.log(`✗ ${violations.length} 项违规：\n`);
