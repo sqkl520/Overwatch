@@ -4,9 +4,9 @@
 
 ## 1. 这是什么
 
-扫描本机所有 Claude Code 会话的 transcript（会话记录文件），事后重建每个会话的真实状态，并为卡住的会话准备一条可直接粘贴的接力草稿。
+**本库不能自动接力。** 目标会话运行时，宿主的 `--resume` 注入会落到副本上，窗口里看不到任何东西；跨会话通道又强制标注来源。草稿只能你复制发送。
 
-**边界：本库不能自动接力。** 目标会话正在运行时，宿主的 `--bg --resume` 注入会落到副本上，你的窗口里不会出现任何东西；跨会话消息通道又强制标注来源（`From {发送方标题}`），无法无痕替你说话。草稿只能由你复制发送。见 `docs/adr/0001-config-only.md`。
+它扫描本机所有 Claude Code 会话的 transcript，重建真实状态，并为卡住的会话准备接力草稿。
 
 ## 2. 五分钟上手
 
@@ -107,7 +107,7 @@ check-structure · 仓库结构硬门
 |---|---|
 | `[PRODUCING]` | 五态之一，宽度固定，方便竖着扫 |
 | 项目名 | 目录名还原（`D--Projects-Overwatch` → `Projects/Overwatch`），超 24 列截断 |
-| `calls` | 扫到的工具调用总数，含子 agent。单会话最多读末尾 400 次 |
+| `calls` | 扫到的工具调用总数，含子 agent。为控制耗时，每个文件只读末尾 4 MB；主 transcript 取末尾 1200 条记录，每个子 agent 取末尾 400 条 |
 | `sub` | 子 agent 数量，`30/272~` 见下 |
 | `depth` | 派生树最大层深 |
 | `novelty` | 轨迹新颖度 0–1：最近 20 次调用里「没见过的调用」的加权占比。1.00 = 全是新动作；连续三窗低于 0.20 判 `STALLED`。不足一窗为 `null` |
@@ -207,7 +207,7 @@ NO_COLOR=1 node scripts/oversight-tui.mjs   # 仍交互，但无色
 
 1. 扫描发现 `BLOCKED` / `STALLED`。
 2. 看 `needs`：它在等什么。
-3. 有 `suggestedReply` → TUI 按 `c` 复制；没有 → 派 `oversight-relay` 写草稿，再派 `oversight-safety` 过红线。
+3. 有 `suggestedReply` → TUI 按 `c` 复制；没有 → 派 `oversight-relay` 写草稿，再派 `oversight-safety` 过红线（`/oversight relay <session-id>`）。
 4. 粘贴到目标会话，回车。
 5. 下一轮扫描，该会话重新进入监控。
 
@@ -312,7 +312,7 @@ NO_COLOR=1 node scripts/oversight-tui.mjs   # 仍交互，但无色
 
 **Q：`--days 30` 为什么这么慢？**
 
-它按**文件**扫，不按天。窗口越长，落进来的 transcript 越多：本机 `--days 3` 是 19 个会话、13 秒；`--days 30` 是 124 个会话、实测 48 秒。每个会话最多读 4 MB 尾部、最多展开 30 个子 agent，所以耗时不随天数线性增长，而随「还没被裁掉的文件数」增长。（`oversight-tui.mjs --help` 写「30 天约需 110 秒」是更早的实测值。）日常用 `--days 3`。面板里按 `q` 会立刻杀掉扫描子进程，不会卡住等它跑完。
+它按**文件**扫，不按天。窗口越长，落进来的 transcript 越多：本机 `--days 3` 是 19 个会话、13 秒；`--days 30` 是 124 个会话、实测 48 秒。每个会话最多读 4 MB 尾部、最多展开 30 个子 agent，所以耗时不随天数线性增长，而随「还没被裁掉的文件数」增长。（`--help` 里原本写「30 天约需 110 秒」，那是优化前的值；现已改为「实测约 40 秒，随语料增长」。）日常用 `--days 3`。面板里按 `q` 会立刻杀掉扫描子进程，不会卡住等它跑完。
 
 **Q：扫描会不会影响正在跑的会话？**
 
@@ -393,7 +393,7 @@ node --test scripts/state-model.test.mjs
 | `无法定位 transcript 根目录`，退出码 2 | 这台机器还没有会话记录，或 `HOME`/`USERPROFILE` 指错 | 确认 `~/.claude/projects/` 存在，在正确用户下运行 |
 | 输出 0 个会话，但你知道有 | `--days` 太短，或 `--project` 过滤词不匹配 | 放宽 `--days`；`--project` 做子串匹配，写目录名的一部分即可 |
 | 面板顶部 `⚠ 扫描失败…` | 扫描超时（>180 秒）、非零退出无 JSON、或输出不是合法 JSON | 手动跑 `node scripts/scan-sessions.mjs --json \| head` 看真实报错；确认 Node ≥ 18 |
-| 某会话 `calls` 很小但明显干过很多活 | 单会话只读末尾 400 次调用、4 MB | 正常设计，不是 bug |
+| 某会话 `calls` 很小但明显干过很多活 | 每个文件只读末尾 4 MB，主 transcript 取末尾 1200 条记录，子 agent 各取 400 条 | 正常设计，不是 bug |
 | `sub` 明显小于预期 | 子 agent 上限 30，超出被截断（显示 `30/N~`） | 正常设计；调大上限会显著拖慢扫描 |
 
 排查顺序固定：先 `node --version`，再 `node scripts/scan-sessions.mjs --days 1`，再 `--json` 看结构，最后才怀疑代码。大多数「扫描坏了」是环境或路径问题。
