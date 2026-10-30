@@ -21,13 +21,15 @@
 
 import {
   existsSync, readdirSync, statSync, readFileSync, writeFileSync,
-  mkdirSync, renameSync, rmSync, appendFileSync,
+  mkdirSync, renameSync, rmSync, appendFileSync, openSync, readSync, closeSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+
+import { classifyStop } from './classify-stop.mjs';
 
 // ── 常量 ──────────────────────────────────────────────────────────────
 

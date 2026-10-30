@@ -119,8 +119,24 @@ powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='no
 
 ## 已知限制
 
-1. **任务计划在这台机器上不可用**（`0x1`，连 `cmd /c echo` 都失败）。原因未查清——
-   任务计划的操作日志默认关闭，开启需要额外配置。启动文件夹是已验证的替代。
+1. **任务计划在这台机器上不可用**（`0x1`，连 `cmd /c echo` 都失败）。启动文件夹是已验证的替代。
+
+   排查过的方向全部无效：
+
+   | 尝试 | 结果 |
+   |---|---|
+   | PowerShell `Register-ScheduledTask`，`RunLevel Limited` + `InteractiveToken` | `0x1` |
+   | 同上，去掉显式 principal | `0x1` |
+   | `schtasks /Create /RL HIGHEST` | 报告成功，无输出文件 |
+   | `schtasks /Create /RU SYSTEM` | 报告成功，无输出文件 |
+   | 最小 VBS（只写一行日志） | 不执行 |
+   | 最小 `cmd /c echo hello > file` | 不执行 |
+
+   `schtasks /Query /V` 会直接挂住（超时后无输出），说明任务计划服务本身响应异常。
+   Operational 日志默认关闭，开启它需要额外配置，我没有继续深挖。
+
+   **如果你在新机器上装，先跑一条最小任务验证计划任务可用**，可用则优先用它
+   （支持崩溃重启、`StartWhenAvailable` 补跑），不可用再退回本文的启动文件夹方案。
 2. **只在登录后启动**。机器重启但没人登录时不会跑。
 3. **没有守护**。进程崩了不会自动重启；`watch.mjs` 自己捕获异常，但 OOM 之类救不了。
 4. 通知走 WinRT Toast，被「专注助手」静音时用户看不到。P0 阶段这没关系（只观察），
