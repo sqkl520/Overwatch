@@ -16,28 +16,27 @@ jobs:
         with:
           node-version: '20'
 
-      # 硬门：结构违规即失败
+      # 硬门：结构 + 语法 + 每个导出函数能否被调用
       - name: Structure gate
         run: node scripts/check-structure.mjs
 
-      # 硬门：四态判定回归测试
-      - name: State model tests
-        run: node --test scripts/state-model.test.mjs
+      # 硬门：全部回归测试（81 条，含四态判定、TUI 视觉、键位路由）
+      - name: Tests
+        run: node --test scripts/*.test.mjs
 
-      # 建议门：脚本语法检查。存量未清零前不阻塞。
-      # 升级路径：全部通过后删掉 continue-on-error，改为硬门。
-      - name: Script syntax (advisory)
-        continue-on-error: true
+      # 硬门：文档里的相对链接必须能解析。
+      # 曾是 continue-on-error 的建议门，理由是「存量未清零」；存量其实一直是 0，
+      # 那条注释只是让检查永远不红。现已升级为硬门，并加 --include 限制范围。
+      - name: Dead links
         run: |
-          for f in scripts/*.mjs; do
-            node --check "$f" || echo "::warning file=$f::语法检查失败"
-          done
-
-      # 建议门：死链检查。同样待存量清零后升级为硬门。
-      - name: Dead links (advisory)
-        continue-on-error: true
-        run: |
-          grep -rhoE '\]\((docs/[^)]+|templates/[^)]+|scripts/[^)]+)\)' README.md CLAUDE.md docs/ 2>/dev/null \
-            | sed -E 's/^\]\(//; s/\)$//' | sort -u | while read -r p; do
-              [ -e "$p" ] || echo "::warning::死链: $p"
-            done
+          fail=0
+          while read -r p; do
+            if [ ! -e "$p" ]; then
+              echo "::error file=README.md::死链: $p"
+              fail=1
+            fi
+          done < <(
+            grep -rhoE '\]\(([^)#]+\.md)(#[^)]*)?\)' README.md CLAUDE.md docs/*.md 2>/dev/null \
+              | sed -E 's/^\]\(//; s/\)$//; s/#.*//' | sort -u
+          )
+          exit $fail

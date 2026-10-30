@@ -32,7 +32,8 @@ const HB_FLOOR_MS = 120_000;
 const HB_CEIL_MS = 900_000;
 const HB_CONFIRM_MS = 60_000;
 
-/** 默认权重取自本机 1978 会话的实测占比，见 state-model.md §3.5 */
+/** 默认权重取自本机 2021 个 transcript 的实测占比，见 state-model.md §3.5。
+ *  语料会漂移：`--recalibrate` 可重算（实测三天窗口给出 Bash 0.75，与本值 0.62 差异明显）。 */
 const DEFAULT_WEIGHTS = {
   Bash: 0.62, Read: 0.15, Edit: 0.10, Grep: 0.06,
   Write: 0.03, Agent: 0.02, Glob: 0.02,

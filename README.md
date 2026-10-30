@@ -64,12 +64,16 @@ Overwatch/
 │  ├─ agents/          12 个角色定义（唯一真源，宿主直接加载）
 │  └─ skills/oversight/  调度入口 /oversight
 ├─ docs/
-│  ├─ spec/            五份规格：四态模型 / 派发契约 / 证据纪律 / 接力协议 / 输出格式
+│  ├─ GUIDE.md         使用手册：你会看到什么、该做什么
+│  ├─ CHANGELOG.md     改了什么，按工作阶段记录
+│  ├─ spec/            六份规格：四态模型 / 派发契约 / 证据纪律 / 接力协议 / 输出格式 / TUI 视觉
 │  └─ adr/             两个决策记录：为什么纯配置库、为什么诚实降级
 ├─ scripts/
 │  ├─ scan-sessions.mjs    「眼睛」：扫描会话并判定四态
+│  ├─ oversight-tui.mjs    终端界面：列表 / 详情 / 帮助 / 草稿
+│  ├─ tui-theme.mjs        四态字形与配色（单一真源）
 │  ├─ check-structure.mjs  结构硬门
-│  └─ state-model.test.mjs 四态判定的回归测试
+│  └─ *.test.mjs           81 条回归测试
 ├─ tasks/
 │  ├─ dev-findings.md      范围外发现（不许自行修）
 │  └─ accepted-deviations.md  已知不修（不计入判定）
@@ -77,6 +81,18 @@ Overwatch/
 ```
 
 **每个目录都有真实内容，没有占位目录。** `scripts/check-structure.mjs` 会验证这一点。
+
+---
+
+## 三个脚本
+
+| 命令 | 用途 |
+|---|---|
+| `node scripts/oversight-tui.mjs` | **主界面**。列表 → `Enter` 详情 → `c` 复制接力草稿。非 TTY 自动降级纯文本 |
+| `node scripts/scan-sessions.mjs --days 3` | 一次性快照，输出纯文本或 `--json` |
+| `node scripts/scan-sessions.mjs --recalibrate --days 7` | 重算 novelty 权重（换机器或工作方式变了就跑一次） |
+
+完整说明见 **[docs/GUIDE.md](docs/GUIDE.md)**。
 
 ---
 

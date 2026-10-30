@@ -81,9 +81,21 @@ test('显示宽度：ASCII / CJK / 混排 / 空串 / 全角 / emoji', () => {
   }
 });
 
-test('padDisplay 补到目标宽度，且不超出', () => {
-  for (const width of [0, 5, 10, 20]) {
-    const padded = padDisplay('中文abc', width);
-    assert.ok(displayWidth(padded) <= width + 1, `width=${width} 时溢出`);
+test('padDisplay 补到目标宽度，且绝不超出', () => {
+  // 曾写 <= width + 1，即允许溢出 1 列——一条允许失败的断言等于没有断言。
+  // 实际行为是精确等于目标宽度（或目标更窄时截断到目标），所以断言收紧到 <= width。
+  const samples = ['中文abc', 'abc', '中', '', 'a中b', '（全角）'];
+  for (const s of samples) {
+    for (const width of [0, 1, 5, 10, 20]) {
+      const padded = padDisplay(s, width);
+      assert.ok(
+        displayWidth(padded) <= width,
+        `padDisplay(${JSON.stringify(s)}, ${width}) 宽 ${displayWidth(padded)}，溢出`,
+      );
+      // 目标宽度大于内容时应当补齐到恰好 width
+      if (displayWidth(s) <= width) {
+        assert.equal(displayWidth(padded), width, `未补齐到 ${width}`);
+      }
+    }
   }
 });
