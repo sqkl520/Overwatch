@@ -30,18 +30,24 @@
  *
  * 用法：
  *   import { classifyStop } from './classify-stop.mjs';
- *   const r = classifyStop({ transcriptTail, earlierHumanMessages, jobsState });
+ *
+ *   // 推荐：停止点显式传入，调用方无法传错
+ *   const r = classifyStop({ stopRecord, afterRecords, history });
  *
  * 输入（全部可选，缺省一律降级为 UNCLASSIFIABLE，绝不抛异常）：
- *   transcriptTail        [...]  最近的记录，已解析（顺序即落盘顺序）。
- *                                停止点 = 其中最后一条 assistant 记录；「下一句」= 它之后
- *                                第一条非 tool_result 的 user 记录。调用方可以只传停止点
- *                                那一段，但**不要**把后续 assistant 记录切掉后还指望
- *                                第 1 步命中（那时「下一句」就不在输入里了）。
- *   earlierHumanMessages  [...]  会话中更早的真人消息文本
- *   jobsState             {...}  { state, needs, suggestedReply } | null
- *   permissionMode        ...    可选兜底；tail 里读不到时才用
- *                                （AC6 要求「取最后一条」，该逻辑在 lastPermissionMode）
+ *   stopRecord        {...}       **推荐**。要判定哪一次停止，就传那一条 assistant 记录。
+ *   afterRecords      [...]       停止点之后的记录（到下一个 assistant 之前）。
+ *                                 「下一句」= 其中第一条非 tool_result 的 user 记录。
+ *   history           [...]       会话开头到停止点（含）的记录，用于取 permissionMode。
+ *                                 不给时退回 [stopRecord]。
+ *   ── 以下是兼容路径，新代码不要用 ──
+ *   transcriptTail    [...]       旧契约：停止点 = 其中最后一条 assistant。
+ *                                 **实测同一批语料，tail 怎么切会给出 22.9% / 10.3% / 68.1%
+ *                                 三个结果**（见 docs/research/2026-10-30-stop-signals.md §十）。
+ *                                 只在无法拿到显式停止点时使用；evidence.stopSource 会标 'tail-scan'。
+ *   earlierHumanMessages  [...]   会话中更早的真人消息文本
+ *   jobsState             {...}   { state, needs, suggestedReply } | null
+ *   permissionMode        ...     可选兜底；history / tail 里读不到时才用
  *
  * 【调用方注意】实测一个停止点有两类 stop_reason，不要只挑 end_turn：
  *   - `end_turn`（5918 条 assistant 记录，按轮去重后 3968 个停止点）
@@ -352,12 +358,43 @@ function verdict(kind, autoAnswerable, reason, confidence, evidence) {
  */
 export function classifyStop(input) {
   const args = input && typeof input === 'object' ? input : {};
-  const tail = Array.isArray(args.transcriptTail) ? args.transcriptTail.filter((r) => r && typeof r === 'object') : [];
+
+  // ── 契约：{ stopRecord, afterRecords, history } ──────────────────
+  //
+  // 旧契约是「传一个 transcriptTail，自己找最后一条 assistant 当停止点」。
+  // 实测同一个分类器、同一批语料，只因 tail 构造方式不同就得到三个结果：
+  //   slice(i, i+6)    -> 22.94%  （截断了「下一句」）
+  //   slice(i, i+40)   -> 10.27%  （锚定到最后一个 assistant，不是当前停止点）
+  //   [stop, ...after] -> 67.95%  （正确）
+  // 第二个失败模式代码里没有任何警告，是隐式契约的典型陷阱。
+  // 现在把停止点显式传进来，调用方无法传错。
+  const explicitStop = args.stopRecord && typeof args.stopRecord === 'object' ? args.stopRecord : null;
+
+  // 兼容旧调用：没给 stopRecord 时才回落到「tail 里最后一条 assistant」。
+  // 这条路径保留是为了不打断已有测试，但会在 evidence 里标出来，便于发现误用。
+  let tail = [];
+  if (explicitStop) {
+    tail = [explicitStop];
+  } else {
+    tail = Array.isArray(args.transcriptTail) ? args.transcriptTail.filter((r) => r && typeof r === 'object') : [];
+  }
+
+  const after = explicitStop
+    ? (Array.isArray(args.afterRecords) ? args.afterRecords.filter((r) => r && typeof r === 'object') : [])
+    : null;   // null = 需要从 tail 里切
+
+  // history = 从会话开头到停止点（含）的记录，用于取 permissionMode。
+  // 不给时退回 tail / [stopRecord]。
+  const history = Array.isArray(args.history) ? args.history
+    : (explicitStop ? [explicitStop] : tail);
+
   const earlier = Array.isArray(args.earlierHumanMessages) ? args.earlierHumanMessages : [];
   const jobs = args.jobsState && typeof args.jobsState === 'object' ? args.jobsState : null;
 
   const evidence = {
     stopUuid: null,
+    // 'explicit' = 调用方传了 stopRecord（推荐）；'tail-scan' = 回落路径，可能锚错
+    stopSource: explicitStop ? 'explicit' : 'tail-scan',
     stopReason: null,
     lastToolUse: null,
     originKind: null,
@@ -368,17 +405,21 @@ export function classifyStop(input) {
     jobsNeeds: jobs && typeof jobs.needs === 'string' ? jobs.needs : null,
   };
 
-  // 定位停止点 = 最后一条 assistant 记录。没有它就没法判，如实说「判不了」。
+  // 定位停止点。显式给了 stopRecord 就直接用；否则回落到 tail 里最后一条 assistant。
   let stopIdx = -1;
-  for (let i = tail.length - 1; i >= 0; i--) {
-    if (tail[i].type === 'assistant') { stopIdx = i; break; }
+  if (explicitStop) {
+    stopIdx = 0;
+  } else {
+    for (let i = tail.length - 1; i >= 0; i--) {
+      if (tail[i].type === 'assistant') { stopIdx = i; break; }
+    }
   }
   if (stopIdx < 0) {
     return verdict('UNCLASSIFIABLE', false, '输入里没有 assistant 记录，定位不到停止点', null, evidence);
   }
 
   const stop = tail[stopIdx];
-  const after = tail.slice(stopIdx + 1);
+  const afterRecords = after ?? tail.slice(stopIdx + 1);
   const blocks = contentBlocks(stop);
   const stopText = blocks.filter((b) => b.type === 'text').map((b) => b.text || '').join('\n').trim();
   const toolUses = blocks.filter((b) => b.type === 'tool_use');
@@ -389,14 +430,14 @@ export function classifyStop(input) {
   evidence.lastToolUse = lastTool && typeof lastTool.name === 'string' ? lastTool.name : null;
 
   // AC6：取最后一条，而不是第一条。tail 里没有时才回落到调用方显式给的值。
-  const pmFromTail = lastPermissionMode(tail);
+  const pmFromTail = lastPermissionMode(history);
   evidence.permissionMode = pmFromTail ?? (typeof args.permissionMode === 'string' ? args.permissionMode : null);
   evidence.permissionModeSource = pmFromTail ? 'tail:last' : (evidence.permissionMode ? 'input' : null);
 
   // ── 第 1 步：下一句是 task-notification → WAITING_SUBAGENT ──
   // [R§3.1] 68.3%–68.7% 的 end_turn 后面跟着宿主的子 Agent 完成通知。
   // 这类停止宿主自己会唤醒，OmniSight 插进去 = 重复派发。绝不代答。
-  const nextUtterance = firstUtteranceAfter(after);
+  const nextUtterance = firstUtteranceAfter(afterRecords);
   const nextKind = nextUtterance ? originKindOf(nextUtterance) : null;
   evidence.originKind = nextKind;
   if (nextKind === 'task-notification') {
@@ -412,7 +453,7 @@ export function classifyStop(input) {
   // 有 tool_result 时不判本类：实测 11 次真实调用全部带结果（批准 / 拒绝 / 报错），
   // 其中「You are not in plan mode」是**调用失败**，不是提交，必须落到后续步骤。
   if (lastTool && lastTool.name === 'ExitPlanMode') {
-    const planResult = findToolResult(after, lastTool.id);
+    const planResult = findToolResult(afterRecords, lastTool.id);
     if (!planResult) {
       evidence.planResult = 'absent';
       return verdict(
@@ -428,7 +469,7 @@ export function classifyStop(input) {
   // ── 第 3、4 步：AskUserQuestion 有 / 无 tool_result ──
   // [S§3][S§3.2] 66 次调用里只有 33 次拿到回答 —— 「问了」和「答了」必须分开判。
   if (lastTool && lastTool.name === 'AskUserQuestion') {
-    const answerBlock = findToolResult(after, lastTool.id);
+    const answerBlock = findToolResult(afterRecords, lastTool.id);
     const questions = (lastTool.input && Array.isArray(lastTool.input.questions))
       ? lastTool.input.questions.map((q) => (q && typeof q.question === 'string' ? q.question : '')).filter(Boolean)
       : [];

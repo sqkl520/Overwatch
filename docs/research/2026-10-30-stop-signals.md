@@ -260,8 +260,9 @@ for (const line of raw.split('\n')) {
 `classify-stop.mjs` 的文件头已经警告过第一种（「不要把后续 assistant 记录切掉后还指望第 1 步命中」），
 但没有警告第二种——**传太多会让它定位到最后一个 assistant**，这个方向没有被防住。
 
-**建议**：把接口从「传 tail，你自己找停止点」改成「传 `{stopRecord, afterRecords}`」，
-让调用方无法传错。当前的隐式契约是这类 bug 的温床。
+**已修（2026-10-30）**：接口改成 `{ stopRecord, afterRecords, history }`，停止点显式传入，调用方无法传错。
+实测新契约在 3975 个真实停止点上给出 68.08%，三种旧构造方式（22.92% / 10.26% / 68.08%）中只有正确的那种与之一致。
+旧的 `transcriptTail` 保留为兼容路径，但 `evidence.stopSource` 会标 `tail-scan` 便于发现误用。
 
 ### 附带修正：end_turn 记录数
 

@@ -485,3 +485,75 @@ test('每个 kind 都能被至少一个构造输入命中（枚举没有死值�
   ]);
   assert.deepEqual([...produced].sort(), [...KINDS].sort());
 });
+
+// ── 新契约：{ stopRecord, afterRecords, history } ─────────────────────
+//
+// 引入这组测试的原因：旧契约「传 tail，自己找最后一条 assistant」实测会让
+// 同一个分类器、同一批语料产出三个不同分布（22.94% / 10.27% / 67.95%），
+// 差别只在 tail 怎么切。新契约把停止点显式传进来，调用方无法传错。
+
+const stopRec = (text, extra = {}) => ({
+  type: 'assistant',
+  uuid: 'stop-1',
+  message: { id: 'm1', stop_reason: 'end_turn', content: [{ type: 'text', text }] },
+  ...extra,
+});
+const noteRec = () => ({
+  type: 'user',
+  message: { role: 'user', content: '<task-notification>子 agent 完成</task-notification>' },
+});
+const humanRec = (text) => ({
+  type: 'user',
+  message: { role: 'user', content: [{ type: 'text', text }] },
+});
+
+test('新契约：stopRecord + afterRecords 给出与旧 tail 路径相同的判定', () => {
+  const stop = stopRec('等三个探索 agent');
+  const after = [noteRec()];
+
+  const viaNew = classifyStop({ stopRecord: stop, afterRecords: after });
+  const viaOld = classifyStop({ transcriptTail: [stop, ...after] });
+
+  assert.equal(viaNew.kind, 'WAITING_SUBAGENT');
+  assert.equal(viaNew.kind, viaOld.kind, '新旧契约必须一致');
+  assert.equal(viaNew.evidence.stopSource, 'explicit');
+  assert.equal(viaOld.evidence.stopSource, 'tail-scan');
+});
+
+test('新契约：afterRecords 里混入后续 assistant 也不改变锚点', () => {
+  // 这正是旧契约最危险的误用：传太多，锚定到最后一个 assistant
+  const stop = stopRec('等子 agent');
+  const after = [noteRec(), stopRec('后面还有一轮对话'), humanRec('用户后来说的话')];
+
+  const r = classifyStop({ stopRecord: stop, afterRecords: after });
+  assert.equal(r.kind, 'WAITING_SUBAGENT', '锚点必须是 stopRecord，不是 after 里的 assistant');
+  assert.equal(r.evidence.stopUuid, 'stop-1');
+});
+
+test('新契约：不传 afterRecords 时不崩，只是判不出「下一句」', () => {
+  const r = classifyStop({ stopRecord: stopRec('做完了') });
+  assert.equal(typeof r.kind, 'string');
+  assert.doesNotThrow(() => classifyStop({ stopRecord: stopRec('x') }));
+});
+
+test('新契约：history 用于取 permissionMode，且取最后一条', () => {
+  const history = [
+    { type: 'user', permissionMode: 'bypassPermissions' },
+    { type: 'user', permissionMode: 'default' },
+    stopRec('停下'),
+  ];
+  const r = classifyStop({ stopRecord: stopRec('停下'), afterRecords: [], history });
+  assert.equal(r.evidence.permissionMode, 'default', '必须取最后一条');
+  assert.equal(r.evidence.permissionModeSource, 'tail:last');
+});
+
+test('新契约：给了 stopRecord 就完全忽略 transcriptTail', () => {
+  // 防止调用方同时传两个而不知道哪个生效
+  const stop = stopRec('等子 agent');
+  const r = classifyStop({
+    stopRecord: stop,
+    afterRecords: [noteRec()],
+    transcriptTail: [stopRec('完全无关的另一个停止点'), humanRec('x')],
+  });
+  assert.equal(r.kind, 'WAITING_SUBAGENT', '应当只用 stopRecord + afterRecords');
+});
