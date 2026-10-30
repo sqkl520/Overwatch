@@ -93,8 +93,39 @@ tail -5 "%LOCALAPPDATA%\Overwatch\runner.log"
 ```
 [INFO] watch 启动 dir=%LOCALAPPDATA%Overwatch tick=15000ms
 [INFO] tick jobs jobs=9ms candidates=0 sent=0 suppressed=0 already=0
-[INFO] notified FAILED D--Projects-rea key=6da2fa52dccf2c60 session=5ead31fa
+[INFO] suppressed FAILED kind=WAITING_SUBAGENT session=5ead31fa-a774-4dc8-8e7c-9e7c094756a7
+[INFO] notified BLOCKED D--Projects-rea kind=EXTERNAL_BLOCKED key=6da2fa52dccf2c60 session=...
 ```
+
+`suppressed ... kind=WAITING_SUBAGENT` 是设计内行为：下一句是子 Agent 完成通知的停止，
+宿主自己会唤醒，不发通知（占真实停止的约 68%）。
+
+## 看分类分布
+
+P0 期的核心产物是 `%LOCALAPPDATA%\Overwatch\observations.jsonl`：每条判定一行，
+**包括被抑制的**。它是 P1 的数据来源，不要随手删。
+
+```bash
+node scripts/watch.mjs --stats
+```
+
+输出：
+
+```
+观察样本：6 条（2026-10-30 ~ 2026-10-30）
+分类分布：
+  ASKED_UNANSWERED         1  16.7%
+  EXTERNAL_BLOCKED         1  16.7%
+  WAITING_SUBAGENT         1  16.7%
+  ...
+通知：发了 3 条，抑制 3 条
+按 state 交叉：
+  STALLED → WAITING_SUBAGENT 1 / ASKED_UNANSWERED 1 / PLAN_SUBMITTED 1
+  BLOCKED → EXTERNAL_BLOCKED 1
+```
+
+`why` 告诉你看这一行为什么没发：`*-suppressed`（分类门）、`budget-*`（限额）、
+`already-notified`（同一边沿已处理）、`dry-run`、`classify-error`（判不了，退回按 state 判断）。
 
 ## 三层轮询的代价
 

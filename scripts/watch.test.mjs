@@ -21,6 +21,8 @@ import {
   dedupeKey, reasonClass, canNotify, recordSent, emptyState, loadState, saveState,
   probeJobs, probeMtime, diffProbe, foldProbe, candidatesFromScan,
   createLogger, dispatchCandidates, runTick, defaultStateDir, __internals,
+  findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
+  observationStats, formatStats, NOTIFY_KINDS,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -502,4 +504,236 @@ test('限额常量与规格一致', () => {
   assert.equal(__internals.PROBE_INTERVAL, 5 * MIN);
   assert.equal(__internals.FULL_INTERVAL, 30 * MIN);
   assert.equal(__internals.LOG_MAX_BYTES, 1024 * 1024);
+});
+
+// ── 停止分类接入 ─────────────────────────────────────────────────────
+
+/** 造一个 transcript：一轮干净结束，下一句是 task-notification（68% 的真实形态）。 */
+function writeWaitingSubagent(path, sessionId) {
+  const recs = [
+    { type: 'user', uuid: 'u1', message: { role: 'user', content: '跑一下测试' }, permissionMode: 'default' },
+    { type: 'assistant', uuid: 'a1', message: { id: 'm1', role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: '好' }] } },
+    { type: 'user', uuid: 'u2', origin: { kind: 'task-notification' }, message: { role: 'user', content: '<task-notification>done</task-notification>' } },
+  ];
+  writeFileSync(path, recs.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  void sessionId;
+}
+
+test('分类：findStopPoint 定位最后一条 assistant，并切出 afterRecords', () => {
+  const stop = findStopPoint([
+    { type: 'user', uuid: 'u1' },
+    { type: 'assistant', uuid: 'a1', message: { stop_reason: 'tool_use' } },
+    { type: 'user', uuid: 'u2' },
+    { type: 'assistant', uuid: 'a2', message: { stop_reason: 'tool_use' } },
+    { type: 'user', uuid: 'u3' },
+  ]);
+  assert.equal(stop.stopRecord.uuid, 'a2', '停止点必须是最后一条 assistant');
+  assert.equal(stop.afterRecords.length, 1);
+  assert.equal(stop.afterRecords[0].uuid, 'u3');
+  assert.equal(stop.history.length, 4, 'history 含停止点本身');
+  assert.equal(findStopPoint([{ type: 'user' }]), null);
+  assert.equal(findStopPoint([]), null);
+});
+
+test('分类：WAITING_SUBAGENT 被抑制，不发通知，但写进观察日志', async () => {
+  const root = tmp();
+  try {
+    const sid = 'sess-wait';
+    mkdirSync(join(root, 'projects', 'proj-a'), { recursive: true });
+    mkdirSync(join(root, 'jobs', 'j1'), { recursive: true });
+    const now = Date.now();
+    writeFileSync(join(root, 'jobs', 'j1', 'state.json'), JSON.stringify({
+      state: 'failed', sessionId: sid, updatedAt: new Date(now).toISOString(), cwd: 'D:\\Projects\\proj-a',
+    }));
+    writeWaitingSubagent(join(root, 'projects', 'proj-a', `${sid}.jsonl`));
+    let n = 0;
+    const r = await runTick({
+      dir: join(root, 'state'), claudeDir: root, nowMs: now, forceFull: true,
+      notifier: async () => { n++; },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+    });
+    assert.equal(n, 0, '等子 Agent 的停止不得发通知');
+    assert.equal(r.sent.length, 0);
+    assert.equal(r.suppressed.length, 1);
+    assert.equal(r.suppressed[0].kind, 'WAITING_SUBAGENT');
+
+    const raw = readFileSync(join(root, 'state', 'observations.jsonl'), 'utf8').trim().split('\n');
+    assert.equal(raw.length, 1, '被抑制的也必须进观察日志');
+    const o = JSON.parse(raw[0]);
+    assert.equal(o.kind, 'WAITING_SUBAGENT');
+    assert.equal(o.notified, false);
+    assert.equal(o.why, 'waiting-subagent-suppressed');
+    assert.equal(o.state, 'FAILED');
+    for (const f of ['ts', 'sessionId', 'state', 'kind', 'autoAnswerable', 'reason', 'confidence', 'notified', 'why']) {
+      assert.ok(f in o, `观察行缺字段 ${f}`);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('分类：UNCLASSIFIABLE 保守放行（判不了就当需要注意）', async () => {
+  const root = tmp();
+  try {
+    const sid = 'sess-unk';
+    mkdirSync(join(root, 'projects', 'proj-b'), { recursive: true });
+    const now = Date.now();
+    writeFileSync(join(root, 'projects', 'proj-b', `${sid}.jsonl`), [
+      { type: 'assistant', uuid: 'a1', message: { id: 'm1', stop_reason: 'end_turn', content: [{ type: 'text', text: '随便一句' }] } },
+    ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+    mkdirSync(join(root, 'jobs', 'j1'), { recursive: true });
+    writeFileSync(join(root, 'jobs', 'j1', 'state.json'), JSON.stringify({
+      state: 'failed', sessionId: sid, updatedAt: new Date(now).toISOString(), cwd: 'D:\\Projects\\proj-b',
+    }));
+
+    let n = 0;
+    await runTick({
+      dir: join(root, 'state'), claudeDir: root, nowMs: now, forceFull: true,
+      notifier: async () => { n++; },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+    });
+    assert.equal(n, 1, 'UNCLASSIFIABLE 必须放行');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('分类：COMPLETION_REPORT 被抑制', async () => {
+  const root = tmp();
+  try {
+    const sid = 'sess-done';
+    mkdirSync(join(root, 'projects', 'proj-c'), { recursive: true });
+    const now = Date.now();
+    writeFileSync(join(root, 'projects', 'proj-c', `${sid}.jsonl`), [
+      { type: 'assistant', uuid: 'a1', message: { id: 'm1', stop_reason: 'end_turn', content: [{ type: 'text', text: '已完成，工作区干净' }] } },
+    ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+    mkdirSync(join(root, 'jobs', 'j1'), { recursive: true });
+    writeFileSync(join(root, 'jobs', 'j1', 'state.json'), JSON.stringify({
+      state: 'failed', sessionId: sid, updatedAt: new Date(now).toISOString(), cwd: 'D:\\Projects\\proj-c',
+    }));
+
+    let n = 0;
+    const r = await runTick({
+      dir: join(root, 'state'), claudeDir: root, nowMs: now, forceFull: true,
+      notifier: async () => { n++; },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+    });
+    assert.equal(n, 0, '完成汇报不催');
+    assert.equal(r.suppressed[0].kind, 'COMPLETION_REPORT');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('分类失败：找不到 transcript 时退回按 state 通知，且标 classify=error 不静默', async () => {
+  const root = tmp();
+  try {
+    const now = Date.now();
+    mkdirSync(join(root, 'projects'), { recursive: true });
+    mkdirSync(join(root, 'jobs', 'j1'), { recursive: true });
+    writeFileSync(join(root, 'jobs', 'j1', 'state.json'), JSON.stringify({
+      state: 'failed', sessionId: 'no-transcript', updatedAt: new Date(now).toISOString(), cwd: 'D:\\Projects\\nope',
+    }));
+
+    const logs = [];
+    let n = 0;
+    const r = await runTick({
+      dir: join(root, 'state'), claudeDir: root, nowMs: now, forceFull: true,
+      notifier: async () => { n++; },
+      logger: { info: () => {}, warn: (m) => logs.push(m), error: (m) => logs.push(m) },
+      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+    });
+    assert.equal(n, 1, '分类失败必须保持接入前的行为：仍按 state 通知');
+    const o = JSON.parse(readFileSync(join(root, 'state', 'observations.jsonl'), 'utf8').trim());
+    assert.equal(o.classify, 'error');
+    assert.equal(o.notified, true);
+    void r; void logs;
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('分类：mtime 未变时复用缓存，不再读文件', async () => {
+  const root = tmp();
+  try {
+    const sid = 'sess-cache';
+    const p = join(root, 'proj-d');
+    mkdirSync(p, { recursive: true });
+    writeWaitingSubagent(join(p, `${sid}.jsonl`));
+    const cache = new Map();
+    const a = classifyCandidate({ sessionId: sid, state: 'STALLED', project: 'proj-d' },
+      { projectsRoot: root, nowMs: Date.now(), cache });
+    assert.equal(a.kind, 'WAITING_SUBAGENT');
+    assert.equal(cache.size, 1, '判定结果必须入缓存');
+
+    // 第二次命中的是同一个对象（引用相同 = 走了缓存分支，没有重新构造 verdict）
+    const cachedVerdict = cache.get(join(p, `${sid}.jsonl`)).verdict;
+    const b = classifyCandidate({ sessionId: sid, state: 'STALLED', project: 'proj-d' },
+      { projectsRoot: root, nowMs: Date.now(), cache });
+    assert.equal(cache.get(join(p, `${sid}.jsonl`)).verdict, cachedVerdict);
+    assert.equal(b.kind, a.kind);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('观察日志：追加写、不覆盖，同一停止事件进程内只写一行', () => {
+  const dir = tmp();
+  try {
+    const log = createObservationLog(dir);
+    log.append({ sessionId: 's', state: 'STALLED', kind: 'WAITING_SUBAGENT', why: 'waiting-subagent-suppressed', fingerprint: '1' });
+    log.append({ sessionId: 's', state: 'STALLED', kind: 'WAITING_SUBAGENT', why: 'waiting-subagent-suppressed', fingerprint: '1' });
+    log.append({ sessionId: 's', state: 'STALLED', kind: 'ASKED_UNANSWERED', why: 'notifyable', fingerprint: '2' });
+    const lines = readFileSync(join(dir, 'observations.jsonl'), 'utf8').trim().split('\n');
+    assert.equal(lines.length, 2, '重复事件不得刷行；新事件必须写');
+    assert.equal(JSON.parse(lines[0]).kind, 'WAITING_SUBAGENT');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('观察日志：超过 5MB 轮转到 .1，旧内容不丢', () => {
+  const dir = tmp();
+  try {
+    const log = createObservationLog(dir, { maxBytes: 500 });
+    for (let i = 0; i < 40; i++) {
+      log.append({ sessionId: `s${i}`, state: 'STALLED', kind: 'UNCLASSIFIABLE', why: 'notifyable', pad: 'x'.repeat(40) });
+    }
+    assert.ok(existsSync(join(dir, 'observations.jsonl.1')), '必须轮转');
+    assert.ok(statSync(join(dir, 'observations.jsonl')).size <= 500);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('--stats：分类分布、通知/抑制、按 state 交叉', () => {
+  const dir = tmp();
+  try {
+    const log = createObservationLog(dir);
+    log.append([
+      { ts: '2026-10-31T01:00:00Z', sessionId: 'a', state: 'STALLED', kind: 'WAITING_SUBAGENT', notified: false },
+      { ts: '2026-10-31T02:00:00Z', sessionId: 'b', state: 'STALLED', kind: 'WAITING_SUBAGENT', notified: false, x: 1 },
+      { ts: '2026-10-31T03:00:00Z', sessionId: 'c', state: 'BLOCKED', kind: 'EXTERNAL_BLOCKED', notified: true, x: 2 },
+      { ts: '2026-10-31T04:00:00Z', sessionId: 'd', state: 'FAILED', kind: 'UNCLASSIFIABLE', notified: true, x: 3 },
+    ]);
+    const st = observationStats(dir);
+    assert.equal(st.total, 4);
+    assert.equal(st.notified, 2);
+    assert.equal(st.suppressed, 2);
+    assert.equal(st.firstTs, '2026-10-31T01:00:00Z');
+    assert.equal(st.kinds[0].kind, 'WAITING_SUBAGENT');
+    assert.equal(st.kinds[0].n, 2);
+    assert.equal(st.kinds[0].pct, 50);
+
+    const text = formatStats(st);
+    assert.match(text, /观察样本：4 条（2026-10-31 ~ 2026-10-31）/);
+    assert.match(text, /WAITING_SUBAGENT\s+2\s+50\.0%/);
+    assert.match(text, /通知：发了 2 条，抑制 2 条/);
+    assert.match(text, /STALLED → WAITING_SUBAGENT 2/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('readTranscriptTail：大文件只读尾部，且丢掉被截断的首行', () => {
+  const dir = tmp();
+  try {
+    const p = join(dir, 'big.jsonl');
+    const recs = [];
+    for (let i = 0; i < 2000; i++) recs.push({ i, pad: 'y'.repeat(60) });
+    writeFileSync(p, recs.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    const { records, truncated } = readTranscriptTail(p, 4096);
+    assert.equal(truncated, true);
+    assert.ok(records.length > 0);
+    assert.equal(records[records.length - 1].i, 1999, '必须读到真正的末行');
+    assert.ok(records.every((r) => typeof r.i === 'number'), '首行被截断时必须丢弃');
+    assert.deepEqual(readTranscriptTail(join(dir, 'missing.jsonl')).records, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

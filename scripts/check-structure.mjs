@@ -297,6 +297,7 @@ const PROBE_ARGS = {
   textOf: '[{}]', buildPayloadXml: '["t", "b", "g"]',
   lastPermissionMode: '[]', parseAskAnswers: '""', relevanceOf: '["a", ["b"]]',
   answerIsNegative: '""', findEarlierMatch: '["a", ["b"]]', classifyStop: '[{}]',
+  findStopPoint: '[[]]', formatStats: '[{}]',
 };
 
 /** 需要临时目录的导出，参数由探针注入 `_sandbox` */
@@ -304,6 +305,8 @@ const SANDBOX_ARGS = {
   loadState: '[_sandbox]', saveState: '[_sandbox, {}]',
   probeJobs: '[_sandbox]', probeMtime: '[_sandbox]',
   createLogger: '[_sandbox]', defaultStateDir: '{}', defaultNotifyDir: '{}',
+  createObservationLog: '[_sandbox]', observationStats: '[_sandbox]',
+  classifyCandidate: '[{}]', readTranscriptTail: '["/nonexistent"]',
 };
 
 /** `node --check` 只查语法，查不到「调用了一个不存在的函数」。
@@ -421,6 +424,8 @@ function checkUnregisteredExports() {
     'buildPayloadXml', 'defaultNotifyDir', 'lastPermissionMode',
     'parseAskAnswers', 'relevanceOf', 'answerIsNegative',
     'findEarlierMatch', 'classifyStop',
+    'findStopPoint', 'readTranscriptTail', 'classifyCandidate',
+    'createObservationLog', 'observationStats', 'formatStats', 'NOTIFY_KINDS', 'OBS_MAX_BYTES',
     'recalibrateWeights', 'NOTIFY_STATES', '__internals', 'STATES', 'DAY', 'HOUR', 'MINUTE', 'App', 'KINDS',
   ]);
   const INTENTIONALLY_PROBED_FREE = new Set([
