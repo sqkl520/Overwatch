@@ -261,3 +261,25 @@ test('failed 优先于 blocked（同时存在时以失败为准）', () => {
   const calls = [callAt('ls', now)];
   assert.equal(judgeState({ calls, gapsMs: [], sessionState: 'failed' }).state, 'FAILED');
 });
+
+// ── 权重重估（DF-003）────────────────────────────────────────────────
+
+test('recalibrateWeights 把计数归一化成权重', async () => {
+  const { recalibrateWeights } = await import('./scan-sessions.mjs');
+  const r = recalibrateWeights({ Bash: 60, Read: 20, Edit: 10, Grep: 5, Write: 3, Agent: 1, Glob: 1 });
+  assert.ok(Math.abs(r.weights.Bash - 0.60) < 1e-9, `Bash=${r.weights.Bash}`);
+  assert.ok(Math.abs(r.weights.Read - 0.20) < 1e-9);
+  assert.equal(r.total, 100);
+});
+
+test('recalibrateWeights 处理表外工具并报告占比', async () => {
+  const { recalibrateWeights } = await import('./scan-sessions.mjs');
+  const r = recalibrateWeights({ Bash: 50, Read: 25, Unknown1: 15, Unknown2: 10 });
+  assert.ok(r.otherPct > 20, `表外占比应被算出来：${r.otherPct}`);
+  assert.ok(Math.abs(r.weights.Bash - 0.50) < 1e-9, '归一化分母应是全部调用而非已知工具');
+});
+
+test('recalibrateWeights 空输入返回 null 而不是全零', async () => {
+  const { recalibrateWeights } = await import('./scan-sessions.mjs');
+  assert.equal(recalibrateWeights({}), null);
+});

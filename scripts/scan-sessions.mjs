@@ -439,9 +439,28 @@ function readJobs() {
   return out;
 }
 
+/** 统计本机真实的工具分布，用于重估 novelty 权重（§3.5）。
+ *  换机器或语料特征变化后跑一次，把输出写回 DEFAULT_WEIGHTS。 */
+export function recalibrateWeights(counts) {
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  if (!total) return null;
+  // 只保留 7 个已知工具；其余归入「其它」，按 0.02 的兜底权重处理
+  const known = Object.keys(DEFAULT_WEIGHTS);
+  const out = {};
+  let assigned = 0;
+  for (const k of known) {
+    const v = counts[k] ?? 0;
+    out[k] = v / total;
+    assigned += v;
+  }
+  const other = (total - assigned) / total;
+  return { weights: out, otherPct: other * 100, total, samples: Object.keys(counts).length };
+}
+
 function main(argv) {
   const args = new Set(argv);
   const json = args.has('--json');
+  const recalibrate = args.has('--recalibrate');
   const projectFilter = (() => {
     const i = argv.indexOf('--project');
     return i >= 0 ? argv[i + 1] : null;
@@ -459,6 +478,7 @@ function main(argv) {
 
   const cutoff = Date.now() - days * 86_400_000;
   const results = [];
+  const toolCounts = {};
   const jobs = readJobs();
   const jobBySession = new Map(jobs.filter((j) => j.sessionId).map((j) => [j.sessionId, j]));
 
@@ -478,6 +498,9 @@ function main(argv) {
 
       const scanned = scanSessionDir(join(projectPath, sessionId));
       if (!scanned || !scanned.allCalls.length) continue;
+      if (recalibrate) {
+        for (const c of scanned.allCalls) toolCounts[c.name] = (toolCounts[c.name] || 0) + 1;
+      }
 
       // 宿主权威状态：jobs 里的 failed/blocked 必须传进去，否则那个分支永远是死的
       const job = jobBySession.get(sessionId);
@@ -525,6 +548,29 @@ function main(argv) {
 
   results.sort((a, b) => b.idleSec - a.idleSec);
   const live = readLiveSessions();
+
+  if (recalibrate) {
+    const r = recalibrateWeights(toolCounts);
+    if (!r) { console.error('没有可统计的调用，无法重算。'); process.exit(2); }
+    if (json) {
+      console.log(JSON.stringify({ recalibratedAt: new Date().toISOString(), days, ...r }, null, 2));
+    } else {
+      console.log(`novelty 权重重估 · 最近 ${days} 天 · ${r.total.toLocaleString()} 次调用\n`);
+      console.log('把下面这段写回 scripts/scan-sessions.mjs 的 DEFAULT_WEIGHTS：\n');
+      console.log('const DEFAULT_WEIGHTS = {');
+      const entries = Object.entries(r.weights);
+      for (let i = 0; i < entries.length; i += 2) {
+        const pair = entries.slice(i, i + 2).map(([k, v]) => `${k}: ${v.toFixed(2)}`);
+        console.log('  ' + pair.join(', ') + (i + 2 < entries.length ? ',' : ''));
+      }
+      console.log('};\n');
+      console.log(`未列入的表外工具占 ${r.otherPct.toFixed(1)}%（按 0.02 兜底权重处理）`);
+      if (r.otherPct > 15) {
+        console.log('⚠ 表外工具占比偏高，建议把它们加进 DEFAULT_WEIGHTS 再重估一次。');
+      }
+    }
+    process.exit(0);
+  }
 
   if (json) {
     console.log(JSON.stringify({ generatedAt: new Date().toISOString(), days, live, sessions: results }, null, 2));

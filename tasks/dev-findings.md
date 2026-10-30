@@ -47,13 +47,13 @@
 - **修复**：加 `DORMANT_MS = 1h` 新鲜度闸门，超时判 `EXPLORING` + `reason: dormant` + `liveness: stale`
 - **回归测试**：`state-model.test.mjs` 的「长时间无活动的会话判休眠，不判 FAILED」
 
-### DF-003 [open] `--recalibrate` 在文档中承诺但脚本未实现
+### DF-003 [fixed] `--recalibrate` 在文档中承诺但脚本未实现
 
 - **发现于**：验收 run（未覆盖项）
 - **位置**：`scripts/scan-sessions.mjs:15` 的用法注释、`docs/spec/state-model.md` §3.5
 - **证据**：`main()` 只解析 `--json` / `--project` / `--days`，传 `--recalibrate` 被静默忽略。
 - **影响**：规格说「换环境应重估权重」，但没有可执行路径。
-- **建议归属**：独立小任务
+- **修复**：新增 `recalibrateWeights()` 与 `--recalibrate` 分支，输出可直接粘回源码的 `DEFAULT_WEIGHTS` 字面量，并报告表外工具占比。实测 `--days 3` 得到 Bash 0.75 / Read 0.09 / Edit 0.09，与写死的全量权重（0.62/0.15/0.10）差异明显——正是它该存在的理由：权重会随工作方式漂移。
 
 ### DF-004 [triaged] ADR 数字已重算，但权重重估仍无执行路径
 

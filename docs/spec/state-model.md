@@ -120,7 +120,7 @@ novelty = Σ_t ( w_t · unique_t / total_t ) / Σ_t w_t
 | Agent | 0.02 |
 | Glob | 0.02 |
 
-权重来自单机样本（2021 个 transcript），换环境应重估。
+权重来自单机样本（2021 个 transcript），换环境应重估：`node scripts/scan-sessions.mjs --recalibrate --days 7` 会统计本机实际的工具分布，并打印可直接粘回源码的 `DEFAULT_WEIGHTS` 字面量。
 
 ### 3.6 窗口参数
 
