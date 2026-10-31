@@ -510,27 +510,31 @@ function checkChangelog() {
     return { h, subject: subject || '' };
   });
 
-  // 找最近一个被记录的提交，只检查它之后的
+  // 一个提交不可能在自己的内容里写自己的 hash —— 这是结构性的，不是疏漏。
+  //
+  // 第一版用「豁免 HEAD」处理（SKIP_HEAD = 1），结果是：每提交一次，上一个提交就
+  // 变成新的违规项，修它又要再提交一次，再产生新的违规项。**无限后退**，
+  // 而且每次 commit 之后 `check-structure` 都红。这正是它真跑起来时暴露的。
+  //
+  // 现在的规则有两条，合起来才闭环：
+  //   1. **边界**：只检查「最近一次修改本文件的提交」之后的提交。
+  //      历史欠账不追溯（追也追不动），但新的改动跑不掉。
+  //   2. **自文档豁免**：改动了 `docs/CHANGELOG.md` 本身的提交视为已记录。
+  //      它写的条目就是记录，再要求它引用自己的 hash 是把记账当成了目的。
+  //
+  // 剩下的：既没动 CHANGELOG、又改了源码/规格、又没被任何 hash 引用 —— 那才是真欠账。
+  const SOURCE_RE = /^(scripts\/|\.claude\/|docs\/|templates\/|rules\/|README\.md|CLAUDE\.md)/;
+  const SKIP_RE = /^(tasks\/runs\/)/;
+
   let boundary = -1;
   for (let i = 0; i < commits.length; i++) {
-    if (isRecorded(commits[i].h)) { boundary = i; break; }
+    const files = git(['show', '--name-only', '--format=', commits[i].h]);
+    if (files && files.trim().split('\n').includes('docs/CHANGELOG.md')) { boundary = i; break; }
   }
-  if (boundary === -1) {
-    warn('docs/CHANGELOG.md', '前 60 个提交里一个 hash 都没被引用 —— 无法判断边界，跳过');
-    return;
-  }
-
-  // 自指豁免：**HEAD 永远检查不了**——一个提交无法在自己的内容里写自己的 hash。
-  // 不加这一条，任何「修改 CHANGELOG 门」的提交都会把自己判违规，
-  // 而 fix 只能是再提交一次去记上一个，无限后退。
-  // 代价：最新一个提交永远是盲区。可接受，因为下一次提交会把它纳入检查。
-  const SKIP_HEAD = 1;
-
-  const SOURCE_RE = /^(scripts\/|\.claude\/|docs\/|templates\/|rules\/|README\.md|CLAUDE\.md)/;
-  const SKIP_RE = /^(docs\/CHANGELOG\.md$|tasks\/runs\/)/;
+  if (boundary <= 0) return; // 最近一次提交就改了 CHANGELOG，或找不到边界：没有可检查范围
 
   const missing = [];
-  for (let i = SKIP_HEAD; i < boundary; i++) {
+  for (let i = 0; i < boundary; i++) {
     const { h, subject } = commits[i];
     const files = git(['show', '--name-only', '--format=', h]);
     if (files === null) continue;
