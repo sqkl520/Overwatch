@@ -72,6 +72,41 @@ liveness: reconstructed（事后重建，非实时上报）
 `dormant` 的会话不告警——它们只是结束了，不是坏了。
 
 零依赖，只需 Node ≥ 18。
+### 在别处运行
+
+```bash
+git clone <repo> && cd Overwatch
+node scripts/scan-sessions.mjs --days 3      # 不需要安装，直接能跑
+node scripts/watch.mjs --inbox                # 看有没有会话在等你
+```
+
+**零依赖**，只要 Node ≥ 18。
+
+想让它常驻并弹通知：
+
+```bash
+node scripts/install-watcher.mjs install
+```
+
+| 平台 | 开机自启 | 桌面通知 |
+|---|---|---|
+| Windows | ✓ 启动文件夹 | ✓ Toast |
+| macOS | 给出 launchd 配置 | ✗ 退回终端输出 |
+| Linux | 给出 systemd user unit | ✗ 退回终端输出 |
+
+没有通知通道时，通知会写进 `runner.log` 并标为正常投递——
+**不会静默丢弃**，你可以定期 `--inbox` 看。
+
+#### 同一台机器跑两份
+
+数据目录默认是固定路径（`%LOCALAPPDATA%\Overwatch` / `~/.local/state/overwatch`），
+**两份克隆会共用它**。检测到会报 `state-shared` 并把冲突的仓库路径写进日志。
+要隔离就显式指定：
+
+```bash
+OVERWATCH_STATE_DIR=/path/to/my-state node scripts/watch.mjs
+```
+
 
 ---
 
