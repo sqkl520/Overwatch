@@ -704,6 +704,28 @@
   索引里必须有「未实现」字样。负向测试两条：去掉 README 的指向 → 门报错；
   索引里删掉一份文档名 → 门报「没有被索引提到」。
 
+### Fixed（TUI 看不见正在等你的会话）
+
+- **主界面对 `WAITING` 完全失明。** 实测：一个 `status:"waiting"` 的会话在
+  `scan-sessions` 的人读输出里正确显示 `← 正在等你（input needed）`，
+  但 TUI 列表里**完全没有它**。
+- 根因：TUI 只读 `data.sessions`（transcript 扫描结果），而这个会话**没有 transcript**——
+  它只存在于 `sessions/*.json`。而**正在等你这件事，恰恰常常发生在会话还没写多少 transcript 的时候**。
+  主入口看不见它，等于这个功能是瞎的。
+- 现在由 `mergeLiveSessions()` 合并两个来源，只补 `WAITING` / `BLOCKED` / `FAILED`
+  （其余状态没有 transcript 就没有信息，补进来是噪音）。
+- **顺带修掉三个连带问题**：
+  - `STATE_ORDER` 是本地硬编码的第二份状态表，没跟上 `tui-theme.STATES`，
+    于是 `WAITING` 显示成 `UNKNOWN`——**比不显示更糟，看起来像数据坏了**。现在从 `STATES` 派生。
+  - `calls` 为 null 时显示 `calls=0`，是在撒谎（可能是 0 次，也可能是没扫）。现在显示 `—`。
+  - 路径里的控制字符会破坏终端渲染，现在替换成空格。
+- **我自己在同一件事上栽了第三次**：先只改了 `App.sessions()`，
+  纯文本路径 `printPlain` 仍直接读 `data.sessions`，于是同一个会话
+  在交互界面出现了、在 `| head` 输出里还是看不见。
+  抽成 `mergeLiveSessions()` 让两条路径只能调同一个函数，
+  并加了一条测试断言「至少两处调用」。
+- **变异验证**（两条）：`printPlain` 改回裸读 → 1 红；`App.sessions` 改回裸读 → 1 红。
+
 ### Notes（已知且不打算近期修）
 
 1. **在线停止分类 95.4% 判 `UNCLASSIFIABLE`** —— 结构性，分类器需要「下一句」而在线时下一句还没发生。

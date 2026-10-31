@@ -439,6 +439,7 @@ function checkUnregisteredExports() {
     'unclassifiableMinIdleSec', 'tooRecentToNotify', 'UNCLASSIFIABLE_MIN_IDLE_SEC', 'IDLE_BUCKETS',
     'traceability', 'readJobStates', 'probeWaiting', 'readLiveSessionStates',
     'buildInbox', 'formatInbox', 'healthCheck', 'formatHealth', 'HEALTH_PERIODS',
+    'statusToState', 'liveToRow', 'mergeLiveSessions',
     // install-watcher.mjs
     'launcherPath', 'templatePath', 'stateDirFor', 'startupDir', 'shortcutPath',
     'renderLauncher', 'needsRegenerate', 'createShortcut', 'witnessPath', 'writeWitness', 'readWitness', 'checkStateIntegrity', 'HOST_FACT_STATES',

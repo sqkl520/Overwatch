@@ -27,7 +27,11 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const SCAN_PATH = join(SCRIPT_DIR, 'scan-sessions.mjs');
 
 /** 终端展示顺序：异常态在前。与 scan-sessions.mjs 的人类输出保持一致。 */
-const STATE_ORDER = ['BLOCKED', 'FAILED', 'STALLED', 'PRODUCING', 'EXPLORING'];
+// 顺序必须覆盖 tui-theme.STATES 的全部键，否则新状态会显示成 UNKNOWN。
+// 2026-11-01：WAITING 加进 tui-theme 之后这里没跟上，一个正在等用户的会话
+// 在 TUI 里显示成 UNKNOWN —— 比不显示更糟，因为它看起来像数据坏了。
+// 现在直接从 STATES 派生，两边不可能再分叉。
+const STATE_ORDER = Object.keys(STATES);
 
 // 字形与颜色是单一真源，来自 tui-theme.mjs。
 // 本文件曾自带一份 GLYPHS 表，与 tui-theme 不一致：BLOCKED 用了 ▲（规范里是 STALLED 的），
@@ -396,7 +400,12 @@ function listRow(session, cols, selected) {
 
   let line = marker + fitWidth(stateColumn(session), COL_STATE) + ' '
     + fitWidth(projectLabel(sanitize(session.project)), COL_PROJECT);
-  if (showCalls) line += ' ' + fitWidth(`calls=${String(session.calls ?? 0).padStart(5)}`, COL_CALLS);
+  // calls 为 null 表示「不是扫描出来的」——这类会话没有 transcript。
+  // 显示成 calls=0 是在撒谎（它可能是 0 次调用，也可能是没扫）。
+  if (showCalls) {
+    const v = session.calls == null ? '—' : String(session.calls).padStart(5);
+    line += ' ' + fitWidth(`calls=${v}`, COL_CALLS);
+  }
   if (showNov) line += ' ' + fitWidth(`nov=${fmtNovelty(session.novelty)}`, COL_NOV);
   if (showIdle) line += ' ' + fitWidth(`idle=${fmtDur(session.idleSec)}`, COL_IDLE);
 
@@ -594,6 +603,81 @@ function bottomBorder(width) {
 
 // ── 应用 ──────────────────────────────────────────────────────────────
 
+/** 把一条 live 会话（sessions/*.json，无 transcript）转成列表行。
+ *
+ *  只用于 WAITING / BLOCKED / FAILED —— 这三种状态不依赖 transcript 就能说清
+ *  「它在等你」/「它受阻」/「它失败了」，而且是唯一需要人立刻行动的三类。
+ *  其余状态没有 transcript 就没有信息（calls / novelty 全空），补进来只是噪音。 */
+export function statusToState(live) {
+  if (!live) return null;
+  if (live.status === 'waiting') return 'WAITING';
+  if (live.status === 'failed') return 'FAILED';
+  if (live.status === 'blocked') return 'BLOCKED';
+  return null;
+}
+
+export function liveToRow(live, nowMs = Date.now()) {
+  const st = statusToState(live);
+  const updated = Number(live.statusUpdatedAt ?? 0);
+  const idleSec = Number.isFinite(updated) && updated > 0 ? Math.round((nowMs - updated) / 1000) : null;
+  // 路径来自宿主文件，可能含控制字符（实测一个手写的 cwd 里反斜杠+t 被写成了制表符）。
+  // 控制字符进终端会破坏渲染，替换成空格而不是删除——保持列对齐。
+  const CTRL = new RegExp('[' + String.fromCharCode(1) + '-' + String.fromCharCode(31) + ']', 'g');
+  const base = live.cwd ? String(live.cwd) : (live.name || '');
+  const where = base.split(/[\/]/).pop().replace(CTRL, ' ') || null;
+  return {
+    project: where || null,
+    sessionId: live.sessionId,
+    // 没有 transcript 就没有这些数字 —— 显式给 null，不要假装是 0。
+    lastActivity: Number.isFinite(updated) && updated > 0 ? new Date(updated).toISOString() : null,
+    idleSec,
+    calls: null,
+    subagents: null,
+    subagentsTotal: null,
+    subagentsTruncated: false,
+    subagentsComplete: true,
+    maxDepth: 0,
+    novelty: null,
+    noveltyAll: null,
+    hbThresholdSec: null,
+    lastGapSec: null,
+    state: st,
+    reason: live.status === 'waiting'
+      ? (live.waitingFor ? `waiting:${live.waitingFor}` : 'host-reported-waiting')
+      : `host-reported-${live.status}`,
+    liveness: 'live',
+    hostState: live.status,
+    jobDetail: null,
+    tokens: null,
+    needs: live.needs ?? null,
+    suggestedReply: live.suggestedReply ?? null,
+    // 标记来源：列表里能看出「这条是从宿主实时状态补的，不是扫描出来的」
+    source: 'live',
+  };
+}
+
+/** 合并「扫描出的会话」与「只有 live 没有 transcript 的会话」。
+ *
+ *  **两条展示路径（交互 App 与纯文本快照）必须用同一个函数。**
+ *  2026-11-01：我先只改了 `App.sessions()`，纯文本路径仍然直接读 `data.sessions`，
+ *  于是同一个 waiting 会话在交互界面出现了、在 `| head` 输出里还是看不见。
+ *  这是我第三次在「改了契约却漏掉另一个调用点」上栽跟头（前两次见 DF-012、DF-017）。
+ *  所以这次把它抽出来，两边都只能调它。 */
+export function mergeLiveSessions(data, nowMs = Date.now()) {
+  const scanned = data?.sessions ?? [];
+  const live = data?.live ?? [];
+  // **正在等你这件事，恰恰常常发生在会话还没写多少 transcript 的时候。**
+  // 主界面看不见它，等于这个功能的主入口是瞎的。
+  const have = new Set(scanned.map((s) => s.sessionId));
+  const extra = [];
+  for (const l of live) {
+    if (!l || !l.sessionId || have.has(l.sessionId)) continue;
+    if (!statusToState(l)) continue;   // 只补 WAITING / BLOCKED / FAILED
+    extra.push(liveToRow(l, nowMs));
+  }
+  return extra.length ? [...scanned, ...extra] : scanned;
+}
+
 export class App {
   constructor({ stdout, stdin, env, days, intervalSec, scan, useColor }) {
     this.stdout = stdout;
@@ -630,9 +714,7 @@ export class App {
 
   now() { return Date.now(); }
 
-  sessions() {
-    return this.data?.sessions ?? [];
-  }
+  sessions() { return mergeLiveSessions(this.data, this.now()); }
 
   sortedSessions() {
     // 排序只依赖 scan 给出的 state / idleSec；不重算任何状态
@@ -982,7 +1064,7 @@ function usage() {
 
 /** 纯文本快照。sink 可注入，便于测试；默认写 process.stdout。 */
 export function printPlain(data, days, sink = process.stdout) {
-  const sessions = [...(data.sessions ?? [])].sort((a, b) => {
+  const sessions = [...mergeLiveSessions(data)].sort((a, b) => {
     const ai = STATE_ORDER.indexOf(a.state);
     const bi = STATE_ORDER.indexOf(b.state);
     const ar = ai < 0 ? STATE_ORDER.length : ai;

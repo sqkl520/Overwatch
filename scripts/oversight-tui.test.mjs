@@ -14,6 +14,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { wrapToWidth, truncateToWidth, parseArgs, parseKeys, sanitize, buildDraft } from './oversight-tui.mjs';
 import { displayWidth } from './tui-theme.mjs';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 // ── sanitize：外部来源字段必须净化 ────────────────────────────────────
 
@@ -281,4 +283,62 @@ test('detailLines 在 blocked 会话上显示 needs 与 suggestedReply', async (
   const text = detailLines(session, 100, false).join('\n');
   assert.ok(text.includes('要不要继续'), 'needs 未显示');
   assert.ok(text.includes('继续'), 'suggestedReply 未显示');
+});
+
+// ── live 会话必须进列表（2026-11-01）────────────────────────────────
+
+import { statusToState, liveToRow, mergeLiveSessions } from './oversight-tui.mjs';
+
+test('statusToState：只认 WAITING / FAILED / BLOCKED，busy/idle 返回 null', () => {
+  assert.equal(statusToState({ status: 'waiting' }), 'WAITING');
+  assert.equal(statusToState({ status: 'failed' }), 'FAILED');
+  assert.equal(statusToState({ status: 'blocked' }), 'BLOCKED');
+  assert.equal(statusToState({ status: 'busy' }), null);
+  assert.equal(statusToState({ status: 'idle' }), null);
+  assert.equal(statusToState(null), null);
+});
+
+test('mergeLiveSessions：只在一半 live 里的 waiting 会话必须补进列表', () => {
+  // 实测：一个 status:"waiting" 的会话在 scan 的人读输出里正确显示，
+  // 但 TUI 里完全看不到——因为 TUI 只读 data.sessions，而它没有 transcript。
+  // 正在等你这件事，恰恰常常发生在会话还没写多少 transcript 的时候。
+  const data = {
+    sessions: [{ sessionId: 'has-transcript', state: 'PRODUCING', project: 'a' }],
+    live: [
+      { sessionId: 'has-transcript', status: 'busy' },          // 已有，不重复补
+      { sessionId: 'only-live', status: 'waiting', waitingFor: 'input needed', cwd: 'D:\P\demo' },
+      { sessionId: 'just-idle', status: 'idle' },               // 不是需要处理的状态，不补
+    ],
+  };
+  const out = mergeLiveSessions(data, Date.now());
+  assert.equal(out.length, 2);
+  const added = out.find((s) => s.sessionId === 'only-live');
+  assert.ok(added, 'waiting 会话必须被补进来');
+  assert.equal(added.state, 'WAITING');
+  assert.equal(added.source, 'live');
+  assert.equal(added.calls, null, '没有 transcript 时 calls 必须是 null，不是 0');
+});
+
+test('mergeLiveSessions：没有 live 数据时原样返回', () => {
+  const data = { sessions: [{ sessionId: 'a', state: 'PRODUCING' }] };
+  assert.equal(mergeLiveSessions(data).length, 1);
+  assert.equal(mergeLiveSessions({}).length, 0);
+});
+
+test('liveToRow：路径里的控制字符被替换，不破坏终端渲染', () => {
+  const row = liveToRow({
+    sessionId: 's', status: 'waiting', waitingFor: 'input needed',
+    cwd: 'D:Projects' + String.fromCharCode(9) + 'demo',   // 制表符，实测会破坏对齐
+    statusUpdatedAt: Date.now(),
+  });
+  assert.ok(!/[\u0001-\u001f]/.test(row.project), `project 仍含控制字符：${JSON.stringify(row.project)}`);
+});
+
+test('mergeLiveSessions 与 App.sessions 必须同源——两条展示路径不能各写一份', () => {
+  // 2026-11-01：先只改了 App.sessions()，纯文本路径仍读 data.sessions，
+  // 于是同一个 waiting 会话在交互界面出现了、在 | head 输出里还是看不见。
+  const src = readFileSync(join(import.meta.dirname, 'oversight-tui.mjs'), 'utf8');
+  // 扣掉定义本身那一处
+  const uses = (src.match(/mergeLiveSessions\(/g) || []).length - 1;
+  assert.ok(uses >= 2, `App.sessions 与 printPlain 都必须调用它，实际只有 ${uses} 处`);
 });
