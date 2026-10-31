@@ -134,6 +134,12 @@ function main(argv) {
     console.log(`快捷方式  ${lnk}  ${existsSync(lnk) ? '✓ 存在' : '✗ 不存在'}`);
     console.log('');
     console.log('启动器**不在数据目录里**：数据被删不影响重启（DF-022）。');
+    console.log('');
+    // 装好了但没在跑，是最容易忽略的情况。安装状态必须和存活状态一起看（DF-023）。
+    console.log('运行状态（node scripts/watch.mjs --health 看详情）：');
+    const h = spawnSync(process.execPath, [join(repo, 'scripts', 'watch.mjs'), '--health'], { encoding: 'utf8' });
+    const healthOut = String(h.stdout || '').trim();
+    console.log(healthOut ? healthOut.split(String.fromCharCode(10)).map((l) => '  ' + l).join(String.fromCharCode(10)) : '  （无法判定）');
     return same && existsSync(lnk) ? 0 : 1;
   }
 

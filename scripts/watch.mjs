@@ -1919,6 +1919,77 @@ export function formatInbox(items) {
   return lines.join('\n');
 }
 
+/** 守护进程是否**真的在工作**，而不只是进程存在。
+ *
+ *  DF-023：2026-10-31 排查时发现常驻进程 CPU 在涨、进程活着，
+ *  但 lastJobsScanAt 停在六小时前——最坏的一类故障：看起来在跑，实际没在跑。
+ *  我当时一直用「进程存在」当作「在监控」，并据此判断「还没有真实数据」。
+ *
+ *  判据来自**调度周期本身**，不是拍的：
+ *    L-fast 每 1 分钟跑一次 → 超过 3 个周期（3 分钟）没写 lastJobsScanAt 就是 stale
+ *    L-mid  每 5 分钟跑一次 → 超过 3 个周期（15 分钟）就是 stale
+ *  取 3 个周期而不是 1 个：单次 tick 可能因为扫描慢而推后，1 个周期会误报。
+ *  超过 3 个周期还没动静，就不是「慢」，是「停了」。
+ *
+ *  返回 { healthy, reasons[], layers[] }。reasons 为空才算健康。 */
+export const HEALTH_PERIODS = Object.freeze({
+  jobs: JOBS_INTERVAL,
+  probe: PROBE_INTERVAL,
+});
+
+export function healthCheck(state, { nowMs = Date.now(), periods = HEALTH_PERIODS } = {}) {
+  const layers = [];
+  const reasons = [];
+
+  for (const [name, interval] of Object.entries(periods)) {
+    const key = name === 'jobs' ? 'lastJobsScanAt' : 'lastProbeAt';
+    const iso = state && state[key];
+    const t = Date.parse(iso || '');
+    if (!Number.isFinite(t)) {
+      layers.push({ name, interval, lastAt: null, ageMs: null, stale: true, reason: '从未运行' });
+      reasons.push(`${name}：从未运行（${key} 为空）`);
+      continue;
+    }
+    const ageMs = nowMs - t;
+    const limit = interval * 3;
+    const stale = ageMs > limit;
+    layers.push({ name, interval, lastAt: iso, ageMs, stale, limit });
+    if (stale) {
+      reasons.push(`${name}：已 ${fmtAge(ageMs)} 未运行（上限 ${fmtAge(limit)}）`);
+    }
+  }
+  return { healthy: reasons.length === 0, reasons, layers };
+}
+
+function fmtAge(ms) {
+  const m = Math.round(ms / 60000);
+  if (m < 60) return `${m} 分钟`;
+  const h = (m / 60).toFixed(1);
+  if (h < 48) return `${h} 小时`;
+  return `${(h / 24).toFixed(1)} 天`;
+}
+
+export function formatHealth(result) {
+  if (!result) return '无法判定：没有状态文件。';
+  const lines = [];
+  for (const l of result.layers) {
+    const age = l.ageMs == null ? '从未' : fmtAge(l.ageMs);
+    const mark = l.stale ? '✗' : '✓';
+    lines.push(`  ${mark} ${l.name.padEnd(6)} 上次 ${age}前   周期 ${fmtAge(l.interval)}（上限 ${fmtAge(l.interval * 3)}）`);
+  }
+  lines.push('');
+  if (result.healthy) {
+    lines.push('判定：运行中。所有层都在周期内。');
+  } else {
+    lines.push('判定：**没有在工作**。');
+    for (const r of result.reasons) lines.push(`  - ${r}`);
+    lines.push('');
+    lines.push('注意：这**不代表进程死了**。进程可能还活着但卡住了——');
+    lines.push('这恰恰是 DF-023 记的那类故障：看起来在跑，实际没在跑。');
+  }
+  return lines.join('\n');
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────
 
 async function main(argv) {
@@ -1939,6 +2010,25 @@ async function main(argv) {
     console.log(formatStats(observationStats(defaultStateDir()), { minIdleSec: unclassifiableMinIdleSec() }));
     return;
   }
+
+  if (flags.has('--health')) {
+    const dir = defaultStateDir();
+    let state;
+    try {
+      state = loadState(dir, { logger: null }).state;
+    } catch {
+      console.log('无法读取状态文件——守护进程可能从未运行过。');
+      process.exit(1);
+    }
+    const r = healthCheck(state, { nowMs: Date.now() });
+    if (flags.has('--json')) {
+      console.log(JSON.stringify({ generatedAt: new Date().toISOString(), ...r }, null, 2));
+    } else {
+      console.log(formatHealth(r));
+    }
+    process.exit(r.healthy ? 0 : 1);
+  }
+
 
   if (flags.has('--inbox')) {
     const dir = defaultStateDir();

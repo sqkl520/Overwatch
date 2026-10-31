@@ -24,7 +24,7 @@ import {
   pruneNotified, NOTIFIED_TTL_HOURS, notifyTitle, NOTIFY_STATES,
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
   observationStats, formatStats, readObservationRows, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
-  traceability, readJobStates, probeWaiting, readLiveSessionStates, buildInbox, formatInbox, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
+  traceability, readJobStates, probeWaiting, readLiveSessionStates, buildInbox, formatInbox, healthCheck, formatHealth, HEALTH_PERIODS, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -1704,4 +1704,46 @@ test('probeWaiting 的候选带上 waitingFor', () => {
     const r = probeWaiting(dir, { nowMs: now });
     assert.equal(r.found[0].waitingFor, 'dialog open');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── 存活指标：进程活着 ≠ 在工作（DF-023）──────────────────────────
+
+test('healthCheck：刚跑过 → 健康', () => {
+  const now = Date.now();
+  const r = healthCheck({ lastJobsScanAt: new Date(now - 30_000).toISOString(),
+    lastProbeAt: new Date(now - 60_000).toISOString() }, { nowMs: now });
+  assert.equal(r.healthy, true);
+  assert.deepEqual(r.reasons, []);
+});
+
+test('healthCheck：抓得住「进程活着但六小时没扫描」——这正是 DF-023', () => {
+  const now = Date.now();
+  const old = new Date(now - 6 * 3600e3).toISOString();
+  const r = healthCheck({ lastJobsScanAt: old, lastProbeAt: old }, { nowMs: now });
+  assert.equal(r.healthy, false, '六小时不动必须判不健康');
+  assert.ok(r.reasons.some((x) => x.includes('jobs')));
+  assert.ok(r.reasons.some((x) => x.includes('probe')));
+});
+
+test('healthCheck：超过 1 个周期但不超 3 个 → 仍算健康（单次 tick 变慢是正常的）', () => {
+  const now = Date.now();
+  const r = healthCheck({
+    lastJobsScanAt: new Date(now - 2 * 60_000).toISOString(),   // 2 个周期
+    lastProbeAt: new Date(now - 10 * 60_000).toISOString(),     // 2 个周期
+  }, { nowMs: now });
+  assert.equal(r.healthy, true, '2 个周期不该误报——扫描慢会把 tick 推后');
+});
+
+test('healthCheck：从未运行过 → 不健康，且说明是「从未」而不是「很久」', () => {
+  const r = healthCheck({}, { nowMs: Date.now() });
+  assert.equal(r.healthy, false);
+  assert.ok(r.reasons.some((x) => x.includes('从未运行')));
+});
+
+test('formatHealth：不健康时明确区分「进程死了」与「进程卡住」', () => {
+  const now = Date.now();
+  const out = formatHealth(healthCheck({ lastJobsScanAt: new Date(now - 6 * 3600e3).toISOString(),
+    lastProbeAt: new Date(now - 6 * 3600e3).toISOString() }, { nowMs: now }));
+  assert.ok(out.includes('没有在工作'));
+  assert.ok(out.includes('不代表进程死了'), '必须说清这不是进程崩溃，而是卡住');
 });

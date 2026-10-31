@@ -438,7 +438,7 @@ function checkUnregisteredExports() {
     'createObservationLog', 'observationStats', 'formatStats', 'readObservationRows', 'readObservationRows', 'NOTIFY_KINDS', 'OBS_MAX_BYTES',
     'unclassifiableMinIdleSec', 'tooRecentToNotify', 'UNCLASSIFIABLE_MIN_IDLE_SEC', 'IDLE_BUCKETS',
     'traceability', 'readJobStates', 'probeWaiting', 'readLiveSessionStates',
-    'buildInbox', 'formatInbox',
+    'buildInbox', 'formatInbox', 'healthCheck', 'formatHealth', 'HEALTH_PERIODS',
     // install-watcher.mjs
     'launcherPath', 'templatePath', 'stateDirFor', 'startupDir', 'shortcutPath',
     'renderLauncher', 'needsRegenerate', 'createShortcut', 'witnessPath', 'writeWitness', 'readWitness', 'checkStateIntegrity', 'HOST_FACT_STATES',
@@ -669,6 +669,10 @@ function checkInboxWiring() {
   if (existsSync(skill)) {
     let t = '';
     try { t = readFileSync(skill, 'utf8'); } catch { /* ignore */ }
+    if (!t.includes('--health')) {
+      fail('.claude/skills/oversight/SKILL.md',
+        '调度入口没有引用 `watch.mjs --health` —— 无法区分「进程死了」和「进程卡住了」（DF-023）');
+    }
     if (!t.includes('--inbox')) {
       fail('.claude/skills/oversight/SKILL.md',
         '调度入口没有引用 `watch.mjs --inbox` —— 后台发现又接不上了（DF-015）');
@@ -690,6 +694,9 @@ function checkInboxWiring() {
   if (existsSync(w)) {
     let t = '';
     try { t = readFileSync(w, 'utf8'); } catch { /* ignore */ }
+    if (!t.includes("flags.has('--health')")) {
+      fail('scripts/watch.mjs', '脚本没有实现 --health，但文档在引用它');
+    }
     if (!t.includes("flags.has('--inbox')")) {
       fail('scripts/watch.mjs', '脚本没有实现 --inbox，但文档在引用它');
     }
