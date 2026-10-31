@@ -24,7 +24,7 @@ import {
   pruneNotified, NOTIFIED_TTL_HOURS, notifyTitle, NOTIFY_STATES,
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
   observationStats, formatStats, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
-  traceability, readJobStates, probeWaiting,
+  traceability, readJobStates, probeWaiting, witnessPath, writeWitness, readWitness, checkStateIntegrity,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -1184,4 +1184,144 @@ test('probeWaiting：坏 JSON 与无 sessionId 的文件被跳过，不抛', () 
 
 test('probeWaiting：WAITING 在 NOTIFY_STATES 里——它是唯一会高频触发的状态', () => {
   assert.ok(NOTIFY_STATES.includes('WAITING'));
+});
+
+// ── 状态完整性：目录消失必须能被发现（DF-020）──────────────────────
+
+test('witnessPath 是状态目录的兄弟，不是公共父目录', () => {
+  const a = witnessPath('/tmp/x/Overwatch');
+  const b = witnessPath('/tmp/y/Overwatch');
+  assert.notEqual(a, b, '不同状态目录不得共用一个见证文件');
+  assert.ok(a.startsWith('/tmp/x/Overwatch'), `见证应在目录旁边：${a}`);
+});
+
+test('checkStateIntegrity：首次运行不算丢失', () => {
+  const dir = tmp();
+  try {
+    const r = checkStateIntegrity(dir);
+    assert.equal(r.lost, false);
+    assert.equal(r.firstRun, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('checkStateIntegrity：见证在、state.json 没了 → 判定丢失', () => {
+  const dir = tmp();
+  try {
+    mkdirSync(dir, { recursive: true });
+    saveState(dir, emptyState());
+    writeWitness(dir, { nowMs: Date.now() });
+    // 模拟目录被清空
+    rmSync(join(dir, 'state.json'));
+    const r = checkStateIntegrity(dir);
+    assert.equal(r.lost, true, '见证记录过保存，但 state.json 不见了');
+    assert.ok(r.previousSaves >= 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(witnessPath(dir), { force: true });
+  }
+});
+
+test('checkStateIntegrity：目录整个被删也能判定丢失（见证在目录外）', () => {
+  const dir = tmp();
+  try {
+    mkdirSync(dir, { recursive: true });
+    saveState(dir, emptyState());
+    writeWitness(dir, { nowMs: Date.now() });
+    rmSync(dir, { recursive: true, force: true });   // 整个目录消失，正是 10-31 的情形
+    const r = checkStateIntegrity(dir);
+    assert.equal(r.lost, true, '目录整个没了，见证文件仍在，必须报丢失');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(witnessPath(dir), { force: true });
+  }
+});
+
+test('丢失时 runTick 发一条告警，且不阻止继续运行', async () => {
+  const dir = tmp();
+  const claude = tmp();
+  try {
+    const now = Date.now();
+    mkdirSync(join(claude, 'projects'), { recursive: true });
+    mkdirSync(dir, { recursive: true });
+    saveState(dir, emptyState());
+    writeWitness(dir, { nowMs: now });
+    rmSync(join(dir, 'state.json'));
+
+    const calls = [];
+    const r = await runTick({
+      dir, claudeDir: claude, nowMs: now,
+      notifier: async (n) => { calls.push(n); },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+    });
+    assert.equal(calls.length, 1, '应当发一条状态丢失告警');
+    assert.ok(/丢失/.test(calls[0].title), `告警标题应说明丢失：${calls[0].title}`);
+    assert.ok(r, '告警后仍要正常运行，不能退出');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(claude, { recursive: true, force: true });
+    rmSync(witnessPath(dir), { force: true });
+  }
+});
+
+test('dry-run 下丢失只记日志、不发通知（试跑契约同样适用）', async () => {
+  const dir = tmp();
+  const claude = tmp();
+  try {
+    const now = Date.now();
+    mkdirSync(join(claude, 'projects'), { recursive: true });
+    mkdirSync(dir, { recursive: true });
+    saveState(dir, emptyState());
+    writeWitness(dir, { nowMs: now });
+    rmSync(join(dir, 'state.json'));
+
+    let n = 0;
+    const errors = [];
+    await runTick({
+      dir, claudeDir: claude, nowMs: now, dryRun: true,
+      notifier: async () => { n++; },
+      logger: { info: () => {}, warn: () => {}, error: (m) => errors.push(m) },
+      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+    });
+    assert.equal(n, 0, 'dry-run 不得发通知');
+    assert.ok(errors.some((e) => /state-lost/.test(e)), '但必须在日志里留下 state-lost');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(claude, { recursive: true, force: true });
+    rmSync(witnessPath(dir), { force: true });
+  }
+});
+
+test('runTick 每次成功保存都推进见证时间——否则丢失告警会报错误的时间', async () => {
+  const dir = tmp();
+  const claude = tmp();
+  try {
+    const t1 = Date.now() - 60_000;
+    mkdirSync(join(claude, 'projects'), { recursive: true });
+    await runTick({
+      dir, claudeDir: claude, nowMs: t1,
+      notifier: async () => {},
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+    });
+    const w1 = readWitness(dir);
+    assert.ok(w1, 'runTick 必须建立见证文件');
+    assert.equal(w1.lastSavedAt, new Date(t1).toISOString());
+
+    const t2 = t1 + 30_000;
+    await runTick({
+      dir, claudeDir: claude, nowMs: t2, forceFull: true,
+      notifier: async () => {},
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+    });
+    const w2 = readWitness(dir);
+    assert.equal(w2.lastSavedAt, new Date(t2).toISOString(), '每次保存都要推进');
+    assert.ok(w2.saves > w1.saves, `saves 应递增：${w1.saves} → ${w2.saves}`);
+    assert.equal(w2.firstSeenAt, w1.firstSeenAt, 'firstSeenAt 不得被覆盖');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(claude, { recursive: true, force: true });
+    rmSync(witnessPath(dir), { force: true });
+  }
 });

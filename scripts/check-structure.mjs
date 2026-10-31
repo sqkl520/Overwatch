@@ -437,7 +437,7 @@ function checkUnregisteredExports() {
     'findStopPoint', 'readTranscriptTail', 'classifyCandidate',
     'createObservationLog', 'observationStats', 'formatStats', 'NOTIFY_KINDS', 'OBS_MAX_BYTES',
     'unclassifiableMinIdleSec', 'tooRecentToNotify', 'UNCLASSIFIABLE_MIN_IDLE_SEC', 'IDLE_BUCKETS',
-    'traceability', 'readJobStates', 'probeWaiting',
+    'traceability', 'readJobStates', 'probeWaiting', 'witnessPath', 'writeWitness', 'readWitness', 'checkStateIntegrity',
     'recalibrateWeights', 'NOTIFY_STATES', '__internals', 'STATES', 'DAY', 'HOUR', 'MINUTE', 'App', 'KINDS',
     // replay-observe.mjs
     'nextTick', 'callsUpTo', 'gapsOf', 'capText', 'compactRecord', 'isToolResultOnly',

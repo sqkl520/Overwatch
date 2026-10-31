@@ -83,6 +83,80 @@ const SCAN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'scan-sessions
 // ── 路径 ──────────────────────────────────────────────────────────────
 
 /** 状态目录。测试与自检通过 OVERWATCH_STATE_DIR 改道，绝不碰真实 LOCALAPPDATA。 */
+/** 见证文件（witness）：**故意放在状态目录外面**。
+ *
+ *  为什么需要它：状态目录不存在时无从判断是「第一次运行」还是「数据丢了」——
+ *  `mkdirSync(recursive)` 会静默重建，于是两者表现完全一样。
+ *  2026-10-31 实测：`%LOCALAPPDATA%\Overwatch\` 整个目录消失，5,348 行生产日志、
+ *  状态、观察记录一起没了，而 watcher 照常运行、照常重建目录。**没有任何告警。**
+ *
+ *  见证文件记录「上一次成功保存状态的时间与路径」。目录被删后它仍在，
+ *  于是下一次启动能区分：
+ *    witness 存在 + state.json 不存在 → **数据丢失**，大声告警
+ *    两者都不存在                     → 真正的首次运行，正常静默
+ *
+ *  它自己也会丢（同一块盘、同一次清理），所以这不是备份，只是**一次诚实性检查**。
+ *  真正的持久化是另一个问题，见 DF-021。 */
+export function witnessPath(stateDir) {
+  // 兄弟文件而不是「往上一级」：<Local>/Overwatch → <Local>/Overwatch.witness.json
+  //
+  // 早先写成 dirname(dirname(stateDir))，对 `<Local>/Overwatch` 恰好得出 `<Local>`，
+  // 但对**任意目录**（比如测试用的临时目录）会塌到公共父目录上，
+  // 于是不同 stateDir 共用同一个见证文件、互相污染——测试当场抓到：
+  // 上一个用例留下的见证让下一个用例误报「数据丢失」，多发一条通知。
+  // 兄弟文件的语义对所有目录形状都成立：删掉目录，文件还在。
+  const d = String(stateDir).replace(/[\\/]+$/, '');
+  return `${d}.witness.json`;
+}
+
+export function readWitness(stateDir) {
+  const p = witnessPath(stateDir);
+  try {
+    const j = JSON.parse(readFileSync(p, 'utf8'));
+    return j && typeof j === 'object' ? j : null;
+  } catch { return null; }
+}
+
+export function writeWitness(stateDir, { nowMs = Date.now(), version = 1 } = {}) {
+  const p = witnessPath(stateDir);
+  try {
+    const prev = readWitness(stateDir) || {};
+    writeFileSync(p, JSON.stringify({
+      version,
+      // dir 是绝对路径，只写在本机文件里，不进仓库、不写日志原文
+      dir: String(stateDir),
+      firstSeenAt: prev.firstSeenAt || new Date(nowMs).toISOString(),
+      lastSavedAt: new Date(nowMs).toISOString(),
+      saves: Number(prev.saves || 0) + 1,
+    }, null, 2) + '\n', 'utf8');
+    return { ok: true, path: p };
+  } catch (e) {
+    return { ok: false, path: p, error: e.message };
+  }
+}
+
+/** 启动时的完整性检查。返回 { lost, witness, stateExists }。
+ *
+ *  **lost = true 表示「见证说这里曾经有数据，但数据不见了」。**
+ *
+ *  注意这里刻意**不**阻止守护进程运行：监控坏了的第一反应不该是「干脆不监控」。
+ *  调用方负责大声告警；想要硬失败的人用 --strict。 */
+export function checkStateIntegrity(stateDir, { nowMs = Date.now() } = {}) {
+  const stateExists = existsSync(statePath(String(stateDir)));
+  const witness = readWitness(stateDir);
+  if (!witness) return { lost: false, firstRun: true, witness: null, stateExists, previousSaves: 0 };
+  const previousSaves = Number(witness.saves || 0);
+  const lost = !stateExists && previousSaves > 0;
+  return {
+    lost,
+    firstRun: false,
+    witness,
+    stateExists,
+    previousSaves,
+    lastSavedAt: witness.lastSavedAt || null,
+  };
+}
+
 export function defaultStateDir(env = process.env) {
   if (env.OVERWATCH_STATE_DIR) return env.OVERWATCH_STATE_DIR;
   if (process.platform === 'win32') {
@@ -1264,7 +1338,38 @@ export async function runTick({
   const stateDir = dir || defaultStateDir(env);
   const log = logger || createLogger(stateDir);
   const root = claudeRoot(env, claudeDir);
+
+  // 完整性检查必须在 mkdirSync 之前：一旦建了目录，「丢了」和「首次运行」就分不出来了。
+  const integrity = checkStateIntegrity(stateDir, { nowMs });
+  const dirExisted = existsSync(stateDir);
   mkdirSync(stateDir, { recursive: true });
+
+  if (integrity.lost) {
+    // 大声告警：这是唯一一次能告诉用户「你的历史没了」的时机。
+    // 不退出——监控坏了的第一反应不该是「干脆不监控」。
+    const msg = `state-lost: 见证文件显示 ${integrity.previousSaves} 次保存（最后 ${integrity.lastSavedAt}），` +
+      `但 state.json 和整个状态目录都不在了。历史已丢失，从空状态继续。`;
+    if (log) log.error(msg);
+    if (log && typeof log.warn === 'function') {
+      log.warn('state-lost: 日志与 observations.jsonl 很可能同时在同一次删除中丢失。' +
+        '本次运行会重建目录，但不会重建证据。见 tasks/dev-findings.md DF-020。');
+    }
+    // dry-run 的契约是「只算不发」，对告警同样成立——否则试跑会真的弹窗。
+    // 日志里仍然记录，试跑的人看得到。
+    if (!dryRun) {
+      try {
+        const n = notifier || (async () => {});
+        await n({
+          title: '⚠ Overwatch 状态丢失',
+          body: `上次保存于 ${integrity.lastSavedAt || '未知'}，目录现已为空。已从空状态继续运行。`,
+          urgency: 'high',
+          tag: 'state-lost',
+        });
+      } catch { /* 通知不通不能拖垮启动，日志里已经写了 */ }
+    }
+  } else if (integrity.firstRun && !dirExisted) {
+    if (log) log.info('首次运行：状态目录不存在且无见证文件，正常初始化');
+  }
 
   const projectsRoot = join(root, 'projects');
   // 默认就接上分类：P0 的核心产物是观察日志，忘了传参就整段产出归零。
@@ -1388,7 +1493,13 @@ export async function runTick({
   // dry-run 不落盘：它绕过了发送，但**仍会走 saveState**，
   // 于是和真身抢同一个 state.json，rename 报 EPERM 把整个 tick 打挂。
   // 2026-10-31 实测：一个 --dry-run 实例跑了 6 小时，真身三次 tick-failed。
-  if (!dryRun) saveState(stateDir, state);
+  if (!dryRun) {
+    saveState(stateDir, state);
+    // 见证文件**每次保存后**更新，而不是只在启动时写。
+    // 只在启动时写的话，一个跑了一周的进程会把 lastSavedAt 停在一周前，
+    // 丢失告警就会报出错误的时间——而时间是这条告警唯一有用的部分。
+    writeWitness(stateDir, { nowMs });
+  }
 
   const parts = [];
   for (const layer of summary.ran) parts.push(layer);
