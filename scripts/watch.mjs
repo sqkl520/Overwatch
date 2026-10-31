@@ -502,6 +502,7 @@ export function probeWaiting(sessionsRoot, { nowMs = Date.now() } = {}) {
       sessionId: s.sessionId,
       state: 'WAITING',
       reason: s.waitingFor ? `waiting:${s.waitingFor}` : 'host-reported-waiting',
+      waitingFor: s.waitingFor || null,
       project: s.cwd ? s.cwd.split(/[\\/]/).pop() : (s.name || null),
       detail: s.waitingFor || null,
       needs: typeof s.needs === 'string' ? s.needs : null,
@@ -1285,6 +1286,37 @@ export async function dispatchCandidates(candidates, {
     // 分类能力保留：将来若重新引入基于 transcript 的推断状态，它立刻重新有用。
     const hostFact = HOST_FACT_STATES.includes(c.state);
     let obs = null;
+    if (hostFact) {
+      // 宿主事实**不走分类器**（它对这类候选结构上不可能有效，见上），
+      // 但**观察日志仍然要写**——P0 的全部数据来源就是它。
+      //
+      // 2026-10-31 回归：跳过分类器之后 `obs` 恒为 null，而每处记录都是 `if (obs)`
+      // 守卫，于是通知照发、观察日志一条不写。`observations.jsonl` 六小时没生成，
+      // 我却在看 `--stats` 报 0 条并以为「还没有真实数据」。
+      // 记录与分类是两件事，不能因为不分类就连记录一起丢掉。
+      obs = {
+        ts: new Date(nowMs).toISOString(),
+        sessionId: c.sessionId,
+        state: c.state,
+        idleSec: Number.isFinite(c.idleSec) ? c.idleSec : null,
+        // 宿主事实的分类结论就是它自己：不需要猜。
+        kind: c.state,
+        autoAnswerable: false,
+        reason: c.reason || `host-fact:${c.state}`,
+        confidence: null,
+        notified: false,
+        why: null,
+        // 'host' 与 'ok' / 'error' 区分开：这三类行来自不同的判定路径，
+        // --stats 能据此说清「分布跨了几个策略时期」。
+        classify: 'host',
+        fingerprint: c.evidenceFingerprint || '',
+        // 来源与「在等什么」分开记：前者用于判断哪条管道的候选更准，
+        // 后者用于回答「宿主到底说了什么」。两者都能从候选免费拿到，
+        // 但缺了它们，事后回看分不出「jobs 报的 blocked」与「sessions 报的 waiting」。
+        source: c.source || null,
+        waitingFor: c.waitingFor || null,
+      };
+    }
     if (typeof classify === 'function' && !hostFact) {
 
       try {

@@ -1614,3 +1614,94 @@ test('buildInbox 对 FAILED/BLOCKED 也做对账：会话已不存在则是旧�
   assert.equal(buildInbox(st, { nowMs: now, live: [{ sessionId: 'dead', status: 'busy' }] }).length, 1,
     '会话还在（哪怕是 busy），failed 记录仍需人看一眼');
 });
+
+// ── 宿主事实必须写观察日志（2026-10-31 回归）────────────────────────
+
+test('宿主事实通知时也写观察日志——跳过分类不等于跳过记录', async () => {
+  // 回归来源：为了让宿主事实不调用分类器，`obs` 恒为 null，
+  // 而每处记录都是 `if (obs)` 守卫 → 通知照发、观察日志一条不写。
+  // 六小时里 observations.jsonl 根本没生成，我却在看 --stats 报 0 条
+  // 并以为「还没有真实数据」。**记录与分类是两件事。**
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    const log = createObservationLog(dir);
+    const r = await dispatchCandidates([{
+      sessionId: 'host-1', state: 'WAITING', reason: 'waiting:input needed', project: 'demo',
+      idleSec: 30, lastActivity: new Date(now).toISOString(), evidenceFingerprint: '1',
+    }], {
+      state: emptyState(), nowMs: now, notifier: async () => {},
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      // 明确给一个分类器：宿主事实不该调用它，但仍必须留下记录
+      classify: () => { throw new Error('不该被调用'); },
+      observations: log,
+    });
+    assert.equal(r.sent.length, 1);
+    assert.equal(r.observations.length, 1, '必须留下一条观察记录');
+    const rows = readObservationRows(dir);
+    assert.equal(rows.length, 1, `observations.jsonl 必须写一行，实际 ${rows.length}`);
+    assert.equal(rows[0].state, 'WAITING');
+    assert.equal(rows[0].kind, 'WAITING', '宿主事实的 kind 就是它自己');
+    assert.equal(rows[0].classify, 'host', '标成 host 以区别于 ok/error');
+    assert.equal(rows[0].notified, true);
+    assert.equal(rows[0].idleSec, 30, 'idleSec 必须留下');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('宿主事实被抑制时同样写记录，并写明为什么', async () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    const st = emptyState();
+    // 先消耗掉当日额度，制造 budget 抑制
+    st.budget.sentLog = Array.from({ length: 20 }, (_, i) => new Date(now - i * 1000).toISOString());
+    const log = createObservationLog(dir);
+    const r = await dispatchCandidates([{
+      sessionId: 'host-2', state: 'WAITING', reason: 'waiting:input needed', project: 'demo',
+      idleSec: 30, lastActivity: new Date(now).toISOString(), evidenceFingerprint: '1',
+    }], {
+      state: st, nowMs: now, notifier: async () => {},
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      classify: null, observations: log,
+    });
+    assert.equal(r.sent.length, 0, '超额不得发');
+    const rows = readObservationRows(dir);
+    assert.equal(rows.length, 1, '被抑制的也必须留记录');
+    assert.equal(rows[0].notified, false);
+    assert.ok(rows[0].why && rows[0].why.startsWith('budget-'), `why 应说明原因：${rows[0].why}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('观察记录带 source 与 waitingFor——事后能分清是哪条管道的候选', async () => {
+  // 没有这两个字段时，「jobs 报的 blocked」与「sessions 报的 waiting」
+  // 在日志里长得一样，回看时无法判断哪条管道更准。
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    await dispatchCandidates([{
+      sessionId: 'x', state: 'WAITING', reason: 'waiting:input needed', project: 'demo',
+      idleSec: 30, lastActivity: new Date(now).toISOString(), evidenceFingerprint: '1',
+      source: 'sessions', waitingFor: 'input needed',
+    }], {
+      state: emptyState(), nowMs: now, notifier: async () => {},
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      classify: null, observations: createObservationLog(dir),
+    });
+    const rows = readObservationRows(dir);
+    assert.equal(rows[0].source, 'sessions');
+    assert.equal(rows[0].waitingFor, 'input needed');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('probeWaiting 的候选带上 waitingFor', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    writeFileSync(join(dir, 'a.json'), JSON.stringify({
+      pid: 1, sessionId: 's1', status: 'waiting', waitingFor: 'dialog open',
+      statusUpdatedAt: now, cwd: 'D:\P\demo',
+    }));
+    const r = probeWaiting(dir, { nowMs: now });
+    assert.equal(r.found[0].waitingFor, 'dialog open');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
