@@ -73,7 +73,7 @@ Overwatch/
 │  ├─ oversight-tui.mjs    终端界面：列表 / 详情 / 帮助 / 草稿
 │  ├─ tui-theme.mjs        四态字形与配色（单一真源）
 │  ├─ check-structure.mjs  结构硬门
-│  └─ *.test.mjs           81 条回归测试
+│  └─ *.test.mjs           189 条回归测试
 ├─ tasks/
 │  ├─ dev-findings.md      范围外发现（不许自行修）
 │  └─ accepted-deviations.md  已知不修（不计入判定）
