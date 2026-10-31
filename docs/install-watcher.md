@@ -88,17 +88,26 @@ powershell -NoProfile -Command "Get-Process node | Where-Object { \$_.MainWindow
 tail -5 "%LOCALAPPDATA%\Overwatch\runner.log"
 ```
 
-正常输出长这样：
+正常输出长这样（本机 2026-10-31 实跑，`%LOCALAPPDATA%\Overwatch\watch.log`）：
 
 ```
-[INFO] watch 启动 dir=%LOCALAPPDATA%Overwatch tick=15000ms
-[INFO] tick jobs jobs=9ms candidates=0 sent=0 suppressed=0 already=0
-[INFO] suppressed FAILED kind=WAITING_SUBAGENT session=5ead31fa-a774-4dc8-8e7c-9e7c094756a7
-[INFO] notified BLOCKED D--Projects-rea kind=EXTERNAL_BLOCKED key=6da2fa52dccf2c60 session=...
+[INFO] watch 启动 dir=%LOCALAPPDATA%\Overwatch tick=15000ms
+[INFO] tick jobs jobs=10ms candidates=0 sent=0 suppressed=0 already=0
+[INFO] tick candidates=0 sent=0 suppressed=0 already=0
+[INFO] tick candidates=0 sent=0 suppressed=0 already=0
 ```
 
-`suppressed ... kind=WAITING_SUBAGENT` 是设计内行为：下一句是子 Agent 完成通知的停止，
-宿主自己会唤醒，不发通知（占真实停止的约 68%）。
+绝大多数 tick 是 `candidates=0`——**这是正常的**，说明没有宿主报 `failed` / `blocked`。
+
+真正发通知时的样子：
+
+```
+[INFO] notified FAILED D--Projects-rea-Project-work-shapez key=6da2fa52… session=5ead31fa-…
+```
+
+> ⚠ 本文件此前在这里展示过 `suppressed FAILED kind=WAITING_SUBAGENT`，并称「子 Agent 完成通知的停止占真实停止的约 68%」。
+> **那一行从未出现过**：5,373 条日志里 `suppressed <大写状态> kind=…` 计数为 0。当时的实际日志里根本没有 `kind=` 字段（分类器尚未接入通知路径）。
+> 上文已替换为真实日志。真实的通知样本只有 5 条，全部是 `FAILED`。
 
 ## 看分类分布
 
@@ -109,23 +118,33 @@ P0 期的核心产物是 `%LOCALAPPDATA%\Overwatch\observations.jsonl`：每条�
 node scripts/watch.mjs --stats
 ```
 
-输出：
+输出（**当前真实状态**，2026-10-31 实跑）：
 
 ```
-观察样本：6 条（2026-10-30 ~ 2026-10-30）
+观察样本：0 条（还没有 observations.jsonl）
+```
+
+这不是故障。`observations.jsonl` **只在有候选产生时才写入**，而回滚后（删掉心跳推断、
+`NOTIFY_STATES` 只剩宿主事实）13 小时内候选数为 0——没有会话被宿主报 `failed` 或 `blocked`。
+
+一旦有候选，`--stats` 才开始有内容，格式是：
+
+```
+观察样本：N 条（起始日 ~ 结束日）
 分类分布：
-  ASKED_UNANSWERED         1  16.7%
-  EXTERNAL_BLOCKED         1  16.7%
-  WAITING_SUBAGENT         1  16.7%
-  ...
-通知：发了 3 条，抑制 3 条
+  <KIND>                   <n>  <pct>%
+通知：发了 X 条，抑制 Y 条
 按 state 交叉：
-  STALLED → WAITING_SUBAGENT 1 / ASKED_UNANSWERED 1 / PLAN_SUBMITTED 1
-  BLOCKED → EXTERNAL_BLOCKED 1
+  <STATE> → <KIND> <n> / ...
 ```
 
-`why` 告诉你看这一行为什么没发：`*-suppressed`（分类门）、`budget-*`（限额）、
-`already-notified`（同一边沿已处理）、`dry-run`、`classify-error`（判不了，退回按 state 判断）。
+> ⚠ 本文件此前贴过一段「观察样本：6 条 / ASKED_UNANSWERED 16.7% / WAITING_SUBAGENT 16.7%」的输出，
+> **那是编的**：当时 `observations.jsonl` 根本不存在，`formatStats` 的样本为 0。
+> 现在这里只写实际输出，并明确标注 0 条是预期结果。
+
+`why` 告诉你看这一行为什么没发：`kind-not-notifiable`（分类门）、`budget-*`（限额）、
+`already-notified`（同一边沿已处理）、`dry-run`、`classify-error`（判不了，退回按 state 判断）、
+`unclassifiable-too-recent`（刚停下，等 5 分钟时间门槛）。
 
 ## 三层轮询的代价
 
