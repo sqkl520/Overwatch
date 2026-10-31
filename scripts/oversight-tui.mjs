@@ -206,7 +206,16 @@ export function buildDraft(session) {
   if (!reply && !needs) return null;
   const parts = [];
   if (reply) parts.push(sanitize(reply));
-  if (needs) parts.push(`（目标会话正在等待：${sanitize(needs)}）`);
+  if (needs) {
+    // 措辞必须跟着状态走。2026-11-01 实测：FAILED 会话也被印成「正在等待」——
+    // 一个失败了的会话没有在等你，它停下是因为出错了。
+    // 复制出去的话写错这句，用户会以为对方在提问。
+    const state = session?.state;
+    const lead = state === 'FAILED' ? '（目标会话已失败，停在：'
+      : state === 'BLOCKED' ? '（目标会话受阻，在等：'
+        : '（目标会话正在等待：';
+    parts.push(`${lead}${sanitize(needs)}）`);
+  }
   return parts.join('\n\n');
 }
 
@@ -391,7 +400,7 @@ function stateColumn(session) {
  * 列表行。返回不含 SGR 的纯文本（方便按宽度补齐），着色由上层负责。
  * cols < 72 时逐级舍弃末尾字段，保证不折行。
  */
-function listRow(session, cols, selected) {
+export function listRow(session, cols, selected) {
   const marker = selected ? '> ' : '  ';
   const showCalls = cols >= 44;
   const showNov = cols >= 56;
@@ -472,7 +481,7 @@ export function detailLines(session, cols, useColor) {
   out.push(kv('sessionId', sanitize(session.sessionId)));
   out.push(kv('state', `${glyphOf(session)} ${st}`));
   out.push(kv('reason', sanitize(session.reason)));
-  out.push(kv('liveness', session.liveness));
+  out.push(kv('liveness', sanitize(session.liveness ?? '—')));
   out.push(kv('hostState', sanitize(session.hostState ?? '—')));
   if (session.jobDetail) out.push(kv('jobDetail', sanitize(session.jobDetail)));
   out.push(kv('calls', session.calls));
@@ -1056,7 +1065,9 @@ function usage() {
     '  --plain        即使 TTY 也输出纯文本快照',
     '',
     '非 TTY（管道/重定向）自动输出纯文本快照后退出，不输出 ANSI。',
-    '状态判定全部来自 scan-sessions.mjs --json；本界面不计算任何状态。',
+    '状态判定来自 scan-sessions.mjs --json；但 WAITING / BLOCKED / FAILED 这三类会从',
+    '宿主实时状态（~/.claude/sessions/*.json）补进列表——它们没有 transcript 时',
+    '也存在于宿主状态里，而「正在等你」恰恰常发生在那时。其余状态不做任何推断。',
   ].join('\n');
 }
 

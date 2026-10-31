@@ -455,6 +455,13 @@ function readLiveSessions() {
         name: o.name,
         cwd: o.cwd,
         status: o.status,              // busy / waiting / idle
+        // state 让 live 与 sessions 两个数组**形状一致**：调用方可以只读一个字段。
+        // 2026-11-01 实测：一个 waiting 会话只在 live 里、不在 sessions 里，
+        // 而 --json 没有任何字段提示「该读哪个数组」——只读 sessions 的调用方会静默漏掉它。
+        state: o.status === 'waiting' ? 'WAITING'
+          : o.status === 'failed' ? 'FAILED'
+            : o.status === 'blocked' ? 'BLOCKED'
+              : o.status === 'busy' ? 'PRODUCING' : 'EXPLORING',
         waitingFor: typeof o.waitingFor === 'string' ? o.waitingFor : null,
         statusUpdatedAt: o.statusUpdatedAt,
         kind: o.kind,

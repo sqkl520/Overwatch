@@ -288,7 +288,7 @@ tree_state = (tree_gain ≥ 0.2) ? EXPLORING : 按 §2 依次判定
 | `hb` | 距最后一次 tool_use | 秒或分钟 |
 | `no_write` | 距最后一次持久化变更 | 分钟；不适用于 `exploration` |
 | `budget` | 代理估算 | **必须带 `est:` 前缀** |
-| `liveness` | §4.4 | `reconstructed` / `insufficient-sample` / `stale` |
+| `liveness` | §4.4 | `reconstructed` / `insufficient-sample` / `stale` / `live` |
 
 `liveness` 取值含义：
 

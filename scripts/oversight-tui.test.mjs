@@ -12,7 +12,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { wrapToWidth, truncateToWidth, parseArgs, parseKeys, sanitize, buildDraft } from './oversight-tui.mjs';
+import { wrapToWidth, truncateToWidth, parseArgs, parseKeys, sanitize, buildDraft, listRow, detailLines } from './oversight-tui.mjs';
 import { displayWidth } from './tui-theme.mjs';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -341,4 +341,57 @@ test('mergeLiveSessions 与 App.sessions 必须同源——两条展示路径不
   // 扣掉定义本身那一处
   const uses = (src.match(/mergeLiveSessions\(/g) || []).length - 1;
   assert.ok(uses >= 2, `App.sessions 与 printPlain 都必须调用它，实际只有 ${uses} 处`);
+});
+
+// ── 显示路径普查：每个视图都必须认得 WAITING（2026-11-01）──────
+
+test('列表行：WAITING 有字形与标签，不是 UNKNOWN', () => {
+  const out = listRow({ sessionId: 's', state: 'WAITING', project: 'p', calls: null, novelty: null, idleSec: 60 }, 120, false);
+  assert.ok(out.includes('WAITING'), `列表行应显示 WAITING：${out}`);
+  assert.ok(!out.includes('UNKNOWN'), `不得退化成 UNKNOWN：${out}`);
+});
+
+test('列表行：calls 未知时显示破折号，不是 0', () => {
+  // calls=0 是在撒谎：可能是 0 次调用，也可能是没扫（没有 transcript）。
+  const out = listRow({ sessionId: 's', state: 'WAITING', project: 'p', calls: null, novelty: null, idleSec: 60 }, 120, false);
+  assert.ok(!/calls=\s*0/.test(out), `未知时不得显示 calls=0：${out}`);
+  assert.ok(out.includes('—'), `应为破折号：${out}`);
+});
+
+test('详情页：liveness 与 hostState 有值时不得显示破折号', () => {
+  const out = detailLines({
+    sessionId: 's', state: 'WAITING', reason: 'waiting:input needed', project: 'p',
+    liveness: 'live', hostState: 'waiting', calls: null, novelty: null, idleSec: 60,
+  }, 100, false);
+  const joined = out.join('\n');
+  assert.ok(/liveness\s+live/.test(joined), `liveness 应有值：\n${joined}`);
+  assert.ok(/hostState\s+waiting/.test(joined), `hostState 应有值：\n${joined}`);
+});
+
+test('草稿措辞跟着状态走：FAILED 不能说「正在等待」', () => {
+  // 复制出去的话写错这句，用户会以为对方在提问，而它其实是失败了。
+  const w = buildDraft({ state: 'WAITING', needs: '选 A 还是 B', suggestedReply: 'A' });
+  const f = buildDraft({ state: 'FAILED', needs: '构建报错', suggestedReply: null });
+  const b = buildDraft({ state: 'BLOCKED', needs: '等授权', suggestedReply: null });
+  assert.ok(w.includes('正在等待'));
+  assert.ok(f.includes('已失败'), `FAILED 草稿措辞应说明失败：${f}`);
+  assert.ok(!f.includes('正在等待'), 'FAILED 不得被说成在等待');
+  assert.ok(b.includes('受阻'));
+});
+
+test('帮助文本不得声称「本界面不计算任何状态」——它会从 live 补会话', () => {
+  const src = readFileSync(join(import.meta.dirname, 'oversight-tui.mjs'), 'utf8');
+  assert.ok(!src.includes('本界面不计算任何状态'),
+    '帮助文本已过时：TUI 会从宿主实时状态补 WAITING/BLOCKED/FAILED');
+  assert.ok(src.includes('宿主实时状态'), '帮助文本应说明这个补充');
+});
+
+test('详情页：liveness 必须净化——它来自外部数据，可含 ANSI', () => {
+  // 上一条测试看不出差别（干净值过不过 sanitize 都一样）。
+  // 这条用带 OSC 52 的值：不净化的话，只读渲染器能让终端改写剪贴板。
+  const evil = 'live\x1b]52;c;cHduZWQ=\x07';
+  const out = detailLines({ sessionId: 's', state: 'WAITING', project: 'p', liveness: evil, calls: null }, 100, false);
+  const joined = out.join('\n');
+  assert.ok(!joined.includes('\x1b'), 'liveness 残留 ESC');
+  assert.ok(!joined.includes('\x07'), 'liveness 残留 BEL');
 });
