@@ -474,6 +474,19 @@
 - **更高层分类读不到**：宿主还有 `status_category` / `status_detail` / `needs_action` 三级分类，
   但它们只走 `reportMetadata`（远端桥接），**不落本地盘**。验证：全部 transcript 里 `post_turn_summary`
   只出现在 2 条 user 记录的工具返回内容里，没有 `{type:"system", subtype:"post_turn_summary"}` 记录。
+### Notes（生产状态目录被清空，历史归零）
+
+- **`%LOCALAPPDATA%Overwatch` 整个目录消失**，含 `state.json`、`watch.log`（5,348 行 / 438 KB）、
+  `runner.log`、`start-watch.vbs`、`notify/`。发现时 watcher 进程仍在运行。**原因未查明**，
+  没有证据指向具体操作，不写推测。
+- **后果**：`--trace` 的 5 条通知样本没了（第一个生产指标退回「无样本」）；`observations.jsonl`
+  没了（P0 观察期唯一产出）；13 小时 tick 记录没了。**全程没有告警**——watch 继续跑，
+  `mkdirSync(recursive)` 静默重建目录。
+- 已手工重建目录、重建启动脚本、重启 watcher（`tick jobs waiting`，waiting 探针已在跑）。
+- 登记为 DF-020（目录丢失无告警）与 DF-021（无任何持久化/备份机制）。
+- **这次损失改变了一件事的份量**：此前「第一个生产指标」的 5 条样本虽然判定 FAIL，
+  但它是唯一一次真实生产测量。现在要靠重新积累。**这也是为什么不能把「等一条真实通知」当验收标准**——
+  它又贵又脆。
 ### Notes（已知且不打算近期修）
 
 1. **在线停止分类 95.4% 判 `UNCLASSIFIABLE`** —— 结构性，分类器需要「下一句」而在线时下一句还没发生。
