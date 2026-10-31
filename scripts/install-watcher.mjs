@@ -22,7 +22,7 @@
  * 零依赖，只用 node: 内置模块（通过 powershell 创建快捷方式）。
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -141,6 +141,20 @@ function main(argv) {
     mkdirSync(join(repo, 'scripts', 'install'), { recursive: true });
     writeFileSync(out, renderLauncher({ repo, stateDir, template }), 'utf8');
     console.log(`✓ 启动器已写入 ${out}`);
+
+    // 清掉数据目录里的旧副本（DF-022 之前的位置）。
+    // 留着它不会坏，但它是陷阱：哪天有人手动运行它，就又回到了
+    // 「启动器和数据住在一起」的旧布局，而这次是静默的。
+    const legacy = join(stateDir, 'start-watch.vbs');
+    if (existsSync(legacy)) {
+      try {
+        rmSync(legacy, { force: true });
+        console.log(`✓ 已删除数据目录里的旧启动器 ${legacy}`);
+      } catch (e) {
+        console.log(`⚠ 无法删除旧启动器 ${legacy}：${e.message}（它不影响运行，但请手动删掉）`);
+      }
+    }
+
     mkdirSync(startupDir(), { recursive: true });
     const r = createShortcut({
       lnk,

@@ -625,6 +625,14 @@
 - **变异验证**（四条）：不排除已 ack → 1 红；不按 idleSec 排序 → 1 红；
   不做 WAITING 对账 → 1 红；不标 `unverified` → 1 红。
 
+### Fixed（安装器清理数据目录里的旧启动器副本）
+
+- 升级到 DF-022 布局之后，`%LOCALAPPDATA%\Overwatch\start-watch.vbs` 还留着一份**旧副本**。
+  它能跑，但跑起来就回到了「启动器和数据住在一起」的旧布局，**而且不会有任何提示**。
+  修复留了一个后门，等于没修。
+- `install-watcher.mjs install` 现在会检测并删除这个副本，删不掉时明确警告而不是静默跳过。
+- 实测：运行后数据目录里只剩 `state.json` / `watch.log` / `runner.log` / `notify/` / `launcher.log`。
+
 ### Notes（已知且不打算近期修）
 
 1. **在线停止分类 95.4% 判 `UNCLASSIFIABLE`** —— 结构性，分类器需要「下一句」而在线时下一句还没发生。

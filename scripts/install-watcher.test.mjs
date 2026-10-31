@@ -111,3 +111,12 @@ test('渲染后的脚本可被 cscript 解析（语法检查，不执行）', { 
     assert.equal(r.status, 3, `仓库不存在时应退出 3，实际 ${r.status}：${out}`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('安装器清掉数据目录里的旧启动器——否则它是回到旧布局的静默陷阱', async () => {
+  // 这条不是洁癖：旧副本能跑，但跑起来就回到了「启动器和数据住在一起」的布局，
+  // 而且不会有任何提示。DF-022 的修复不能留一个后门。
+  const src = readFileSync(join(import.meta.dirname, 'install-watcher.mjs'), 'utf8');
+  assert.ok(src.includes("join(stateDir, 'start-watch.vbs')"),
+    '安装器必须处理数据目录里的旧副本');
+  assert.ok(src.includes('rmSync(legacy'), '必须真的删除，而不是只警告');
+});
