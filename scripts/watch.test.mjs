@@ -24,6 +24,7 @@ import {
   pruneNotified, NOTIFIED_TTL_HOURS, notifyTitle, NOTIFY_STATES,
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
   observationStats, formatStats, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
+  traceability, readJobStates,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -1035,5 +1036,81 @@ test('saveState 能覆盖已存在文件，且失败时不留下 tmp 残片', ()
     assert.deepEqual(leftovers, [], `不该留下 tmp 文件：${leftovers}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── 通知可追溯率（第一个生产指标）────────────────────────────────────
+
+test('traceability：通知能追到宿主 failed/blocked 时算可追溯', () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, 'watch.log'),
+      '2026-10-31T01:00:00Z [INFO] notified FAILED demo kind=- key=abc session=s1\n');
+    const r = traceability(dir, [{ sessionId: 's1', state: 'failed' }]);
+    assert.equal(r.total, 1);
+    assert.equal(r.traced, 1);
+    assert.equal(r.ratio, 1);
+    assert.deepEqual(r.failures, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('traceability：宿主没有该会话的记录 → 不可追溯（旧的 hb_gap 推断就是这样）', () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, 'watch.log'),
+      '2026-10-31T01:00:00Z [INFO] notified FAILED demo kind=- key=abc session=ghost\n');
+    const r = traceability(dir, [{ sessionId: 's1', state: 'failed' }]);
+    assert.equal(r.ratio, 0);
+    assert.equal(r.failures.length, 1);
+    assert.equal(r.failures[0].hostState, null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('traceability：宿主记录为 done/stopped 不算可追溯——必须是 failed 或 blocked', () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, 'watch.log'),
+      '2026-10-31T01:00:00Z [INFO] notified FAILED demo kind=- key=abc session=s1\n');
+    for (const st of ['done', 'stopped']) {
+      const r = traceability(dir, [{ sessionId: 's1', state: st }]);
+      assert.equal(r.ratio, 0, `state=${st} 不该被视为可追溯`);
+      assert.equal(r.failures[0].hostState, st);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('traceability：没有通知时返回 ratio=null，不能算通过', () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, 'watch.log'), '2026-10-31T01:00:00Z [INFO] tick candidates=0 sent=0\n');
+    const r = traceability(dir, []);
+    assert.equal(r.total, 0);
+    assert.equal(r.ratio, null, '空样本必须是 null，不是 1.0');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('readJobStates 读得出 needs/suggestedReply，坏文件不抛', () => {
+  const claude = tmp();
+  try {
+    mkdirSync(join(claude, 'jobs', 'a'), { recursive: true });
+    writeFileSync(join(claude, 'jobs', 'a', 'state.json'),
+      JSON.stringify({ sessionId: 's1', state: 'blocked', needs: '选哪个？', suggestedReply: 'A' }));
+    mkdirSync(join(claude, 'jobs', 'b'), { recursive: true });
+    writeFileSync(join(claude, 'jobs', 'b', 'state.json'), '{not json');
+    const out = readJobStates(claude);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].state, 'blocked');
+    assert.equal(out[0].needs, '选哪个？');
+    assert.equal(out[0].suggestedReply, 'A');
+  } finally {
+    rmSync(claude, { recursive: true, force: true });
   }
 });

@@ -1382,6 +1382,73 @@ export async function startWatch({
   log.info('watch 退出');
 }
 
+/** 通知可追溯率：生产环境中唯一能独立判定真伪的指标。
+ *
+ *  问题：一条通知说「会话 X 失败了」，它凭什么？如果答不出「宿主在哪写了这个事实」，
+ *  这条通知就是凭空发明的。
+ *
+ *  阈值（写于测量之前，见 docs/research/2026-10-31-first-production-metric.md）：
+ *  **可追溯率必须 = 100%**，任何一条追不到宿主事实即 FAIL。不设百分比宽容——
+ *  5 条样本上的「80% 可追溯」没有意义，而一条误报的代价是用户开始忽略所有通知。
+ *
+ *  实测历史：旧架构（hb_gap 推断）下 **0/5**，全部不可追溯，结构性必然——
+ *  推断出来的「卡住」在宿主账本上不存在。当前架构候选只来自 jobs.state，按构造必然通过。
+ *
+ *  返回 null 表示「无通知可判定」，不等于通过。 */
+export function traceability(dir, jobs) {
+  const target = asPath(dir);
+  if (!target) return null;
+  let raw;
+  try { raw = readFileSync(logPath(target), 'utf8'); } catch { return null; }
+
+  const notified = [];
+  for (const line of raw.split('\n')) {
+    // 与 logger.info(`notified ...`) 的格式严格对应；变了就得改这里
+    const m = line.match(/^(\S+) \[INFO\] notified (\w+) \S* ?(?:kind=\S+ )?key=(\w+) session=(\S+)$/);
+    if (m) notified.push({ ts: m[1], state: m[2], key: m[3], sessionId: m[4] });
+  }
+  if (!notified.length) return { total: 0, traced: 0, ratio: null, failures: [] };
+
+  const bySession = new Map();
+  for (const j of jobs || []) {
+    if (j && j.sessionId) bySession.set(String(j.sessionId), j);
+  }
+
+  const failures = [];
+  for (const n of notified) {
+    const j = bySession.get(n.sessionId);
+    const ok = Boolean(j) && (j.state === 'failed' || j.state === 'blocked');
+    if (!ok) failures.push({ ...n, hostState: j ? j.state : null });
+  }
+  return {
+    total: notified.length,
+    traced: notified.length - failures.length,
+    ratio: (notified.length - failures.length) / notified.length,
+    failures,
+  };
+}
+
+/** 读宿主 job 文件，供 traceability 使用。 */
+export function readJobStates(claudeDir) {
+  const root = join(String(claudeDir || join(homedir(), '.claude')), 'jobs');
+  const out = [];
+  let dirs;
+  try { dirs = readdirSync(root); } catch { return out; }
+  for (const d of dirs) {
+    let raw;
+    try { raw = readFileSync(join(root, d, 'state.json'), 'utf8'); } catch { continue; }
+    let j;
+    try { j = JSON.parse(raw); } catch { continue; }
+    out.push({
+      sessionId: j.sessionId || d,
+      state: j.state || null,
+      needs: typeof j.needs === 'string' ? j.needs : null,
+      suggestedReply: typeof j.suggestedReply === 'string' ? j.suggestedReply : null,
+    });
+  }
+  return out;
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────
 
 async function main(argv) {
@@ -1392,6 +1459,7 @@ async function main(argv) {
     console.log('      node scripts/watch.mjs --full     # 强制全量跑一轮');
     console.log('      node scripts/watch.mjs --dry-run  # 只算不发');
     console.log('      node scripts/watch.mjs --stats    # 读观察日志出分布');
+    console.log('      node scripts/watch.mjs --trace    # 通知可追溯率（生产指标，阈值 100%）');
     console.log(`状态目录：${defaultStateDir()}`);
     console.log(`UNCLASSIFIABLE 时间门槛：${unclassifiableMinIdleSec()}s（OVERWATCH_UNCLASSIFIABLE_MIN_IDLE 可覆盖）`);
     return;
@@ -1400,6 +1468,24 @@ async function main(argv) {
   if (flags.has('--stats')) {
     console.log(formatStats(observationStats(defaultStateDir()), { minIdleSec: unclassifiableMinIdleSec() }));
     return;
+  }
+
+  if (flags.has('--trace')) {
+    const dir = defaultStateDir();
+    const r = traceability(dir, readJobStates());
+    if (!r || r.total === 0) {
+      console.log('没有可判定的通知（日志里没有任何 notified 行）。');
+      console.log('这不是通过——它表示还没机会犯错。见 docs/research/2026-10-31-first-production-metric.md');
+      process.exit(0);
+    }
+    console.log(`通知可追溯率：${(r.ratio * 100).toFixed(1)}%  (${r.traced}/${r.total})`);
+    console.log('阈值：100%（测量前写死，不设百分比宽容）');
+    for (const f of r.failures) {
+      console.log(`  UNTRACEABLE ${f.ts} state=${f.state} session=${f.sessionId.slice(0, 8)}` +
+        `  → ${f.hostState === null ? '宿主无此记录' : `宿主记录为 ${f.hostState}`}`);
+    }
+    console.log(r.ratio >= 1 ? '判定：PASS' : '判定：FAIL');
+    process.exit(r.ratio >= 1 ? 0 : 1);
   }
 
   const dryRun = flags.has('--dry-run');
