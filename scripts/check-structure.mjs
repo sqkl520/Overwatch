@@ -519,11 +519,17 @@ function checkChangelog() {
     return;
   }
 
+  // 自指豁免：**HEAD 永远检查不了**——一个提交无法在自己的内容里写自己的 hash。
+  // 不加这一条，任何「修改 CHANGELOG 门」的提交都会把自己判违规，
+  // 而 fix 只能是再提交一次去记上一个，无限后退。
+  // 代价：最新一个提交永远是盲区。可接受，因为下一次提交会把它纳入检查。
+  const SKIP_HEAD = 1;
+
   const SOURCE_RE = /^(scripts\/|\.claude\/|docs\/|templates\/|rules\/|README\.md|CLAUDE\.md)/;
   const SKIP_RE = /^(docs\/CHANGELOG\.md$|tasks\/runs\/)/;
 
   const missing = [];
-  for (let i = 0; i < boundary; i++) {
+  for (let i = SKIP_HEAD; i < boundary; i++) {
     const { h, subject } = commits[i];
     const files = git(['show', '--name-only', '--format=', h]);
     if (files === null) continue;
