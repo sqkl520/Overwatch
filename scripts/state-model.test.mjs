@@ -283,3 +283,50 @@ test('recalibrateWeights 空输入返回 null 而不是全零', async () => {
   const { recalibrateWeights } = await import('./scan-sessions.mjs');
   assert.equal(recalibrateWeights({}), null);
 });
+
+// ── 大间隔不再推断 FAILED（2026-10-31 回退）───────────────────────────
+//
+// 全语料实测：大间隔（>600s）之后 3390 次里 3390 次恢复，误报率 100%。
+// 真实通知样本 3/3 也是误报（一条通知后 49 秒就恢复）。
+// 判据已删除，这些测试锁住「不会被误判」。
+
+/** 造一串调用：前 39 次每次隔 1 秒，最后一次隔 gapSec 秒。
+ *
+ *  为什么是 39 而不是 19：p95 取的是第 95 百分位。39 个 1 秒 + 1 个大值，
+ *  p95 仍落在 1 秒（clamp 后 120 秒），大值才对得上「超过 p95」。
+ *  用 19 个时，20 个 gap 里第 19 位就是大值，p95 会跟着涨到 600，
+ *  判据变成 600 > 600 = false，测不出任何东西。 */
+function callsWithFinalGap(gapSec, { now = Date.now(), idleSec = 0 } = {}) {
+  const calls = [];
+  const tail = now - idleSec * 1000;
+  for (let i = 0; i < 40; i++) {
+    calls.push(callAt('ls', tail - gapSec * 1000 - (40 - i) * 1000));
+  }
+  calls.push(callAt('ls', tail));
+  return calls;
+}
+
+test('大间隔不判 FAILED —— 它只说明歇了一会儿', () => {
+  // 末次间隔 600 秒，停够 120 秒。删除前这条会判 FAILED。
+  // idle 必须 > threshold(120s) + HB_CONFIRM_MS(60s) = 180s，否则旧判据也不会触发，测不出东西
+  const calls = callsWithFinalGap(600, { idleSec: 300 });
+  const gaps = calls.slice(1).map((c, i) => c.ts - calls[i].ts);
+  assert.ok(Math.max(...gaps) >= 600_000, `构造必须有 >=600 秒间隔，实际 ${Math.max(...gaps)}`);
+  const v = judgeState({ calls, gapsMs: gaps });
+  assert.notEqual(v.state, 'FAILED', `大间隔被误判为 FAILED：${v.reason}`);
+});
+
+test('大间隔 + 停够一小时落 dormant，不是 FAILED', () => {
+  const calls = callsWithFinalGap(900, { idleSec: 4000 });
+  const gaps = calls.slice(1).map((c, i) => c.ts - calls[i].ts);
+  const v = judgeState({ calls, gapsMs: gaps });
+  assert.notEqual(v.state, 'FAILED');
+  assert.equal(v.state, 'EXPLORING');
+  assert.equal(v.reason, 'dormant');
+});
+
+test('FAILED 只来自宿主明确报错', () => {
+  const calls = [callAt('ls', Date.now())];
+  assert.equal(judgeState({ calls, gapsMs: [] }).state, 'EXPLORING', '无宿主信号时不该 FAILED');
+  assert.equal(judgeState({ calls, gapsMs: [], sessionState: 'failed' }).state, 'FAILED');
+});

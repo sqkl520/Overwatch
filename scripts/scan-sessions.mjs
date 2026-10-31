@@ -185,13 +185,18 @@ export function judgeState({ sessionState, calls, gapsMs, now: nowMs }) {
     };
   }
 
-  // 2. FAILED（推断）
-  if (calls.length > 0 && gapsMs.length > 0) {
-    const lastGap = gapsMs[gapsMs.length - 1];
-    if (threshold && lastGap > threshold && idleMs > threshold + HB_CONFIRM_MS) {
-      return { state: 'FAILED', reason: `hb_gap=${Math.round(lastGap / 1000)}s > p95=${Math.round(threshold / 1000)}s` };
-    }
-  }
+  // 2. FAILED —— **只信宿主明确报错，不从间隔推断**
+  //
+  // 这里原本有一条推断：末次间隔超过自适应 p95 且停够 60 秒 → 判 FAILED。
+  // 2026-10-31 全语料实测后删掉了：**大间隔（>600s）之后 3390 次里 3390 次恢复了，
+  // 误报率 100%**。真实通知样本 3/3 也是误报（一条通知后 49 秒就恢复）。
+  //
+  // 原因是语义错误：大间隔只说明「它歇了一会儿」——可能在等 API、跑长命令、
+  // 或用户走开了。它不说明进程死了，而 FAILED 的语义是「该重跑了」。
+  //
+  // 现在是：大间隔的会话仍落 EXPLORING（可能是 dormant），只有宿主
+  // jobs.state === 'failed' 才判 FAILED（见上面的第 0 步）。
+  // 详见 docs/research/2026-10-31-rollback-executed.md。
 
   // 2. STALLED —— 需要连续 3 个滑窗都低于阈值
   const windows = [];
