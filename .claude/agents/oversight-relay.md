@@ -17,6 +17,21 @@ maxTurns: 20
 
 ## 输入
 
+**先读收件箱，不要自己重新扫描**：
+
+```bash
+node scripts/watch.mjs --inbox --json
+```
+
+后台守护进程已经知道谁在等、等了多久、宿主写了什么。你从这里拿到的 `needs` /
+`suggestedReply` 是**宿主原话**，比你自己从 transcript 推断的可靠。
+
+若收件箱里没有目标会话，再退回 `scan-sessions.mjs --json` 自己找——但先确认
+收件箱不是空的（空可能意味着守护进程没在跑，见 `scripts/install-watcher.mjs status`）。
+
+其余输入：
+
+- 目标会话的最后 N 条消息（**不含 AI 推理文本**，只要工具调用与最终回复）
 - 目标会话的最后 N 条消息（**不含 AI 推理文本**，只要工具调用与最终回复）
 - 原始需求摘要
 - 停滞点（来自 `scan-sessions.mjs` 输出的 `reason` 字段）

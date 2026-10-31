@@ -438,6 +438,7 @@ function checkUnregisteredExports() {
     'createObservationLog', 'observationStats', 'formatStats', 'readObservationRows', 'readObservationRows', 'NOTIFY_KINDS', 'OBS_MAX_BYTES',
     'unclassifiableMinIdleSec', 'tooRecentToNotify', 'UNCLASSIFIABLE_MIN_IDLE_SEC', 'IDLE_BUCKETS',
     'traceability', 'readJobStates', 'probeWaiting', 'readLiveSessionStates',
+    'buildInbox', 'formatInbox',
     // install-watcher.mjs
     'launcherPath', 'templatePath', 'stateDirFor', 'startupDir', 'shortcutPath',
     'renderLauncher', 'needsRegenerate', 'createShortcut', 'witnessPath', 'writeWitness', 'readWitness', 'checkStateIntegrity', 'HOST_FACT_STATES',
@@ -654,6 +655,47 @@ function checkLauncherPlacement() {
   }
 }
 
+/** DF-015：监控与调度必须保持连通。
+ *
+ *  两半曾经彻底断开：`watch.mjs` 后台发现 WAITING 并发通知，而 12 个 agent 定义里
+ *  零个引用它，SKILL.md 也只调 `scan-sessions.mjs`。主线程永远不知道后台看见过什么，
+ *  两边各自重扫，既慢又不一致。
+ *
+ *  修法是「一份数据两个消费者」：watch 把发现写进 `state.notified`，
+ *  调度侧用 `--inbox` 读同一份。这条检查保证**接口不会再次悄悄断掉**——
+ *  文档写了但没人调用，和没写是一样的。 */
+function checkInboxWiring() {
+  const skill = join(ROOT, '.claude', 'skills', 'oversight', 'SKILL.md');
+  if (existsSync(skill)) {
+    let t = '';
+    try { t = readFileSync(skill, 'utf8'); } catch { /* ignore */ }
+    if (!t.includes('--inbox')) {
+      fail('.claude/skills/oversight/SKILL.md',
+        '调度入口没有引用 `watch.mjs --inbox` —— 后台发现又接不上了（DF-015）');
+    }
+  }
+  // 至少一个 agent 必须知道收件箱存在，否则派出去的 agent 会各自重扫。
+  const agentDir = join(ROOT, '.claude', 'agents');
+  if (existsSync(agentDir)) {
+    const files = readdirSync(agentDir).filter((f) => f.endsWith('.md'));
+    const refs = files.filter((f) => {
+      try { return readFileSync(join(agentDir, f), 'utf8').includes('--inbox'); } catch { return false; }
+    });
+    if (files.length && !refs.length) {
+      fail('.claude/agents/', `12 个角色定义里没有一个引用 --inbox —— 监控与调度脱节（DF-015）`);
+    }
+  }
+  // 脚本侧必须真的实现了这个命令
+  const w = join(ROOT, 'scripts', 'watch.mjs');
+  if (existsSync(w)) {
+    let t = '';
+    try { t = readFileSync(w, 'utf8'); } catch { /* ignore */ }
+    if (!t.includes("flags.has('--inbox')")) {
+      fail('scripts/watch.mjs', '脚本没有实现 --inbox，但文档在引用它');
+    }
+  }
+}
+
 // ── 运行 ──────────────────────────────────────────────────────────────
 
 console.log('check-structure · 仓库结构硬门\n');
@@ -671,6 +713,7 @@ checkLinks();
 checkChangelog();
 checkLedger();
 checkLauncherPlacement();
+checkInboxWiring();
 
 if (violations.length) {
   console.log(`✗ ${violations.length} 项违规：\n`);

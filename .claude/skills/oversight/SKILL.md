@@ -9,7 +9,29 @@ disable-model-invocation: true
 
 > 主线程只做三件事：**拆解、派发、汇总**。不亲自检索、分析、编码、写作。
 
-## 0. 先确认能力
+## 0. 先看后台发现了什么
+
+```bash
+node scripts/watch.mjs --inbox
+```
+
+**这一条必须先跑。** 后台守护进程（`watch.mjs`）5×24 小时盯着所有会话，它已经知道
+谁在等人、谁失败了。不先读它，你就会把已经知道的事重新发现一遍——而且可能发现得不一样。
+
+收件箱的每一行都带着宿主的原话（`needs` / `suggestedReply`），**逐字转给 Agent，不许摘要**。
+
+分路处理：
+
+| 收件箱里的情况 | 谁处理 |
+|---|---|
+| `WAITING` / `BLOCKED` 且有 `suggestedReply` | 宿主已给半成品。直接给用户复制，**不必派 Agent** |
+| `WAITING` / `BLOCKED` 只有 `needs` | 派 `oversight-relay`，把 `needs` 逐字给它 |
+| `WAITING` 但 `needs` 为空 | 先要 transcript 才知道在等什么。派 `oversight-relay`，让它读会话尾部重建 |
+| 收件箱为空 | 不代表健康，可能守护进程没跑。跑 `node scripts/install-watcher.mjs status` 确认 |
+
+后台只**发现**，不**处理**——它不改代码、不代答、不重跑。处置永远在你（或你派的 Agent）这里。
+
+## 0.5 再确认扫描能力
 
 ```bash
 node scripts/scan-sessions.mjs --days 3

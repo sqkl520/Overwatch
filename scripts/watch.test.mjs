@@ -24,7 +24,7 @@ import {
   pruneNotified, NOTIFIED_TTL_HOURS, notifyTitle, NOTIFY_STATES,
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
   observationStats, formatStats, readObservationRows, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
-  traceability, readJobStates, probeWaiting, readLiveSessionStates, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
+  traceability, readJobStates, probeWaiting, readLiveSessionStates, buildInbox, formatInbox, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -1499,4 +1499,118 @@ test('observationStats 统计 classify 分布', () => {
     const st = observationStats(dir);
     assert.deepEqual(st.byClass, { error: 1, ok: 1 });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── 收件箱：把后台的发现交给调度侧（DF-015）────────────────────────
+
+const mkState = (notified) => ({ version: 1, notified, budget: { sentLog: [], perSession: {} }, muteUntil: null });
+
+test('buildInbox 只留需要人处理的状态，且排除已 ack 的', () => {
+  const now = Date.now();
+  const st = mkState({
+    a: { sessionId: 's1', state: 'WAITING', idleSec: 10, notifyCount: 1, lastSeenAt: new Date(now).toISOString() },
+    b: { sessionId: 's2', state: 'PRODUCING', idleSec: 10, notifyCount: 1, lastSeenAt: new Date(now).toISOString() },
+    c: { sessionId: 's3', state: 'BLOCKED', idleSec: 10, notifyCount: 1, ackAt: new Date(now).toISOString(), lastSeenAt: new Date(now).toISOString() },
+  });
+  const out = buildInbox(st, { nowMs: now });
+  assert.equal(out.length, 1, `只应剩 WAITING，实际：${out.map((o) => o.state)}`);
+  assert.equal(out[0].sessionId, 's1');
+});
+
+test('buildInbox 按 idleSec 升序，刚等上的排前面', () => {
+  const now = Date.now();
+  const iso = new Date(now).toISOString();
+  const st = mkState({
+    a: { sessionId: 'slow', state: 'WAITING', idleSec: 3600, notifyCount: 1, lastSeenAt: iso },
+    b: { sessionId: 'fresh', state: 'WAITING', idleSec: 5, notifyCount: 1, lastSeenAt: iso },
+  });
+  assert.deepEqual(buildInbox(st, { nowMs: now }).map((o) => o.sessionId), ['fresh', 'slow']);
+});
+
+test('buildInbox 丢掉超过 ttl 的陈旧条目——三天前就等着的不再是新闻', () => {
+  const now = Date.now();
+  const st = mkState({
+    old: { sessionId: 'old', state: 'WAITING', idleSec: 5, notifyCount: 1,
+      lastSeenAt: new Date(now - 100 * 3600e3).toISOString() },
+  });
+  assert.equal(buildInbox(st, { nowMs: now, ttlHours: 72 }).length, 0);
+  assert.equal(buildInbox(st, { nowMs: now, ttlHours: 200 }).length, 1);
+});
+
+test('formatInbox 逐字保留 needs / suggestedReply——§5.1 不许摘要', () => {
+  const out = formatInbox([{
+    sessionId: 'abcdef1234567', state: 'BLOCKED', project: 'demo',
+    needs: '要我先交实测单，还是你先看四份报告？', suggestedReply: '把实测单发给我',
+    idleSec: 120, notified: true,
+  }]);
+  assert.ok(out.includes('要我先交实测单，还是你先看四份报告？'), 'needs 必须原样出现');
+  assert.ok(out.includes('把实测单发给我'), 'suggestedReply 必须原样出现');
+  assert.ok(out.includes('不要改写'), '必须提醒 Agent 不要改写');
+});
+
+test('formatInbox 空收件箱明确说「不等于健康」', () => {
+  const out = formatInbox([]);
+  assert.ok(out.includes('收件箱：空'));
+  assert.ok(out.includes('不等于健康'), '空必须与「一切正常」区分开');
+});
+
+test('buildInbox 缺 idleSec 的排最后但不丢——「不知道等了多久」不是「不用管」', () => {
+  const now = Date.now();
+  const iso = new Date(now).toISOString();
+  const st = mkState({
+    a: { sessionId: 'known', state: 'WAITING', idleSec: 60, notifyCount: 1, lastSeenAt: iso },
+    b: { sessionId: 'unknown', state: 'WAITING', notifyCount: 1, lastSeenAt: iso },
+  });
+  const out = buildInbox(st, { nowMs: now });
+  assert.equal(out.length, 2);
+  assert.equal(out[1].sessionId, 'unknown');
+});
+
+// ── 收件箱必须与当前宿主状态对账（历史表 ≠ 现状表）──────────────
+
+test('buildInbox 丢掉「历史说在等、现在已经不在了」的条目', () => {
+  const now = Date.now();
+  const iso = new Date(now).toISOString();
+  const st = mkState({
+    a: { sessionId: 'gone', state: 'WAITING', idleSec: 60, notifyCount: 1, lastSeenAt: iso },
+  });
+  // 宿主现在说这个会话是 busy —— 它已经回答了
+  const live = [{ sessionId: 'gone', status: 'busy' }];
+  assert.equal(buildInbox(st, { nowMs: now, live }).length, 0,
+    'state.notified 是历史表，不能当成现状');
+});
+
+test('buildInbox 保留仍然真实在等的条目', () => {
+  const now = Date.now();
+  const iso = new Date(now).toISOString();
+  const st = mkState({
+    a: { sessionId: 'still', state: 'WAITING', idleSec: 60, notifyCount: 1, lastSeenAt: iso },
+  });
+  const live = [{ sessionId: 'still', status: 'waiting' }];
+  const out = buildInbox(st, { nowMs: now, live });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].stale, false);
+  assert.equal(out[0].liveStatus, 'waiting');
+});
+
+test('buildInbox 没有 live 数据时标 unverified 而不是假装确定', () => {
+  const now = Date.now();
+  const iso = new Date(now).toISOString();
+  const st = mkState({
+    a: { sessionId: 'x', state: 'WAITING', idleSec: 60, notifyCount: 1, lastSeenAt: iso },
+  });
+  const out = buildInbox(st, { nowMs: now });   // 不传 live
+  assert.equal(out.length, 1, '无 live 时不能丢弃，但也不能断言');
+  assert.equal(out[0].unverified, true, '必须标出「未与宿主核对」');
+});
+
+test('buildInbox 对 FAILED/BLOCKED 也做对账：会话已不存在则是旧账', () => {
+  const now = Date.now();
+  const iso = new Date(now).toISOString();
+  const st = mkState({
+    a: { sessionId: 'dead', state: 'FAILED', idleSec: 60, notifyCount: 1, lastSeenAt: iso },
+  });
+  assert.equal(buildInbox(st, { nowMs: now, live: [] }).length, 0, '会话已不在 → 旧账');
+  assert.equal(buildInbox(st, { nowMs: now, live: [{ sessionId: 'dead', status: 'busy' }] }).length, 1,
+    '会话还在（哪怕是 busy），failed 记录仍需人看一眼');
 });

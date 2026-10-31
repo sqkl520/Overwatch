@@ -151,7 +151,7 @@
 - **仍未覆盖**：滚动窗口（`listOffset` 的跟随逻辑）、窄屏拆列的视觉正确性（只验证不崩）。
 - **已做**：`detailLines` 已导出并单独测试（见 oversight-tui.test.mjs）。
 
-### DF-015 [open] 12 个角色定义里没有一个引用 watch.mjs，监控与调度两半没接上
+### DF-015 [fixed] 12 个角色定义里没有一个引用 watch.mjs，监控与调度两半没接上
 
 - **发现于**：2026-10-31 锐评 agent（结论「4/10」的第三条指控）
 - **位置**：`.claude/agents/*.md`（12 个文件，743 行）、`.claude/skills/oversight/SKILL.md`
@@ -162,7 +162,8 @@
   反过来 SKILL.md 让主线程自己扫会话，与后台守夜人重复劳动。
 - **为什么不自行修**：怎么接是产品决策——让 `watch` 写一个主线程读取的状态文件、让 `probe` agent 直接读
   `observations.jsonl`、还是承认后台只做通知不参与调度。三条路的产品含义不同。
-- **状态**：已登记，未处理。
+- **处置（2026-10-31 已修）**：`watch.mjs --inbox` 提供收件箱，SKILL.md §0、relay、probe 全部改为先读它。
+  `checkInboxWiring()` 守住这条线不再断。
 
 ### DF-016 [open] docs/design/ 下 970 行描述的能力没有对应实现
 

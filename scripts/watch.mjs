@@ -1364,6 +1364,13 @@ export async function dispatchCandidates(candidates, {
         notifyCount: 0,
         ackAt: null,
         source: c.source,
+        // 收件箱需要的上下文。`state.notified` 原本只是去重表，
+        // 但它同时是**唯一持久化下来的「发现了什么」**——调度侧读它比自己重扫便宜且一致。
+        project: c.project || null,
+        needs: c.needs || null,
+        suggestedReply: c.suggestedReply || null,
+        idleSec: Number.isFinite(c.idleSec) ? c.idleSec : null,
+        lastSeenAt: new Date(nowMs).toISOString(),
       };
     }
     const rec = state.notified[key];
@@ -1783,6 +1790,103 @@ export function readJobStates(claudeDir) {
   return out;
 }
 
+/** 调度侧读取监控侧：把 `state.notified` 转成「谁在等我」的清单。
+ *
+ *  DF-015：两半一直没接上。`watch.mjs` 后台发现了 WAITING/BLOCKED，发个通知就完了；
+ *  `.claude/agents/*` 与 SKILL.md 对 `watch.mjs` 零引用，主线程永远不知道后台看见过什么。
+ *
+ *  ⚠ **`state.notified` 是历史表，不是现状表。** 它记录「曾经通知过什么」，
+ *  条目会一直留到 TTL 过期。直接拿它当收件箱会撒谎：
+ *  2026-10-31 实测，4 个会话早已变回 `busy`，收件箱却说它们还在等。
+ *  这正是 DF-015「两半各说各话」的新版本，只是方向反了。
+ *
+ *  所以 `live` 必须传入：**收件箱是历史记录 × 当前宿主状态 的交集**。
+ *  没有 live 数据时不猜——把条目标成 `stale: true` 并说明无法确认，
+ *  让调用方知道这是旧账而不是现状。 */
+export function buildInbox(state, { nowMs = Date.now(), ttlHours = 72, states = HOST_FACT_STATES, live = null } = {}) {
+  const out = [];
+  const ttlMs = Math.max(0, Number(ttlHours) || 0) * 3600e3;
+  const notified = (state && state.notified) || {};
+  const liveBySession = new Map();
+  for (const s of live || []) {
+    if (s && s.sessionId) liveBySession.set(String(s.sessionId), s);
+  }
+  const haveLive = Array.isArray(live);
+
+  for (const [key, e] of Object.entries(notified)) {
+    if (!e || !states.includes(e.state)) continue;
+    if (e.ackAt) continue;
+    const seen = Date.parse(e.lastSeenAt || e.firstSeenAt || '');
+    if (Number.isFinite(seen) && ttlMs > 0 && nowMs - seen > ttlMs) continue;
+
+    // 与当前宿主状态对账
+    let stale = false;
+    let liveStatus = null;
+    if (haveLive) {
+      const cur = liveBySession.get(String(e.sessionId));
+      liveStatus = cur ? cur.status : null;
+      // 历史说 WAITING，但现在已不是 waiting → 这条已经过时
+      if (e.state === 'WAITING' && liveStatus !== 'waiting') stale = true;
+      // 历史说 FAILED/BLOCKED，但会话已不存在或状态已变 → 也过时
+      if ((e.state === 'FAILED' || e.state === 'BLOCKED') && !cur) stale = true;
+    }
+
+    out.push({
+      key,
+      sessionId: e.sessionId || null,
+      state: e.state,
+      reason: e.reason || null,
+      project: e.project || null,
+      needs: e.needs || null,
+      suggestedReply: e.suggestedReply || null,
+      idleSec: Number.isFinite(e.idleSec) ? e.idleSec : null,
+      firstSeenAt: e.firstSeenAt || null,
+      lastSeenAt: e.lastSeenAt || null,
+      notified: (e.notifyCount || 0) > 0,
+      source: e.source || null,
+      // stale=true：历史说有，当前宿主说没有了。默认不展示，但保留在数据里。
+      stale,
+      liveStatus,
+      // 没有 live 数据时不能断言现状
+      unverified: !haveLive,
+    });
+  }
+  const active = out.filter((o) => !o.stale);
+  active.sort((a, b) => {
+    const ai = a.idleSec == null ? Infinity : a.idleSec;
+    const bi = b.idleSec == null ? Infinity : b.idleSec;
+    return ai - bi;
+  });
+  return active;
+}
+
+/** 把收件箱渲染成 SKILL.md 可以直接交给 Agent 的文本。
+ *  必须逐字带上 needs / suggestedReply：`relay-protocol.md` §5.1 要求不许摘要。 */
+export function formatInbox(items) {
+  if (!items || !items.length) {
+    return '收件箱：空。后台没有发现任何在等你或失败的会话。\n' +
+      '（空不等于健康——也可能是守护进程没在跑。用 `node scripts/install-watcher.mjs status` 确认。）';
+  }
+  const lines = [`收件箱：${items.length} 个会话需要人处理`];
+  const unverified = items.filter((it) => it.unverified).length;
+  if (unverified) {
+    lines.push(`⚠ 其中 ${unverified} 条没有与当前宿主状态核对（读不到 sessions/）。`);
+    lines.push('  它们可能早就自己走了——动手前先确认会话还在。');
+  }
+  for (const it of items) {
+    const where = it.project || (it.sessionId || '').slice(0, 8);
+    const idle = it.idleSec == null ? '等了未知时长' : `已等 ${Math.round(it.idleSec / 60)} 分钟`;
+    const mark = it.unverified ? '（未核对）' : '';
+    lines.push('');
+    lines.push(`## ${it.state} · ${where}（${idle}）${mark}`);
+    lines.push(`- sessionId: ${it.sessionId}`);
+    if (it.needs) lines.push(`- 它在等：${it.needs}`);
+    if (it.suggestedReply) lines.push(`- 宿主建议回复（逐字，不要改写）：${it.suggestedReply}`);
+    if (!it.needs && !it.suggestedReply) lines.push('- 宿主没写 needs —— 需要看 transcript 才知道它在等什么');
+  }
+  return lines.join('\n');
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────
 
 async function main(argv) {
@@ -1803,6 +1907,21 @@ async function main(argv) {
     console.log(formatStats(observationStats(defaultStateDir()), { minIdleSec: unclassifiableMinIdleSec() }));
     return;
   }
+
+  if (flags.has('--inbox')) {
+    const dir = defaultStateDir();
+    const { state } = loadState(dir, { logger: null });
+    // 必须带上当前宿主状态对账：state.notified 是历史表，不是现状表。
+    const items = buildInbox(state, { nowMs: Date.now(), live: readLiveSessionStates() });
+    if (flags.has('--json')) {
+      console.log(JSON.stringify({ generatedAt: new Date().toISOString(), items }, null, 2));
+    } else {
+      console.log(formatInbox(items));
+    }
+    // 空收件箱不是错误：没有需要处理的事，退出 0。调用方靠文本判断。
+    process.exit(0);
+  }
+
 
   if (flags.has('--trace')) {
     const dir = defaultStateDir();

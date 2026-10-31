@@ -603,6 +603,28 @@
 - **变异验证**（三条）：让宿主事实重新调用分类器 → 1 红；把 `stale` 恒置 0 → 1 红；
   不统计 `byClass` → 1 红。
 
+### Added（DF-015：监控与调度接上了，用一份数据两个消费者）
+
+- **`watch.mjs --inbox`**：调度侧读后台的发现。不引入新存储——`state.notified` 本来就是
+  持久化的去重表，现在它同时是收件箱。**一份数据，两个消费者**，不会分叉。
+- 收件箱条目带上 `needs` / `suggestedReply` / `project` / `idleSec`，
+  `formatInbox()` 明确标注「逐字，不要改写」（`relay-protocol.md` §5.1 的要求）。
+- **`SKILL.md` 新增 §0「先看后台发现了什么」**，排在扫描之前，并按状态分路：
+  有 `suggestedReply` 的直接抄给用户、只有 `needs` 的派 relay、`needs` 为空的派 probe。
+- **`oversight-relay` / `oversight-probe` 改为先读收件箱再自己扫。**
+  probe 的触发条件从「STALLED」（实测 0.018% 命中）改为「收件箱里 WAITING 但 needs 为空」。
+- **结构门新增 `checkInboxWiring()`**：SKILL.md 必须引用 `--inbox`、至少一个 agent 必须知道它、
+  脚本必须真的实现它。文档写了但没人调用，和没写是一样的。负向测试：把 SKILL.md 里的
+  `--inbox` 替换掉 → 门报「后台发现又接不上了」。
+- **写的时候抓到自己一个 bug，而且是这个功能的要点**：第一版直接拿 `state.notified` 当收件箱，
+  于是 4 个**早已变回 `busy`** 的会话被报成「正在等你」。
+  `state.notified` 是**历史表，不是现状表**——条目会留到 TTL 过期。
+  现在 `buildInbox` 必须传入当前宿主状态对账，是「历史 × 现状」的交集；
+  读不到 `sessions/` 时标 `unverified` 而不是假装确定。
+  这正是 DF-015「两半各说各话」的新版本，只是方向反了。
+- **变异验证**（四条）：不排除已 ack → 1 红；不按 idleSec 排序 → 1 红；
+  不做 WAITING 对账 → 1 红；不标 `unverified` → 1 红。
+
 ### Notes（已知且不打算近期修）
 
 1. **在线停止分类 95.4% 判 `UNCLASSIFIABLE`** —— 结构性，分类器需要「下一句」而在线时下一句还没发生。
