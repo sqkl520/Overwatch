@@ -12,7 +12,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync, statSync, utimesSync,
+  mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync, statSync, utimesSync, readdirSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -23,7 +23,7 @@ import {
   createLogger, dispatchCandidates, runTick, defaultStateDir, __internals,
   pruneNotified, NOTIFIED_TTL_HOURS, notifyTitle, NOTIFY_STATES,
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
-  observationStats, formatStats, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
+  observationStats, formatStats, readObservationRows, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
   traceability, readJobStates, probeWaiting, readLiveSessionStates, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
 } from './watch.mjs';
 
@@ -265,20 +265,23 @@ test('状态损坏：改名留证并从空状态起步，不静默吞', () => {
 
 // ── AC7 日志轮转 ─────────────────────────────────────────────────────
 
-test('AC7 日志：单文件上限 1MB，超出轮转到 .log.1', () => {
+test('AC7 日志：单文件上限 1MB，超出时归档而不是覆盖', () => {
   const dir = tmp();
   try {
     const logger = createLogger(dir, { maxBytes: 2000 });
     const line = 'x'.repeat(100);
-    let written = 0;
-    for (let i = 0; i < 100; i++) { logger.info(line); written++; }
+    for (let i = 0; i < 100; i++) { logger.info(line); }
 
     const f = join(dir, 'watch.log');
-    const r = join(dir, 'watch.log.1');
     assert.ok(existsSync(f), 'watch.log 必须存在');
-    assert.ok(existsSync(r), '超出上限必须轮转到 watch.log.1');
     assert.ok(statSync(f).size <= 2000, `当前日志不得超过上限，实际 ${statSync(f).size}`);
-    assert.ok(statSync(r).size > 0, '轮转文件必须有内容');
+
+    // 旧实现只留一个 watch.log.1，两天就会把更早的日志永久删掉。
+    // 现在每次轮转另存带时间戳的归档，**永不覆盖**。
+    const archives = readdirSync(dir).filter((n) => /^watch..+.log$/.test(n));
+    assert.ok(archives.length >= 1, `必须有归档，实际目录：${readdirSync(dir).join(',')}`);
+    const total = archives.reduce((a, n) => a + statSync(join(dir, n)).size, 0);
+    assert.ok(total > 0, '归档必须有内容');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -896,15 +899,22 @@ test('观察日志：追加写、不覆盖，同一停止事件进程内只写�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('观察日志：超过 5MB 轮转到 .1，旧内容不丢', () => {
+test('观察日志：超限时归档而不是覆盖，一行都不丢', () => {
   const dir = tmp();
   try {
     const log = createObservationLog(dir, { maxBytes: 500 });
-    for (let i = 0; i < 40; i++) {
+    const N = 40;
+    for (let i = 0; i < N; i++) {
       log.append({ sessionId: `s${i}`, state: 'STALLED', kind: 'UNCLASSIFIABLE', why: 'notifyable', pad: 'x'.repeat(40) });
     }
-    assert.ok(existsSync(join(dir, 'observations.jsonl.1')), '必须轮转');
-    assert.ok(statSync(join(dir, 'observations.jsonl')).size <= 500);
+    // 旧实现「轮转到 .1，只留一份」会永久丢掉更早的数据。这条测试真正要保证的是
+    // **一条都不丢**——旧版本的名字这么写，但只检查了 .1 存在，从没验证过内容完整。
+    const archived = readdirSync(dir).filter((n) => /^observations..+.jsonl$/.test(n));
+    assert.ok(archived.length >= 1, '必须产生归档');
+    const all = readObservationRows(dir);
+    assert.equal(all.length, N, `40 条写入后必须能全部读回，实际 ${all.length}`);
+    const ids = new Set(all.map((r) => r.sessionId));
+    for (let i = 0; i < N; i++) assert.ok(ids.has(`s${i}`), `丢了 s${i}`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

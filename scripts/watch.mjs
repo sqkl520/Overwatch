@@ -210,8 +210,16 @@ export function createLogger(dir, { maxBytes = LOG_MAX_BYTES, mirror = null } = 
     let size = 0;
     try { size = statSync(file).size; } catch { return; }
     if (size + incoming > maxBytes) {
-      try { rmSync(rotated, { force: true }); } catch { /* ignore */ }
-      try { renameSync(file, rotated); } catch { /* ignore */ }
+      // 归档而不是覆盖 watch.log.1。实测日志约 511 KB/天、上限 1 MiB，
+      // 所以「只留一份」意味着**每两天永久丢掉更早的全部日志**。
+      // 那是排查「昨晚到底发生了什么」时唯一的东西。
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const archived = join(target, `watch.${stamp}.log`);
+      try { renameSync(file, archived); } catch {
+        // 归档失败时退回旧行为，至少不让日志无限增长
+        try { rmSync(rotated, { force: true }); } catch { /* ignore */ }
+        try { renameSync(file, rotated); } catch { /* ignore */ }
+      }
     }
   };
 
@@ -987,7 +995,6 @@ export function createObservationLog(dir, { maxBytes = OBS_MAX_BYTES } = {}) {
   }
   mkdirSync(target, { recursive: true });
   const file = join(target, 'observations.jsonl');
-  const rotated = file + '.1';
   const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : OBS_MAX_BYTES;
   if (!observationSeen.has(file)) observationSeen.set(file, new Set());
   const seen = observationSeen.get(file);
@@ -1010,8 +1017,12 @@ export function createObservationLog(dir, { maxBytes = OBS_MAX_BYTES } = {}) {
         let size = 0;
         try { size = statSync(file).size; } catch { size = 0; }
         if (size > 0 && size + buf.length > limit) {
-          try { rmSync(rotated, { force: true }); } catch { /* ignore */ }
-          try { renameSync(file, rotated); } catch { /* ignore */ }
+          // 归档而不是覆盖。旧实现是「轮转到 .1，只留一份」——最早的证据会被永久删掉，
+          // 而观察期的全部价值来自积累。现在每次轮转另存一个带时间戳的文件，
+          // **从不删除**。存档多了由人决定怎么处理，不由程序替你决定。
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const archived = join(target, `observations.${stamp}.jsonl`);
+          try { renameSync(file, archived); } catch { /* 归档失败就别动原文件，继续写 */ }
         }
         appendFileSync(file, buf);
       } catch { /* 写不了观察日志不能让守护进程死掉；由调用方的日志记 WARN */ }
@@ -1019,11 +1030,18 @@ export function createObservationLog(dir, { maxBytes = OBS_MAX_BYTES } = {}) {
   };
 }
 
-function readObservationRows(dir) {
+export function readObservationRows(dir) {
   const target = asPath(dir);
   const out = [];
   if (!target) return out;
-  for (const name of ['observations.jsonl.1', 'observations.jsonl']) {
+  // 归档名形如 observations.2026-10-31T16-00-00-000Z.jsonl，按名排序即时间序。
+  // 一并读入：--stats 必须看到全部历史，否则「攒够样本再判定」永远攒不够。
+  let names = [];
+  try { names = readdirSync(target); } catch { /* 目录不存在 */ }
+  const archived = names
+    .filter((n) => /^observations..+.jsonl$/.test(n))
+    .sort();
+  for (const name of [...archived, 'observations.jsonl']) {
     let raw;
     try { raw = readFileSync(join(target, name), 'utf8'); } catch { continue; }
     for (const line of raw.split('\n')) {
@@ -1651,8 +1669,18 @@ export async function startWatch({
 export function traceability(dir, jobs, liveSessions = null) {
   const target = asPath(dir);
   if (!target) return null;
+  // 必须把归档日志一起读：watch.log 每 1 MiB 轮转（约两天），
+  // 只读当前文件的话，**两天前的通知会从分母里消失**，
+  // 指标会随日志轮转「自己变好」——那是这轮修持久化时才意识到的问题。
   let raw;
-  try { raw = readFileSync(logPath(target), 'utf8'); } catch { return null; }
+  try {
+    const names = readdirSync(target);
+    const archives = names.filter((n) => /^watch\..+\.log$/.test(n)).sort();
+    raw = [...archives, 'watch.log']
+      .map((n) => { try { return readFileSync(join(target, n), 'utf8'); } catch { return ''; } })
+      .join('\n');
+  } catch { return null; }
+  if (!raw) return null;
 
   const notified = [];
   for (const line of raw.split('\n')) {
