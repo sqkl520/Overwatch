@@ -76,7 +76,7 @@ const ACTIVE_WINDOW = 24 * HOUR;
  *  锐评的原话：「通知只能由宿主事实触发」。剩下的判定能力等于
  *  `claude agents --json` 的 busy/idle/blocked 加一次 Write 检测 —— 这是诚实的边界。
  */
-export const NOTIFY_STATES = ['FAILED', 'BLOCKED'];
+export const NOTIFY_STATES = ['WAITING', 'FAILED', 'BLOCKED'];
 
 const SCAN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'scan-sessions.mjs');
 
@@ -355,6 +355,63 @@ export function recordSent(state, sessionId, nowMs = Date.now()) {
  *
  * 绝不调 `claude agents --json`：3.0–5.4 秒，而且会把已死的后台会话复活。
  */
+/** 读 ~/.claude/sessions/*.json —— 宿主的**实时**会话状态，含 waiting。
+ *
+ *  为什么单独一个探针而不是并进 probeJobs：两个数据源的更新节奏完全不同。
+ *  jobs/*.json 只在这台机器跑过后台作业时出现（实测 25.6 天里 3 次 failed/blocked），
+ *  而 sessions/*.json 每个活着的交互会话都有一份，status 随一次对话实时翻转。
+ *  把前者放进 1 分钟轮询是对的（它稀疏但关键），后者同样便宜（纯读小 JSON）。
+ *
+ *  waiting 与 jobs 的 failed/blocked 有本质区别：
+ *    failed/blocked —— 过去发生的事实，会留着
+ *    waiting        —— 此刻为真，用户一回话就消失
+ *  后者才是「叫醒用户」真正需要的信号。
+ *
+ *  逆向来源：claude.exe 2.1.270，wS = { running:"busy", requires_action:"waiting", idle:"idle" }
+ *  与 bVo() 的五个判定分支。见 scan-sessions.mjs 的 readLiveSessions 注释。 */
+export function probeWaiting(sessionsRoot, { nowMs = Date.now() } = {}) {
+  const started = process.hrtime.bigint();
+  const found = [];
+  let scanned = 0;
+  let skipped = 0;
+  const target = asPath(sessionsRoot);
+  if (!target || !existsSync(target)) return { found, scanned, skipped, elapsedMs: 0 };
+  let files;
+  try { files = readdirSync(target); } catch (e) {
+    throw new Error(`读取 sessions 目录失败：${target}：${e.message}`);
+  }
+  for (const name of files) {
+    if (!name.endsWith('.json')) { skipped++; continue; }
+    let s;
+    try { s = JSON.parse(readFileSync(join(target, name), 'utf8')); } catch { skipped++; continue; }
+    if (!s.sessionId) { skipped++; continue; }
+    scanned++;
+    if (s.status !== 'waiting') { skipped++; continue; }
+    const updated = Number(s.statusUpdatedAt ?? s.updatedAt ?? 0);
+    if (!Number.isFinite(updated) || updated <= 0) { skipped++; continue; }
+    // 和其他状态用同一个活跃窗口：一个 20 天前就 waiting 的记录不是新闻
+    if (nowMs - updated > ACTIVE_WINDOW) { skipped++; continue; }
+    found.push({
+      sessionId: s.sessionId,
+      state: 'WAITING',
+      reason: s.waitingFor ? `waiting:${s.waitingFor}` : 'host-reported-waiting',
+      project: s.cwd ? s.cwd.split(/[\\/]/).pop() : (s.name || null),
+      detail: s.waitingFor || null,
+      needs: typeof s.needs === 'string' ? s.needs : null,
+      suggestedReply: null,
+      updatedAt: new Date(updated).toISOString(),
+      idleSec: Math.round((nowMs - updated) / 1000),
+      source: 'sessions',
+    });
+  }
+  return {
+    found,
+    scanned,
+    skipped,
+    elapsedMs: Number(process.hrtime.bigint() - started) / 1e6,
+  };
+}
+
 export function probeJobs(jobsRoot, { nowMs = Date.now() } = {}) {
   const started = process.hrtime.bigint();
   const found = [];
@@ -1231,11 +1288,22 @@ export async function runTick({
   let eligible = [];
 
   // ── L-fast ──
+  // 两个来源一起跑：jobs 抓「过去失败过」，sessions 抓「此刻在等你」。
+  // 后者才是高频且可行动的信号，但少了前者就看不见后台作业的失败。
   if (due(state.lastJobsScanAt, JOBS_INTERVAL) || forceFull) {
     const jobs = probeJobs(join(root, 'jobs'), { nowMs });
     summary.ran.push('jobs');
     summary.timings.jobsMs = Math.round(jobs.elapsedMs);
     candidates = candidates.concat(jobs.found);
+    try {
+      const waiting = probeWaiting(join(root, 'sessions'), { nowMs });
+      summary.ran.push('waiting');
+      summary.timings.waitingMs = Math.round(waiting.elapsedMs);
+      candidates = candidates.concat(waiting.found);
+    } catch (e) {
+      // sessions 目录读不了不该拖垮整轮：jobs 的结果仍然有效
+      if (log) log.warn(`waiting-probe-failed: ${e.message}`);
+    }
     state.lastJobsScanAt = new Date(nowMs).toISOString();
   }
 

@@ -23,10 +23,31 @@
 |---|---|---|---|
 | 0 | `FAILED` | **仅**宿主 `~/.claude/jobs/*/state.json` 的 `state === 'failed'` | 全量重跑。**优先于一切推断**，不被时间冲淡 |
 | 0.5 | `BLOCKED` | **仅**宿主 `state === 'blocked'` | 读它的 `needs` / `suggestedReply`，由人决定 |
+| 0.6 | `WAITING` | **仅**宿主 `~/.claude/sessions/*.json` 的 `status === 'waiting'` | **回它**。带 `waitingFor` 说明在等什么 |
 | 1 | `EXPLORING`（休眠） | 最后一次调用距今超过 **1 小时**（`DORMANT_MS`） | 不干预。标注 `reason: dormant`、`liveness: stale` |
 | 2 | `STALLED` | 连续 3 个窗口 novelty < 0.2，**且**该窗口内无持久化变更，**且**派生树无任一节点有增益 | L2 探针 → L3 收窄 → L4 重新拆解 |
 | 3 | `PRODUCING` | 窗口内存在**持久化变更**：成功的 `Write` / `Edit`，或 Bash 命令命中写入类动词表（§3.4） | 不干预，等验收 |
 | 4 | `EXPLORING` | 其余全部情况（只读工具、novelty 达标、或冷启动样本不足） | **不干预**，只做预算管理与状态行标注 |
+
+### 2.0.3 `WAITING` —— 宿主一直在报，而我没读（2026-10-31）
+
+逆向 `claude.exe` 2.1.270 后发现宿主的状态是三态，不是两态：
+
+```js
+var wS = { running: "busy", requires_action: "waiting", idle: "idle" };
+```
+
+`waitingFor` 由 `bVo()` 判定，取值包括 `input needed` / `dialog open` / `permission prompt` /
+`worker request` / `sandbox request` / `goal proposal`。
+
+**修复前 `readLiveSessions()` 的注释写死「busy / idle」，`waiting` 从未被读出来。**
+后果实测：一个 `status:"waiting"`, `waitingFor:"input needed"` 的会话等了 23 天，
+被 `judgeState` 判成 `EXPLORING / dormant` —— **它在等人，系统说它在睡觉。**
+
+`WAITING` 必须排在 `dormant` **之前**：dormant 是「没在做事」，waiting 是「在等你」，
+后者信息量更大且可行动，不能被前者盖掉。
+
+完整逆向过程见 [`../research/2026-10-31-reverse-engineered-waiting-signal.md`](../research/2026-10-31-reverse-engineered-waiting-signal.md)。
 
 ### 2.0.1 心跳推断已删除（2026-10-31）
 

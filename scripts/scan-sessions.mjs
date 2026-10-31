@@ -162,7 +162,7 @@ export function heartbeatThreshold(gapsMs) {
 const DORMANT_MS = 60 * 60 * 1000;
 
 /** 四态判定，有序互斥，首个命中即返回（§2） */
-export function judgeState({ sessionState, calls, gapsMs, now: nowMs }) {
+export function judgeState({ sessionState, waitingFor, calls, gapsMs, now: nowMs }) {
   const now = nowMs ?? Date.now();
   const threshold = heartbeatThreshold(gapsMs);
   const lastCall = calls.length ? calls[calls.length - 1] : null;
@@ -174,6 +174,26 @@ export function judgeState({ sessionState, calls, gapsMs, now: nowMs }) {
   // 0.5 宿主报 blocked：在等输入（权限确认 / API 恢复 / sandbox），不是失败也不是探索。
   //     必须单独成态：按 EXPLORING 处理会让用户以为它还在干活。
   if (sessionState === 'blocked') return { state: 'BLOCKED', reason: 'host-reported-blocked' };
+
+  // 0.6 宿主报 waiting：**它此刻正在等用户**。这是宿主自己判定的，不是推断。
+  //
+  //     2026-10-31 逆向 claude.exe 2.1.270 得到判定函数：
+  //       if (queuedElicitation) return "input needed";
+  //       if (topDialogWaitingFor !== undefined) return topDialogWaitingFor;
+  //       if (pendingWorkerRequest) return "worker request";
+  //       if (pendingSandboxRequest) return "sandbox request";
+  //       if (isShowingLocalJSXCommand && !isResponseStreaming && !delegatedActive) return "dialog open";
+  //
+  //     在发现这条之前，一个 `waiting / input needed` 的会话会被下面第 1 步判成
+  //     `EXPLORING / dormant`——**它 23 天前就该等用户了，而系统说它在睡觉**。
+  //     必须排在 dormant 之前：dormant 是「没在做事」，waiting 是「在等你」，
+  //     后者信息量更大且可行动，不能被前者盖掉。
+  if (sessionState === 'waiting') {
+    return {
+      state: 'WAITING',
+      reason: waitingFor ? `waiting:${waitingFor}` : 'host-reported-waiting',
+    };
+  }
 
   // 1. 休眠：长时间无活动，既不是探索也不是失败，只是结束了。
   //    必须排在 host-failed 之后——宿主明确报过 failed 的，不该被时间冲淡。
@@ -400,7 +420,27 @@ function findTranscriptRoot() {
   return existsSync(root) ? root : null;
 }
 
-/** 从 ~/.claude/sessions/*.json 读活跃会话（宿主已落盘的权威状态） */
+/** 从 ~/.claude/sessions/*.json 读活跃会话（宿主已落盘的权威状态）。
+ *
+ *  **这里有三个状态，不是两个。** 2026-10-31 逆向 claude.exe 2.1.270 后确认：
+ *
+ *    var wS = { running: "busy", requires_action: "waiting", idle: "idle" };
+ *
+ *  `waiting` 是宿主明确判定「正在等用户」的实时状态，由 bVo() 逐个判断产生：
+ *
+ *    if (appState.queuedElicitation)        return "input needed";
+ *    if (appState.topDialogWaitingFor !== undefined) return topDialogWaitingFor;  // "dialog open" / "goal proposal"
+ *    if (appState.pendingWorkerRequest)     return "worker request";
+ *    if (appState.pendingSandboxRequest)    return "sandbox request";
+ *    if (isShowingLocalJSXCommand && !isResponseStreaming && !delegatedActive) return "dialog open";
+ *
+ *  **本函数此前只读 busy / idle，把 `waiting` 整个漏掉了**，注释还断言「只有 busy/idle」。
+ *  实测后果：2026-10-31 有一个会话 `status:"waiting"`, `waitingFor:"input needed"`，
+ *  而被 `judgeState` 判成 `EXPLORING / dormant`（「它只是睡了」）。
+ *  它当时就在等用户，而系统说它在睡觉。
+ *
+ *  这是**宿主事实**，不是推断：不需要看 transcript、不需要算 novelty、不需要分类器。
+ *  它只在等待发生的那一刻为真，用户一回应就变回 busy/idle —— 正是通知该用的信号。 */
 function readLiveSessions() {
   const dir = join(homedir(), '.claude', 'sessions');
   if (!existsSync(dir)) return [];
@@ -414,7 +454,8 @@ function readLiveSessions() {
         sessionId: o.sessionId,
         name: o.name,
         cwd: o.cwd,
-        status: o.status,              // busy / idle
+        status: o.status,              // busy / waiting / idle
+        waitingFor: typeof o.waitingFor === 'string' ? o.waitingFor : null,
         statusUpdatedAt: o.statusUpdatedAt,
         kind: o.kind,
         entrypoint: o.entrypoint,
@@ -505,6 +546,10 @@ function main(argv) {
   const toolCounts = {};
   const jobs = readJobs();
   const jobBySession = new Map(jobs.filter((j) => j.sessionId).map((j) => [j.sessionId, j]));
+  // 宿主的实时状态（含 waiting）按 sessionId 索引，供判定使用。
+  // 注意：sessions/*.json 里只有**当前还活着**的会话，历史会话查不到 —— 这是优势不是缺陷：
+  // waiting 只在等待发生的那一刻为真，不会像 jobs 的 failed 那样留着陈旧值。
+  const liveBySession = new Map(readLiveSessions().filter((s) => s.sessionId).map((s) => [s.sessionId, s]));
 
   for (const projectDir of readdirSync(root)) {
     const projectPath = join(root, projectDir);
@@ -526,14 +571,18 @@ function main(argv) {
         for (const c of scanned.allCalls) toolCounts[c.name] = (toolCounts[c.name] || 0) + 1;
       }
 
-      // 宿主权威状态：jobs 里的 failed/blocked 必须传进去，否则那个分支永远是死的
+      // 宿主权威状态：jobs 里的 failed/blocked 与 sessions 里的 waiting
+      // 都必须传进去，否则那些分支永远是死的
       const job = jobBySession.get(sessionId);
+      const live = liveBySession.get(sessionId);
       const hostState = job?.state === 'failed' ? 'failed'
         : job?.state === 'blocked' ? 'blocked'
-          : undefined;
+          : live?.status === 'waiting' ? 'waiting'
+            : undefined;
 
       const verdict = judgeState({
         sessionState: hostState,
+        waitingFor: live?.waitingFor ?? null,
         calls: scanned.allCalls,
         gapsMs: scanned.gaps,
       });
@@ -624,12 +673,17 @@ function printHuman(results, live, days) {
     console.log(`宿主注册的活跃会话 ${live.length} 个：`);
     for (const s of live) {
       const msg = s.canMessage ? '可投递(带来源标注)' : '不可投递';
-      console.log(`  ${s.status.padEnd(5)} ${String(s.name || s.sessionId).slice(0, 32).padEnd(34)} ${msg}`);
+      // waiting 会话把「在等什么」直接摆在行尾。这是宿主给的实时信号，
+      // 也是这份列表里唯一**需要用户立刻行动**的信息，不能藏在详情页里。
+      const wait = s.status === 'waiting'
+        ? `  ← 正在等你${s.waitingFor ? `（${s.waitingFor}）` : ''}`
+        : '';
+      console.log(`  ${s.status.padEnd(7)} ${String(s.name || s.sessionId).slice(0, 32).padEnd(34)} ${msg}${wait}`);
     }
     console.log('');
   }
 
-  const order = ['BLOCKED', 'FAILED', 'STALLED', 'PRODUCING', 'EXPLORING'];
+  const order = ['WAITING', 'BLOCKED', 'FAILED', 'STALLED', 'PRODUCING', 'EXPLORING'];
   const sorted = [...results].sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state) || b.idleSec - a.idleSec);
   for (const r of sorted) {
     const nov = r.novelty === null ? 'null' : r.novelty.toFixed(2);

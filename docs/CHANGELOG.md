@@ -453,6 +453,27 @@
 - **负向证据**：造一个只改 `scripts/watch.mjs`、不动 CHANGELOG 的提交，门报出「1 个提交改动了源码但没有条目」；
   撤销后通过。
 - **诚实的代价**：历史欠账不追溯（那 37 个提交）。这条门只保证**从今往后**不再漂移，不声称过去的账已经平了。
+### Added（逆向宿主，找到真正的「等待」信号）
+
+- **`WAITING` 状态**。逆向 `claude.exe` 2.1.270 后发现宿主的状态是三态不是两态：
+  `wS = { running: "busy", requires_action: "waiting", idle: "idle" }`。
+  `waitingFor` 由 `bVo()` 判定，取值 `input needed` / `dialog open` / `permission prompt` /
+  `worker request` / `sandbox request` / `goal proposal`。
+  - **我此前的注释写死「busy / idle」，`waiting` 从未被读出来。** 实测后果：一个
+    `status:"waiting", waitingFor:"input needed"` 的会话等了 **23 天**，被 `judgeState` 判成
+    `EXPLORING / dormant`——**它在等人，系统说它在睡觉**。
+  - 修复：`readLiveSessions()` 读 `waitingFor`；`judgeState` 新增 `WAITING` 且**排在 `dormant` 之前**
+    （dormant 是「没在做事」，waiting 是「在等你」，后者信息量更大且可行动）；
+    `probeWaiting()` 进 L-fast 1 分钟层；`NOTIFY_STATES = ['WAITING','FAILED','BLOCKED']`；
+    TUI 字形 `!`；列表页行尾直接显示 `← 正在等你（input needed）`。
+  - **这是唯一「动作方向明确」的信号**：`failed` 告诉你该重跑，`waiting` 告诉你该回话。
+    其余所有状态都只是描述。而且它是**实时**的——用户一回话就消失，不像 `jobs.state` 会留着陈旧值。
+  - **变异验证**（三条）：删掉 `WAITING` 分支 → 3 条测试红；把它移到 `dormant` 之后（复现原始 bug 的排序）→ 1 条红；
+    把 `busy` 也当成候选 → 1 条红；去掉活跃窗口闸门 → 1 条红。
+  - 完整逆向过程（含字节偏移与源码摘录）：`docs/research/2026-10-31-reverse-engineered-waiting-signal.md`。
+- **更高层分类读不到**：宿主还有 `status_category` / `status_detail` / `needs_action` 三级分类，
+  但它们只走 `reportMetadata`（远端桥接），**不落本地盘**。验证：全部 transcript 里 `post_turn_summary`
+  只出现在 2 条 user 记录的工具返回内容里，没有 `{type:"system", subtype:"post_turn_summary"}` 记录。
 ### Notes（已知且不打算近期修）
 
 1. **在线停止分类 95.4% 判 `UNCLASSIFIABLE`** —— 结构性，分类器需要「下一句」而在线时下一句还没发生。

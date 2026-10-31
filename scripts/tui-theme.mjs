@@ -31,10 +31,18 @@ const SGR = {
 /**
  * 每个状态的三通道表示。
  *
- * 注意：判定链（state-model.md §2）是四态；BLOCKED 不在这条链上，它是宿主
- * 报告的事实（等待人输入），优先级最高但也最需要人处理，所以放在第一位。
+ * 注意：判定链（state-model.md §2）里，WAITING 与 BLOCKED 都是宿主事实而非推断，
+ * 优先级最高也最需要人处理，所以排在前面。两者的区别：
+ *   WAITING —— 会话活着，此刻正在等你（可要求子 agent、开对话框、等审批）
+ *   BLOCKED —— 宿主报告会话受阻，需要人回复或明确放弃
  */
 export const STATES = {
+  WAITING: {
+    glyph: '!',
+    color: 'brightYellow',
+    label: 'WAITING',
+    meaning: '宿主报告会话此刻正在等用户（waitingFor: input needed / dialog open / worker request / sandbox request / goal proposal）。这是实时信号，用户一回应就消失。',
+  },
   BLOCKED: {
     glyph: '?',
     color: 'yellow',

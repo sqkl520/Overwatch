@@ -330,3 +330,35 @@ test('FAILED 只来自宿主明确报错', () => {
   assert.equal(judgeState({ calls, gapsMs: [] }).state, 'EXPLORING', '无宿主信号时不该 FAILED');
   assert.equal(judgeState({ calls, gapsMs: [], sessionState: 'failed' }).state, 'FAILED');
 });
+
+// ── WAITING：宿主实时状态（2026-10-31 逆向 claude.exe 2.1.270 得到）──────
+
+test('宿主报 waiting → WAITING，且不被 dormant 盖掉', () => {
+  // 这是真实故障的复现：该会话 idle 23 天，status=waiting, waitingFor=input needed，
+  // 却因为 idleMs > DORMANT_MS 被判成 EXPLORING/dormant。
+  const now = Date.now();
+  const calls = [{ ts: now - 23 * 86400_000, name: 'Read', sig: 'read|a', persistent: false }];
+  const r = judgeState({ sessionState: 'waiting', waitingFor: 'input needed', calls, gapsMs: [], now });
+  assert.equal(r.state, 'WAITING', 'waiting 必须优先于 dormant——它在等你，不是在睡觉');
+  assert.equal(r.reason, 'waiting:input needed');
+});
+
+test('waitingFor 缺失时仍判 WAITING，reason 用兜底值', () => {
+  const r = judgeState({ sessionState: 'waiting', waitingFor: null, calls: [], gapsMs: [], now: Date.now() });
+  assert.equal(r.state, 'WAITING');
+  assert.equal(r.reason, 'host-reported-waiting');
+});
+
+test('waiting 的各种 waitingFor 都原样带进 reason', () => {
+  for (const w of ['input needed', 'dialog open', 'worker request', 'sandbox request', 'goal proposal']) {
+    const r = judgeState({ sessionState: 'waiting', waitingFor: w, calls: [], gapsMs: [], now: Date.now() });
+    assert.equal(r.state, 'WAITING');
+    assert.equal(r.reason, `waiting:${w}`);
+  }
+});
+
+test('FAILED 与 BLOCKED 优先于 WAITING（严重度排序）', () => {
+  const now = Date.now();
+  assert.equal(judgeState({ sessionState: 'failed', waitingFor: 'input needed', calls: [], gapsMs: [], now }).state, 'FAILED');
+  assert.equal(judgeState({ sessionState: 'blocked', waitingFor: 'input needed', calls: [], gapsMs: [], now }).state, 'BLOCKED');
+});

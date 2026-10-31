@@ -24,7 +24,7 @@ import {
   pruneNotified, NOTIFIED_TTL_HOURS, notifyTitle, NOTIFY_STATES,
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
   observationStats, formatStats, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
-  traceability, readJobStates,
+  traceability, readJobStates, probeWaiting,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -369,10 +369,11 @@ test('AC3 层调度：第二轮不会重跑全量（L-full 只在 30 分钟到�
     await runTick({ dir, claudeDir: claude, logger, notifier, scan, nowMs: now });
     assert.equal(fullRuns, 1, '30 秒后不得重跑全量');
 
-    // 2 分钟后：只有 L-fast 到期
+    // 2 分钟后：只有 L-fast 到期。它现在跑两个探针——jobs（过去失败过）
+    // 与 sessions（此刻在等你）。两者都便宜（纯读小 JSON），合起来才是完整的一层。
     now += 2 * MIN;
     const s2 = await runTick({ dir, claudeDir: claude, logger, notifier, scan, nowMs: now });
-    assert.deepEqual(s2.ran, ['jobs'], '2 分钟后只应跑 jobs');
+    assert.deepEqual(s2.ran, ['jobs', 'waiting'], '2 分钟后应只跑 L-fast 的两个探针');
     assert.equal(fullRuns, 1);
 
     // 再 4 分钟（累计 6 分钟）：L-mid 到期，但没变化 → 不起增量扫描
@@ -1113,4 +1114,74 @@ test('readJobStates 读得出 needs/suggestedReply，坏文件不抛', () => {
   } finally {
     rmSync(claude, { recursive: true, force: true });
   }
+});
+
+// ── probeWaiting：宿主实时 waiting 信号 ──────────────────────────────
+
+const mkSession = (dir, pid, obj) => writeFileSync(join(dir, `${pid}.json`), JSON.stringify(obj));
+
+test('probeWaiting：waiting 会话被抓成候选，带 waitingFor', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    mkSession(dir, 1, {
+      pid: 1, sessionId: 's-wait', status: 'waiting', waitingFor: 'input needed',
+      statusUpdatedAt: now - 5000, cwd: 'D:\\P\\demo', name: 'demo',
+    });
+    const r = probeWaiting(dir, { nowMs: now });
+    assert.equal(r.found.length, 1);
+    assert.equal(r.found[0].state, 'WAITING');
+    assert.equal(r.found[0].reason, 'waiting:input needed');
+    assert.equal(r.found[0].project, 'demo');
+    assert.equal(r.found[0].source, 'sessions');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('probeWaiting：busy / idle 不产生候选', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    for (const [i, st] of ['busy', 'idle'].entries()) {
+      mkSession(dir, i + 1, { pid: i + 1, sessionId: `s${i}`, status: st, statusUpdatedAt: now });
+    }
+    assert.equal(probeWaiting(dir, { nowMs: now }).found.length, 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('probeWaiting：waiting 太久（超出活跃窗口）不算——20 天前的等待不是新闻', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    mkSession(dir, 1, {
+      pid: 1, sessionId: 'old', status: 'waiting', waitingFor: 'input needed',
+      statusUpdatedAt: now - 20 * 86400_000,
+    });
+    assert.equal(probeWaiting(dir, { nowMs: now }).found.length, 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('probeWaiting：缺 waitingFor 仍算候选，reason 用兜底值', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    mkSession(dir, 1, { pid: 1, sessionId: 's', status: 'waiting', statusUpdatedAt: now });
+    const r = probeWaiting(dir, { nowMs: now });
+    assert.equal(r.found[0].reason, 'host-reported-waiting');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('probeWaiting：坏 JSON 与无 sessionId 的文件被跳过，不抛', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    writeFileSync(join(dir, 'bad.json'), '{oops');
+    mkSession(dir, 2, { pid: 2, status: 'waiting', statusUpdatedAt: now }); // 无 sessionId
+    const r = probeWaiting(dir, { nowMs: now });
+    assert.equal(r.found.length, 0);
+    assert.ok(r.skipped >= 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('probeWaiting：WAITING 在 NOTIFY_STATES 里——它是唯一会高频触发的状态', () => {
+  assert.ok(NOTIFY_STATES.includes('WAITING'));
 });
