@@ -60,8 +60,20 @@ const LOG_MAX_BYTES = 1024 * 1024;
  *  首轮跑起来会把它们全当新边沿，一次刷屏 20 条。 */
 const ACTIVE_WINDOW = 24 * HOUR;
 
-/** 需要通知的终态。STALLED 是主产品信号（不再产出），P0 只看这三类。 */
-export const NOTIFY_STATES = ['FAILED', 'BLOCKED', 'STALLED'];
+/** 需要通知的终态。
+ *
+ *  **只有宿主明确报的两种。** 删掉 STALLED 和推断来的 FAILED 是 2026-10-31 的决定，
+ *  依据是两条实测：
+ *
+ *  - `STALLED` 从未触发过。129 个会话里 novelty 最小值 0.60，而判 STALLED 要求
+ *    连续三窗 < 0.2。它是配置里的一条死规则。
+ *  - 间隔推断的 FAILED 误报。大间隔之后 94.8% 的会话还有 tool_use；
+ *    且 3697 次 `sleep N` 里 3470 次 ≥30 秒 —— 「心跳断裂」测到的主要是宿主在故意等待。
+ *
+ *  锐评的原话：「通知只能由宿主事实触发」。剩下的判定能力等于
+ *  `claude agents --json` 的 busy/idle/blocked 加一次 Write 检测 —— 这是诚实的边界。
+ */
+export const NOTIFY_STATES = ['FAILED', 'BLOCKED'];
 
 const SCAN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'scan-sessions.mjs');
 

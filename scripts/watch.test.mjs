@@ -21,7 +21,7 @@ import {
   dedupeKey, reasonClass, canNotify, recordSent, emptyState, loadState, saveState,
   probeJobs, probeMtime, diffProbe, foldProbe, candidatesFromScan,
   createLogger, dispatchCandidates, runTick, defaultStateDir, __internals,
-  pruneNotified, NOTIFIED_TTL_HOURS, notifyTitle,
+  pruneNotified, NOTIFIED_TTL_HOURS, notifyTitle, NOTIFY_STATES,
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
   observationStats, formatStats, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
 } from './watch.mjs';
@@ -428,7 +428,7 @@ test('AC3 层调度：projects 有变化时只对变化的项目跑增量', asyn
 
 // ── 候选筛选 ─────────────────────────────────────────────────────────
 
-test('只把活跃窗口内的 FAILED/BLOCKED/STALLED 转成候选', () => {
+test('只把活跃窗口内的 FAILED/BLOCKED 转成候选（STALLED 已移除）', () => {
   const now = Date.now();
   const iso = (msAgo) => new Date(now - msAgo).toISOString();
   const sessions = [
@@ -437,9 +437,18 @@ test('只把活跃窗口内的 FAILED/BLOCKED/STALLED 转成候选', () => {
     { sessionId: 'c', state: 'PRODUCING', reason: 'r', lastActivity: iso(60_000) },
     { sessionId: 'd', state: 'EXPLORING', reason: 'r', lastActivity: iso(60_000) },
     { sessionId: 'e', state: 'BLOCKED', reason: 'r', lastActivity: iso(48 * 3600_000) },
+    { sessionId: 'f', state: 'BLOCKED', reason: 'r', lastActivity: iso(60_000) },
   ];
   const c = candidatesFromScan(sessions, { nowMs: now });
-  assert.deepEqual(c.map((x) => x.sessionId).sort(), ['a', 'b'], 'PRODUCING/EXPLORING/陈旧会话不得通知');
+  // STALLED（b）已从 NOTIFY_STATES 移除：它从未在真实语料里触发过。
+  // 陈旧的 BLOCKED（e）超出 24h 活跃窗口。
+  assert.deepEqual(c.map((x) => x.sessionId).sort(), ['a', 'f'], '只有活跃的 FAILED/BLOCKED 该通知');
+});
+
+test('STALLED 不再是可通知状态', () => {
+  assert.ok(!NOTIFY_STATES.includes('STALLED'), 'STALLED 从未在真实语料触发，不该保留在通知状态里');
+  assert.ok(NOTIFY_STATES.includes('FAILED'));
+  assert.ok(NOTIFY_STATES.includes('BLOCKED'));
 });
 
 test('runTick 的 dry-run 会算出候选但不发通知', async () => {
