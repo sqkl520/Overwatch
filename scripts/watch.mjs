@@ -953,6 +953,30 @@ export function formatStats(stats, { minIdleSec = UNCLASSIFIABLE_MIN_IDLE_SEC } 
 
 // ── 通知投递 ──────────────────────────────────────────────────────────
 
+/** 通知标题。**必须让不确定性和确定性一眼可分。**
+ *
+ *  回放实测：66 条通知里 64 条是 UNCLASSIFIABLE（97%）。而原来的标题是
+ *  `${state} · 项目名`，完全没有体现分类结果 —— 用户看到 "STALLED · foo"
+ *  会以为是确认卡住了，实际是「我判不出来」。这是把不确定性包装成确定性，
+ *  违反 docs/spec/output-format.md §2.1「不允许估算出一个看起来精确的数」。
+ *
+ *  Windows toast 默认只显示标题，body 要展开才看得到 —— 所以分类结果必须在标题里。
+ */
+export function notifyTitle(c) {
+  const where = c.project || (c.sessionId || '').slice(0, 8);
+  const kind = c.kind || null;
+  if (kind === 'UNCLASSIFIABLE') {
+    // 明确告诉用户这是「不确定」，而不是「确认卡住」
+    return `？ ${where} · 疑似停滞（判不出类型）`;
+  }
+  if (kind === 'EXTERNAL_BLOCKED') return `⏸ ${where} · 外部阻塞`;
+  if (kind === 'WAITING_APPROVAL') return `⏸ ${where} · 等你批准`;
+  if (kind === 'ASKED_UNANSWERED') return `？ ${where} · 问了没答`;
+  if (kind === 'PLAN_SUBMITTED') return `📋 ${where} · 计划待批`;
+  // 没有分类结果时退回 state，但标注「未分类」
+  return `${c.state} · ${where}（未分类）`;
+}
+
 function describe(c) {
   const where = c.project ? `${c.project}` : (c.sessionId || '').slice(0, 8);
   const bits = [where, c.reason];
@@ -1084,7 +1108,7 @@ export async function dispatchCandidates(candidates, {
 
     try {
       await notifier({
-        title: `${c.state} · ${c.project || (c.sessionId || '').slice(0, 8)}`,
+        title: notifyTitle(c),
         body: describe(c),
         tag: rec.state.toLowerCase(),
       });

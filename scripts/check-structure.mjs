@@ -433,7 +433,7 @@ function checkUnregisteredExports() {
     'createLogger', 'defaultStateDir', 'escapeXml', 'sanitizeTag', 'textOf',
     'buildPayloadXml', 'defaultNotifyDir', 'lastPermissionMode',
     'parseAskAnswers', 'relevanceOf', 'answerIsNegative',
-    'findEarlierMatch', 'classifyStop',
+    'findEarlierMatch', 'classifyStop', 'notifyTitle',
     'findStopPoint', 'readTranscriptTail', 'classifyCandidate',
     'createObservationLog', 'observationStats', 'formatStats', 'NOTIFY_KINDS', 'OBS_MAX_BYTES',
     'unclassifiableMinIdleSec', 'tooRecentToNotify', 'UNCLASSIFIABLE_MIN_IDLE_SEC', 'IDLE_BUCKETS',

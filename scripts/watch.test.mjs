@@ -21,7 +21,7 @@ import {
   dedupeKey, reasonClass, canNotify, recordSent, emptyState, loadState, saveState,
   probeJobs, probeMtime, diffProbe, foldProbe, candidatesFromScan,
   createLogger, dispatchCandidates, runTick, defaultStateDir, __internals,
-  pruneNotified, NOTIFIED_TTL_HOURS,
+  pruneNotified, NOTIFIED_TTL_HOURS, notifyTitle,
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
   observationStats, formatStats, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
 } from './watch.mjs';
@@ -953,4 +953,35 @@ test('loadState 读入时会清理过期条目', () => {
     assert.equal(Object.keys(state.notified).length, 1, '只应留下未过期的');
     assert.ok(state.notified.recent, '保留的必须是 recent');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── 通知标题必须让不确定性可见 ────────────────────────────────────────
+//
+// 回放实测 66 条通知里 64 条是 UNCLASSIFIABLE（97%）。
+// 原标题是 `${state} · 项目名`，用户会以为是确认卡住了。
+// Windows toast 默认只显示标题，所以分类结果必须在标题里。
+
+test('notifyTitle：UNCLASSIFIABLE 必须明确标注「判不出类型」', () => {
+  const t = notifyTitle({ state: 'STALLED', project: 'foo', kind: 'UNCLASSIFIABLE' });
+  assert.ok(t.includes('判不出类型'), `标题未体现不确定性: ${t}`);
+  assert.ok(!t.startsWith('STALLED'), '不能以确定的 state 开头');
+});
+
+test('notifyTitle：确定信号用各自的措辞', () => {
+  assert.ok(notifyTitle({ state: 'BLOCKED', project: 'a', kind: 'EXTERNAL_BLOCKED' }).includes('外部阻塞'));
+  assert.ok(notifyTitle({ state: 'STALLED', project: 'b', kind: 'WAITING_APPROVAL' }).includes('等你批准'));
+  assert.ok(notifyTitle({ state: 'STALLED', project: 'c', kind: 'ASKED_UNANSWERED' }).includes('问了没答'));
+  assert.ok(notifyTitle({ state: 'STALLED', project: 'd', kind: 'PLAN_SUBMITTED' }).includes('计划待批'));
+});
+
+test('notifyTitle：没有分类结果时标注「未分类」', () => {
+  const t = notifyTitle({ state: 'FAILED', project: 'x', kind: null });
+  assert.ok(t.includes('未分类'), `未标注未分类: ${t}`);
+  assert.ok(t.includes('FAILED'));
+});
+
+test('notifyTitle：没有 project 时用 sessionId 前 8 位', () => {
+  const t = notifyTitle({ state: 'STALLED', project: null, sessionId: 'abcdef1234567890', kind: 'UNCLASSIFIABLE' });
+  assert.ok(t.includes('abcdef12'));
+  assert.ok(!t.includes('null'));
 });
