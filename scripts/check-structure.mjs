@@ -440,6 +440,8 @@ function checkUnregisteredExports() {
     'traceability', 'readJobStates', 'probeWaiting', 'readLiveSessionStates',
     'buildInbox', 'formatInbox', 'healthCheck', 'formatHealth', 'HEALTH_PERIODS',
     'statusToState', 'liveToRow', 'mergeLiveSessions', 'listRow', 'detailLines',
+    // validate-run.mjs
+    'validateGraph', 'validateFile', 'CAPABILITIES', 'SHAPES', 'REQUIRED_FOR_COMPLEX', 'MIN_SUBTREES',
     // install-watcher.mjs
     'launcherPath', 'templatePath', 'stateDirFor', 'startupDir', 'shortcutPath',
     'renderLauncher', 'needsRegenerate', 'createShortcut', 'witnessPath', 'writeWitness', 'readWitness', 'checkStateIntegrity', 'HOST_FACT_STATES',
@@ -670,6 +672,10 @@ function checkInboxWiring() {
   if (existsSync(skill)) {
     let t = '';
     try { t = readFileSync(skill, 'utf8'); } catch { /* ignore */ }
+    if (!t.includes('validate-run.mjs')) {
+      fail('.claude/skills/oversight/SKILL.md',
+        '规划阶段没有引用 validate-run.mjs —— planner 的产物没人校验（硬约束 4/8）');
+    }
     if (!t.includes('--health')) {
       fail('.claude/skills/oversight/SKILL.md',
         '调度入口没有引用 `watch.mjs --health` —— 无法区分「进程死了」和「进程卡住了」（DF-023）');
@@ -745,6 +751,36 @@ function checkDesignIndex() {
   }
 }
 
+/** 定义了但从不派发的 agent = 死代码。
+ *
+ *  2026-11-01 实测：`oversight-probe` 的角色定义存在、触发条件还专门改过，
+ *  但 SKILL.md **从不派它**——它的触发条件永远不会生效。
+ *  定义里写得再对，没人调用就等于不存在。
+ *
+ *  检查：agents/ 下每个角色，至少要在 SKILL.md 里被提到一次。
+ *  豁免：明确标注「由其他 agent 派生」的角色（目前没有，但留出口）。 */
+function checkAgentReachability() {
+  const agentDir = join(ROOT, '.claude', 'agents');
+  const skill = join(ROOT, '.claude', 'skills', 'oversight', 'SKILL.md');
+  if (!existsSync(agentDir) || !existsSync(skill)) return;
+  let sk = '';
+  try { sk = readFileSync(skill, 'utf8'); } catch { return; }
+  const files = readdirSync(agentDir).filter((f) => f.endsWith('.md'));
+  const orphans = [];
+  for (const f of files) {
+    const name = f.replace(/\.md$/, '');
+    let body = '';
+    try { body = readFileSync(join(agentDir, f), 'utf8'); } catch { continue; }
+    // 允许角色自己在 frontmatter 里声明「不由 SKILL 直接派发」
+    if (/dispatched-by:\s*other/.test(body)) continue;
+    if (!sk.includes(name)) orphans.push(name);
+  }
+  if (orphans.length) {
+    fail('.claude/skills/oversight/SKILL.md',
+      `这些角色定义了却从不被派发：${orphans.join(', ')} —— 定义里写得再对，没人调用等于不存在`);
+  }
+}
+
 // ── 运行 ──────────────────────────────────────────────────────────────
 
 console.log('check-structure · 仓库结构硬门\n');
@@ -764,6 +800,7 @@ checkLedger();
 checkLauncherPlacement();
 checkInboxWiring();
 checkDesignIndex();
+checkAgentReachability();
 
 if (violations.length) {
   console.log(`✗ ${violations.length} 项违规：\n`);

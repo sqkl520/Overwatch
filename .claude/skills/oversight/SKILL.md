@@ -41,8 +41,17 @@ node scripts/watch.mjs --inbox
 |---|---|
 | `WAITING` / `BLOCKED` 且有 `suggestedReply` | 宿主已给半成品。直接给用户复制，**不必派 Agent** |
 | `WAITING` / `BLOCKED` 只有 `needs` | 派 `oversight-relay`，把 `needs` 逐字给它 |
-| `WAITING` 但 `needs` 为空 | 要 transcript 才知道在等什么。派 `oversight-relay`，让它读会话尾部重建 |
+| `WAITING` 但 `needs` 为空 | **先派 `oversight-probe` 判定它在等什么**，再据此派 `oversight-relay` |
+| `FAILED` | 派 `oversight-relay`，从 transcript 重建失败点；**不要按「在等待」写措辞** |
 | 收件箱为空且 §0 判定健康 | 确实没有需要处理的事 |
+
+**`needs` 为空时不能直接派 relay。** relay 拿不到「在等什么」就只能编——
+它的输入契约里写着「`needs` / `suggestedReply`（若有，逐字给出）」，
+没有就得靠 transcript 猜。`oversight-probe` 的职责正是先判这一步：
+它只看工具调用日志、不读推理文本，三选一给出 `HEALTHY_EXPLORING` / `UNFOCUSED` / `LOOPING`。
+
+> 2026-11-01 发现：`oversight-probe` 定义存在、触发条件也改过，
+> 但 SKILL.md **从不派它**——它的触发条件永远不会生效。
 
 后台只**发现**，不**处理**——它不改代码、不代答、不重跑。处置永远在你（或你派的 Agent）这里。
 
@@ -69,6 +78,16 @@ node scripts/scan-sessions.mjs --days 3
 ## 2. Phase A：规划
 
 派 `oversight-planner`，输入原始需求 + P0 答案 + 台账。产出 `tasks/runs/<run-id>/task-graph.json`。
+
+**拿到产物先校验，再派发：**
+
+```bash
+node scripts/validate-run.mjs tasks/runs/<run-id>/task-graph.json
+```
+
+不通过就退回 planner 重做，**不要自己补字段**——补出来的预算和依赖关系是编的，
+下游 Agent 会当真。这个校验器把 `planner.md` 里的 schema 变成可执行的检查；
+在它出现之前，第一个真实 run 就漏了 `token_budget_pct` / `parallel_with` / `depends_on` 三个必填字段。
 
 **主线程审核拆解图**，确认没有「主线程自己顺手做了」的隐含任务，然后派发。
 

@@ -751,6 +751,32 @@
 其中 `liveness` 的变异**第一次没抓到**——因为测试用的是干净值，过不过 `sanitize` 都一样；
 补了一条带 OSC 52 的测试才关住。
 
+### Fixed（派发链路普查：两个断点）
+
+按照"显示路径普查"同样的方法查了派发链路（`SKILL.md` → planner → agent → 产出），
+发现两处断点。它们都不是读代码能看出来的。
+
+**断点一：`oversight-probe` 定义了却从不被派发。**
+角色定义存在、触发条件还专门改过，但 `SKILL.md` 零引用——触发条件永远不会生效。
+后果：`WAITING` 但 `needs` 为空时直接派 relay，relay 拿不到「在等什么」只能编。
+修：路由表补「先 probe 再 relay」；结构门新增 `checkAgentReachability()`，
+任何角色定义了却不被派发直接 fail。
+
+**断点二：`task-graph.json` 的 schema 写了，产物从不校验。**
+`oversight-planner.md` 里 schema 完整，但没有任何东西检查产出符合它。
+**第一个真实 run（`2026-10-30-p0`）就漏了三个必填字段**：`token_budget_pct` / `parallel_with` / `depends_on`。
+修：新增 `scripts/validate-run.mjs`（12 条测试），把 schema 变成可执行检查；
+SKILL.md 要求「先校验再派发，不通过退回 planner，不要自己补字段」；
+结构门保证这条引用不被删。**三个变异全部被抓。**
+
+**校验器抓出的第二个问题——阈值是我编的**：第一版写「≥5 个子任务就算复杂」，
+把一个真实的 2 任务 run 判违规。但那个 run 是合理的：一次小改动不需要 5 个 Agent。
+CLAUDE.md 说的是「复杂任务」，而「是不是复杂」是规划时的判断，不是数字推断。
+把阈值硬塞进校验器只会训练人绕过它。改成调用方显式传 `requireComplex`。
+
+**顺带发现**：`tasks/runs/` 整个被 gitignore（含会话 ID），所以历史派发产物不在仓库里，
+无法回溯。审计记录改放在 `docs/research/2026-11-01-dispatch-chain-audit.md`。
+
 ### Notes（已知且不打算近期修）
 
 1. **在线停止分类 95.4% 判 `UNCLASSIFIABLE`** —— 结构性，分类器需要「下一句」而在线时下一句还没发生。
