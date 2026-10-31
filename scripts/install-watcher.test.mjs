@@ -14,7 +14,7 @@ import { join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
-  launcherPath, templatePath, stateDirFor, startupDir, shortcutPath,
+  launcherPath, templatePath, stateDirFor, startupDir, shortcutPath, autostartAdvice,
   renderLauncher, needsRegenerate,
 } from './install-watcher.mjs';
 
@@ -119,4 +119,22 @@ test('安装器清掉数据目录里的旧启动器——否则它是回到旧�
   assert.ok(src.includes("join(stateDir, 'start-watch.vbs')"),
     '安装器必须处理数据目录里的旧副本');
   assert.ok(src.includes('rmSync(legacy'), '必须真的删除，而不是只警告');
+});
+
+test('startupDir 在非 Windows 返回 null——不能拼出不存在的路径', () => {
+  // 早期版本无条件拼 %APPDATA%\Microsoft\Windows\...，在别的平台上会静默建出垃圾目录。
+  if (process.platform !== 'win32') {
+    assert.equal(startupDir({ APPDATA: '/x' }), null);
+  }
+  // 显式覆盖优先于平台判断
+  assert.equal(startupDir({ OVERWATCH_STARTUP_DIR: '/custom/startup' }), '/custom/startup');
+});
+
+test('autostartAdvice 给出可执行的替代做法，不是占位符', async () => {
+  const { autostartAdvice } = await import('./install-watcher.mjs');
+  const mac = autostartAdvice('darwin');
+  assert.ok(mac.includes('launchctl') && mac.includes('launchd'), 'macOS 应给 launchd 做法');
+  const linux = autostartAdvice('linux');
+  assert.ok(linux.includes('systemctl') && linux.includes('.service'), 'Linux 应给 systemd 做法');
+  assert.ok(linux.includes('--inbox'), '应给出不配守护进程时的退路');
 });

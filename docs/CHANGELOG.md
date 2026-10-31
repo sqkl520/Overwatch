@@ -777,6 +777,35 @@ CLAUDE.md 说的是「复杂任务」，而「是不是复杂」是规划时的�
 **顺带发现**：`tasks/runs/` 整个被 gitignore（含会话 ID），所以历史派发产物不在仓库里，
 无法回溯。审计记录改放在 `docs/research/2026-11-01-dispatch-chain-audit.md`。
 
+### Fixed（换台机器/换个目录跑起来的三个障碍）
+
+方向：先让它在别处能跑。实测把仓库复制到临时目录，发现三处问题。
+
+**1. 没有桌面通知通道时，系统完全静默。**
+非 Windows（或 wscript 缺失）时，旧代码把 notifier 换成必抛错的函数，
+于是每个候选 → `notify-failed` → `delivery: 'failed'` → **永不重试**。
+系统发现了会话在等你，然后什么也不做，只在日志留一行 ERROR。
+现在退回**终端输出**（写进 runner.log），走成功路径标记 `delivery: 'submitted'`，
+不会被永久吞掉。真正的发送失败仍标 `failed`——兜底不等于掩盖故障。
+
+**2. 同一台机器上两份克隆静默共用同一个 `state.json`。**
+`defaultStateDir()` 是固定路径，**完全不看仓库位置**。正常情况这是对的
+（换目录、换版本不丢数据），但两份克隆会互相覆盖、抢 `rename`、发重复通知，
+而没有任何提示。实测：把仓库复制到临时目录跑，`--health` 报的是原仓库进程的数据。
+不改变路径，只让冲突可见：新增 `owner.json` 归属标记，
+检测到不同仓库时 ERROR + WARN，并给出 `OVERWATCH_STATE_DIR` 隔离方法。
+
+**3. 安装器在非 Windows 上会拼出不存在的路径。**
+`startupDir()` 无条件拼 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`，
+在别的平台上 `install` 会静默建出一串垃圾目录、假装装好了。
+现在非 Windows 返回 null，并给出**实测可用的替代做法**：
+macOS 的 launchd plist、Linux 的 systemd user unit，以及「不配守护进程就跑 `--inbox`」的退路。
+
+**端到端验证**：仓库复制到临时目录 + 独立 `OVERWATCH_STATE_DIR` → 扫描、health、
+`owner.json`、日志全部正常，且不碰原仓库的数据。
+
+**变异验证**：冲突检测恒 false → 1 红；通知兜底（两条：兜底走成功路径、真失败仍标 failed）。
+
 ### Notes（已知且不打算近期修）
 
 1. **在线停止分类 95.4% 判 `UNCLASSIFIABLE`** —— 结构性，分类器需要「下一句」而在线时下一句还没发生。

@@ -440,11 +440,12 @@ function checkUnregisteredExports() {
     'traceability', 'readJobStates', 'probeWaiting', 'readLiveSessionStates',
     'buildInbox', 'formatInbox', 'healthCheck', 'formatHealth', 'HEALTH_PERIODS',
     'statusToState', 'liveToRow', 'mergeLiveSessions', 'listRow', 'detailLines',
+    'claimOwnership', 'readOwner', 'ownerPath',
     // validate-run.mjs
     'validateGraph', 'validateFile', 'CAPABILITIES', 'SHAPES', 'REQUIRED_FOR_COMPLEX', 'MIN_SUBTREES',
     // install-watcher.mjs
     'launcherPath', 'templatePath', 'stateDirFor', 'startupDir', 'shortcutPath',
-    'renderLauncher', 'needsRegenerate', 'createShortcut', 'witnessPath', 'writeWitness', 'readWitness', 'checkStateIntegrity', 'HOST_FACT_STATES',
+    'renderLauncher', 'needsRegenerate', 'createShortcut', 'autostartAdvice', 'witnessPath', 'writeWitness', 'readWitness', 'checkStateIntegrity', 'HOST_FACT_STATES',
     'recalibrateWeights', 'NOTIFY_STATES', '__internals', 'STATES', 'DAY', 'HOUR', 'MINUTE', 'App', 'KINDS',
     // replay-observe.mjs
     'nextTick', 'callsUpTo', 'gapsOf', 'capText', 'compactRecord', 'isToolResultOnly',

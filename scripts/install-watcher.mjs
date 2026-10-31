@@ -52,10 +52,47 @@ export function stateDirFor(env = process.env) {
   return join(xdg, 'overwatch');
 }
 
+/** 开机自启目录。
+ *
+ *  **只有 Windows 有"启动文件夹"这个机制。** 早期版本无条件拼出
+ *  `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`——
+ *  在 macOS / Linux 上那是个不存在的路径，`install` 会静默建出一串垃圾目录。
+ *
+ *  非 Windows 返回 null，调用方据此给出**正确的替代做法**（launchd / systemd），
+ *  而不是假装装好了。 */
 export function startupDir(env = process.env) {
   if (env.OVERWATCH_STARTUP_DIR) return env.OVERWATCH_STARTUP_DIR;
+  if (process.platform !== 'win32') return null;
   return join(env.APPDATA || join(homedir(), 'AppData', 'Roaming'),
     'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
+}
+
+/** 非 Windows 上该告诉用户怎么做。不是占位符——是实测可用的命令。 */
+export function autostartAdvice(platform = process.platform) {
+  if (platform === 'darwin') {
+    return [
+      'macOS 没有"启动文件夹"。用 launchd：',
+      '  1. 写 ~/Library/LaunchAgents/com.overwatch.watch.plist',
+      '     ProgramArguments = ["/usr/local/bin/node", "<repo>/scripts/watch.mjs"]',
+      '     RunAtLoad = true, KeepAlive = true',
+      '  2. launchctl load ~/Library/LaunchAgents/com.overwatch.watch.plist',
+      '',
+      '不想配守护进程的话：定期跑 `node scripts/watch.mjs --inbox` 也能用，只是不实时。',
+    ].join('\n');
+  }
+  if (platform === 'linux') {
+    return [
+      'Linux 用 systemd user unit：',
+      '  1. 写 ~/.config/systemd/user/overwatch.service',
+      '     ExecStart=/usr/bin/node <repo>/scripts/watch.mjs',
+      '     Restart=always',
+      '  2. systemctl --user enable --now overwatch',
+      '  3. 让它在登出后继续跑：loginctl enable-linger $USER',
+      '',
+      '不想配守护进程的话：定期跑 `node scripts/watch.mjs --inbox` 也能用，只是不实时。',
+    ].join('\n');
+  }
+  return '未知平台：请手动在启动时运行 `node scripts/watch.mjs`。';
 }
 
 export function shortcutPath(env = process.env) {
@@ -161,10 +198,20 @@ function main(argv) {
       }
     }
 
-    mkdirSync(startupDir(), { recursive: true });
+    // 非 Windows 没有"启动文件夹"。**不能假装装好了**——
+    // 要么给出正确的替代做法，要么明确说做不到。
+    const sd = startupDir();
+    if (!sd) {
+      console.log('✓ 启动器已就位，但**没有自动注册开机自启**（本平台无"启动文件夹"）。');
+      console.log('');
+      console.log(autostartAdvice());
+      return 0;
+    }
+
+    mkdirSync(sd, { recursive: true });
     const r = createShortcut({
       lnk,
-      target: join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe'),
+      target: join(process.env.SystemRoot || 'C:\Windows', 'System32', 'wscript.exe'),
       args: `"${out}"`,
       workdir: repo,
     });

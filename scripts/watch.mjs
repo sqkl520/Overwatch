@@ -79,6 +79,8 @@ const ACTIVE_WINDOW = 24 * HOUR;
 export const NOTIFY_STATES = ['WAITING', 'FAILED', 'BLOCKED'];
 
 const SCAN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'scan-sessions.mjs');
+/** 本仓库根目录。用于归属检查：判断是否被另一个克隆共用数据目录。 */
+const ROOT_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 
 // ── 路径 ──────────────────────────────────────────────────────────────
 
@@ -155,6 +157,48 @@ export function checkStateIntegrity(stateDir, { nowMs = Date.now() } = {}) {
     previousSaves,
     lastSavedAt: witness.lastSavedAt || null,
   };
+}
+
+/** 数据目录的归属标记：记录是哪个仓库在用它。
+ *
+ *  为什么需要：`defaultStateDir()` 是个固定路径，**完全不看仓库位置**。
+ *  这在正常情况是对的（换目录、换版本都不丢数据），但同一台机器上有两份克隆时，
+ *  它们会共用同一个 `state.json`、抢同一个 `rename`、发重复通知，
+ *  而**没有任何地方会提示这件事**。
+ *
+ *  2026-11-01 实测：把仓库复制到临时目录跑，`--health` 报的是原仓库进程的数据，
+ *  看起来一切正常。
+ *
+ *  这里不改变路径（那会让「换了目录数据就丢」），只让冲突可见。 */
+export function ownerPath(stateDir) {
+  return join(String(stateDir).replace(/[\/]+$/, ''), 'owner.json');
+}
+
+export function readOwner(stateDir) {
+  try {
+    const j = JSON.parse(readFileSync(ownerPath(stateDir), 'utf8'));
+    return j && typeof j === 'object' ? j : null;
+  } catch { return null; }
+}
+
+/** 声明/校验归属。返回 { owner, previous, conflict }。
+ *  conflict = 记录里的仓库路径与当前不同 → 两份克隆在共用一个数据目录。 */
+export function claimOwnership(stateDir, repoPath, { nowMs = Date.now() } = {}) {
+  const prev = readOwner(stateDir);
+  const me = String(repoPath || '').replace(/[\/]+$/, '');
+  const conflict = Boolean(prev && prev.repo && me && prev.repo !== me);
+  const record = {
+    repo: me,
+    firstSeenAt: conflict ? (prev.firstSeenAt || new Date(nowMs).toISOString()) : (prev?.firstSeenAt || new Date(nowMs).toISOString()),
+    lastSeenAt: new Date(nowMs).toISOString(),
+    // 冲突时保留上一个仓库，让人能看到是谁在抢
+    alsoUsedBy: conflict ? [...new Set([...(prev.alsoUsedBy || []), prev.repo])].filter(Boolean) : (prev?.alsoUsedBy || []),
+  };
+  try {
+    mkdirSync(String(stateDir), { recursive: true });
+    writeFileSync(ownerPath(stateDir), JSON.stringify(record, null, 2) + '\n', 'utf8');
+  } catch { /* 写不了也继续跑，这只是元数据 */ }
+  return { owner: record, previous: prev, conflict };
 }
 
 export function defaultStateDir(env = process.env) {
@@ -1484,6 +1528,17 @@ export async function runTick({
   const root = claudeRoot(env, claudeDir);
 
   // 完整性检查必须在 mkdirSync 之前：一旦建了目录，「丢了」和「首次运行」就分不出来了。
+  // 归属检查：同一台机器上两份克隆会静默共用同一个 state.json。
+  // 不改变路径（那会让「换目录就丢数据」），只让冲突可见。
+  const claim = claimOwnership(stateDir, ROOT_DIR, { nowMs });
+  if (claim.conflict) {
+    const prevRepo = claim.previous && claim.previous.repo;
+    const msg = `state-shared: 数据目录 ${stateDir} 已被另一个仓库使用（${prevRepo}）。` +
+      '两份克隆共用同一个 state.json 会互相覆盖、发重复通知。';
+    if (log) log.error(msg);
+    if (log) log.warn('state-shared: 想隔离的话，给其中一份设 OVERWATCH_STATE_DIR 指向不同目录。');
+  }
+
   const integrity = checkStateIntegrity(stateDir, { nowMs });
   const dirExisted = existsSync(stateDir);
   mkdirSync(stateDir, { recursive: true });
@@ -2084,9 +2139,25 @@ async function main(argv) {
     if (!mod.isNotificationAvailable()) throw new Error('通知通道不可用（需要 Windows + wscript + powershell）');
     notifier = mod.sendNotification;
   } catch (e) {
-    console.error(`通知不可用，本次仅记录：${e.message}`);
-    // AC5 的失败路径：退回「仅记录」，而不是假装通知成功
-    notifier = async () => { throw new Error(`通知不可用：${e.message}`); };
+    // 没有桌面通知通道（非 Windows、或 wscript 缺失）时，退回**终端输出**。
+    //
+    // 2026-11-01 实测：旧代码退回一个必抛错的函数，于是每个候选都变成
+    // `notify-failed` → `delivery: 'failed'` → **永不重试**。
+    // 结果是在没有通知通道的机器上，系统是完全静默的：
+    // 它发现了会话在等你，然后什么也不做，只在日志里留一行 ERROR。
+    // 换台机器跑起来的用户永远收不到任何东西，也不会知道为什么。
+    //
+    // 终端输出不完美（守护进程没有终端），但它至少写进 runner.log，
+    // 并且标记为 `delivery: 'console'` 而不是 'failed'——所以**不会被永久吞掉**。
+    const why = e.message;
+    console.error(`通知通道不可用，改为写日志：${why}`);
+    console.error('  桌面通知需要 Windows + wscript + powershell。');
+    console.error('  跨平台用法：定期跑 `node scripts/watch.mjs --inbox` 查看待处理项。');
+    notifier = async (n) => {
+      const line = `[NOTIFY] ${n.title || '(无标题)'}${n.body ? ' — ' + n.body : ''}`;
+      console.error(line);
+      if (n.logger && typeof n.logger.info === 'function') n.logger.info(line);
+    };
   }
 
   if (flags.has('--once') || forceFull) {

@@ -24,7 +24,8 @@ import {
   pruneNotified, NOTIFIED_TTL_HOURS, notifyTitle, NOTIFY_STATES,
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
   observationStats, formatStats, readObservationRows, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
-  traceability, readJobStates, probeWaiting, readLiveSessionStates, buildInbox, formatInbox, healthCheck, formatHealth, HEALTH_PERIODS, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
+  traceability, readJobStates, probeWaiting, readLiveSessionStates, buildInbox, formatInbox, healthCheck, formatHealth, HEALTH_PERIODS,
+  claimOwnership, readOwner, ownerPath, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -1773,4 +1774,87 @@ test('buildInbox：会话 idle 时保留 FAILED——idle 可能正是失败后�
   });
   const out = buildInbox(st, { nowMs: now, live: [{ sessionId: 'parked', status: 'idle' }] });
   assert.equal(out.length, 1, 'idle 不等于已恢复');
+});
+
+// ── 没有桌面通知通道时不能静默（2026-11-01）────────────────────────
+
+test('console 兜底通知返回正常，走成功路径而不是 delivery:failed', async () => {
+  // 旧代码在非 Windows 上把 notifier 换成必抛错的函数，
+  // 于是每个候选 → notify-failed → delivery:'failed' → **永不重试**。
+  // 系统完全静默，只在日志留一行 ERROR。
+  const now = Date.now();
+  const st = emptyState();
+  const out = await dispatchCandidates([{
+    sessionId: 's1', state: 'WAITING', reason: 'waiting:input needed', project: 'demo',
+    idleSec: 5, lastActivity: new Date(now).toISOString(), evidenceFingerprint: '1',
+  }], {
+    state: st, nowMs: now,
+    // 终端兜底：不抛错，只打印
+    notifier: async (n) => { assert.ok(n.title.includes('demo')); },
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    classify: null,
+  });
+  assert.equal(out.sent.length, 1, '兜底通道也算发出去');
+  assert.equal(out.failed.length, 0, '不应标记为失败');
+  const rec = Object.values(st.notified)[0];
+  assert.equal(rec.delivery, 'submitted', '必须是 submitted，否则永不再试');
+});
+
+test('真正发送失败时仍然标记 failed——兜底不等于掩盖故障', async () => {
+  const now = Date.now();
+  const st = emptyState();
+  const out = await dispatchCandidates([{
+    sessionId: 's2', state: 'WAITING', reason: 'waiting:input needed', project: 'demo',
+    idleSec: 5, lastActivity: new Date(now).toISOString(), evidenceFingerprint: '1',
+  }], {
+    state: st, nowMs: now,
+    notifier: async () => { throw new Error('通道炸了'); },
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    classify: null,
+  });
+  assert.equal(out.failed.length, 1);
+  assert.equal(Object.values(st.notified)[0].delivery, 'failed');
+});
+
+// ── 数据目录归属：两份克隆共用一个目录时不能静默（2026-11-01）──────
+
+test('claimOwnership：首次声明不报冲突', () => {
+  const dir = tmp();
+  try {
+    const r = claimOwnership(dir, '/repo/a', { nowMs: Date.now() });
+    assert.equal(r.conflict, false);
+    assert.equal(r.owner.repo, '/repo/a');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('claimOwnership：另一个仓库用同一目录 → 冲突，且上一个被记下来', () => {
+  // 实测：把仓库复制到临时目录跑，--health 报的是原仓库进程的数据，看起来一切正常。
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    claimOwnership(dir, '/repo/a', { nowMs: now });
+    const r = claimOwnership(dir, '/repo/b', { nowMs: now + 1000 });
+    assert.equal(r.conflict, true, '必须报冲突');
+    assert.equal(r.previous.repo, '/repo/a');
+    assert.ok(r.owner.alsoUsedBy.includes('/repo/a'), '要留下是谁在抢');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('claimOwnership：同一仓库重复声明不算冲突', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    claimOwnership(dir, '/repo/a', { nowMs: now });
+    const r = claimOwnership(dir, '/repo/a', { nowMs: now + 1000 });
+    assert.equal(r.conflict, false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('claimOwnership：末尾斜杠不影响判定', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    claimOwnership(dir, '/repo/a', { nowMs: now });
+    assert.equal(claimOwnership(dir, '/repo/a/', { nowMs: now + 1 }).conflict, false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
