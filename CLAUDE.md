@@ -19,7 +19,7 @@
 
 | 需要什么 | 读哪个 |
 |---|---|
-| 四态怎么判、阈值多少 | `docs/spec/state-model.md` |
+| 状态怎么判、阈值多少 | `docs/spec/state-model.md` |
 | 怎么派发、给 Agent 什么 | `docs/spec/dispatch-contract.md` |
 | finding 怎么写、台账怎么用 | `docs/spec/evidence-discipline.md` |
 | 接力怎么触发、草稿怎么写 | `docs/spec/relay-protocol.md` |
@@ -29,13 +29,16 @@
 ## 常用命令
 
 ```bash
-node scripts/scan-sessions.mjs --days 3        # 扫描会话，判定四态
+node scripts/scan-sessions.mjs --days 3        # 扫描会话，判定状态（实测约 33 秒）
 node scripts/scan-sessions.mjs --json          # 机器可读
 node scripts/check-structure.mjs               # 结构硬门
-node --test scripts/state-model.test.mjs       # 四态判定回归测试
+node --test scripts/*.test.mjs                 # 全量回归测试（192 条）
 ```
 
-**任何改动后必须跑 `check-structure.mjs` 和测试。** 两者都绿才能提交。
+**任何改动后必须跑 `check-structure.mjs` 和全量测试。** 两者都绿才能提交。
+
+> 注意：实际产出有区分度的只有宿主上报的 `FAILED` / `BLOCKED`。其余状态是描述，不是判据——
+> 不要用 `EXPLORING` / `PRODUCING` / `STALLED` 去驱动重跑或重拆解。见 `README.md`「关于『四态』」。
 
 ## 目录归属（谁能写哪里）
 

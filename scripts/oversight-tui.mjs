@@ -213,7 +213,7 @@ export function buildDraft(session) {
  * 注意：scan 在存在 FAILED 会话时 exit 1，但 stdout 仍是完整 JSON，不能当失败。
  *
  * 返回 { promise, cancel }：cancel() 会 kill 子进程。
- * 没有这个的话，按 q 之后进程要等扫描跑完（--days 30 实测约 40 秒）才真正退出，
+ * 没有这个的话，按 q 之后进程要等扫描跑完（--days 30 实测约 87 秒）才真正退出，
  * 期间终端已恢复但用户以为卡死。实测曾出现 11.5 秒空窗。
  */
 function defaultScan({ days, exec = execFile }) {
@@ -969,7 +969,7 @@ function usage() {
     '',
     '用法：node scripts/oversight-tui.mjs [--days N] [--interval S] [--plain]',
     '',
-    '  --days N       扫描窗口，默认 3 天（--days 30 实测约 40 秒，随语料增长）',
+    '  --days N       扫描窗口，默认 3 天（--days 30 实测约 87 秒，随语料增长）',
     '  --interval S   轮询间隔秒数，默认 8',
     '  --plain        即使 TTY 也输出纯文本快照',
     '',

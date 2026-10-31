@@ -24,7 +24,11 @@
 - 派生树任一节点仍有增益（见 `state-model.md` §5）；
 - 状态判定为 `PRODUCING` 或 `EXPLORING`。
 
-只有同时满足「`idle` 超过 N 分钟」+「最后一条 AI 消息是问句」+「四态为 `STALLED` 或冷启动 `EXPLORING`」才触发。
+只有同时满足「`idle` 超过 N 分钟」+「最后一条 AI 消息是问句」+「状态为 `STALLED` 或冷启动 `EXPLORING`」才触发。
+
+> ⚠ `STALLED` 实测命中率 0.018%，且从未出现在会话末态——**按本条件触发的接力，实际上不会发生**。
+> 当前真正可用的是 [`needs` / `suggestedReply` 透传](../spec/state-model.md)（宿主自己写的等待内容）。
+> 本节保留作为设计意图，不代表已实现的能力。
 
 ### 1.2 (c) 的判定细节
 
