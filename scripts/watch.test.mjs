@@ -838,30 +838,50 @@ test('分类：COMPLETION_REPORT 被抑制', async () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('分类失败：找不到 transcript 时退回按 state 通知，且标 classify=error 不静默', async () => {
+test('分类失败：非宿主事实的候选找不到 transcript 时，仍按 state 通知并标 classify=error', async () => {
   const root = tmp();
   try {
     const now = Date.now();
     mkdirSync(join(root, 'projects'), { recursive: true });
-    mkdirSync(join(root, 'jobs', 'j1'), { recursive: true });
-    writeFileSync(join(root, 'jobs', 'j1', 'state.json'), JSON.stringify({
-      state: 'failed', sessionId: 'no-transcript', updatedAt: new Date(now).toISOString(), cwd: 'D:\\Projects\\nope',
-    }));
 
-    const logs = [];
+    // 宿主事实（WAITING/FAILED/BLOCKED）现在**不调用分类器**——那是对不可能有效的
+    // 地方白花成本（见 dispatchCandidates 注释）。所以要测「分类失败」这条路径，
+    // 必须用非宿主事实的候选，直接走 dispatchCandidates。
     let n = 0;
-    const r = await runTick({
-      dir: join(root, 'state'), claudeDir: root, nowMs: now, forceFull: true,
-      notifier: async () => { n++; },
-      logger: { info: () => {}, warn: (m) => logs.push(m), error: (m) => logs.push(m) },
-      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+    const r = await dispatchCandidates([{
+      sessionId: 'no-transcript', state: 'EXPLORING', reason: 'read-only', project: 'nope',
+      idleSec: 0, lastActivity: new Date(now).toISOString(), evidenceFingerprint: '1',
+    }], {
+      state: emptyState(), nowMs: now, notifier: async () => { n++; },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      classify: (c) => classifyCandidate(c, { projectsRoot: join(root, 'projects'), nowMs: now, logger: { info: () => {}, warn: () => {}, error: () => {} } }),
+      observations: createObservationLog(join(root, 'state')),
     });
-    assert.equal(n, 1, '分类失败必须保持接入前的行为：仍按 state 通知');
     const o = JSON.parse(readFileSync(join(root, 'state', 'observations.jsonl'), 'utf8').trim());
     assert.equal(o.classify, 'error');
-    assert.equal(o.notified, true);
-    void r; void logs;
+    assert.equal(o.kind, 'UNCLASSIFIABLE');
+    // 关键：失败不能静默变成「不发」。kind 门只拦 classify!=='error' 的，
+    // 所以 error 会退回按 state 判断，最终仍然发出。
+    assert.equal(n, 1, '分类失败必须保持接入前的行为：仍按 state 通知');
+    assert.equal(r.sent.length, 1);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('宿主事实候选不调用分类器——它对这类候选在结构上不可能有效', async () => {
+  const now = Date.now();
+  for (const st of HOST_FACT_STATES) {
+    let called = 0;
+    const r = await dispatchCandidates([{
+      sessionId: `s-${st}`, state: st, reason: 'host', project: 'p',
+      idleSec: 0, lastActivity: new Date(now).toISOString(), evidenceFingerprint: '1',
+    }], {
+      state: emptyState(), nowMs: now, notifier: async () => {},
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      classify: () => { called++; return { kind: 'UNCLASSIFIABLE', classify: 'error' }; },
+    });
+    assert.equal(called, 0, `${st} 不该调用分类器——它没有可读的停止点`);
+    assert.equal(r.sent.length, 1, `${st} 仍必须通知`);
+  }
 });
 
 test('分类：mtime 未变时复用缓存，不再读文件', async () => {
@@ -1442,4 +1462,41 @@ test('readLiveSessionStates 返回全部状态，不只是 waiting', () => {
     assert.equal(out.length, 3);
     assert.deepEqual(out.map((o) => o.status).sort(), ['busy', 'idle', 'waiting']);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// ── 观察统计：区分新旧策略时期 ────────────────────────────────────────
+
+test('--stats 标出 classify=error 的旧行，避免把两段策略混成一个分布', () => {
+  const stats = {
+    total: 3, firstTs: '2026-10-31T00:00:00Z', lastTs: '2026-10-31T01:00:00Z',
+    kinds: [{ kind: 'UNCLASSIFIABLE', n: 3, pct: 100 }],
+    notified: 0, suppressed: 3, byState: [], unclassifiableIdle: null,
+    byClass: { error: 2, ok: 1 },
+  };
+  const out = formatStats(stats);
+  assert.ok(out.includes('2 条 classify=error'), `未标出旧行：\n${out}`);
+  assert.ok(out.includes('现在不调用分类器'), '应解释为什么这些行不会再产生');
+});
+
+test('--stats 在没有旧行时不打这条警告', () => {
+  const stats = {
+    total: 2, firstTs: '2026-10-31T00:00:00Z', lastTs: '2026-10-31T01:00:00Z',
+    kinds: [{ kind: 'ASKED_UNANSWERED', n: 2, pct: 100 }],
+    notified: 1, suppressed: 1, byState: [], unclassifiableIdle: null,
+    byClass: { ok: 2 },
+  };
+  assert.ok(!formatStats(stats).includes('classify=error'));
+});
+
+test('observationStats 统计 classify 分布', () => {
+  const dir = tmp();
+  try {
+    const log = createObservationLog(dir);
+    log.append([
+      { ts: '2026-10-31T01:00:00Z', sessionId: 'a', state: 'WAITING', kind: 'UNCLASSIFIABLE', classify: 'error', notified: false },
+      { ts: '2026-10-31T02:00:00Z', sessionId: 'b', state: 'WAITING', kind: 'ASKED_UNANSWERED', classify: 'ok', notified: true },
+    ]);
+    const st = observationStats(dir);
+    assert.deepEqual(st.byClass, { error: 1, ok: 1 });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

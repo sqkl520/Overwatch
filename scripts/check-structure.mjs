@@ -569,6 +569,19 @@ function checkLedger() {
   if (existsSync(df)) {
     let text;
     try { text = readFileSync(df, 'utf8'); } catch { text = ''; }
+    // 标题里的状态必须与正文 `**状态**：xxx` 一致。
+    // 2026-10-31 实测：DF-020 标题写 [open]、正文写 fixed，两个地方对不上，
+    // 而台账是「还有多少债」的唯一来源。不一致的台账比没有台账更坏。
+    for (const b of text.split(/^### /m).slice(1)) {
+      const head = b.match(/^(DF-\d{3}) \[([a-z]+)\]/);
+      if (!head) continue;
+      const body = b.match(/\*\*状态\*\*[：:]\s*([a-z]+)/);
+      if (!body) continue;
+      if (body[1] !== head[2]) {
+        fail('tasks/dev-findings.md', `${head[1]} 标题写 [${head[2]}]，正文写 ${body[1]} —— 状态不一致`);
+      }
+    }
+
     const entries = [...text.matchAll(/^### (DF-\d{3}) \[([a-z]+)\]/gm)];
     const real = entries.filter(([, , st]) => ENUM.has(st));
     const bad = entries.filter(([, , st]) => !ENUM.has(st));

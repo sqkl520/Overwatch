@@ -1073,7 +1073,11 @@ export function observationStats(dir) {
     notified: 0,
     suppressed: 0,
     byState: [],
+    byState: [],
     unclassifiableIdle: null,
+    // classify 的取值分布（'ok' / 'error'）。用于识别「旧策略时期的行」：
+    // 宿主事实候选现在不调用分类器，所以新行不会再有 classify=error。
+    byClass: {},
   };
   if (!rows.length) return res;
 
@@ -1085,6 +1089,8 @@ export function observationStats(dir) {
   let unkNoIdle = 0;
   for (const r of rows) {
     const kind = typeof r.kind === 'string' ? r.kind : 'UNKNOWN';
+    const cls = typeof r.classify === 'string' ? r.classify : 'none';
+    res.byClass[cls] = (res.byClass[cls] || 0) + 1;
     kindCount.set(kind, (kindCount.get(kind) || 0) + 1);
     const state = typeof r.state === 'string' ? r.state : 'UNKNOWN';
     stateCount.set(state, (stateCount.get(state) || 0) + 1);
@@ -1153,6 +1159,18 @@ export function formatStats(stats, { minIdleSec = UNCLASSIFIABLE_MIN_IDLE_SEC } 
     lines.push(`  ${k.kind.padEnd(pad)} ${String(k.n).padStart(5)}  ${k.pct.toFixed(1)}%`);
   }
   lines.push(`通知：发了 ${s.notified} 条，抑制 ${s.suppressed} 条`);
+  // 样本里若含「按当前策略不会再产生」的行，必须说出来。
+  //
+  // 2026-10-31：宿主事实候选改为不调用分类器后，`classify:error` + `UNCLASSIFIABLE`
+  // 这类行再也不会产生。但旧行还留在日志里，`--stats` 会照样把它们算进分布，
+  // 于是「分类分布」看起来像当前行为，实际是一段已经结束的历史。
+  // 分布图本身没错，错的是**没标注它跨了两个不同的策略时期**。
+  const stale = s.byClass ? (s.byClass.error || 0) : 0;
+  if (stale) {
+    lines.push(`  ⚠ 其中 ${stale} 条 classify=error 是旧策略时期的（宿主事实候选现在不调用分类器），`);
+    lines.push('    它们不会再产生，但会稀释上面各行的比例。要干净分布请看时间靠后的部分。');
+  }
+
 
   // 时间维度：直接回答「门槛该不该调」。
   // 若 <300s 桶里出现「通知」，说明门槛没有生效（例如 UNCLASSIFIABLE 之外的原因漏进来）。
@@ -1252,10 +1270,23 @@ export async function dispatchCandidates(candidates, {
     const c = { ...candidate };
 
     // ── 停止分类 ──
-    // 没有 projectsRoot（例如纯 jobs 目录的测试夹具）时跳过分类，行为与接入前一致。
-    // 但**只要给了 projectsRoot**，任何分类失败都必须标记出来，不能静默当成功。
+    // 宿主事实状态**不调用分类器**。
+    //
+    // 理由不是「分类器不准」，而是**它对这类候选在结构上不可能有效**：
+    // classifyStop 需要 transcript 里的一个停止点，而 WAITING 来自 sessions/*.json，
+    // 那些会话可能根本没有可读的 transcript 尾部。实测对一个真实 WAITING 候选调用它，
+    // 100% 返回 kind=UNCLASSIFIABLE + classify=error。
+    //
+    // 调用的代价不是零：它每轮都去读 transcript 尾部，产出却是一行
+    // 「找不到该会话的 transcript」写进观察日志，把真实信号淹掉。
+    // 2026-10-31 实测观察日志 6 条里 5 条是这种噪音，唯一有信息量的 1 条
+    // （ASKED_UNANSWERED）也不影响通知——因为宿主事实本来就跳过分类门。
+    //
+    // 分类能力保留：将来若重新引入基于 transcript 的推断状态，它立刻重新有用。
+    const hostFact = HOST_FACT_STATES.includes(c.state);
     let obs = null;
-    if (typeof classify === 'function') {
+    if (typeof classify === 'function' && !hostFact) {
+
       try {
         obs = classify(c);
       } catch (e) {
