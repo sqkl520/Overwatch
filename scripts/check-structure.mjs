@@ -703,6 +703,47 @@ function checkInboxWiring() {
   }
 }
 
+/** DF-016：设计文档必须标明「未实现」，且索引必须覆盖每一份。
+ *
+ *  970 行设计文档描述的能力一行代码都没有，而在此之前**没有任何入口指向它们**——
+ *  读者只知道仓库里有这个目录，不知道里面是什么。
+ *
+ *  这里守住三件事：
+ *    1. design/README.md 存在（索引本身不能没有）
+ *    2. design/ 下每一份 .md 都在索引里被提到（新增文档不能绕过索引）
+ *    3. 索引里必须出现「未实现」字样（不能哪天被悄悄改成「部分实现」）
+ */
+function checkDesignIndex() {
+  const dir = join(ROOT, 'docs', 'design');
+  if (!existsSync(dir)) return;
+  const index = join(dir, 'README.md');
+  if (!existsSync(index)) {
+    fail('docs/design/README.md', '缺少设计存档索引——读者会以为这些文档描述的是已实现能力');
+    return;
+  }
+  let idx = '';
+  try { idx = readFileSync(index, 'utf8'); } catch { /* ignore */ }
+  if (!/未实现/.test(idx)) {
+    fail('docs/design/README.md', '索引必须明确写出这些文档描述的能力「未实现」');
+  }
+  const docs = readdirSync(dir).filter((f) => f.endsWith('.md') && f !== 'README.md');
+  for (const f of docs) {
+    if (!idx.includes(f)) {
+      fail('docs/design/README.md', `${f} 没有被索引提到——新增设计文档必须登记状态`);
+    }
+  }
+  // 入口必须指向索引：否则还是没人会点进去
+  for (const entry of ['README.md', 'CLAUDE.md']) {
+    const p = join(ROOT, entry);
+    if (!existsSync(p)) continue;
+    let t = '';
+    try { t = readFileSync(p, 'utf8'); } catch { /* ignore */ }
+    if (!t.includes('docs/design/README.md')) {
+      fail(entry, '没有指向 docs/design/README.md —— 读者找不到设计文档的状态说明');
+    }
+  }
+}
+
 // ── 运行 ──────────────────────────────────────────────────────────────
 
 console.log('check-structure · 仓库结构硬门\n');
@@ -721,6 +762,7 @@ checkChangelog();
 checkLedger();
 checkLauncherPlacement();
 checkInboxWiring();
+checkDesignIndex();
 
 if (violations.length) {
   console.log(`✗ ${violations.length} 项违规：\n`);

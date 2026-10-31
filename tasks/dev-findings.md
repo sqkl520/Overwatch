@@ -165,7 +165,7 @@
 - **处置（2026-10-31 已修）**：`watch.mjs --inbox` 提供收件箱，SKILL.md §0、relay、probe 全部改为先读它。
   `checkInboxWiring()` 守住这条线不再断。
 
-### DF-016 [open] docs/design/ 下 970 行描述的能力没有对应实现
+### DF-016 [fixed] docs/design/ 下 970 行描述的能力没有对应实现
 
 - **发现于**：2026-10-31 锐评 agent（「970 行设计文档对应 0 行代码，天花板 2.5%」）
 - **位置**：`docs/design/hosted-mode.md`（457 行）、`docs/design/verdict-intent-contract.md`、`docs/spec/dispatch-contract.md`
@@ -174,7 +174,8 @@
 - **影响**：读者（包括未来的我）会以为系统具备分级升级与代决策能力。ADR-0001 已声明「纯配置库、不自动接力」，
   **但设计文档没有同步降级**，两者给出相反的印象。
 - **为什么不自行修**：删还是标注，取决于 P1 是否真的要做 hosted mode。现在删掉等于销毁设计投入。
-- **状态**：已登记，未处理。当前处置是在 README「已知局限」里点明天花板。
+- **处置（2026-10-31 已修）**：新增 `docs/design/README.md` 索引与「哪节已实现」对照表，
+  `README.md` / `CLAUDE.md` 都指向它；结构门 `checkDesignIndex()` 守住索引不被绕过。
 
 ### DF-017 [fixed] 在线停止分类 95.4% 判 UNCLASSIFIABLE，分类器在在线路径基本失效
 

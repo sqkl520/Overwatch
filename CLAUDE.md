@@ -25,6 +25,7 @@
 | 接力怎么触发、草稿怎么写 | `docs/spec/relay-protocol.md` |
 | 输出长什么样 | `docs/spec/output-format.md` |
 | 为什么是纯配置库 / 为什么降级 | `docs/adr/0001-config-only.md`、`docs/adr/0002-honest-degradation.md` |
+| 想看设计推演（**全部未实现**） | `docs/design/README.md` —— 先读它，再决定要不要点进去 |
 
 ## 常用命令
 
