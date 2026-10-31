@@ -151,4 +151,56 @@
 - **仍未覆盖**：滚动窗口（`listOffset` 的跟随逻辑）、窄屏拆列的视觉正确性（只验证不崩）。
 - **已做**：`detailLines` 已导出并单独测试（见 oversight-tui.test.mjs）。
 
+### DF-015 [open] 12 个角色定义里没有一个引用 watch.mjs，监控与调度两半没接上
+
+- **发现于**：2026-10-31 锐评 agent（结论「4/10」的第三条指控）
+- **位置**：`.claude/agents/*.md`（12 个文件，743 行）、`.claude/skills/oversight/SKILL.md`
+- **证据**：在 `.claude/` 下 grep `watch.mjs` 无任何结果。只有 `oversight-probe.md` 与 `oversight-relay.md` 提到
+  `scan-sessions.mjs`，其余 10 个角色对监控层零引用。SKILL.md 也只调 `scan-sessions`。
+- **影响**：产品有两个部分——「守夜人」`watch.mjs`（后台常驻、发通知）与「调度流程」`SKILL.md`（主线程派发 agent）。
+  **两者共享同一份判定逻辑，却互不知情。** 后台发现 `BLOCKED` 发通知，主线程的调度流程完全不知道这件事发生过；
+  反过来 SKILL.md 让主线程自己扫会话，与后台守夜人重复劳动。
+- **为什么不自行修**：怎么接是产品决策——让 `watch` 写一个主线程读取的状态文件、让 `probe` agent 直接读
+  `observations.jsonl`、还是承认后台只做通知不参与调度。三条路的产品含义不同。
+- **状态**：已登记，未处理。
+
+### DF-016 [open] docs/design/ 下 970 行描述的能力没有对应实现
+
+- **发现于**：2026-10-31 锐评 agent（「970 行设计文档对应 0 行代码，天花板 2.5%」）
+- **位置**：`docs/design/hosted-mode.md`（457 行）、`docs/design/verdict-intent-contract.md`、`docs/spec/dispatch-contract.md`
+- **证据**：`docs/design/` 下三个文件共 970+ 行，描述 L1–L5 升级、意图契约、判定-意图双层。
+  `scripts/` 里没有任何模块实现它们；`watch.mjs` 只做「检测 → 通知」，不做升级也不做代决策。
+- **影响**：读者（包括未来的我）会以为系统具备分级升级与代决策能力。ADR-0001 已声明「纯配置库、不自动接力」，
+  **但设计文档没有同步降级**，两者给出相反的印象。
+- **为什么不自行修**：删还是标注，取决于 P1 是否真的要做 hosted mode。现在删掉等于销毁设计投入。
+- **状态**：已登记，未处理。当前处置是在 README「已知局限」里点明天花板。
+
+### DF-017 [open] 在线停止分类 95.4% 判 UNCLASSIFIABLE，分类器在在线路径基本失效
+
+- **发现于**：2026-10-31 全语料回放（`docs/research/2026-10-31-online-classification.md`）
+- **位置**：`scripts/classify-stop.mjs`、`watch.mjs` 的 `classifyCandidate`
+- **证据**：146 个会话、真实在线上下文下，`classifyStop` 输出 **100% `UNCLASSIFIABLE`**（同一批数据若允许看「下一句」
+  则只有 22.94%）。
+- **影响**：分类门对通知几乎不起作用。**当前已通过 `NOTIFY_STATES` 收窄绕过这个问题**——通知只认宿主事实，
+  不走分类门。但 `classifyStop` 仍被 `watch.mjs` 调用，其输出只用于日志与观察记录。
+- **为什么没修成**：结构性限制，不是 bug。第一条分类规则需要「下一句」，而在线时下一句还没发生。
+- **状态**：已知，不打算近期修。已写入 README「已知局限」与 `observe-period.md` §六。
+
+### DF-018 [open] 抑制正确率没有自动测量手段
+
+- **发现于**：`docs/observe-period.md` Q2，自 `e9a8693` 起存在
+- **位置**：`watch.mjs` 的观察日志
+- **证据**：`observations.jsonl` 只记判定当时的状态，不记「后来怎么样了」。无法回答「被抑制的候选里有多少其实一直卡着」。
+- **影响**：`tooRecentToNotify` 这个 5 分钟门槛的取值没有任何数据支撑，只是理论上合理。
+- **需要什么**：每次判定后 N 分钟再查一次状态（「回访」机制）。属 P1。
+- **状态**：已登记，未处理。
+
+### DF-019 [open] needs / suggestedReply 覆盖稀疏，透传能力实际很少触发
+
+- **发现于**：2026-10-31 复算
+- **位置**：`scan-sessions.mjs` 的 `parseJobs`、`watch.mjs` 的 `probeJobs`
+- **证据**：本机 16 个 job 文件里只有 **2 个**带 `needs`、**1 个**带 `suggestedReply`。
+- **影响**：这是 README 宣传的主要能力之一（「透传宿主写好的等待内容」），但真实数据里触发频率很低。
+- **为什么不修**：宿主只在阻塞时写这两个字段，写不写取决于用法，不是本库能控制的。
+- **状态**：已知，不修。已写入 README「已知局限」。
 _（新增条目追加在此行上方）_

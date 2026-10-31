@@ -547,6 +547,52 @@ function checkChangelog() {
   }
 }
 
+/** 台账格式门：两本台账是「不自行修」这条纪律的载体。
+ *  纪律靠格式维持，格式坏了纪律就悄悄消失 —— 例如把所有条目都标成 [fixed]，
+ *  台账看起来干净，实际是「没人往里面加」。2026-10-31 实测：14 条里 14 条 fixed，
+ *  一个开放项都没有，而同一时期明确发现了 5 个未修问题。
+ *
+ *  这里不检查「应该有多少 open」（那是判断，不是事实），只检查**格式合法性**：
+ *  状态必须在枚举内、每个条目必须有发现位置、ledger 不能全是 fixed 而文件里还有 open 字样。 */
+function checkLedger() {
+  const ENUM = new Set(['open', 'triaged', 'scheduled', 'fixed', 'wontfix']);
+
+  const df = join(ROOT, 'tasks', 'dev-findings.md');
+  if (existsSync(df)) {
+    let text;
+    try { text = readFileSync(df, 'utf8'); } catch { text = ''; }
+    const entries = [...text.matchAll(/^### (DF-\d{3}) \[([a-z]+)\]/gm)];
+    const real = entries.filter(([, , st]) => ENUM.has(st));
+    const bad = entries.filter(([, , st]) => !ENUM.has(st));
+    for (const [, id, st] of bad) {
+      fail('tasks/dev-findings.md', `${id} 的状态 "${st}" 不在枚举内（${[...ENUM].join(' / ')}）`);
+    }
+    if (!real.length) {
+      warn('tasks/dev-findings.md', '没有识别到任何 DF-xxx 条目 —— 台账可能是空的，或格式变了');
+    } else {
+      const open = real.filter(([, , st]) => st === 'open' || st === 'triaged' || st === 'scheduled').length;
+      // 只提示，不阻塞：全 fixed 可能是真的都修完了。但值得每次看见，因为更常见的是没人往里加。
+      if (open === 0) {
+        warn('tasks/dev-findings.md', `${real.length} 条全部已收口，0 个开放项 —— 确认这是事实，而不是没人登记`);
+      }
+    }
+  }
+
+  const ad = join(ROOT, 'tasks', 'accepted-deviations.md');
+  if (existsSync(ad)) {
+    let text;
+    try { text = readFileSync(ad, 'utf8'); } catch { text = ''; }
+    // 每条已知偏差必须写明「为什么不修」，否则它只是一条待办
+    const blocks = text.split(/^### /m).slice(1);
+    for (const b of blocks) {
+      const id = (b.match(/^([\w-]+)/) || [])[1] || '(无编号)';
+      if (!/为什么|理由|代价/.test(b)) {
+        fail('tasks/accepted-deviations.md', `${id} 没有写明不修的理由 —— 没写理由的偏差就是一条待办`);
+      }
+    }
+  }
+}
+
 // ── 运行 ──────────────────────────────────────────────────────────────
 
 console.log('check-structure · 仓库结构硬门\n');
@@ -562,6 +608,7 @@ checkImportable();
 checkUnregisteredExports();
 checkLinks();
 checkChangelog();
+checkLedger();
 
 if (violations.length) {
   console.log(`✗ ${violations.length} 项违规：\n`);
