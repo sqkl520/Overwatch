@@ -1859,7 +1859,13 @@ export function buildInbox(state, { nowMs = Date.now(), ttlHours = 72, states = 
       liveStatus = cur ? cur.status : null;
       // 历史说 WAITING，但现在已不是 waiting → 这条已经过时
       if (e.state === 'WAITING' && liveStatus !== 'waiting') stale = true;
-      // 历史说 FAILED/BLOCKED，但会话已不存在或状态已变 → 也过时
+      // FAILED / BLOCKED 的失效条件**不只是「会话不在了」**。
+      // 2026-10-31 实测假阳性：一个会话早就在正常工作（live.status='busy'），
+      // 但 jobs 里那条 failed 记录还在，收件箱就把它当「需要人处理」报出来。
+      // jobs/*/state.json 是**最后一次作业的结果**，不是会话的当前状态。
+      // 所以：会话仍活着且显然在干活（busy）→ 那条失败记录已经过时。
+      // 注意不把 'idle' 也算过时：idle 可能正是失败之后停在那儿等你看。
+      if ((e.state === 'FAILED' || e.state === 'BLOCKED') && cur && liveStatus === 'busy') stale = true;
       if ((e.state === 'FAILED' || e.state === 'BLOCKED') && !cur) stale = true;
     }
 

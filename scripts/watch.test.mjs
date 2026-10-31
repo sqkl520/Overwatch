@@ -1611,8 +1611,12 @@ test('buildInbox 对 FAILED/BLOCKED 也做对账：会话已不存在则是旧�
     a: { sessionId: 'dead', state: 'FAILED', idleSec: 60, notifyCount: 1, lastSeenAt: iso },
   });
   assert.equal(buildInbox(st, { nowMs: now, live: [] }).length, 0, '会话已不在 → 旧账');
-  assert.equal(buildInbox(st, { nowMs: now, live: [{ sessionId: 'dead', status: 'busy' }] }).length, 1,
-    '会话还在（哪怕是 busy），failed 记录仍需人看一眼');
+  // busy 表示它已经在干活——旧失败记录已过时（2026-10-31 实测假阳性）。
+  assert.equal(buildInbox(st, { nowMs: now, live: [{ sessionId: 'dead', status: 'busy' }] }).length, 0,
+    'busy = 已恢复，不该再报');
+  // idle 则保留：可能正是失败后停在那儿等你看。
+  assert.equal(buildInbox(st, { nowMs: now, live: [{ sessionId: 'dead', status: 'idle' }] }).length, 1,
+    'idle 不等于已恢复');
 });
 
 // ── 宿主事实必须写观察日志（2026-10-31 回归）────────────────────────
@@ -1746,4 +1750,27 @@ test('formatHealth：不健康时明确区分「进程死了」与「进程卡�
     lastProbeAt: new Date(now - 6 * 3600e3).toISOString() }, { nowMs: now }));
   assert.ok(out.includes('没有在工作'));
   assert.ok(out.includes('不代表进程死了'), '必须说清这不是进程崩溃，而是卡住');
+});
+
+test('buildInbox：会话已恢复正常工作（busy）时，旧的 FAILED 记录算过时', () => {
+  // 2026-10-31 实测假阳性：一个会话在正常工作，jobs 里那条 failed 还在，
+  // 收件箱就报「需要人处理」。jobs/state.json 是**最后一次作业的结果**，
+  // 不是会话的当前状态。
+  const now = Date.now();
+  const iso = new Date(now).toISOString();
+  const st = mkState({
+    a: { sessionId: 'recovered', state: 'FAILED', idleSec: 60, notifyCount: 1, lastSeenAt: iso },
+  });
+  assert.equal(buildInbox(st, { nowMs: now, live: [{ sessionId: 'recovered', status: 'busy' }] }).length, 0,
+    '会话已经在干活了，旧失败记录不该再打扰');
+});
+
+test('buildInbox：会话 idle 时保留 FAILED——idle 可能正是失败后停在那儿等你看', () => {
+  const now = Date.now();
+  const iso = new Date(now).toISOString();
+  const st = mkState({
+    a: { sessionId: 'parked', state: 'FAILED', idleSec: 60, notifyCount: 1, lastSeenAt: iso },
+  });
+  const out = buildInbox(st, { nowMs: now, live: [{ sessionId: 'parked', status: 'idle' }] });
+  assert.equal(out.length, 1, 'idle 不等于已恢复');
 });
