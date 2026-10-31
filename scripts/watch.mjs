@@ -443,6 +443,31 @@ export function recordSent(state, sessionId, nowMs = Date.now()) {
  *
  *  逆向来源：claude.exe 2.1.270，wS = { running:"busy", requires_action:"waiting", idle:"idle" }
  *  与 bVo() 的五个判定分支。见 scan-sessions.mjs 的 readLiveSessions 注释。 */
+/** 读全部会话状态（不限 waiting），供可追溯性检查使用。
+ *
+ *  `probeWaiting` 只返回 waiting 的（它是通知源），但 `--trace` 需要看到**所有**
+ *  会话的 status，才能判断某条 WAITING 通知对应的会话当时是不是真的在等。
+ *  两者共用同一份文件格式，但目的不同，不要合并。 */
+export function readLiveSessionStates(claudeDir = null) {
+  const root = join(String(claudeDir || join(homedir(), '.claude')), 'sessions');
+  const out = [];
+  let files;
+  try { files = readdirSync(root); } catch { return out; }
+  for (const name of files) {
+    if (!name.endsWith('.json')) continue;
+    let s;
+    try { s = JSON.parse(readFileSync(join(root, name), 'utf8')); } catch { continue; }
+    if (!s.sessionId) continue;
+    out.push({
+      sessionId: s.sessionId,
+      status: s.status || null,
+      waitingFor: typeof s.waitingFor === 'string' ? s.waitingFor : null,
+      statusUpdatedAt: s.statusUpdatedAt ?? null,
+    });
+  }
+  return out;
+}
+
 export function probeWaiting(sessionsRoot, { nowMs = Date.now() } = {}) {
   const started = process.hrtime.bigint();
   const found = [];
@@ -701,6 +726,14 @@ export function candidatesFromScan(sessions, { nowMs = Date.now(), states = NOTI
 export const NOTIFY_KINDS = Object.freeze([
   'EXTERNAL_BLOCKED', 'WAITING_APPROVAL', 'ASKED_UNANSWERED', 'PLAN_SUBMITTED', 'UNCLASSIFIABLE',
 ]);
+
+/** 由宿主直接写下、不经过 transcript 推断的状态。
+ *
+ *  这三者对「分类门 / 时间门」免疫，理由相同：它们不是「这次停止是问句还是结束」的猜测，
+ *  而是宿主自己的结论。拿分类器再判一遍，只会把确定信号降级成不确定的。
+ *  ——实测：WAITING 候选会被 classifyCandidate 判成 UNCLASSIFIABLE + classify:error
+ *  （sessions/ 里没有对应停止点），然后撞上 5 分钟时间门被抑制。 */
+export const HOST_FACT_STATES = Object.freeze(['WAITING', 'FAILED', 'BLOCKED']);
 
 /** `UNCLASSIFIABLE` 的最短观察期，秒。默认 5 分钟。
  *
@@ -1135,6 +1168,20 @@ export function formatStats(stats, { minIdleSec = UNCLASSIFIABLE_MIN_IDLE_SEC } 
  */
 export function notifyTitle(c) {
   const where = c.project || (c.sessionId || '').slice(0, 8);
+
+  // 宿主事实优先于分类结果。分类器对 WAITING 候选返回 UNCLASSIFIABLE
+  // （sessions/ 里没有对应停止点），如果先看 kind，标题会变成
+  // 「疑似停滞（判不出类型）」——**把一个确定的等待说成猜测**。
+  // 端到端跑真实候选时就是这么暴露的。
+  if (c.state === 'WAITING') {
+    const what = String(c.reason || '').replace(/^waiting:/, '');
+    return what && what !== c.reason
+      ? `✋ ${where} · 正在等你（${what}）`
+      : `✋ ${where} · 正在等你`;
+  }
+  if (c.state === 'BLOCKED') return `⏸ ${where} · 受阻`;
+  if (c.state === 'FAILED') return `✖ ${where} · 宿主报失败`;
+
   const kind = c.kind || null;
   if (kind === 'UNCLASSIFIABLE') {
     // 明确告诉用户这是「不确定」，而不是「确认卡住」
@@ -1224,10 +1271,19 @@ export async function dispatchCandidates(candidates, {
       continue;
     }
 
+    // ── 宿主事实：跳过分类门与时间门 ──
+    // WAITING / FAILED / BLOCKED 都来自宿主自己写下的状态，不是从 transcript 推的。
+    // 对它们做「这次停止是不是问句」的分类毫无意义：
+    //   实测 WAITING 候选被 classifyCandidate 判成 UNCLASSIFIABLE + classify:error
+    //   （因为 sessions 里没有对应的停止点），随后撞上 5 分钟时间门被抑制——
+    //   **一个刚发生 5 秒的真实等待，被当成「刚停下，再等等」压掉了。**
+    // 这跟 jobs 的 failed/blocked 是同一类东西，本来就该走同一条路。
+    const isHostFact = HOST_FACT_STATES.includes(c.state);
+
     // ── 分类门：不该通知的停止直接抑制 ──
     // kind 门先于去重表登记：被抑制的候选不占用一个 notified 条目，
     // 否则同一会话下次因为别的原因停下来时会被「已处理」挡住。
-    if (obs && obs.classify !== 'error' && !NOTIFY_KINDS.includes(obs.kind)) {
+    if (!isHostFact && obs && obs.classify !== 'error' && !NOTIFY_KINDS.includes(obs.kind)) {
       summary.suppressed.push({ key, sessionId: c.sessionId, why: 'kind-not-notifiable', kind: obs.kind });
       summary.observations.push({ ...obs, notified: false });
       if (logger) logger.info(`suppressed ${c.state} kind=${obs.kind} session=${c.sessionId}`);
@@ -1240,7 +1296,7 @@ export async function dispatchCandidates(candidates, {
     // 它挡的是理论边界，不是实际噪音。实际压制噪音的是 hb_gap 判据自带的下限。
     // 与 kind 门同样先于 state 登记：被时间门挡下的不占用 notified 条目，
     // 等 idleSec 涨过门槛时同一轮就能正常走后面的流程。
-    if (obs && obs.classify !== 'error' && tooRecentToNotify(obs.kind, c.idleSec ?? obs.idleSec, minIdle)) {
+    if (!isHostFact && obs && obs.classify !== 'error' && tooRecentToNotify(obs.kind, c.idleSec ?? obs.idleSec, minIdle)) {
       const idle = c.idleSec ?? obs.idleSec;
       summary.suppressed.push({ key, sessionId: c.sessionId, why: 'unclassifiable-too-recent', kind: obs.kind, idleSec: idle });
       summary.observations.push({ ...obs, idleSec: idle, notified: false, why: 'unclassifiable-too-recent' });
@@ -1426,10 +1482,13 @@ export async function runTick({
     // 全量也到期时，增量就是纯浪费——全量本来就把所有项目扫一遍。
     // 首次运行（没有探针基线）尤其明显：21 个项目全被判为「变化」，
     // 跑 5 次增量再跑全量，白烧约 10 秒。首轮只建立基线，不扫。
-    const fullAlsoDue = forceFull || due(state.lastFullScanAt, FULL_INTERVAL);
+    // 全量只在 --full 时跑（见下方 L-full 注释），所以「全量同轮到期就跳过增量」
+    // 这个优化已经没有意义了——跳过增量的唯一结果是什么都没扫。
+    // 首次建立基线仍然跳过（没有基线谈不上「变化」），其余情况一律扫变化的项目。
     if (firstProbe) {
-      log.info(`probe 基线已建立：${probe.projects.length} 个项目（首轮不跑增量，交给全量）`);
-    } else if (fullAlsoDue) {
+      log.info(`probe 基线已建立：${probe.projects.length} 个项目（首轮只建基线，不扫描）`);
+    } else if (forceFull) {
+      log.info(`probe changed=${changed.length} 但本轮 --full，跳过增量`);
       log.info(`probe changed=${changed.length} 但全量同轮到期，跳过增量`);
     } else {
       // 只对变化的项目跑增量：约 1.5–2s，不是 20s
@@ -1448,20 +1507,29 @@ export async function runTick({
   }
 
   // ── L-full ──
-  if (forceFull || due(state.lastFullScanAt, FULL_INTERVAL)) {
-    const hasScanned = summary.ran.some((r) => r.startsWith('scan:'));
-    // 增量已经把变化的项目扫过了；全量仍按 30 分钟节奏补一次盲区
+  //
+  // **2026-10-31 停用。** 它原本每 30 分钟全量扫一次，理由是「补增量漏掉的盲区」。
+  // 但 `candidatesFromScan` 只认 `NOTIFY_STATES`，而那三个状态（WAITING / FAILED /
+  // BLOCKED）**全部来自宿主文件**，L-fast 每分钟已经完整读过一遍
+  // （`probeJobs` 读 jobs/，`probeWaiting` 读 sessions/）。
+  //
+  // 于是 L-full 的产出恒为空集：实测连续三次 `full=28159ms / 21543ms / 19106ms`，
+  // 每次 `candidates=0`。**一天烧约 25 分钟 CPU，换零个候选。**
+  //
+  // 留着它只有一个理由：为「将来某个基于 transcript 的推断状态」做准备。
+  // 那种状态下它会重新有用，但那时应该连同判据一起加回来——而不是现在空转。
+  //
+  // `--full` 仍然可用：手动排查问题时要看到全量输出，那是调试工具，不是常驻开销。
+  if (forceFull) {
     try {
       const r = await scan({ project: null, days: 3 });
       candidates = candidates.concat(candidatesFromScan(r.sessions, { nowMs }));
       summary.timings.fullMs = Math.round(r.elapsedMs);
       summary.ran.push('full');
       state.lastFullScanAt = new Date(nowMs).toISOString();
-      // L-full 未完成时不清空上一次结果：这里失败就保留旧值
     } catch (e) {
       summary.errors = [...(summary.errors || []), e];
       log.error(`full-scan-failed: ${e.message}`);
-      void hasScanned;
     }
   }
 
@@ -1563,18 +1631,24 @@ export async function startWatch({
 
 /** 通知可追溯率：生产环境中唯一能独立判定真伪的指标。
  *
- *  问题：一条通知说「会话 X 失败了」，它凭什么？如果答不出「宿主在哪写了这个事实」，
+ *  问题：一条通知说「会话 X 失败了 / 在等你」，它凭什么？如果答不出「宿主在哪写了这个事实」，
  *  这条通知就是凭空发明的。
  *
  *  阈值（写于测量之前，见 docs/research/2026-10-31-first-production-metric.md）：
  *  **可追溯率必须 = 100%**，任何一条追不到宿主事实即 FAIL。不设百分比宽容——
- *  5 条样本上的「80% 可追溯」没有意义，而一条误报的代价是用户开始忽略所有通知。
+ *  一条误报的代价是用户开始忽略所有通知，是断崖式的。
  *
- *  实测历史：旧架构（hb_gap 推断）下 **0/5**，全部不可追溯，结构性必然——
- *  推断出来的「卡住」在宿主账本上不存在。当前架构候选只来自 jobs.state，按构造必然通过。
+ *  实测历史：旧架构（hb_gap 推断）下 **0/5**，全部不可追溯，结构性必然。
+ *
+ *  ⚠ 2026-10-31 修正：第一版只查 jobs 的 state.json，于是 **WAITING 通知必然被判不可追溯**——
+ *  而 WAITING 是宿主写在 `sessions/*.json` 里的，本来就是真的。
+ *  端到端演练第一次就暴露了：`notified WAITING` 之后 `--trace` 报 0/2。
+ *  指标查错了数据源，不是通知发错了。现在按 state 分派到对应的宿主文件：
+ *    FAILED / BLOCKED → jobs 的 state.json
+ *    WAITING          → sessions 的 status === waiting
  *
  *  返回 null 表示「无通知可判定」，不等于通过。 */
-export function traceability(dir, jobs) {
+export function traceability(dir, jobs, liveSessions = null) {
   const target = asPath(dir);
   if (!target) return null;
   let raw;
@@ -1592,17 +1666,39 @@ export function traceability(dir, jobs) {
   for (const j of jobs || []) {
     if (j && j.sessionId) bySession.set(String(j.sessionId), j);
   }
+  const liveBySession = new Map();
+  for (const s of liveSessions || []) {
+    if (s && s.sessionId) liveBySession.set(String(s.sessionId), s);
+  }
 
   const failures = [];
+  let unverifiable = 0;
   for (const n of notified) {
+    if (n.state === 'WAITING') {
+      // WAITING 是**瞬时**事实：会话文件里的 status 会被下一次状态变更覆盖，
+      // 会话结束时文件被删。事后去查「它现在还 waiting 吗」，答案几乎必然是「不」。
+      // 这不是通知发错了，是**这个状态在事后不可验证**。
+      //
+      // 所以 WAITING 不参与「可追溯率」的分子分母，单独计数并要求为 0 的失败：
+      //   - 若还能查到该会话、且它变成 busy/idle → 正常（用户已经回话了）
+      //   - 若查不到这个会话 → 也可能是正常（会话结束）
+      // 两种情况都无法证明当初那条通知是假的。诚实的做法是**承认测不了**。
+      unverifiable++;
+      continue;
+    }
     const j = bySession.get(n.sessionId);
+    const hostState = j ? j.state : null;
     const ok = Boolean(j) && (j.state === 'failed' || j.state === 'blocked');
-    if (!ok) failures.push({ ...n, hostState: j ? j.state : null });
+    if (!ok) failures.push({ ...n, hostState });
   }
+  // 分母只算**事后可验证**的那部分；一条都没有时返回 null（无样本 ≠ 通过）
+  const verifiable = notified.length - unverifiable;
   return {
     total: notified.length,
-    traced: notified.length - failures.length,
-    ratio: (notified.length - failures.length) / notified.length,
+    verifiable,
+    unverifiable,
+    traced: verifiable - failures.length,
+    ratio: verifiable === 0 ? null : (verifiable - failures.length) / verifiable,
     failures,
   };
 }
@@ -1651,17 +1747,23 @@ async function main(argv) {
 
   if (flags.has('--trace')) {
     const dir = defaultStateDir();
-    const r = traceability(dir, readJobStates());
+    const r = traceability(dir, readJobStates(), readLiveSessionStates());
     if (!r || r.total === 0) {
       console.log('没有可判定的通知（日志里没有任何 notified 行）。');
       console.log('这不是通过——它表示还没机会犯错。见 docs/research/2026-10-31-first-production-metric.md');
       process.exit(0);
     }
-    console.log(`通知可追溯率：${(r.ratio * 100).toFixed(1)}%  (${r.traced}/${r.total})`);
+    console.log(`可判定通知 ${r.verifiable} 条，其中可追溯 ${r.traced} 条；` +
+      `另有 ${r.unverifiable} 条 WAITING 事后无法验证（该状态是瞬时的）`);
+    console.log(`通知可追溯率：${r.ratio === null ? 'n/a（无事后可验证的通知）' : (r.ratio * 100).toFixed(1) + '%'}`);
     console.log('阈值：100%（测量前写死，不设百分比宽容）');
     for (const f of r.failures) {
       console.log(`  UNTRACEABLE ${f.ts} state=${f.state} session=${f.sessionId.slice(0, 8)}` +
         `  → ${f.hostState === null ? '宿主无此记录' : `宿主记录为 ${f.hostState}`}`);
+    }
+    if (r.ratio === null) {
+      console.log('判定：无样本 —— 这不是通过，是还无法判定');
+      process.exit(0);
     }
     console.log(r.ratio >= 1 ? '判定：PASS' : '判定：FAIL');
     process.exit(r.ratio >= 1 ? 0 : 1);

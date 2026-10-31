@@ -24,7 +24,7 @@ import {
   pruneNotified, NOTIFIED_TTL_HOURS, notifyTitle, NOTIFY_STATES,
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
   observationStats, formatStats, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
-  traceability, readJobStates, probeWaiting, witnessPath, writeWitness, readWitness, checkStateIntegrity,
+  traceability, readJobStates, probeWaiting, readLiveSessionStates, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -345,7 +345,7 @@ test('AC3 L-mid：mtime 探针不递归子目录，diff 只报变化的项目', 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('AC3 层调度：第二轮不会重跑全量（L-full 只在 30 分钟到期时跑）', async () => {
+test('AC3 层调度：L-full 只在 --full 时跑，常驻路径不再全量扫描', async () => {
   const dir = tmp();
   const claude = tmp();
   try {
@@ -362,31 +362,37 @@ test('AC3 层调度：第二轮不会重跑全量（L-full 只在 30 分钟到�
 
     let now = Date.now();
     await runTick({ dir, claudeDir: claude, logger, notifier, scan, nowMs: now });
-    assert.equal(fullRuns, 1, '首轮应跑一次全量');
+    assert.equal(fullRuns, 0, '常驻首轮不再跑全量——L-fast 的探针已经覆盖全部候选来源');
 
-    // 30 秒后：三层都没到期（1min / 5min / 30min）
+    // 30 秒后：三层都没到期
     now += 30_000;
     await runTick({ dir, claudeDir: claude, logger, notifier, scan, nowMs: now });
-    assert.equal(fullRuns, 1, '30 秒后不得重跑全量');
+    assert.equal(fullRuns, 0);
 
-    // 2 分钟后：只有 L-fast 到期。它现在跑两个探针——jobs（过去失败过）
-    // 与 sessions（此刻在等你）。两者都便宜（纯读小 JSON），合起来才是完整的一层。
+    // 2 分钟后：只有 L-fast 到期。它跑两个探针——jobs（过去失败过）
+    // 与 sessions（此刻在等你）。两者都便宜（纯读小 JSON）。
     now += 2 * MIN;
     const s2 = await runTick({ dir, claudeDir: claude, logger, notifier, scan, nowMs: now });
     assert.deepEqual(s2.ran, ['jobs', 'waiting'], '2 分钟后应只跑 L-fast 的两个探针');
-    assert.equal(fullRuns, 1);
+    assert.equal(fullRuns, 0);
 
     // 再 4 分钟（累计 6 分钟）：L-mid 到期，但没变化 → 不起增量扫描
     now += 4 * MIN;
     const s3 = await runTick({ dir, claudeDir: claude, logger, notifier, scan, nowMs: now });
     assert.ok(s3.ran.includes('probe'));
     assert.equal(incRuns, 0, '没有变化不得起增量扫描');
-    assert.equal(fullRuns, 1, '全量仍不得重跑');
 
-    // 31 分钟后：L-full 到期
+    // 31 分钟后：**仍然不跑全量**。这是本次改动的核心断言。
+    // 旧行为是每 30 分钟烧 19–28 秒，产出恒为 0 个候选（实测三次 full=28159/21543/19106ms）。
     now += 31 * MIN;
     await runTick({ dir, claudeDir: claude, logger, notifier, scan, nowMs: now });
-    assert.equal(fullRuns, 2, '31 分钟后应再跑一次全量');
+    assert.equal(fullRuns, 0, '常驻路径永不自动全量');
+
+    // 但 --full 仍然可用：它是排查工具
+    now += MIN;
+    const s4 = await runTick({ dir, claudeDir: claude, logger, notifier, scan, nowMs: now, forceFull: true });
+    assert.equal(fullRuns, 1, '--full 必须仍然执行全量');
+    assert.ok(s4.ran.includes('full'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(claude, { recursive: true, force: true });
@@ -559,11 +565,17 @@ test('分类：WAITING_SUBAGENT 被抑制，不发通知，但写进观察日志
     }));
     writeWaitingSubagent(join(root, 'projects', 'proj-a', `${sid}.jsonl`));
     let n = 0;
-    const r = await runTick({
-      dir: join(root, 'state'), claudeDir: root, nowMs: now, forceFull: true,
-      notifier: async () => { n++; },
+    // 走 dispatchCandidates 而不是 runTick：jobs 的 failed 现在是宿主事实，
+    // 按设计跳过分类门，端到端已经测不到「WAITING_SUBAGENT 被抑制」这条路径。
+    // 分类器本身仍在运行（供观察日志与 P1 使用），所以要单独钉住它的行为。
+    const r = await dispatchCandidates([{
+      sessionId: sid, state: 'EXPLORING', reason: 'read-only', project: 'proj-a',
+      idleSec: 0, lastActivity: new Date(now).toISOString(), evidenceFingerprint: '1',
+    }], {
+      state: emptyState(), nowMs: now, notifier: async () => { n++; },
       logger: { info: () => {}, warn: () => {}, error: () => {} },
-      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+      classify: (c) => classifyCandidate(c, { projectsRoot: join(root, 'projects'), nowMs: now, logger: { info: () => {}, warn: () => {}, error: () => {} } }),
+      observations: createObservationLog(join(root, 'state')),
     });
     assert.equal(n, 0, '等子 Agent 的停止不得发通知');
     assert.equal(r.sent.length, 0);
@@ -576,7 +588,7 @@ test('分类：WAITING_SUBAGENT 被抑制，不发通知，但写进观察日志
     assert.equal(o.kind, 'WAITING_SUBAGENT');
     assert.equal(o.notified, false);
     assert.equal(o.why, 'waiting-subagent-suppressed');
-    assert.equal(o.state, 'FAILED');
+    assert.equal(o.state, 'EXPLORING');
     for (const f of ['ts', 'sessionId', 'state', 'kind', 'autoAnswerable', 'reason', 'confidence', 'notified', 'why']) {
       assert.ok(f in o, `观察行缺字段 ${f}`);
     }
@@ -718,7 +730,7 @@ test('时间门槛：观察日志记录 idleSec / notified / why', async () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('时间门槛：jobs 候选带 idleSec（来自 updatedAt），端到端抑制 10 秒前的停止', async () => {
+test('时间门：非宿主事实的 UNCLASSIFIABLE 刚停下仍被抑制（端到端）', async () => {
   const root = tmp();
   try {
     const sid = 'sess-recent';
@@ -727,23 +739,45 @@ test('时间门槛：jobs 候选带 idleSec（来自 updatedAt），端到端抑
       { type: 'assistant', uuid: 'a1', message: { id: 'm1', stop_reason: 'end_turn', content: [{ type: 'text', text: '随便一句' }] } },
     ].map((r) => JSON.stringify(r)).join('\n') + '\n');
     const now = Date.now();
-    mkdirSync(join(root, 'jobs', 'j1'), { recursive: true });
-    writeFileSync(join(root, 'jobs', 'j1', 'state.json'), JSON.stringify({
-      state: 'failed', sessionId: sid, updatedAt: new Date(now - 10_000).toISOString(), cwd: 'D:\\Projects\\proj-e',
-    }));
 
-    let n = 0;
-    const r = await runTick({
-      dir: join(root, 'state'), claudeDir: root, nowMs: now, forceFull: true,
-      notifier: async () => { n++; },
+    // 直接测 dispatchCandidates：runTick 的候选现在只来自宿主事实状态，
+    // 它们按设计跳过时间门，端到端已经测不到这条路径了。
+    // 时间门仍然被 watch 用于任何**将来重新引入的推断状态**，所以要单独钉住。
+    const r = await dispatchCandidates([{
+      sessionId: sid, state: 'EXPLORING', reason: 'read-only', project: 'proj-e',
+      idleSec: 10, lastActivity: new Date(now - 10_000).toISOString(), evidenceFingerprint: '1',
+    }], {
+      state: emptyState(), nowMs: now, notifier: async () => {},
       logger: { info: () => {}, warn: () => {}, error: () => {} },
-      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+      classify: (c) => classifyCandidate(c, { projectsRoot: join(root, 'projects'), nowMs: now, logger: { info: () => {}, warn: () => {}, error: () => {} } }),
     });
-    assert.equal(n, 0, '刚停 10 秒的 UNCLASSIFIABLE 不得通知');
+    assert.equal(r.sent.length, 0, '刚停 10 秒的 UNCLASSIFIABLE 不得通知');
     assert.equal(r.suppressed[0].why, 'unclassifiable-too-recent');
-    const row = JSON.parse(readFileSync(join(root, 'state', 'observations.jsonl'), 'utf8').trim());
-    assert.ok(row.idleSec >= 10 && row.idleSec < 20, `jobs 候选的 idleSec 必须来自 updatedAt，实际 ${row.idleSec}`);
+    assert.equal(r.suppressed[0].idleSec, 10, 'idleSec 必须透传进抑制记录');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('宿主事实（WAITING/FAILED/BLOCKED）跳过分类门与时间门——它们是确定信号', async () => {
+  const now = Date.now();
+  // 分类器说什么都不该影响这三个状态。
+  const hostile = () => ({
+    ts: new Date(now).toISOString(), sessionId: 's', state: 'WAITING', idleSec: 0,
+    kind: 'WAITING_SUBAGENT', autoAnswerable: false, reason: 'x', confidence: null,
+    notified: false, classify: 'ok',
+  });
+  for (const st of HOST_FACT_STATES) {
+    const r = await dispatchCandidates([{
+      sessionId: `s-${st}`, state: st, reason: 'host', project: 'p',
+      idleSec: 0, lastActivity: new Date(now).toISOString(), evidenceFingerprint: '1',
+    }], {
+      state: emptyState(), nowMs: now, notifier: async () => {},
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      classify: hostile,
+    });
+    assert.equal(r.sent.length, 1,
+      `${st} 不该被 kind 门抑制——它是宿主写的，不是推断出来的`);
+    assert.equal(r.suppressed.length, 0, `${st} 也不该被时间门抑制`);
+  }
 });
 
 test('--stats：UNCLASSIFIABLE 按 idle 分桶，并标出每个桶的通知情况', () => {
@@ -781,19 +815,22 @@ test('分类：COMPLETION_REPORT 被抑制', async () => {
     writeFileSync(join(root, 'projects', 'proj-c', `${sid}.jsonl`), [
       { type: 'assistant', uuid: 'a1', message: { id: 'm1', stop_reason: 'end_turn', content: [{ type: 'text', text: '已完成，工作区干净' }] } },
     ].map((r) => JSON.stringify(r)).join('\n') + '\n');
-    mkdirSync(join(root, 'jobs', 'j1'), { recursive: true });
-    writeFileSync(join(root, 'jobs', 'j1', 'state.json'), JSON.stringify({
-      state: 'failed', sessionId: sid, updatedAt: new Date(now).toISOString(), cwd: 'D:\\Projects\\proj-c',
-    }));
 
-    let n = 0;
-    const r = await runTick({
-      dir: join(root, 'state'), claudeDir: root, nowMs: now, forceFull: true,
-      notifier: async () => { n++; },
+    // 直接测 dispatchCandidates 而不是 runTick。
+    // 走 runTick 已经测不到分类门了：候选只能来自宿主事实状态
+    // （WAITING / FAILED / BLOCKED），而这几个按设计**跳过**分类门。
+    // 分类器本身仍然被 watch 调用（用于观察日志与 P1 数据），
+    // 所以这条测试改为直接对一个非宿主事实候选断言分类行为。
+    const r = await dispatchCandidates([{
+      sessionId: sid, state: 'FAILED', reason: 'host-reported-failed', project: 'proj-c',
+      idleSec: 0, lastActivity: new Date(now).toISOString(), evidenceFingerprint: '1',
+      // 显式覆盖 state，让这条候选走分类门：HOST_FACT_STATES 之外的状态
+    }].map((c) => ({ ...c, state: 'EXPLORING', reason: 'read-only' })), {
+      state: emptyState(), nowMs: now, notifier: async () => {},
       logger: { info: () => {}, warn: () => {}, error: () => {} },
-      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+      classify: (c) => classifyCandidate(c, { projectsRoot: join(root, 'projects'), nowMs: now, logger: { info: () => {}, warn: () => {}, error: () => {} } }),
     });
-    assert.equal(n, 0, '完成汇报不催');
+    assert.equal(r.sent.length, 0, '完成汇报不催');
     assert.equal(r.suppressed[0].kind, 'COMPLETION_REPORT');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -979,16 +1016,19 @@ test('notifyTitle：UNCLASSIFIABLE 必须明确标注「判不出类型」', () 
 });
 
 test('notifyTitle：确定信号用各自的措辞', () => {
-  assert.ok(notifyTitle({ state: 'BLOCKED', project: 'a', kind: 'EXTERNAL_BLOCKED' }).includes('外部阻塞'));
-  assert.ok(notifyTitle({ state: 'STALLED', project: 'b', kind: 'WAITING_APPROVAL' }).includes('等你批准'));
-  assert.ok(notifyTitle({ state: 'STALLED', project: 'c', kind: 'ASKED_UNANSWERED' }).includes('问了没答'));
-  assert.ok(notifyTitle({ state: 'STALLED', project: 'd', kind: 'PLAN_SUBMITTED' }).includes('计划待批'));
+  // 宿主事实优先：BLOCKED 现在直接说「受阻」，不再被 kind 覆盖。
+  assert.ok(notifyTitle({ state: 'BLOCKED', project: 'a', kind: 'EXTERNAL_BLOCKED' }).includes('受阻'));
+  // 分类措辞仍然作用于非宿主事实的候选（将来若重新引入推断状态，这条路还在）
+  assert.ok(notifyTitle({ state: 'EXPLORING', project: 'b', kind: 'WAITING_APPROVAL' }).includes('等你批准'));
+  assert.ok(notifyTitle({ state: 'EXPLORING', project: 'c', kind: 'ASKED_UNANSWERED' }).includes('问了没答'));
+  assert.ok(notifyTitle({ state: 'EXPLORING', project: 'd', kind: 'PLAN_SUBMITTED' }).includes('计划待批'));
 });
 
 test('notifyTitle：没有分类结果时标注「未分类」', () => {
-  const t = notifyTitle({ state: 'FAILED', project: 'x', kind: null });
+  // FAILED 现在是宿主事实，有自己的措辞；未分类的兜底用在非宿主事实上。
+  const t = notifyTitle({ state: 'EXPLORING', project: 'x', kind: null });
   assert.ok(t.includes('未分类'), `未标注未分类: ${t}`);
-  assert.ok(t.includes('FAILED'));
+  assert.ok(t.includes('EXPLORING'));
 });
 
 test('notifyTitle：没有 project 时用 sessionId 前 8 位', () => {
@@ -1324,4 +1364,72 @@ test('runTick 每次成功保存都推进见证时间——否则丢失告警会
     rmSync(claude, { recursive: true, force: true });
     rmSync(witnessPath(dir), { force: true });
   }
+});
+
+// ── 标题必须是「正在等你」，不能被分类器降级成「判不出类型」────────
+
+test('notifyTitle：WAITING 说「正在等你」，即使分类器给了 UNCLASSIFIABLE', () => {
+  // 端到端跑真实 WAITING 候选时暴露的：分类器对 sessions/ 候选返回 UNCLASSIFIABLE，
+  // 旧版先看 kind，于是把确定的等待印成了「疑似停滞（判不出类型）」。
+  const t = notifyTitle({
+    state: 'WAITING', reason: 'waiting:input needed', project: 'demo',
+    sessionId: 'abcdef123456', kind: 'UNCLASSIFIABLE',
+  });
+  assert.ok(t.includes('正在等你'), `标题应说正在等你：${t}`);
+  assert.ok(t.includes('input needed'), `应带上在等什么：${t}`);
+  assert.ok(!t.includes('判不出类型'), '确定的等待不得被说成猜测');
+  assert.ok(!t.includes('未分类'));
+});
+
+test('notifyTitle：WAITING 没有 waitingFor 时也能出完整标题', () => {
+  const t = notifyTitle({ state: 'WAITING', reason: 'host-reported-waiting', project: 'demo' });
+  assert.ok(t.includes('正在等你'));
+  assert.ok(!t.includes('undefined'));
+  assert.ok(!t.includes('waiting:'));
+});
+
+test('notifyTitle：FAILED / BLOCKED 走宿主事实措辞', () => {
+  assert.ok(notifyTitle({ state: 'FAILED', project: 'x', kind: 'UNCLASSIFIABLE' }).includes('宿主报失败'));
+  assert.ok(notifyTitle({ state: 'BLOCKED', project: 'x' }).includes('受阻'));
+});
+
+test('traceability：WAITING 不计入可追溯率——它是瞬时状态，事后必然查不到', () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, 'watch.log'),
+      '2026-10-31T01:00:00Z [INFO] notified WAITING demo kind=- key=k1 session=w1\n');
+    // 会话现在早已 busy（用户回过话了）——若把 WAITING 计入，就会误判为不可追溯
+    const r = traceability(dir, [], [{ sessionId: 'w1', status: 'busy' }]);
+    assert.equal(r.total, 1);
+    assert.equal(r.unverifiable, 1);
+    assert.equal(r.verifiable, 0);
+    assert.equal(r.ratio, null, '没有可验证样本时必须是 null，不是 0 也不是 1');
+    assert.deepEqual(r.failures, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('traceability：FAILED 仍必须能追到 jobs 的 failed/blocked', () => {
+  const dir = tmp();
+  try {
+    writeFileSync(join(dir, 'watch.log'),
+      '2026-10-31T01:00:00Z [INFO] notified FAILED demo kind=- key=k1 session=f1\n');
+    assert.equal(traceability(dir, [{ sessionId: 'f1', state: 'failed' }], []).ratio, 1);
+    assert.equal(traceability(dir, [{ sessionId: 'f1', state: 'done' }], []).ratio, 0);
+    assert.equal(traceability(dir, [], []).ratio, 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('readLiveSessionStates 返回全部状态，不只是 waiting', () => {
+  const root = tmp();
+  try {
+    mkdirSync(join(root, 'sessions'), { recursive: true });
+    const now = Date.now();
+    for (const [i, st] of ['busy', 'idle', 'waiting'].entries()) {
+      writeFileSync(join(root, 'sessions', `${i}.json`),
+        JSON.stringify({ sessionId: `s${i}`, status: st, statusUpdatedAt: now }));
+    }
+    const out = readLiveSessionStates(root);
+    assert.equal(out.length, 3);
+    assert.deepEqual(out.map((o) => o.status).sort(), ['busy', 'idle', 'waiting']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
