@@ -437,7 +437,10 @@ function checkUnregisteredExports() {
     'findStopPoint', 'readTranscriptTail', 'classifyCandidate',
     'createObservationLog', 'observationStats', 'formatStats', 'readObservationRows', 'readObservationRows', 'NOTIFY_KINDS', 'OBS_MAX_BYTES',
     'unclassifiableMinIdleSec', 'tooRecentToNotify', 'UNCLASSIFIABLE_MIN_IDLE_SEC', 'IDLE_BUCKETS',
-    'traceability', 'readJobStates', 'probeWaiting', 'readLiveSessionStates', 'witnessPath', 'writeWitness', 'readWitness', 'checkStateIntegrity', 'HOST_FACT_STATES',
+    'traceability', 'readJobStates', 'probeWaiting', 'readLiveSessionStates',
+    // install-watcher.mjs
+    'launcherPath', 'templatePath', 'stateDirFor', 'startupDir', 'shortcutPath',
+    'renderLauncher', 'needsRegenerate', 'createShortcut', 'witnessPath', 'writeWitness', 'readWitness', 'checkStateIntegrity', 'HOST_FACT_STATES',
     'recalibrateWeights', 'NOTIFY_STATES', '__internals', 'STATES', 'DAY', 'HOUR', 'MINUTE', 'App', 'KINDS',
     // replay-observe.mjs
     'nextTick', 'callsUpTo', 'gapsOf', 'capText', 'compactRecord', 'isToolResultOnly',
@@ -598,6 +601,46 @@ function checkLedger() {
   }
 }
 
+/** DF-022：启动器绝不能落在数据目录里。
+ *
+ *  那是真实发生过的事故：start-watch.vbs 住在 %LOCALAPPDATA%\Overwatch\ 里，
+ *  而那个目录正是它要保护的。一次整目录删除把启动器和数据一起删掉，
+ *  监控系统就此起不来——数据能重新积累，起不来则永远没有积累的机会。
+ *
+ *  这里把位置关系变成可执行的检查，而不是靠安装文档里的一句话。 */
+function checkLauncherPlacement() {
+  const installDir = join(ROOT, 'scripts', 'install');
+  const tpl = join(installDir, 'start-watch.vbs.template');
+  const out = join(installDir, 'start-watch.vbs');
+  if (!existsSync(tpl)) {
+    fail('scripts/install/start-watch.vbs.template', '缺少启动器模板——安装器将无物可渲染');
+    return;
+  }
+  let raw;
+  try { raw = readFileSync(tpl, 'utf8'); } catch (e) {
+    fail('scripts/install/start-watch.vbs.template', `读不了模板：${e.message}`);
+    return;
+  }
+  for (const ph of ['__REPO__', '__STATE_DIR__']) {
+    if (!raw.includes(ph)) {
+      fail('scripts/install/start-watch.vbs.template', `模板缺少占位符 ${ph}`);
+    }
+  }
+  // 模板必须纯 ASCII：VBScript 按 ANSI 读，非 ASCII 会截断字符串字面量
+  const bad = [...new Set([...raw].filter((ch) => ch.charCodeAt(0) > 127))];
+  if (bad.length) {
+    fail('scripts/install/start-watch.vbs.template',
+      `模板含非 ASCII 字符 ${JSON.stringify(bad.join(''))}——VBScript 会误读并截断字符串`);
+  }
+  // 若产物已生成，它必须在仓库内（即不在数据目录）
+  if (existsSync(out)) {
+    const rel = relative(ROOT, out);
+    if (rel.startsWith('..')) {
+      fail(rel, '启动器产物落在仓库外——它必须与数据目录分离');
+    }
+  }
+}
+
 // ── 运行 ──────────────────────────────────────────────────────────────
 
 console.log('check-structure · 仓库结构硬门\n');
@@ -614,6 +657,7 @@ checkUnregisteredExports();
 checkLinks();
 checkChangelog();
 checkLedger();
+checkLauncherPlacement();
 
 if (violations.length) {
   console.log(`✗ ${violations.length} 项违规：\n`);

@@ -1,0 +1,65 @@
+' Overwatch watcher launcher template.
+'
+' Why wscript instead of powershell -WindowStyle Hidden:
+' powershell.exe is a console program, so -WindowStyle only affects windows it
+' creates itself. The conhost window is created by Task Scheduler before that,
+' so it cannot be hidden. Measured with a WinEvent hook: that path emits 2
+' window events including FOREGROUND (it steals focus from a fullscreen game).
+' wscript.exe is a GUI program; Run(..., 0, ...) sets SW_HIDE at creation.
+'
+' THIS FILE LIVES IN THE REPO, NOT IN THE DATA DIRECTORY. See DF-022:
+' the launcher used to be written to %LOCALAPPDATA%\Overwatch\, which is the
+' same directory it is supposed to protect. Deleting that directory deleted
+' the launcher, so the monitor could not be restarted at all.
+'
+' Keep this file pure ASCII. VBScript reads .vbs as ANSI, so UTF-8 Chinese
+' comments become mojibake and can terminate string literals early.
+
+Option Explicit
+
+Dim sh, fso, repo, stateDir, launcherLog, runnerLog, cmd
+
+On Error Resume Next
+Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+
+' Both are substituted by scripts/install-watcher.mjs. Do not hand-edit.
+repo = "__REPO__"
+stateDir = "__STATE_DIR__"
+
+If Err.Number <> 0 Then
+  WScript.Quit 2
+End If
+
+If Not fso.FolderExists(repo) Then
+  ' The repo moved or was deleted. There is nowhere to write a log that is
+  ' guaranteed to survive, so fail through the exit code and let the
+  ' shortcut's presence remind the user.
+  WScript.Quit 3
+End If
+
+If Not fso.FolderExists(stateDir) Then
+  fso.CreateFolder stateDir
+End If
+
+launcherLog = stateDir & "\launcher.log"
+runnerLog = stateDir & "\runner.log"
+
+Sub Note(msg)
+  Dim g
+  Set g = fso.OpenTextFile(launcherLog, 8, True)
+  g.WriteLine Now & " [vbs] " & msg
+  g.Close
+End Sub
+
+cmd = "cmd /c cd /d """ & repo & """ && node scripts\watch.mjs >> """ & runnerLog & """ 2>&1"
+Note "launching"
+sh.Run cmd, 0, False
+
+If Err.Number <> 0 Then
+  Note "Run failed: " & Err.Number & " " & Err.Description
+  WScript.Quit 4
+End If
+
+Note "dispatched"
+WScript.Quit 0

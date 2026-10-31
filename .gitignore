@@ -15,6 +15,11 @@ tmp/
 .DS_Store
 Thumbs.db
 
+# 安装器生成的启动器：内容依赖本机仓库路径，模板才是版本控制的真源。
+# 模板 scripts/install/start-watch.vbs.template 必须提交；
+# 产物由  渲染出来。
+scripts/install/start-watch.vbs
+
 # ── 注意 ──────────────────────────────────────────────
 # 本文件刻意不包含 .claude/ 、rules/ 、docs/ 、tasks/ 。
 # 那些目录就是本仓库的产品本体。参考项目的 .gitignore 忽略它们是有意的

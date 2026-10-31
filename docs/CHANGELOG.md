@@ -565,6 +565,25 @@
   因为没有任何东西在运行。我是靠手工重写启动脚本才恢复的。
   这比「数据丢失」更糟：数据可以重新积累，起不来则连积累的机会都没有。
 - 未修，因为启动器放哪里是产品决策（仓库脚本生成到别处 / 用户指定稳定路径 / 系统服务）。
+### Fixed（DF-022：启动器搬出数据目录）
+
+- **启动器不再住在它要保护的那个目录里。** 旧安装说明让人把 `start-watch.vbs` 写到
+  `%LOCALAPPDATA%\Overwatch\`——那正是数据目录。2026-10-31 演练中整目录一删，
+  **启动器和数据一起没了，监控系统起不来**。数据能重新积累，起不来则永远没有积累的机会。
+- 现在三处分离：
+  - 模板 `scripts/install/start-watch.vbs.template`（版本控制，纯 ASCII）
+  - 产物 `scripts/install/start-watch.vbs`（由 `node scripts/install-watcher.mjs install` 渲染，
+    含本机路径，已 gitignore）
+  - 开机自启 `<Startup>/Overwatch Watch.lnk` → 指向产物
+- `install-watcher.mjs` 支持 `status` / `install` / `uninstall`，零依赖。
+  用临时 `.ps1` 而不是 `powershell -Command` 建快捷方式——路径里的中文与空格在命令行传参时会被二次解析。
+- **端到端演练**：删掉整个数据目录后，从仓库启动器一次成功重启，日志同时给出
+  `state-lost: 见证文件显示 434 次保存`。**「站得起来」和「知道自己丢过东西」这两件事现在同时成立。**
+- **结构门新增 `checkLauncherPlacement()`**：模板必须存在、必须含两个占位符、必须纯 ASCII，
+  产物必须在仓库内。负向测试：往模板追加中文注释 → 门报「模板含非 ASCII 字符」。
+- **测试**：`install-watcher.test.mjs` 9 条，含一条用 `cscript` 真解析渲染结果（跳过非 Windows）。
+  三个变异被抓：把启动器路径改回数据目录 → 1 红；去掉双引号转义 → 1 红；模板加非 ASCII → 1 红。
+
 ### Notes（已知且不打算近期修）
 
 1. **在线停止分类 95.4% 判 `UNCLASSIFIABLE`** —— 结构性，分类器需要「下一句」而在线时下一句还没发生。

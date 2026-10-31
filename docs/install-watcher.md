@@ -22,58 +22,50 @@ conhost 窗口由外层创建，在出现之前无法隐藏。
 
 抢焦点那条足以让人第一周就关掉整个功能。
 
-## 安装（三步）
+## 安装（一条命令）
 
-> 下文的 `%REPO%` 换成你的仓库路径，`%LOCALAPPDATA%` 保持原样（Windows 会自己展开）。
-
-### 1. 写启动脚本
-
-`%LOCALAPPDATA%\Overwatch\start-watch.vbs`：
-
-```vbscript
-Option Explicit
-Dim sh, fso, repo, logDir, runnerLog, cmd
-On Error Resume Next
-Set sh = CreateObject("WScript.Shell")
-Set fso = CreateObject("Scripting.FileSystemObject")
-logDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\Overwatch"
-runnerLog = logDir & "\runner.log"
-
-repo = "%REPO%"
-If Not fso.FolderExists(repo) Then WScript.Quit 3
-
-cmd = "cmd /c cd /d """ & repo & """ && node scripts\watch.mjs >> """ & runnerLog & """ 2>&1"
-sh.Run cmd, 0, False
-WScript.Quit 0
+```bash
+node scripts/install-watcher.mjs install
 ```
 
-> **必须纯 ASCII。** VBScript 按 ANSI 读 `.vbs`，UTF-8 中文会变成乱码并
-> 提前截断字符串字面量。我踩过这个坑，报错是「未结束的字符串常量」但指向的行号是错的。
+它会做两件事：把启动器渲染到 **仓库里**，然后建一个指向它的开机自启快捷方式。
 
-### 2. 放一个快捷方式
-
-放到 `shell:startup`（`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`）：
-
-- 目标：`C:\Windows\System32\wscript.exe`
-- 参数：`"<上面那个 vbs 的完整路径>"`
-- 起始位置：仓库根目录
-
-一行命令：
-
-```powershell
-$startup = [Environment]::GetFolderPath('Startup')
-$lnk = Join-Path $startup 'Overwatch Watch.lnk'
-$sh = New-Object -ComObject WScript.Shell
-$s = $sh.CreateShortcut($lnk)
-$s.TargetPath = 'C:\Windows\System32\wscript.exe'
-$s.Arguments = '"%LOCALAPPDATA%\Overwatch\start-watch.vbs"'
-$s.WorkingDirectory = '%REPO%'
-$s.Save()
+```bash
+node scripts/install-watcher.mjs status     # 看状态
+node scripts/install-watcher.mjs uninstall  # 移除开机自启（启动器文件留在仓库）
 ```
 
-### 3. 立刻起一次（不必重启）
+### 为什么启动器必须放在仓库里（DF-022）
 
-直接运行那个 `.lnk` 即可，等价于下次登录时的行为。
+旧版本的安装说明让人把 `start-watch.vbs` 写到 `%LOCALAPPDATA%\Overwatch\` ——
+**那正是它要保护的数据目录**。
+
+2026-10-31 实测：把数据目录整个删掉（为了验证丢失检测），启动器跟着没了，
+**监控系统就此起不来**。数据可以重新积累，起不来则永远没有积累的机会。
+
+现在三个文件各有各的位置，互不牵连：
+
+| 文件 | 位置 | 删掉会怎样 |
+|---|---|---|
+| 启动器 | `<repo>/scripts/install/start-watch.vbs`（由模板生成） | 重跑 `install` 即可 |
+| 开机自启 | `<Startup>/Overwatch Watch.lnk` → 启动器 | 同上 |
+| 数据 | `%LOCALAPPDATA%\Overwatch\` | **告警 + 从空状态继续**，监控不中断 |
+
+删掉数据目录之后，重启是这样的：
+
+```
+[INFO] watch 启动 dir=...\Overwatch tick=15000ms
+[ERROR] state-lost: 见证文件显示 434 次保存（...），但 state.json 和整个状态目录都不在了。
+[WARN] state-lost: 日志与 observations.jsonl 很可能同时在同一次删除中丢失。
+```
+
+**这两行是这次改动的全部意义**：系统能自己站起来，并且告诉你它丢过东西。
+
+### 模板须为纯 ASCII
+
+VBScript 按 ANSI 读 `.vbs`，UTF-8 中文会变成乱码并提前截断字符串字面量。
+踩过的坑：报错是「未结束的字符串常量」，但**指向的行号是错的**。
+`install-watcher.test.mjs` 里有一条测试专门守这个约束。
 
 ## 验证
 

@@ -205,7 +205,7 @@
 - **状态**：已知，不修。已写入 README「已知局限」。
 ### DF-020 [open] 状态目录被清空后，所有生产历史无声消失
 
-- **发现于**：2026-10-31 22:50 检查 watcher 时发现 `%LOCALAPPDATA%Overwatch` 整个目录不存在
+- **发现于**：2026-10-31 22:50 检查 watcher 时发现 `%LOCALAPPDATA%\Overwatch` 整个目录不存在
 - **位置**：`watch.mjs` 的 `defaultStateDir()` 与启动脚本
 - **证据**：该目录此前有 `state.json`（5.6 KB）、`watch.log`（438 KB / 5,348 行）、`runner.log`、
   `start-watch.vbs`、`notify/`。发现时**全都不在了**，目录本身也不存在。同一时刻 watcher 进程
@@ -259,24 +259,27 @@
 
 
 - **发现于**：由 DF-020 引出的结构性问题
-- **位置**：`%LOCALAPPDATA%Overwatch`（`state.json` / `watch.log` / `observations.jsonl`）
+- **位置**：`%LOCALAPPDATA%\Overwatch`（`state.json` / `watch.log` / `observations.jsonl`）
 - **证据**：`try { state = loadState(...) }` 在文件缺失时返回空状态并继续；`saveState` 每次用
   `rename` 覆盖。**没有任何快照、轮转保留多份、或异地副本。** `watch.log` 只保留 `.1` 一份轮转。
 - **影响**：同一类故障（目录被删、磁盘满、rename 损坏）都会让「已经积累的证据」归零，
   而观察期与指标的全部价值都来自积累。
 - **状态**：已登记，未处理。
-### DF-022 [open] 启动脚本住在它要保护的那个目录里
+### DF-022 [fixed] 启动脚本住在它要保护的那个目录里
 
 - **发现于**：2026-10-31 持久化演练。为验证「目录丢失能否被发现」，我把
-  `%LOCALAPPDATA%Overwatch` 整个删掉——**连同 `start-watch.vbs` 一起**。
+  `%LOCALAPPDATA%\Overwatch` 整个删掉——**连同 `start-watch.vbs` 一起**。
   然后我发现无法重启守护进程：启动器自己没了。
-- **位置**：`%LOCALAPPDATA%Overwatchstart-watch.vbs`
+- **位置**：`%LOCALAPPDATA%\Overwatch\start-watch.vbs`
 - **影响**：这是比「数据丢失」更糟的一类故障——**监测系统自己起不来了**。
   告警逻辑再完善也没用，因为没有任何东西在运行。演练中我是靠手工重写启动脚本才恢复的，
   而这个脚本的内容只存在于我的上下文和这次对话里。
 - **为什么没顺手修**：启动器放哪里是产品决策——放仓库（`scripts/install-watcher.ps1` 生成到别处）、
   放用户指定的稳定路径、还是做成系统服务（需要管理员权限）。三条路的安装/卸载语义不同。
-- **状态**：已登记，未处理。当前已手工重建启动脚本并恢复运行（pid 60892）。
+- **处置（2026-10-31 已修）**：启动器搬进仓库（模板 + 生成产物），开机自启快捷方式指向仓库内的产物。
+  安装/卸载统一走 `node scripts/install-watcher.mjs install|uninstall`。
+  结构门新增 `checkLauncherPlacement()` 守这个位置关系。
+  演练复现：删掉整个数据目录 → 从仓库启动器一次重启成功，并报出 state-lost。
 - **顺带确认**：见证文件在目录外，**在整目录删除中存活**（记录了 360 次保存），
   所以「丢失检测」这部分是有效的；坏的是「丢失之后怎么重启」。
 _（新增条目追加在此行上方）_
