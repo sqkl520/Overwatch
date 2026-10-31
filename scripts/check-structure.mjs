@@ -472,6 +472,75 @@ function checkUnregisteredExports() {
   });
 }
 
+/** CHANGELOG 硬规则：docs/CHANGELOG.md 自己规定「任何代码/配置/文档的更改都必须记入」，
+ *  但在 2026-10-31 之前**没有任何门检查它** —— 实测有 18+ 个提交没有条目。
+ *  规则没人执行就不叫规则，叫愿望。
+ *
+ *  检查方式：找出「最后一个被 CHANGELOG 引用过的 commit」到 HEAD 之间的全部提交，
+ *  若有提交改动了源码/规格却没在 CHANGELOG 里留下 hash，即为违规。
+ *
+ *  为什么用 hash 而不用日期或行数：hash 是唯一无歧义的锚点，且本文件已经要求
+ *  「每条必须写出处——commit hash」。要求写 hash，就该能验证 hash 在不在。
+ *
+ *  豁免：纯 CHANGELOG 自身的提交、以及 docs/runs 下的运行台账。 */
+function checkChangelog() {
+  const f = join(ROOT, 'docs', 'CHANGELOG.md');
+  if (!existsSync(f)) return;
+  let text;
+  try { text = readFileSync(f, 'utf8'); } catch { return; }
+
+  const git = (args) => {
+    const r = spawnSync('git', args, { cwd: ROOT, encoding: 'utf8' });
+    return r.status === 0 ? String(r.stdout || '') : null;
+  };
+
+  const log = git(['log', '--format=%h%x09%s', '-60']);
+  if (log === null) return; // 不是 git 仓库（如解压后的发布包），跳过
+
+  // CHANGELOG 里出现过的 7-40 位 hex 都当作「已记录」
+  const recorded = new Set([...text.matchAll(/\b([0-9a-f]{7,40})\b/g)].map((m) => m[1]));
+  const isRecorded = (h) => {
+    for (const r of recorded) if (h.startsWith(r) || r.startsWith(h)) return true;
+    return false;
+  };
+
+  const commits = log.trim().split('\n').filter(Boolean).map((l) => {
+    const [h, subject] = l.split('\t');
+    return { h, subject: subject || '' };
+  });
+
+  // 找最近一个被记录的提交，只检查它之后的
+  let boundary = -1;
+  for (let i = 0; i < commits.length; i++) {
+    if (isRecorded(commits[i].h)) { boundary = i; break; }
+  }
+  if (boundary === -1) {
+    warn('docs/CHANGELOG.md', '前 60 个提交里一个 hash 都没被引用 —— 无法判断边界，跳过');
+    return;
+  }
+
+  const SOURCE_RE = /^(scripts\/|\.claude\/|docs\/|templates\/|rules\/|README\.md|CLAUDE\.md)/;
+  const SKIP_RE = /^(docs\/CHANGELOG\.md$|tasks\/runs\/)/;
+
+  const missing = [];
+  for (let i = 0; i < boundary; i++) {
+    const { h, subject } = commits[i];
+    const files = git(['show', '--name-only', '--format=', h]);
+    if (files === null) continue;
+    const touched = files.trim().split('\n').filter(Boolean)
+      .filter((p) => SOURCE_RE.test(p) && !SKIP_RE.test(p));
+    if (!touched.length) continue;
+    missing.push(`${h} ${subject.slice(0, 50)}`);
+  }
+
+  if (missing.length) {
+    fail('docs/CHANGELOG.md',
+      `${missing.length} 个提交改动了源码/规格但没有 CHANGELOG 条目（本文件自己规定的硬规则）：\n      ` +
+      missing.slice(0, 8).join('\n      ') +
+      (missing.length > 8 ? `\n      …还有 ${missing.length - 8} 个` : ''));
+  }
+}
+
 // ── 运行 ──────────────────────────────────────────────────────────────
 
 console.log('check-structure · 仓库结构硬门\n');
@@ -486,6 +555,7 @@ checkSyntax();
 checkImportable();
 checkUnregisteredExports();
 checkLinks();
+checkChangelog();
 
 if (violations.length) {
   console.log(`✗ ${violations.length} 项违规：\n`);

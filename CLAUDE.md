@@ -65,7 +65,7 @@ node --test scripts/*.test.mjs                 # 全量回归测试（192 条）
 
 ## 提交前
 
-1. `node scripts/check-structure.mjs` 通过
-2. `node --test scripts/state-model.test.mjs` 全绿
+1. `node scripts/check-structure.mjs` 通过（含 CHANGELOG 硬规则：改了源码/规格却没记条目会**直接 fail**）
+2. `node --test scripts/*.test.mjs` 全绿
 3. 若改了规格，同步更新 ADR 或台账
 4. 不用 `git add -A` —— 先 `git status` 看清楚
