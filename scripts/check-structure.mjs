@@ -299,6 +299,15 @@ const PROBE_ARGS = {
   answerIsNegative: '""', findEarlierMatch: '["a", ["b"]]', classifyStop: '[{}]',
   findStopPoint: '[[]]', formatStats: '[{}]',
   unclassifiableMinIdleSec: '[]', tooRecentToNotify: '["UNCLASSIFIABLE", 60, 300]',
+  // replay-observe.mjs：回放脚本的纯函数。参数取最小可构造输入，
+  // 目的是让「导出但调用即炸」（ReferenceError）在结构门就暴露。
+  nextTick: '[0, 0]', callsUpTo: '[[0, 1], 0]', gapsOf: '[[]]',
+  capText: '"x"', compactRecord: '[{}]', isToolResultOnly: '[{}]',
+  originKindOf: '[{}]', pct: '[1, 2]', buildSessionStops: '[[]]',
+  sliceStops: '[[], []]', stateAt: '[{ ts: [], calls: [] }, 0]',
+  observeStop: '[{ ts: [], calls: [] }, { t0: 0, after: [] }, 0]',
+  corpusSummary: '[[]]', runDelayModel: '[[], {}]', runPollModel: '[[], {}]',
+  rewatchSuppressed: '[[], {}]', renderStats: '[[]]',
 };
 
 /** 需要临时目录的导出，参数由探针注入 `_sandbox` */
@@ -429,11 +438,18 @@ function checkUnregisteredExports() {
     'createObservationLog', 'observationStats', 'formatStats', 'NOTIFY_KINDS', 'OBS_MAX_BYTES',
     'unclassifiableMinIdleSec', 'tooRecentToNotify', 'UNCLASSIFIABLE_MIN_IDLE_SEC', 'IDLE_BUCKETS',
     'recalibrateWeights', 'NOTIFY_STATES', '__internals', 'STATES', 'DAY', 'HOUR', 'MINUTE', 'App', 'KINDS',
+    // replay-observe.mjs
+    'nextTick', 'callsUpTo', 'gapsOf', 'capText', 'compactRecord', 'isToolResultOnly',
+    'originKindOf', 'pct', 'buildSessionStops', 'sliceStops', 'stateAt', 'observeStop',
+    'corpusSummary', 'runDelayModel', 'runPollModel', 'rewatchSuppressed', 'renderStats',
+    'POLL_INTERVAL_MS', 'DEFAULT_MIN_IDLE_SWEEP', 'DEFAULT_DELAYS_SEC',
   ]);
   const INTENTIONALLY_PROBED_FREE = new Set([
     'main', 'printPlain', 'copyToClipboard', 'startWatch', 'runTick',
     'runScan', 'dispatchCandidates', 'sendNotification', 'isNotificationAvailable',
     'NOTIFY_STATES', '__internals',
+    // 这两个要读真实 transcript 目录（1GB），不能塞进结构门；由 CLI 自测覆盖。
+    'parseTranscript', 'listTranscripts', 'loadCorpus',
   ]);
 
   const files = readdirSync(dir).filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs') && !CLI_SCRIPTS.has(f));

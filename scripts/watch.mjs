@@ -19,8 +19,12 @@
  * 零依赖，只用 node: 内置模块。
  *
  * 通知门（v2）：state → 停止分类 kind → **UNCLASSIFIABLE 的 5 分钟时间门槛** → 去重 → 限额。
- * 时间门槛是必需的：在线路径 87.7% 的停止判为 UNCLASSIFIABLE，而实测 94% 在 5 分钟内会继续，
- * 立刻通知等于用 94% 的噪音换 6% 的信号。见 UNCLASSIFIABLE_MIN_IDLE_SEC。
+ * 时间门槛针对的是"刚停下"这一类噪音：在线路径 87.7% 的停止判为 UNCLASSIFIABLE。
+ *
+ * ⚠ 2026-10-31 更正：本文件曾写"94% 在 5 分钟内继续"，那个数字是错的。
+ * 它统计的是"停止后的下一条记录"，其中 3479/4577 是宿主 0.1 秒后写入的
+ * stop_hook_summary，不是人继续了。只看真人接话，60 秒内继续的比例是 3.6%，
+ * p50 是 3.1 小时。见 docs/research/2026-10-31-replay-observations.md §五。
  */
 
 import {
@@ -531,7 +535,12 @@ export const NOTIFY_KINDS = Object.freeze([
  *
  *  为什么需要：在线路径下 87.7% 的停止判为 UNCLASSIFIABLE，而它是「保守放行」的。
  *  实测 162300 个「停止 → 下一条记录」样本：p50=1s、p75=6s、p90=102s、p95=395s，
- *  88.6% 在 60 秒内继续、94.0% 在 5 分钟内继续。**刚停下就通知，94% 是噪音。**
+ *  但那个数字测的是"下一条记录"，不是"下一句人话"——其中 95% 是宿主 0.1 秒后写的
+ *  stop_hook_summary。只看真人接话：<60s 3.6%、<300s 9.5%、p50 3.1 小时。
+ *
+ *  更关键的是：实测候选的 idleSec 中位数是 1052 秒，300 秒门槛碰不到绝大多数样本。
+ *  把门槛从 60 调到 300，通知量几乎不变。这个门槛目前是"空门"，留着是因为
+ *  它挡的是理论上的边界情况，不是实际噪音。见 docs/research/2026-10-31-replay-observations.md。
  *  停得久仍不动才是信号——这不需要预测未来，只需要观察过去。
  *  详见 docs/research/2026-10-31-online-classification.md §6 第 3 条。
  *
@@ -822,7 +831,7 @@ function readObservationRows(dir) {
 }
 
 /** UNCLASSIFIABLE 的时间分桶。边界与「停止 → 下一条记录」的实测分位对齐：
- *  <60s 88.6% 会继续、<300s 94.0% 会继续、<900s 97.9% 会继续。
+ *  修正后（只看真人接话）：<60s 3.6%、<300s 9.5%、<900s 15.4%，p50 3.1 小时。
  *  看这张表就是为了回答「门槛该不该往前/往后挪」。 */
 export const IDLE_BUCKETS = Object.freeze([
   { label: '<60s', min: 0, max: 60 },
@@ -1031,8 +1040,9 @@ export async function dispatchCandidates(candidates, {
     }
 
     // ── 时间门：UNCLASSIFIABLE 刚停下先不发 ──
-    // 87.7% 的在线停止判为 UNCLASSIFIABLE，而 94% 在 5 分钟内会继续 ——
-    // 立刻发就是把「还没停够久」当成「卡住了」。门槛只作用于这一个 kind。
+    // 87.7% 的在线停止判为 UNCLASSIFIABLE。门槛只作用于这一个 kind。
+    // 注意：实测候选的 idleSec 中位数 1052s，300s 门槛在真实数据上几乎从不触发 ——
+    // 它挡的是理论边界，不是实际噪音。实际压制噪音的是 hb_gap 判据自带的下限。
     // 与 kind 门同样先于 state 登记：被时间门挡下的不占用 notified 条目，
     // 等 idleSec 涨过门槛时同一轮就能正常走后面的流程。
     if (obs && obs.classify !== 'error' && tooRecentToNotify(obs.kind, c.idleSec ?? obs.idleSec, minIdle)) {
