@@ -17,6 +17,10 @@
  *
  * 状态与日志只写 %LOCALAPPDATA%\Overwatch\，**永不写仓库**（AC1）。
  * 零依赖，只用 node: 内置模块。
+ *
+ * 通知门（v2）：state → 停止分类 kind → **UNCLASSIFIABLE 的 5 分钟时间门槛** → 去重 → 限额。
+ * 时间门槛是必需的：在线路径 87.7% 的停止判为 UNCLASSIFIABLE，而实测 94% 在 5 分钟内会继续，
+ * 立刻通知等于用 94% 的噪音换 6% 的信号。见 UNCLASSIFIABLE_MIN_IDLE_SEC。
  */
 
 import {
@@ -276,7 +280,7 @@ export function recordSent(state, sessionId, nowMs = Date.now()) {
  *
  * 绝不调 `claude agents --json`：3.0–5.4 秒，而且会把已死的后台会话复活。
  */
-export function probeJobs(jobsRoot) {
+export function probeJobs(jobsRoot, { nowMs = Date.now() } = {}) {
   const started = process.hrtime.bigint();
   const found = [];
   let scanned = 0;
@@ -304,7 +308,7 @@ export function probeJobs(jobsRoot) {
     if (job.state !== 'failed' && job.state !== 'blocked') { skipped++; continue; }
     const sessionId = job.sessionId || job.resumeSessionId || name;
     const updated = Date.parse(job.updatedAt || job.lastTerminalAt || job.createdAt || '');
-    if (!Number.isFinite(updated) || Date.now() - updated > ACTIVE_WINDOW) { skipped++; continue; }
+    if (!Number.isFinite(updated) || nowMs - updated > ACTIVE_WINDOW) { skipped++; continue; }
     found.push({
       sessionId,
       state: job.state === 'failed' ? 'FAILED' : 'BLOCKED',
@@ -314,6 +318,9 @@ export function probeJobs(jobsRoot) {
       needs: job.needs || null,
       suggestedReply: job.suggestedReply || null,
       updatedAt: job.updatedAt || null,
+      // 时间门槛需要「停/失败了多久」。jobs 的权威时间戳是 updatedAt，
+      // 上面已经保证它可解析且在活跃窗口内，所以这里一定拿得到。
+      idleSec: Math.round((nowMs - updated) / 1000),
       source: 'jobs',
     });
   }
@@ -449,7 +456,11 @@ export function candidatesFromScan(sessions, { nowMs = Date.now(), states = NOTI
       reason: s.reason || 'unknown',
       project: s.project,
       needs: s.needs || null,
-      idleSec: s.idleSec,
+      // scan 一般会直接给 idleSec；缺了就从 lastActivity 反推，别让时间门槛因为
+      // 上游少一个字段而静默失效。
+      idleSec: Number.isFinite(s.idleSec)
+        ? s.idleSec
+        : (Number.isFinite(activity) ? Math.round((nowMs - activity) / 1000) : null),
       lastActivity: s.lastActivity,
       // 证据指纹：会话静止时 lastActivity 稳定；真的「卡在别处」时它会变。
       // 不用 idleSec——那是每轮都在走的，会让去重失效。
@@ -472,17 +483,52 @@ export function candidatesFromScan(sessions, { nowMs = Date.now(), states = NOTI
 /** 会发通知的 kind。其余一律抑制——理由见下表，不是可调参数：
  *
  *   WAITING_SUBAGENT    否  68% 的停止属于这一类，宿主自己会唤醒（R§3.1）
- *   EXTERNAL_BLOCKED    是  卡在外部条件，用户需要知道
- *   WAITING_APPROVAL    是  等用户批准
- *   ASKED_UNANSWERED    是  问了没答
- *   PLAN_SUBMITTED      是  计划等批准
+ *   EXTERNAL_BLOCKED    是  卡在外部条件，用户需要知道（不设时间门槛：jobs 是确定信号）
+ *   WAITING_APPROVAL    是  等用户批准（不设时间门槛）
+ *   ASKED_UNANSWERED    是  问了没答（不设时间门槛）
+ *   PLAN_SUBMITTED      是  计划等批准（不设时间门槛：plan 模式本来就要人批）
  *   COMPLETION_REPORT   否  做完了不需要催（完成与停滞不可分，但不必通知）
  *   ASKED_AND_ANSWERED  否  已经在对话里答过了
- *   UNCLASSIFIABLE      是  保守：判不了就当需要注意
+ *   UNCLASSIFIABLE      是  保守：判不了就当需要注意 —— **但先过 5 分钟时间门槛**，
+ *                            否则 87.7% 的在线停止会把它变成刷屏源（见 UNCLASSIFIABLE_MIN_IDLE_SEC）
  */
 export const NOTIFY_KINDS = Object.freeze([
   'EXTERNAL_BLOCKED', 'WAITING_APPROVAL', 'ASKED_UNANSWERED', 'PLAN_SUBMITTED', 'UNCLASSIFIABLE',
 ]);
+
+/** `UNCLASSIFIABLE` 的最短观察期，秒。默认 5 分钟。
+ *
+ *  为什么需要：在线路径下 87.7% 的停止判为 UNCLASSIFIABLE，而它是「保守放行」的。
+ *  实测 162300 个「停止 → 下一条记录」样本：p50=1s、p75=6s、p90=102s、p95=395s，
+ *  88.6% 在 60 秒内继续、94.0% 在 5 分钟内继续。**刚停下就通知，94% 是噪音。**
+ *  停得久仍不动才是信号——这不需要预测未来，只需要观察过去。
+ *  详见 docs/research/2026-10-31-online-classification.md §6 第 3 条。
+ *
+ *  **只作用于 UNCLASSIFIABLE**：其余 kind 要么本来就抑制，要么本身就是确定信号
+ *  （jobs 的 blocked、结构化工具调用），拿时间再筛一遍只会漏报。
+ *
+ *  覆盖：环境变量 OVERWATCH_UNCLASSIFIABLE_MIN_IDLE（秒，非负整数）。 */
+export const UNCLASSIFIABLE_MIN_IDLE_SEC = 300;
+
+/** 读取门槛，坏值退回默认而不是让守护进程炸掉。
+ *  `0` 是合法值（等价于关掉门槛），所以不能用 `||` 判空。 */
+export function unclassifiableMinIdleSec(env = process.env) {
+  const raw = env && env.OVERWATCH_UNCLASSIFIABLE_MIN_IDLE;
+  if (raw == null || String(raw).trim() === '') return UNCLASSIFIABLE_MIN_IDLE_SEC;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : UNCLASSIFIABLE_MIN_IDLE_SEC;
+}
+
+/** 时间门槛的判定。**只在 kind === 'UNCLASSIFIABLE' 时生效**。
+ *
+ *  idleSec 未知（null / 非数字）时不抑制——上游数据缺失不能变成「永远不通知」，
+ *  那会把一次采集缺陷伪装成一次正常的保守行为。 */
+export function tooRecentToNotify(kind, idleSec, minIdleSec = UNCLASSIFIABLE_MIN_IDLE_SEC) {
+  if (kind !== 'UNCLASSIFIABLE') return false;
+  if (!Number.isFinite(idleSec)) return false;
+  if (!Number.isFinite(minIdleSec) || minIdleSec <= 0) return false;
+  return idleSec < minIdleSec;
+}
 
 /** 只读尾部 1MB。一个停止点及其后的记录远小于这个量；
  *  permissionMode 按要求只扫停止点附近的窗口，不追到会话开头。 */
@@ -619,6 +665,9 @@ export function classifyCandidate(candidate, {
     ts: new Date(nowMs).toISOString(),
     sessionId: c.sessionId || null,
     state: c.state || null,
+    // 当时停了多久。P1 要靠它回答「门槛设 300 秒合不合适」：
+    // 被抑制的那批里后来有多少真的卡住了，只能靠这个字段回头核对。
+    idleSec: Number.isFinite(c.idleSec) ? c.idleSec : null,
     kind: 'UNCLASSIFIABLE',
     autoAnswerable: false,
     reason: '',
@@ -741,6 +790,16 @@ function readObservationRows(dir) {
   return out;
 }
 
+/** UNCLASSIFIABLE 的时间分桶。边界与「停止 → 下一条记录」的实测分位对齐：
+ *  <60s 88.6% 会继续、<300s 94.0% 会继续、<900s 97.9% 会继续。
+ *  看这张表就是为了回答「门槛该不该往前/往后挪」。 */
+export const IDLE_BUCKETS = Object.freeze([
+  { label: '<60s', min: 0, max: 60 },
+  { label: '60-300s', min: 60, max: 300 },
+  { label: '300-900s', min: 300, max: 900 },
+  { label: '>900s', min: 900, max: Infinity },
+]);
+
 /** `--stats`：读观察日志，输出分类分布、通知/抑制比、按 state 的交叉表。 */
 export function observationStats(dir) {
   const rows = readObservationRows(dir);
@@ -752,12 +811,16 @@ export function observationStats(dir) {
     notified: 0,
     suppressed: 0,
     byState: [],
+    unclassifiableIdle: null,
   };
   if (!rows.length) return res;
 
   const kindCount = new Map();
   const stateCount = new Map();
   const cross = new Map();
+  const idleBuckets = new Map();
+  let unk = 0;
+  let unkNoIdle = 0;
   for (const r of rows) {
     const kind = typeof r.kind === 'string' ? r.kind : 'UNKNOWN';
     kindCount.set(kind, (kindCount.get(kind) || 0) + 1);
@@ -768,11 +831,31 @@ export function observationStats(dir) {
     m.set(kind, (m.get(kind) || 0) + 1);
     if (r.notified === true) res.notified++;
     else res.suppressed++;
+    if (kind === 'UNCLASSIFIABLE') {
+      unk++;
+      const idle = Number(r.idleSec);
+      if (Number.isFinite(idle)) {
+        const b = IDLE_BUCKETS.find((x) => idle >= x.min && idle < x.max) || IDLE_BUCKETS[IDLE_BUCKETS.length - 1];
+        const cur = idleBuckets.get(b.label) || { n: 0, notified: 0 };
+        cur.n++;
+        if (r.notified === true) cur.notified++;
+        idleBuckets.set(b.label, cur);
+      } else {
+        unkNoIdle++;
+      }
+    }
     const ts = typeof r.ts === 'string' ? r.ts : null;
     if (ts) {
       if (!res.firstTs || ts < res.firstTs) res.firstTs = ts;
       if (!res.lastTs || ts > res.lastTs) res.lastTs = ts;
     }
+  }
+  if (unk > 0) {
+    res.unclassifiableIdle = {
+      total: unk,
+      withoutIdleSec: unkNoIdle,
+      buckets: IDLE_BUCKETS.map((b) => ({ label: b.label, ...(idleBuckets.get(b.label) || { n: 0, notified: 0 }) })),
+    };
   }
   res.kinds = [...kindCount.entries()]
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
@@ -787,8 +870,18 @@ export function observationStats(dir) {
   return res;
 }
 
+/** 把一个桶的通知情况写成一句话。分布表的价值在于「门槛是否合适」，
+ *  所以每个桶要说清楚实际结果，而不是假定「门槛以上一定发了」——
+ *  预算/去重也会挡，混在一起才是真实情况。 */
+function bucketNote(b, n) {
+  if (!n) return '';
+  if (b.notified === 0) return '（全部抑制）';
+  if (b.notified === n) return '（全部通知）';
+  return `（通知 ${b.notified} / 抑制 ${n - b.notified}）`;
+}
+
 /** 把 observationStats 的结果排版成 CLI 文本。 */
-export function formatStats(stats) {
+export function formatStats(stats, { minIdleSec = UNCLASSIFIABLE_MIN_IDLE_SEC } = {}) {
   const s = stats || { total: 0 };
   if (!s.total) return '观察样本：0 条（还没有 observations.jsonl）';
   const day = (iso) => (iso ? String(iso).slice(0, 10) : '?');
@@ -798,6 +891,19 @@ export function formatStats(stats) {
     lines.push(`  ${k.kind.padEnd(pad)} ${String(k.n).padStart(5)}  ${k.pct.toFixed(1)}%`);
   }
   lines.push(`通知：发了 ${s.notified} 条，抑制 ${s.suppressed} 条`);
+
+  // 时间维度：直接回答「门槛该不该调」。
+  // 若 <300s 桶里出现「通知」，说明门槛没有生效（例如 UNCLASSIFIABLE 之外的原因漏进来）。
+  if (s.unclassifiableIdle) {
+    const u = s.unclassifiableIdle;
+    lines.push(`UNCLASSIFIABLE 按 idle 分布（门槛 ${minIdleSec}s，共 ${u.total} 条）：`);
+    for (const b of u.buckets) {
+      const pct = ((b.n / u.total) * 100).toFixed(1);
+      lines.push(`  ${b.label.padEnd(9)} ${String(b.n).padStart(5)}  ${pct.padStart(5)}%  ${bucketNote(b, b.n)}`.trimEnd());
+    }
+    if (u.withoutIdleSec) lines.push(`  （另有 ${u.withoutIdleSec} 条缺 idleSec，无法分桶）`);
+  }
+
   lines.push('按 state 交叉：');
   for (const row of s.byState) {
     lines.push(`  ${row.state} → ${row.kinds.map(([k, n]) => `${k} ${n}`).join(' / ')}`);
@@ -835,10 +941,12 @@ function outcomeWhy(obs, fallback) {
 export async function dispatchCandidates(candidates, {
   state, logger, notifier, nowMs = Date.now(), dryRun = false,
   classify = null, observations = null,
+  env = process.env, unclassifiableMinIdle = null,
 } = {}) {
   const summary = { sent: [], suppressed: [], failed: [], already: 0, errors: [], observations: [] };
   const baseState = state || emptyState();
   state = baseState;
+  const minIdle = unclassifiableMinIdle == null ? unclassifiableMinIdleSec(env) : unclassifiableMinIdle;
 
   for (const candidate of candidates) {
     const c = { ...candidate };
@@ -853,10 +961,13 @@ export async function dispatchCandidates(candidates, {
       } catch (e) {
         // 分类回调自己炸了也不能中断派发：标成 error，退回按 state 通知
         if (logger) logger.error(`classify-failed session=${c.sessionId}: ${e.message}`);
-        obs = { ts: new Date(nowMs).toISOString(), sessionId: c.sessionId, state: c.state, kind: 'UNCLASSIFIABLE', autoAnswerable: false, reason: `分类异常：${e.message}`, confidence: null, notified: false, why: 'classify-error', classify: 'error' };
+        obs = { ts: new Date(nowMs).toISOString(), sessionId: c.sessionId, state: c.state, idleSec: Number.isFinite(c.idleSec) ? c.idleSec : null, kind: 'UNCLASSIFIABLE', autoAnswerable: false, reason: `分类异常：${e.message}`, confidence: null, notified: false, why: 'classify-error', classify: 'error' };
       }
       if (obs && typeof obs === 'object') {
         obs.fingerprint = c.evidenceFingerprint || '';
+        // 观察日志必须能看出「当时停了多久」——即使注入的 classify 回调没带，
+        // 也从候选补齐，否则 P1 没法回答「门槛该不该调」。
+        if (!Number.isFinite(obs.idleSec) && Number.isFinite(c.idleSec)) obs.idleSec = c.idleSec;
         if (obs.classify !== 'error') {
           c.kind = obs.kind;
           c.autoAnswerable = obs.autoAnswerable;
@@ -885,6 +996,19 @@ export async function dispatchCandidates(candidates, {
       summary.suppressed.push({ key, sessionId: c.sessionId, why: 'kind-not-notifiable', kind: obs.kind });
       summary.observations.push({ ...obs, notified: false });
       if (logger) logger.info(`suppressed ${c.state} kind=${obs.kind} session=${c.sessionId}`);
+      continue;
+    }
+
+    // ── 时间门：UNCLASSIFIABLE 刚停下先不发 ──
+    // 87.7% 的在线停止判为 UNCLASSIFIABLE，而 94% 在 5 分钟内会继续 ——
+    // 立刻发就是把「还没停够久」当成「卡住了」。门槛只作用于这一个 kind。
+    // 与 kind 门同样先于 state 登记：被时间门挡下的不占用 notified 条目，
+    // 等 idleSec 涨过门槛时同一轮就能正常走后面的流程。
+    if (obs && obs.classify !== 'error' && tooRecentToNotify(obs.kind, c.idleSec ?? obs.idleSec, minIdle)) {
+      const idle = c.idleSec ?? obs.idleSec;
+      summary.suppressed.push({ key, sessionId: c.sessionId, why: 'unclassifiable-too-recent', kind: obs.kind, idleSec: idle });
+      summary.observations.push({ ...obs, idleSec: idle, notified: false, why: 'unclassifiable-too-recent' });
+      if (logger) logger.info(`suppressed ${c.state} kind=${obs.kind} idle=${idle}s<${minIdle}s session=${c.sessionId}`);
       continue;
     }
 
@@ -1003,7 +1127,7 @@ export async function runTick({
 
   // ── L-fast ──
   if (due(state.lastJobsScanAt, JOBS_INTERVAL) || forceFull) {
-    const jobs = probeJobs(join(root, 'jobs'));
+    const jobs = probeJobs(join(root, 'jobs'), { nowMs });
     summary.ran.push('jobs');
     summary.timings.jobsMs = Math.round(jobs.elapsedMs);
     candidates = candidates.concat(jobs.found);
@@ -1074,7 +1198,7 @@ export async function runTick({
 
   const dispatched = await dispatchCandidates(eligible, {
     state, logger: log, notifier: notify, nowMs, dryRun,
-    classify: doClassify, observations: obsLog,
+    classify: doClassify, observations: obsLog, env,
   });
   summary.sent = dispatched.sent;
   summary.suppressed = dispatched.suppressed;
@@ -1161,11 +1285,12 @@ async function main(argv) {
     console.log('      node scripts/watch.mjs --dry-run  # 只算不发');
     console.log('      node scripts/watch.mjs --stats    # 读观察日志出分布');
     console.log(`状态目录：${defaultStateDir()}`);
+    console.log(`UNCLASSIFIABLE 时间门槛：${unclassifiableMinIdleSec()}s（OVERWATCH_UNCLASSIFIABLE_MIN_IDLE 可覆盖）`);
     return;
   }
 
   if (flags.has('--stats')) {
-    console.log(formatStats(observationStats(defaultStateDir())));
+    console.log(formatStats(observationStats(defaultStateDir()), { minIdleSec: unclassifiableMinIdleSec() }));
     return;
   }
 
@@ -1211,4 +1336,4 @@ if (isDirect) {
 }
 
 // 供测试与自检使用
-export const __internals = { JOBS_INTERVAL, PROBE_INTERVAL, FULL_INTERVAL, PER_SESSION_MAX_24H, GLOBAL_MAX_24H, GLOBAL_MIN_GAP, LOG_MAX_BYTES, ACTIVE_WINDOW, TAIL_READ_BYTES, OBS_MAX_BYTES };
+export const __internals = { JOBS_INTERVAL, PROBE_INTERVAL, FULL_INTERVAL, PER_SESSION_MAX_24H, GLOBAL_MAX_24H, GLOBAL_MIN_GAP, LOG_MAX_BYTES, ACTIVE_WINDOW, TAIL_READ_BYTES, OBS_MAX_BYTES, UNCLASSIFIABLE_MIN_IDLE_SEC };

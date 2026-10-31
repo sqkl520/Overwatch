@@ -298,6 +298,7 @@ const PROBE_ARGS = {
   lastPermissionMode: '[]', parseAskAnswers: '""', relevanceOf: '["a", ["b"]]',
   answerIsNegative: '""', findEarlierMatch: '["a", ["b"]]', classifyStop: '[{}]',
   findStopPoint: '[[]]', formatStats: '[{}]',
+  unclassifiableMinIdleSec: '[]', tooRecentToNotify: '["UNCLASSIFIABLE", 60, 300]',
 };
 
 /** 需要临时目录的导出，参数由探针注入 `_sandbox` */
@@ -426,6 +427,7 @@ function checkUnregisteredExports() {
     'findEarlierMatch', 'classifyStop',
     'findStopPoint', 'readTranscriptTail', 'classifyCandidate',
     'createObservationLog', 'observationStats', 'formatStats', 'NOTIFY_KINDS', 'OBS_MAX_BYTES',
+    'unclassifiableMinIdleSec', 'tooRecentToNotify', 'UNCLASSIFIABLE_MIN_IDLE_SEC', 'IDLE_BUCKETS',
     'recalibrateWeights', 'NOTIFY_STATES', '__internals', 'STATES', 'DAY', 'HOUR', 'MINUTE', 'App', 'KINDS',
   ]);
   const INTENTIONALLY_PROBED_FREE = new Set([

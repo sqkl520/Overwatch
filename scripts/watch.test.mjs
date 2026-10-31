@@ -22,7 +22,7 @@ import {
   probeJobs, probeMtime, diffProbe, foldProbe, candidatesFromScan,
   createLogger, dispatchCandidates, runTick, defaultStateDir, __internals,
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
-  observationStats, formatStats, NOTIFY_KINDS,
+  observationStats, formatStats, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -571,7 +571,7 @@ test('分类：WAITING_SUBAGENT 被抑制，不发通知，但写进观察日志
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('分类：UNCLASSIFIABLE 保守放行（判不了就当需要注意）', async () => {
+test('分类：UNCLASSIFIABLE 停够 5 分钟才放行（判不了就当需要注意，但先给时间）', async () => {
   const root = tmp();
   try {
     const sid = 'sess-unk';
@@ -581,8 +581,9 @@ test('分类：UNCLASSIFIABLE 保守放行（判不了就当需要注意）', as
       { type: 'assistant', uuid: 'a1', message: { id: 'm1', stop_reason: 'end_turn', content: [{ type: 'text', text: '随便一句' }] } },
     ].map((r) => JSON.stringify(r)).join('\n') + '\n');
     mkdirSync(join(root, 'jobs', 'j1'), { recursive: true });
+    // 10 分钟前就失败了：过了时间门槛，必须放行
     writeFileSync(join(root, 'jobs', 'j1', 'state.json'), JSON.stringify({
-      state: 'failed', sessionId: sid, updatedAt: new Date(now).toISOString(), cwd: 'D:\\Projects\\proj-b',
+      state: 'failed', sessionId: sid, updatedAt: new Date(now - 600_000).toISOString(), cwd: 'D:\\Projects\\proj-b',
     }));
 
     let n = 0;
@@ -592,8 +593,171 @@ test('分类：UNCLASSIFIABLE 保守放行（判不了就当需要注意）', as
       logger: { info: () => {}, warn: () => {}, error: () => {} },
       scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
     });
-    assert.equal(n, 1, 'UNCLASSIFIABLE 必须放行');
+    assert.equal(n, 1, '停了 600s 的 UNCLASSIFIABLE 必须放行');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('时间门槛：UNCLASSIFIABLE idleSec=60 抑制，why=unclassifiable-too-recent', async () => {
+  const calls = [];
+  const r = await dispatchCandidates(
+    [{ sessionId: 'u1', state: 'STALLED', reason: 'novelty=0.8', project: 'p', idleSec: 60, evidenceFingerprint: 'fp' }],
+    {
+      state: emptyState(), notifier: async (x) => { calls.push(x); }, nowMs: Date.now(),
+      classify: (c) => ({ ts: new Date().toISOString(), sessionId: c.sessionId, state: c.state, kind: 'UNCLASSIFIABLE', autoAnswerable: false, reason: '判不了', confidence: null, notified: false, why: 'notifyable', classify: 'ok' }),
+      env: {},
+    },
+  );
+  assert.equal(calls.length, 0, '刚停 60s 不得通知');
+  assert.equal(r.suppressed.length, 1);
+  assert.equal(r.suppressed[0].why, 'unclassifiable-too-recent');
+  assert.equal(r.observations[0].why, 'unclassifiable-too-recent', '不得复用 unclassifiable-suppressed');
+  assert.equal(r.observations[0].notified, false);
+});
+
+test('时间门槛：UNCLASSIFIABLE idleSec=600 通知', async () => {
+  const calls = [];
+  const r = await dispatchCandidates(
+    [{ sessionId: 'u2', state: 'STALLED', reason: 'novelty=0.8', project: 'p', idleSec: 600, evidenceFingerprint: 'fp' }],
+    {
+      state: emptyState(), notifier: async (x) => { calls.push(x); }, nowMs: Date.now(),
+      classify: (c) => ({ ts: new Date().toISOString(), sessionId: c.sessionId, state: c.state, kind: 'UNCLASSIFIABLE', autoAnswerable: false, reason: '判不了', confidence: null, notified: false, why: 'notifyable', classify: 'ok' }),
+      env: {},
+    },
+  );
+  assert.equal(calls.length, 1, '停够 600s 必须通知');
+  assert.equal(r.sent.length, 1);
+  assert.equal(r.observations[0].notified, true);
+});
+
+test('时间门槛：OVERWATCH_UNCLASSIFIABLE_MIN_IDLE 覆盖默认值', async () => {
+  assert.equal(unclassifiableMinIdleSec({}), 300);
+  assert.equal(unclassifiableMinIdleSec({ OVERWATCH_UNCLASSIFIABLE_MIN_IDLE: '30' }), 30);
+  assert.equal(unclassifiableMinIdleSec({ OVERWATCH_UNCLASSIFIABLE_MIN_IDLE: '0' }), 0, '0 是合法值，不能退回默认');
+  assert.equal(unclassifiableMinIdleSec({ OVERWATCH_UNCLASSIFIABLE_MIN_IDLE: 'abc' }), 300, '坏值退回默认');
+  assert.equal(unclassifiableMinIdleSec({ OVERWATCH_UNCLASSIFIABLE_MIN_IDLE: '-5' }), 300);
+
+  const mk = (idleSec) => [{ sessionId: 'e1', state: 'STALLED', reason: 'novelty=0.8', project: 'p', idleSec, evidenceFingerprint: 'fp' }];
+  const classify = (c) => ({ ts: new Date().toISOString(), sessionId: c.sessionId, state: c.state, kind: 'UNCLASSIFIABLE', autoAnswerable: false, reason: '判不了', confidence: null, notified: false, why: 'notifyable', classify: 'ok' });
+
+  // 门槛降到 30s：60s 的候选必须放行（默认 300s 下它会被挡）
+  let calls = 0;
+  await dispatchCandidates(mk(60), {
+    state: emptyState(), notifier: async () => { calls++; }, nowMs: Date.now(), classify,
+    env: { OVERWATCH_UNCLASSIFIABLE_MIN_IDLE: '30' },
+  });
+  assert.equal(calls, 1, '环境变量必须生效');
+
+  // 门槛抬到 900s：600s 的候选必须被挡
+  calls = 0;
+  const r = await dispatchCandidates(mk(600), {
+    state: emptyState(), notifier: async () => { calls++; }, nowMs: Date.now(), classify,
+    env: { OVERWATCH_UNCLASSIFIABLE_MIN_IDLE: '900' },
+  });
+  assert.equal(calls, 0);
+  assert.equal(r.suppressed[0].why, 'unclassifiable-too-recent');
+
+  // 0 = 关闭门槛
+  calls = 0;
+  await dispatchCandidates(mk(0), {
+    state: emptyState(), notifier: async () => { calls++; }, nowMs: Date.now(), classify,
+    env: { OVERWATCH_UNCLASSIFIABLE_MIN_IDLE: '0' },
+  });
+  assert.equal(calls, 1, '门槛为 0 时不得抑制');
+});
+
+test('时间门槛：EXTERNAL_BLOCKED 等确定信号不设门槛（idleSec=10 仍通知）', async () => {
+  const calls = [];
+  const r = await dispatchCandidates(
+    [{
+      sessionId: 'b1', state: 'BLOCKED', reason: 'host-reported-blocked', project: 'p',
+      idleSec: 10, needs: '等授权', evidenceFingerprint: 'fp', source: 'jobs',
+    }],
+    {
+      state: emptyState(), notifier: async (x) => { calls.push(x); }, nowMs: Date.now(),
+      classify: (c) => ({ ts: new Date().toISOString(), sessionId: c.sessionId, state: c.state, kind: 'EXTERNAL_BLOCKED', autoAnswerable: false, reason: '宿主报 blocked', confidence: 1, notified: false, why: 'notifyable', classify: 'ok' }),
+      env: {},
+    },
+  );
+  assert.equal(calls.length, 1, 'jobs 的 blocked 是确定信号，不得被时间门槛吞掉');
+  assert.equal(r.sent.length, 1);
+  assert.equal(tooRecentToNotify('EXTERNAL_BLOCKED', 0, 300), false);
+  assert.equal(tooRecentToNotify('WAITING_APPROVAL', 0, 300), false);
+  assert.equal(tooRecentToNotify('PLAN_SUBMITTED', 0, 300), false);
+  assert.equal(tooRecentToNotify('UNCLASSIFIABLE', 0, 300), true);
+  assert.equal(tooRecentToNotify('UNCLASSIFIABLE', null, 300), false, 'idleSec 缺失不得变成永久不通知');
+});
+
+test('时间门槛：观察日志记录 idleSec / notified / why', async () => {
+  const dir = tmp();
+  try {
+    const obs = createObservationLog(dir);
+    await dispatchCandidates(
+      [{ sessionId: 'o1', state: 'STALLED', reason: 'novelty=0.8', project: 'p', idleSec: 120, evidenceFingerprint: 'fp' }],
+      {
+        state: emptyState(), notifier: async () => {}, nowMs: new Date('2026-10-31T05:00:00Z').getTime(),
+        observations: obs, env: {},
+        classify: (c) => ({ ts: '2026-10-31T05:00:00Z', sessionId: c.sessionId, state: c.state, kind: 'UNCLASSIFIABLE', autoAnswerable: false, reason: '判不了', confidence: null, notified: false, why: 'notifyable', classify: 'ok' }),
+      },
+    );
+    const row = JSON.parse(readFileSync(join(dir, 'observations.jsonl'), 'utf8').trim());
+    assert.equal(row.idleSec, 120, '观察行必须带当时的 idleSec');
+    assert.equal(row.notified, false);
+    assert.equal(row.why, 'unclassifiable-too-recent');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('时间门槛：jobs 候选带 idleSec（来自 updatedAt），端到端抑制 10 秒前的停止', async () => {
+  const root = tmp();
+  try {
+    const sid = 'sess-recent';
+    mkdirSync(join(root, 'projects', 'proj-e'), { recursive: true });
+    writeFileSync(join(root, 'projects', 'proj-e', `${sid}.jsonl`), [
+      { type: 'assistant', uuid: 'a1', message: { id: 'm1', stop_reason: 'end_turn', content: [{ type: 'text', text: '随便一句' }] } },
+    ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+    const now = Date.now();
+    mkdirSync(join(root, 'jobs', 'j1'), { recursive: true });
+    writeFileSync(join(root, 'jobs', 'j1', 'state.json'), JSON.stringify({
+      state: 'failed', sessionId: sid, updatedAt: new Date(now - 10_000).toISOString(), cwd: 'D:\\Projects\\proj-e',
+    }));
+
+    let n = 0;
+    const r = await runTick({
+      dir: join(root, 'state'), claudeDir: root, nowMs: now, forceFull: true,
+      notifier: async () => { n++; },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+    });
+    assert.equal(n, 0, '刚停 10 秒的 UNCLASSIFIABLE 不得通知');
+    assert.equal(r.suppressed[0].why, 'unclassifiable-too-recent');
+    const row = JSON.parse(readFileSync(join(root, 'state', 'observations.jsonl'), 'utf8').trim());
+    assert.ok(row.idleSec >= 10 && row.idleSec < 20, `jobs 候选的 idleSec 必须来自 updatedAt，实际 ${row.idleSec}`);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('--stats：UNCLASSIFIABLE 按 idle 分桶，并标出每个桶的通知情况', () => {
+  const dir = tmp();
+  try {
+    const log = createObservationLog(dir);
+    log.append([
+      { ts: '2026-10-31T01:00:00Z', sessionId: 'a', state: 'STALLED', kind: 'UNCLASSIFIABLE', idleSec: 10, notified: false, why: 'unclassifiable-too-recent' },
+      { ts: '2026-10-31T01:10:00Z', sessionId: 'b', state: 'STALLED', kind: 'UNCLASSIFIABLE', idleSec: 120, notified: false, why: 'unclassifiable-too-recent' },
+      { ts: '2026-10-31T01:20:00Z', sessionId: 'c', state: 'FAILED', kind: 'UNCLASSIFIABLE', idleSec: 600, notified: true, why: null },
+      { ts: '2026-10-31T01:30:00Z', sessionId: 'd', state: 'STALLED', kind: 'EXTERNAL_BLOCKED', idleSec: 5, notified: true, why: null },
+    ]);
+    const st = observationStats(dir);
+    assert.equal(st.unclassifiableIdle.total, 3);
+    assert.equal(st.unclassifiableIdle.withoutIdleSec, 0);
+    const b = Object.fromEntries(st.unclassifiableIdle.buckets.map((x) => [x.label, x]));
+    assert.equal(b['<60s'].n, 1);
+    assert.equal(b['60-300s'].n, 1);
+    assert.equal(b['300-900s'].n, 1);
+    assert.equal(b['>900s'].n, 0);
+
+    const text = formatStats(st, { minIdleSec: 300 });
+    assert.match(text, /UNCLASSIFIABLE 按 idle 分布（门槛 300s，共 3 条）/);
+    assert.match(text, /<60s\s+1\s+33\.3%\s+（全部抑制）/);
+    assert.match(text, /300-900s\s+1\s+33\.3%\s+（全部通知）/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('分类：COMPLETION_REPORT 被抑制', async () => {
