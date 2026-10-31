@@ -21,6 +21,7 @@ import {
   dedupeKey, reasonClass, canNotify, recordSent, emptyState, loadState, saveState,
   probeJobs, probeMtime, diffProbe, foldProbe, candidatesFromScan,
   createLogger, dispatchCandidates, runTick, defaultStateDir, __internals,
+  pruneNotified, NOTIFIED_TTL_HOURS,
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
   observationStats, formatStats, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
 } from './watch.mjs';
@@ -899,5 +900,57 @@ test('readTranscriptTail：大文件只读尾部，且丢掉被截断的首行',
     assert.equal(records[records.length - 1].i, 1999, '必须读到真正的末行');
     assert.ok(records.every((r) => typeof r.i === 'number'), '首行被截断时必须丢弃');
     assert.deepEqual(readTranscriptTail(join(dir, 'missing.jsonl')).records, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── 已通知条目的 TTL（防止 state.json 无限膨胀）──────────────────────
+//
+// 实测：跑一晚攒下 10 条已通知条目，其中一半指向已被清理的 transcript。
+// 那些条目再也不会被匹配到，只会让状态文件一路变大。
+
+test('pruneNotified 删除超过 24h 的条目', () => {
+  const now = Date.now();
+  const notified = {
+    fresh: { firstSeenAt: new Date(now - 2 * 3600_000).toISOString() },
+    stale: { firstSeenAt: new Date(now - 30 * 3600_000).toISOString() },
+  };
+  const r = pruneNotified(notified, now);
+  assert.equal(r.removed, 1);
+  assert.ok(notified.fresh, '24h 内的必须保留');
+  assert.equal(notified.stale, undefined, '超期的必须删除');
+});
+
+test('pruneNotified 删除时间不可解析的坏条目', () => {
+  const now = Date.now();
+  const notified = {
+    broken: { firstSeenAt: 'not-a-date' },
+    missing: {},
+    noTime: null,
+  };
+  const r = pruneNotified(notified, now);
+  assert.equal(r.removed, 3, '坏条目一律清掉，不该永久占位');
+});
+
+test('pruneNotified 对空输入不抛', () => {
+  assert.equal(pruneNotified({}, Date.now()).removed, 0);
+  assert.equal(pruneNotified(null, Date.now()).removed, 0);
+  assert.equal(pruneNotified(undefined, Date.now()).removed, 0);
+});
+
+test('loadState 读入时会清理过期条目', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    writeFileSync(join(dir, 'state.json'), JSON.stringify({
+      version: 1,
+      notified: {
+        old: { firstSeenAt: new Date(now - 48 * 3600_000).toISOString(), sessionId: 'x', state: 'FAILED' },
+        recent: { firstSeenAt: new Date(now - 3600_000).toISOString(), sessionId: 'y', state: 'FAILED' },
+      },
+      budget: { day: null, sent: 0, sentLog: [], perSession: {} },
+    }));
+    const { state } = loadState(dir);
+    assert.equal(Object.keys(state.notified).length, 1, '只应留下未过期的');
+    assert.ok(state.notified.recent, '保留的必须是 recent');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

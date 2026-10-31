@@ -419,7 +419,7 @@ function checkUnregisteredExports() {
     'stripLongStrings', 'collectSubagentFiles', 'stateCounts', 'listRow',
     'columnHeaderLine', 'listHeaderLine', 'usage', 'fmtDur', 'fmtNovelty',
     'projectLabel', 'glyphOf', 'stateOf', 'reasonClass', 'dedupeKey',
-    'emptyState', 'loadState', 'saveState', 'recordSent', 'probeJobs',
+    'emptyState', 'loadState', 'saveState', 'recordSent', 'probeJobs', 'pruneNotified', 'NOTIFIED_TTL_HOURS',
     'probeMtime', 'diffProbe', 'foldProbe', 'canNotify', 'candidatesFromScan',
     'createLogger', 'defaultStateDir', 'escapeXml', 'sanitizeTag', 'textOf',
     'buildPayloadXml', 'defaultNotifyDir', 'lastPermissionMode',

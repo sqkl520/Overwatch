@@ -190,7 +190,38 @@ export function loadState(dir, { logger = null } = {}) {
   };
   if (!Array.isArray(state.budget.sentLog)) state.budget.sentLog = [];
   if (typeof state.budget.perSession !== 'object' || !state.budget.perSession) state.budget.perSession = {};
+
+  // 已通知条目会永久占据去重表。会话被清理后（Claude Code 会删临时 transcript），
+  // 条目就再也不会被匹配到，只会让 state.json 一路膨胀。
+  // 实测：跑了一晚攒下 10 条，其中一半指向已经不存在的会话。
+  // 按 firstSeenAt 的年龄清理，只保留还在 24h 去重窗口内的。
+  const pruned = pruneNotified(state.notified, Date.now());
+  if (pruned.removed && logger) {
+    logger.info(`state 清理：移除 ${pruned.removed} 条超过 ${NOTIFIED_TTL_HOURS}h 的已通知条目`);
+  }
+
   return { state, corrupt: false };
+}
+
+/** 已通知条目保留多久。与限额窗口同为 24h：
+ *  超过这个年龄的条目既不会再被去重命中（会话早就过去了），
+ *  也不该继续占内存。 */
+export const NOTIFIED_TTL_HOURS = 24;
+
+/** 原地删除过期的已通知条目，返回移除数。
+ *  年龄从 firstSeenAt 算；时间不可解析的也删掉——那说明条目本身是坏的。 */
+export function pruneNotified(notified, nowMs = Date.now()) {
+  if (!notified || typeof notified !== 'object') return { removed: 0 };
+  const cutoff = nowMs - NOTIFIED_TTL_HOURS * 3600_000;
+  let removed = 0;
+  for (const [k, v] of Object.entries(notified)) {
+    const t = Date.parse(v && v.firstSeenAt);
+    if (!Number.isFinite(t) || t < cutoff) {
+      delete notified[k];
+      removed++;
+    }
+  }
+  return { removed };
 }
 
 /** tmp + rename 原子替换。写到一半崩掉不会留下半截 JSON。 */
