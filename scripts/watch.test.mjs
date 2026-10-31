@@ -994,3 +994,46 @@ test('notifyTitle：没有 project 时用 sessionId 前 8 位', () => {
   assert.ok(t.includes('abcdef12'));
   assert.ok(!t.includes('null'));
 });
+
+// ── 多实例与 state.json 争用（2026-10-31 实测故障）──────────────���────
+
+test('dry-run 不写 state.json——否则会和真身抢锁', async () => {
+  const dir = tmp();
+  const claude = tmp();
+  try {
+    const now = Date.now();
+    mkdirSync(join(claude, 'jobs', 'j1'), { recursive: true });
+    writeFileSync(join(claude, 'jobs', 'j1', 'state.json'), JSON.stringify({
+      state: 'failed', sessionId: 's1', updatedAt: new Date(now).toISOString(), cwd: 'D:\P\demo',
+    }));
+    mkdirSync(join(claude, 'projects'), { recursive: true });
+    await runTick({
+      dir, claudeDir: claude, nowMs: now, dryRun: true,
+      notifier: async () => {},
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+    });
+    assert.equal(existsSync(join(dir, 'state.json')), false,
+      'dry-run 落盘会与真身争 rename，Windows 上抛 EPERM');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(claude, { recursive: true, force: true });
+  }
+});
+
+test('saveState 能覆盖已存在文件，且失败时不留下 tmp 残片', () => {
+  const dir = tmp();
+  try {
+    saveState(dir, emptyState());
+    const second = emptyState();
+    second.lastProbeAt = '2026-10-31T00:00:00.000Z';
+    saveState(dir, second);
+    assert.equal(JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).lastProbeAt,
+      '2026-10-31T00:00:00.000Z');
+    const { readdirSync } = process.getBuiltinModule('node:fs');
+    const leftovers = readdirSync(dir).filter((f) => f.includes('.tmp-'));
+    assert.deepEqual(leftovers, [], `不该留下 tmp 文件：${leftovers}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

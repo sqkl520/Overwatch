@@ -56,6 +56,9 @@ const GLOBAL_MIN_GAP = 10 * MINUTE;
 
 const LOG_MAX_BYTES = 1024 * 1024;
 
+/** state.json 替换失败时的重试次数（Windows rename 非原子，见 saveState）。 */
+const STATE_RENAME_RETRIES = 4;
+
 /** 只对「最近还有活动」的会话告警。一周前就停了的会话不是新闻，
  *  首轮跑起来会把它们全当新边沿，一次刷屏 20 条。 */
 const ACTIVE_WINDOW = 24 * HOUR;
@@ -240,7 +243,12 @@ export function pruneNotified(notified, nowMs = Date.now()) {
   return { removed };
 }
 
-/** tmp + rename 原子替换。写到一半崩掉不会留下半截 JSON。 */
+/** tmp + rename 原子替换。写到一半崩掉不会留下半截 JSON。
+ *
+ *  Windows 上 rename 不是原子的：目标文件被另一个进程打开时抛 EPERM。
+ *  实测过两个实例（一个真身、一个 --dry-run）同时跑，真身每几小时就
+ *  tick-failed 一次。现在重试几次，仍失败则抛出一条能读懂的错误——
+ *  调用方看到的是「另一个实例在写」，不是一句裸的 EPERM。 */
 export function saveState(dir, state) {
   const target = asPath(dir);
   if (!target) throw new TypeError('saveState: dir 必须是字符串路径');
@@ -248,7 +256,27 @@ export function saveState(dir, state) {
   const p = statePath(target);
   const tmp = `${p}.tmp-${process.pid}`;
   writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', 'utf8');
-  renameSync(tmp, p);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(tmp, p);
+      return;
+    } catch (e) {
+      const transient = e && (e.code === 'EPERM' || e.code === 'EBUSY' || e.code === 'EACCES');
+      if (!transient || attempt >= STATE_RENAME_RETRIES) {
+        try { rmSync(tmp, { force: true }); } catch { /* ignore */ }
+        if (transient) {
+          const err = new Error(
+            `state.json 被另一个进程占用（重试 ${attempt} 次仍失败）。` +
+            '很可能有第二个 watcher 实例在跑——用 `--dry-run` 也会抢锁。'
+          );
+          err.cause = e;
+          throw err;
+        }
+        throw e;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40 * (attempt + 1));
+    }
+  }
 }
 
 // ── 去重 ──────────────────────────────────────────────────────────────
@@ -1289,7 +1317,10 @@ export async function runTick({
   }
   if (dispatched.errors.length) summary.errors = [...(summary.errors || []), ...dispatched.errors];
 
-  saveState(stateDir, state);
+  // dry-run 不落盘：它绕过了发送，但**仍会走 saveState**，
+  // 于是和真身抢同一个 state.json，rename 报 EPERM 把整个 tick 打挂。
+  // 2026-10-31 实测：一个 --dry-run 实例跑了 6 小时，真身三次 tick-failed。
+  if (!dryRun) saveState(stateDir, state);
 
   const parts = [];
   for (const layer of summary.ran) parts.push(layer);
