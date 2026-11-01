@@ -287,3 +287,49 @@ test('mergeHistory：会话消失（transcript 被删）不当成已回答', () 
   assert.equal(m.answered, 0, '不知道状态就不能判已回答');
   assert.equal(hist.entries[k].answeredAt, null);
 });
+
+// ── 历史积压：老问题不该拉低「待回答」（2026-11-01）─────────────────
+
+import { BACKLOG_HOURS } from './asked.mjs';
+
+test('BACKLOG_HOURS 是 24——实测回复 p90 是 14.7h、99% 在 24h 内', () => {
+  assert.equal(BACKLOG_HOURS, 24);
+});
+
+test('mergeHistory：首次见到就已超 24h 的问题标为积压，不计入待回答', () => {
+  // 实测：首轮扫描收进 5 条，最早 21 天前。它们所在的会话早就不动了。
+  const now = Date.now();
+  const hist = { version: 1, entries: {} };
+  const m = mergeHistory(hist, [
+    { filePath: '/p/old.jsonl', project: 'old', kind: 'decision', question: '老问题？', hours: 200 },
+    { filePath: '/p/new.jsonl', project: 'new', kind: 'decision', question: '新问题？', hours: 2 },
+  ], { nowMs: now, stillAsking: new Map([['old', true], ['new', true]]) });
+  assert.equal(m.backlog, 1, '200 小时前的应判积压');
+  assert.equal(m.added, 2);
+  const st = historyStats(hist, { nowMs: now });
+  assert.equal(st.backlog, 1);
+  assert.equal(st.pending, 1, '只有新的那条算待回答');
+});
+
+test('mergeHistory：积压条目不参与回答判定', () => {
+  // 积压会话永远不会回复。「没再扫到」是常态，不是「被回答了」。
+  const now = Date.now();
+  const k = questionKey('old', '老问题？');
+  const hist = { version: 1, entries: { [k]: entry({
+    sessionId: 'old', question: '老问题？', backlog: true,
+  }) } };
+  const m = mergeHistory(hist, [], { nowMs: now, stillAsking: new Map([['old', false]]) });
+  assert.equal(m.answered, 0, '积压条目不该被判已回答');
+  assert.equal(hist.entries[k].answeredAt, null);
+});
+
+test('formatHistory：积压单独说明，且数字引用常量不写死', () => {
+  const out = formatHistory({ total: 4, backlog: 4, backlogHours: 24, answered: 0, pending: 0 });
+  assert.ok(out.includes('历史积压'));
+  assert.ok(out.includes('24 小时'), '应引用常量');
+  assert.ok(out.includes('不会有回复'));
+});
+
+test('historyStats：空历史时 backlogHours 也有值', () => {
+  assert.equal(historyStats({ entries: {} }).backlogHours, BACKLOG_HOURS);
+});

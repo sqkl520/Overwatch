@@ -35,6 +35,23 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 /** 默认只看停够这么久的。1 小时：刚问完、人可能正在看，不该催。 */
 export const DEFAULT_MIN_HOURS = 1;
 
+/** 已经是「积压」而不是「新问题」的阈值（小时）。
+ *
+ *  2026-11-01 实测：首轮扫描一次性收进 5 条问题，最早的是 21 天前。
+ *  它们所在的会话早就不动了——**永远不会有人回答**。
+ *
+ *  把这类和新出现的问题混在一起，会让「已回答 0 / 待回答 N」永远难看，
+ *  而它并不反映系统好坏，只反映「这个仓库里有多少历史遗留」。
+ *
+ *  为什么是 24：实测 492 个真实问答对，回复延迟 p90 = 14.7h、99% 在 24 小时内。
+ *  超过一天还没答的，不是「在等」，是「被忘了」或「会话结束了」。
+ *  （初版写 48，实测发现 44 小时的问题仍被算作待回答——已越过 p99 一倍。）
+ *
+ *  注意：积压条目**仍会出现在 asked.mjs 的输出里**（它们确实没答），
+ *  只是不计入历史的「待回答」统计。
+ */
+export const BACKLOG_HOURS = 24;
+
 /** 会话开场的客套话。这些永远没人回，也不该提醒。 */
 export const GREETING = /今天想做什么|想从哪里开始|有什么需要帮忙|有什么可以帮|吩咐我就好|一声令下|告诉我.{0,6}需求|想做点什么呢|随时准备帮你|想让我帮|需要我做什么/;
 
@@ -217,6 +234,7 @@ export function mergeHistory(hist, found, { nowMs = Date.now(), stillAsking = nu
   const iso = new Date(nowMs).toISOString();
   const seen = new Set();
   let added = 0;
+  let backlog = 0;
 
   for (const it of found) {
     const sid = sessionIdOf(it.filePath);
@@ -224,6 +242,11 @@ export function mergeHistory(hist, found, { nowMs = Date.now(), stillAsking = nu
     seen.add(key);
     const e = hist.entries[key];
     if (!e) {
+      // 首次见到一个**已经很老**的问题 → 标为 backlog，不算「新发现」。
+      // 它所在的会话多半早就不动了，永远不会有人回答；把它算进「待回答」
+      // 只会让统计永远难看，而那不反映系统好坏。
+      const isBacklog = Number(it.hours) >= BACKLOG_HOURS;
+      if (isBacklog) backlog++;
       hist.entries[key] = {
         sessionId: sid,
         project: it.project,
@@ -232,6 +255,9 @@ export function mergeHistory(hist, found, { nowMs = Date.now(), stillAsking = nu
         firstSeenAt: iso,
         lastSeenAt: iso,
         seenCount: 1,
+        // backlog 的条目单独计数，不进「待回答」
+        backlog: isBacklog,
+        questionAgeHoursAtFirstSeen: Number.isFinite(it.hours) ? it.hours : null,
         answeredAt: null,
         answerLatencyHours: null,
       };
@@ -248,6 +274,9 @@ export function mergeHistory(hist, found, { nowMs = Date.now(), stillAsking = nu
   if (stillAsking) {
     for (const [key, e] of Object.entries(hist.entries)) {
       if (e.answeredAt) continue;
+      // backlog 条目不做回答判定：它们对应的会话早已结束，
+      // 「没再扫到」是常态，不是「被回答了」。
+      if (e.backlog) continue;
       // 只有明确知道该会话「不再以问句结尾」才判已回答。用 === false 而不是 !get(...)：
       // Map 里没有这个会话时返回 undefined，那表示「不知道」，不能当成「已不再问」——
       // 否则一个刚被删掉的 transcript 会被记成已回答，污染延迟统计。
@@ -261,14 +290,19 @@ export function mergeHistory(hist, found, { nowMs = Date.now(), stillAsking = nu
       }
     }
   }
-  return { added, answered, total: Object.keys(hist.entries).length };
+  return { added, answered, backlog, total: Object.keys(hist.entries).length };
 }
 
-/** 历史统计。回答「这东西有没有用」。 */
+/** 历史统计。回答「这东西有没有用」。
+ *
+ *  **backlog 条目单独算**：它们对应的会话早就结束了，永远不会有人回答。
+ *  把它们算进「待回答」会让这个数字永远难看，而那不反映系统好坏。 */
 export function historyStats(hist, { nowMs = Date.now() } = {}) {
   const all = Object.values(hist.entries || {});
-  const answered = all.filter((e) => e.answeredAt);
-  const pending = all.filter((e) => !e.answeredAt);
+  const backlog = all.filter((e) => e.backlog);
+  const live = all.filter((e) => !e.backlog);
+  const answered = live.filter((e) => e.answeredAt);
+  const pending = live.filter((e) => !e.answeredAt);
   const lat = answered.map((e) => e.answerLatencyHours).filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
   const q = (x) => (lat.length ? lat[Math.min(lat.length - 1, Math.floor(lat.length * x))] : null);
   // 超过 24 小时仍未回答的：由实测分布，99% 的回复在 24h 内，所以这些基本是被忘了
@@ -278,6 +312,9 @@ export function historyStats(hist, { nowMs = Date.now() } = {}) {
   });
   return {
     total: all.length,
+    backlog: backlog.length,
+    // 让文案引用常量，不写死数字——写死过一次 48，改阈值后文案就对不上了
+    backlogHours: BACKLOG_HOURS,
     answered: answered.length,
     pending: pending.length,
     stalePending: stale.length,
@@ -303,6 +340,10 @@ export function formatHistory(st) {
       '（每次运行 `node scripts/asked.mjs` 都会自动记录，不需要额外操作。）';
   }
   const lines = [`历史：累计 ${st.total} 条问题`];
+  if (st.backlog) {
+    lines.push(`  其中 ${st.backlog} 条是**历史积压**（首次发现时就已超过 ${st.backlogHours} 小时）——`);
+    lines.push('  它们所在的会话早已结束，不会有回复，不计入下面的统计。');
+  }
   lines.push(`  已回答 ${st.answered} 条 · 仍待回答 ${st.pending} 条`);
   if (st.stalePending) {
     lines.push(`  其中 ${st.stalePending} 条已超过 24 小时——由实测分布，99% 的回复在 24h 内，`);
