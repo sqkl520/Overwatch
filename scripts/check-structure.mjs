@@ -439,7 +439,7 @@ function checkUnregisteredExports() {
     'unclassifiableMinIdleSec', 'tooRecentToNotify', 'UNCLASSIFIABLE_MIN_IDLE_SEC', 'IDLE_BUCKETS',
     'traceability', 'readJobStates', 'probeWaiting', 'readLiveSessionStates',
     'buildInbox', 'formatInbox', 'healthCheck', 'formatHealth', 'HEALTH_PERIODS',
-    'statusToState', 'liveToRow', 'mergeLiveSessions', 'listRow', 'detailLines',
+    'statusToState', 'liveToRow', 'mergeLiveSessions', 'listRow', 'detailLines', 'pendingLines',
     'claimOwnership', 'readOwner', 'ownerPath',
     // validate-run.mjs
     'validateGraph', 'validateFile', 'CAPABILITIES', 'SHAPES', 'REQUIRED_FOR_COMPLEX', 'MIN_SUBTREES',

@@ -12,7 +12,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { wrapToWidth, truncateToWidth, parseArgs, parseKeys, sanitize, buildDraft, listRow, detailLines } from './oversight-tui.mjs';
+import { wrapToWidth, truncateToWidth, parseArgs, parseKeys, sanitize, buildDraft, listRow, detailLines, pendingLines } from './oversight-tui.mjs';
 import { displayWidth } from './tui-theme.mjs';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -394,4 +394,32 @@ test('详情页：liveness 必须净化——它来自外部数据，可含 ANSI
   const joined = out.join('\n');
   assert.ok(!joined.includes('\x1b'), 'liveness 残留 ESC');
   assert.ok(!joined.includes('\x07'), 'liveness 残留 BEL');
+});
+
+// ── 首次扫描的等待体验（2026-11-01）────────────────────────────────
+
+test('pendingLines 显示真实等待秒数，不是写死的「约 10 秒」', () => {
+  // 实测 33 个会话要 26 秒，而旧文案写「约 10 秒」——
+  // 一个刚拿到仓库的人会等到以为卡死然后 Ctrl-C。
+  const app = { now: () => 1_000_000, scanStartedAt: 1_000_000 - 26_000 };
+  const out = pendingLines(app, 100).join('\n');
+  assert.ok(out.includes('已等待 26s'), `应显示真实秒数：\n${out}`);
+  assert.ok(!out.includes('约 10 秒'), '不得再写死旧数字');
+});
+
+test('pendingLines 明确说「不是卡死」，并给出不等它的办法', () => {
+  const app = { now: () => 1_000_000, scanStartedAt: 1_000_000 - 5000 };
+  const out = pendingLines(app, 100).join('\n');
+  assert.ok(out.includes('不是卡死'), '要明确排除卡死的误解');
+  assert.ok(out.includes('q'), '要告诉用户怎么退出');
+  assert.ok(out.includes('scan-sessions.mjs'), '要给出一次性快照的退路');
+});
+
+test('pendingLines 不超过给定宽度', () => {
+  const app = { now: () => 1_000_000, scanStartedAt: 1_000_000 - 5000 };
+  for (const cols of [40, 60, 100]) {
+    for (const l of pendingLines(app, cols)) {
+      assert.ok(displayWidth(l) <= cols, `宽度 ${displayWidth(l)} 超过 ${cols}：${l}`);
+    }
+  }
 });

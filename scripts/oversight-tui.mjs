@@ -450,6 +450,30 @@ function columnHeaderLine(cols) {
   return truncateToWidth(line, cols);
 }
 
+/** 首次扫描的等待提示。
+ *
+ *  2026-11-01 实测：本机 33 个会话、26 秒。**一个刚拿到仓库的人第一次打开 TUI，
+ *  看到的是 26 秒的空白 + 一行「刷新中…」**，没有任何提示会等这么久——
+ *  大部分人会以为卡死，然后 Ctrl-C。
+ *
+ *  这里在首次扫描期间显示一台机器上**实测过的**预期，而不是让屏幕呆着不动。
+ *  数字会随语料增长而变，所以同时给出「已等待」计时，让人自己判断是不是异常。 */
+export function pendingLines(app, cols) {
+  const waited = app.scanStartedAt ? app.now() - app.scanStartedAt : 0;
+  const secs = Math.round(waited / 1000);
+  const lines = [
+    '',
+    `  首次扫描进行中… 已等待 ${secs}s`,
+    '',
+    '  扫描全部 transcript 需要时间（本机 33 个会话约 26s，语料越多越久）。',
+    '  这不是卡死——状态行每秒更新一次，`q` 可随时退出。',
+    '',
+    '  不想等的话，用一次性快照：',
+    '    node scripts/scan-sessions.mjs --days 3',
+  ];
+  return lines.map((l) => truncateToWidth(l, cols));
+}
+
 /** 状态行（列表底部第二行）。 */
 function statusLine(app, cols) {
   const sessions = app.sessions();
@@ -713,6 +737,7 @@ export class App {
     this.closed = false;
     this._tick = null;
     this._next = null;
+    this.scanStartedAt = null;
     this._onData = null;
     this._onResize = null;
     this._resolve = null;
@@ -797,6 +822,7 @@ export class App {
     if (this.closed || this.refreshing) return;
     if (this._next) { clearTimeout(this._next); this._next = null; }
     this.refreshing = true;
+    if (!this.scanStartedAt) this.scanStartedAt = this.now();
     this.render();
 
     const job = this.scan({ days: this.days });
@@ -951,11 +977,19 @@ export class App {
     this.listOffset = Math.min(Math.max(0, this.listOffset), maxOffset);
 
     if (!sessions.length) {
-      const msg = this.data
-        ? '（当前窗口内没有会话）'
-        : (this.warning ? `扫描失败：${this.warning}` : '正在扫描…（首次扫描约 10 秒）');
-      lines.push(truncateToWidth(msg, cols));
-      for (let i = 1; i < area; i++) lines.push('');
+      if (this.data) {
+        lines.push(truncateToWidth('（当前窗口内没有会话）', cols));
+        for (let i = 1; i < area; i++) lines.push('');
+      } else if (this.warning) {
+        lines.push(truncateToWidth(`扫描失败：${this.warning}`, cols));
+        for (let i = 1; i < area; i++) lines.push('');
+      } else {
+        // 首次扫描：实测 33 个会话 26 秒，而旧文案写「约 10 秒」——
+        // 一个刚拿到仓库的人会等 26 秒然后以为卡死。
+        const pending = pendingLines(this, cols);
+        for (const l of pending) lines.push(l);
+        for (let i = pending.length; i < area; i++) lines.push('');
+      }
     } else {
       for (let i = 0; i < area; i++) {
         const idx = this.listOffset + i;
