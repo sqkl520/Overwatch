@@ -145,3 +145,145 @@ test('GREETING 不误伤真问题', () => {
   // 客套模式里有「需要我做什么」，别把它套到「需要我删掉旧包吗」上
   assert.equal(GREETING.test('需要我把旧三个删掉腾空间吗？'), false);
 });
+
+// ── 历史：哪些被回答了、平均多久（2026-11-01）──────────────────────
+
+import {
+  questionKey, sessionIdOf, loadHistory, saveHistory,
+  mergeHistory, historyStats, historyPath, formatHistory,
+} from './asked.mjs';
+
+const entry = (over = {}) => ({
+  sessionId: 's1', project: 'p', question: 'q?', kind: 'decision',
+  firstSeenAt: new Date(Date.now() - 3600e3).toISOString(),
+  lastSeenAt: new Date().toISOString(), seenCount: 1, answeredAt: null, answerLatencyHours: null,
+  ...over,
+});
+
+test('questionKey 稳定：同一问题同一 key，不同问题不同 key', () => {
+  assert.equal(questionKey('s1', 'q?'), questionKey('s1', 'q?'));
+  assert.notEqual(questionKey('s1', 'q?'), questionKey('s1', 'other?'));
+  assert.notEqual(questionKey('s1', 'q?'), questionKey('s2', 'q?'));
+});
+
+test('sessionIdOf 从文件路径取 uuid', () => {
+  assert.equal(sessionIdOf("C:\\projects\\x\\abc-123.jsonl"), "abc-123");
+  assert.equal(sessionIdOf('/home/u/.claude/projects/p/def-456.jsonl'), 'def-456');
+});
+
+test('mergeHistory：新发现记 firstSeenAt', () => {
+  const now = Date.now();
+  const hist = { version: 1, entries: {} };
+  const m = mergeHistory(hist, [{ filePath: '/p/a.jsonl', project: 'p', kind: 'decision', question: 'q?' }],
+    { nowMs: now, stillAsking: new Map([['a', true]]) });
+  assert.equal(m.added, 1);
+  const e = Object.values(hist.entries)[0];
+  assert.equal(e.firstSeenAt, new Date(now).toISOString());
+  assert.equal(e.answeredAt, null);
+});
+
+test('mergeHistory：会话不再以问句结尾 → 判已回答并记延迟', () => {
+  const now = Date.now();
+  const first = new Date(now - 5 * 3600e3).toISOString();
+  const hist = { version: 1, entries: { k1: entry({ sessionId: 'a', firstSeenAt: first }) } };
+  const m = mergeHistory(hist, [], { nowMs: now, stillAsking: new Map([['a', false]]) });
+  assert.equal(m.answered, 1);
+  assert.equal(hist.entries.k1.answerLatencyHours, 5);
+});
+
+test('mergeHistory：被门槛过滤 ≠ 已回答（实测 bug）', () => {
+  // 第一版用「这次没扫到」判已回答，于是 --hours 9999 一跑，
+  // 5 条全被判成已回答、延迟算出 0 小时。
+  const now = Date.now();
+  const hist = { version: 1, entries: { k1: entry({ sessionId: 'a' }) } };
+  const m = mergeHistory(hist, [], { nowMs: now, stillAsking: new Map([['a', true]]) });
+  assert.equal(m.answered, 0, '仍在问的不算已回答');
+  assert.equal(hist.entries.k1.answeredAt, null);
+});
+
+test('mergeHistory：没有 stillAsking 时保守处理，不做回答判定', () => {
+  const hist = { version: 1, entries: { k1: entry({ sessionId: 'a' }) } };
+  const m = mergeHistory(hist, [], { nowMs: Date.now() });
+  assert.equal(m.answered, 0, '不知道状态就不猜');
+});
+
+test('mergeHistory：已回答的问题又出现 → 撤销回答状态', () => {
+  const now = Date.now();
+  // key 必须和 mergeHistory 算出的一致：sessionId 来自文件路径，question 来自候选
+  const k = questionKey('a', 'q?');
+  const hist = { version: 1, entries: { [k]: entry({
+    sessionId: 'a', question: 'q?', answeredAt: new Date(now - 1000).toISOString(), answerLatencyHours: 2,
+  }) } };
+  mergeHistory(hist, [{ filePath: '/p/a.jsonl', project: 'p', kind: 'decision', question: 'q?' }],
+    { nowMs: now, stillAsking: new Map([['a', true]]) });
+  assert.equal(hist.entries[k].answeredAt, null, '同文本重问说明上次不是真回答');
+});
+
+test('historyStats：算出延迟分位与超 24h 未答', () => {
+  const now = Date.now();
+  const hist = { version: 1, entries: {
+    a: entry({ firstSeenAt: new Date(now - 2 * 3600e3).toISOString(), answeredAt: new Date(now).toISOString(), answerLatencyHours: 2 }),
+    b: entry({ firstSeenAt: new Date(now - 10 * 3600e3).toISOString(), answeredAt: new Date(now).toISOString(), answerLatencyHours: 10 }),
+    c: entry({ firstSeenAt: new Date(now - 48 * 3600e3).toISOString() }),
+  } };
+  const st = historyStats(hist, { nowMs: now });
+  assert.equal(st.total, 3);
+  assert.equal(st.answered, 2);
+  assert.equal(st.pending, 1);
+  assert.equal(st.stalePending, 1, '超过 24h 未答的应单列');
+  assert.ok(st.latency.p50 >= 2 && st.latency.p50 <= 10);
+});
+
+test('historyStats：空历史不崩', () => {
+  const st = historyStats({ entries: {} });
+  assert.equal(st.total, 0);
+  assert.equal(st.latency, null);
+});
+
+test('loadHistory：坏文件与缺失都返回空历史，不抛', () => {
+  assert.deepEqual(loadHistory('/nonexistent/x.json').entries, {});
+});
+
+test('saveHistory 与 loadHistory 往返一致', () => {
+  const dir = tmp();
+  try {
+    const f = join(dir, 'h.json');
+    const hist = { version: 1, entries: { k: entry() } };
+    saveHistory(f, hist);
+    assert.deepEqual(loadHistory(f).entries.k.sessionId, 's1');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('historyPath 不在仓库里', () => {
+  const p = historyPath({ LOCALAPPDATA: 'C:\Local', OVERWATCH_STATE_DIR: '' });
+  assert.ok(!p.includes('Projects'), `历史不能写在仓库：${p}`);
+});
+
+test('formatHistory：空历史说明会自动记录', () => {
+  const out = formatHistory({ total: 0 });
+  assert.ok(out.includes('空'));
+  assert.ok(out.includes('自动记录'), '要说明不用额外操作');
+});
+
+test('mergeHistory：这次仍扫到的问题绝不能被判已回答', () => {
+  // 去掉 `seen.has(key)` 守卫的话，一条还在问的问题会被判成已回答——
+  // 因为 stillAsking 是 Map<'a', true>，但循环里没排除已见到的 key。
+  const now = Date.now();
+  const k = questionKey('a', 'q?');
+  const hist = { version: 1, entries: { [k]: entry({ sessionId: 'a', question: 'q?' }) } };
+  const m = mergeHistory(hist, [{ filePath: '/p/a.jsonl', project: 'p', kind: 'decision', question: 'q?' }],
+    { nowMs: now, stillAsking: new Map([['a', true]]) });
+  assert.equal(m.answered, 0);
+  assert.equal(hist.entries[k].answeredAt, null, '仍在问的不能判已回答');
+});
+
+test('mergeHistory：会话消失（transcript 被删）不当成已回答', () => {
+  // === false 而不是 !get(...)：Map 里查不到表示「不知道」，不是「答完了」。
+  // 否则删掉一个 transcript 会凭空产生一条「已回答」记录，污染延迟统计。
+  const now = Date.now();
+  const k = questionKey('gone', 'q?');
+  const hist = { version: 1, entries: { [k]: entry({ sessionId: 'gone', question: 'q?' }) } };
+  const m = mergeHistory(hist, [], { nowMs: now, stillAsking: new Map() }); // 空 Map：查不到
+  assert.equal(m.answered, 0, '不知道状态就不能判已回答');
+  assert.equal(hist.entries[k].answeredAt, null);
+});

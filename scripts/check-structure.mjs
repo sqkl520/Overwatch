@@ -444,6 +444,8 @@ function checkUnregisteredExports() {
     // asked.mjs
     'lastAssistantText', 'endsWithQuestion', 'classifyQuestion',
     'inspectTranscript', 'scanAll', 'formatResult', 'GREETING', 'DEFAULT_MIN_HOURS',
+    'questionKey', 'sessionIdOf', 'loadHistory', 'saveHistory', 'mergeHistory',
+    'historyStats', 'historyPath', 'formatHistory',
     // validate-run.mjs
     'validateGraph', 'validateFile', 'CAPABILITIES', 'SHAPES', 'REQUIRED_FOR_COMPLEX', 'MIN_SUBTREES',
     // install-watcher.mjs

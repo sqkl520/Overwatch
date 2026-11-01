@@ -25,7 +25,7 @@
  * 零依赖。
  */
 
-import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { join, basename, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -125,15 +125,24 @@ export function scanAll({ projectsRoot, nowMs = Date.now(), minHours = DEFAULT_M
 
   const found = [];
   const skipped = { greeting: 0, tooRecent: 0 };
+  // 每个会话当前「是否仍以未回答的问句结尾」。
+  // 判定「已回答」必须靠它，而不是靠「这次没出现在结果里」——
+  // 后者会把「被 minHours 门槛过滤掉」也算成已回答，产生 0 小时假延迟（实测过）。
+  const stillAsking = new Map();
   for (const f of files) {
     const r = inspectTranscript(f, { nowMs, minHours });
+    const sid = sessionIdOf(f);
+    // 注意：这里是「该会话现在是否仍以未回答的问句结尾」，**与 minHours 门槛无关**。
+    // 早期写成 Boolean(r && !r.skipped)，于是被门槛过滤的也被记成 false，
+    // 高门槛一跑就把 5 条全判成「已回答」，延迟算出 0 小时。
+    stillAsking.set(sid, Boolean(r && r.skipped !== 'greeting'));
     if (!r) continue;
     if (r.skipped === 'greeting') { skipped.greeting++; continue; }
     if (r.skipped === 'too-recent') { skipped.tooRecent++; continue; }
     found.push(r);
   }
   found.sort((a, b) => a.hours - b.hours); // 最近的排前面
-  return { found, scanned: files.length, skipped };
+  return { found, scanned: files.length, skipped, stillAsking };
 }
 
 export function formatResult(result) {
@@ -155,23 +164,210 @@ export function formatResult(result) {
   return lines.join('\n');
 }
 
+// ── 历史：这条问题是什么时候第一次出现的、后来被回答了吗 ──
+//
+// 由 492 个真实问答对得出的判据（2026-11-01 实测）：
+//   回复延迟 p50 = 0.83h，p90 = 14.7h，**99% 在 24 小时内**。
+//   所以「超过 24 小时没答」不是"还在考虑"，是"被忘了"——这是历史里最该看的数字。
+//
+// 为什么要历史：单次快照只能回答"现在谁在等我"，回答不了
+//   "哪些提醒后真的被处理了""我平均多久回一次""这个东西到底有没有用"。
+//   而没有后两个数字，就无法判断该不该继续提醒。
+
+import { createHash } from 'node:crypto';
+
+/** 会话内问题的稳定标识：sessionId + 问题文本的指纹。
+ *  不用行号——transcript 会追加，行号会变。 */
+export function questionKey(sessionId, question) {
+  const h = createHash('sha256').update(`${sessionId}|${question}`).digest('hex').slice(0, 12);
+  return h;
+}
+
+/** 从文件路径推 sessionId（文件名就是 uuid）。
+ *
+ *  路径在 Windows 上可能含 `\`（转义后的字面双反斜杠），
+ *  `[\d]` 类的单字符类挡不住。用「剥掉目录与扩展名」而不是 split，
+ *  这样对 `/`、`\`、`\` 混排都成立。 */
+export function sessionIdOf(filePath) {
+  const s = String(filePath).replace(/\.jsonl$/, '');
+  const idx = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return idx >= 0 ? s.slice(idx + 1) : s;
+}
+
+export function loadHistory(file) {
+  try {
+    const j = JSON.parse(readFileSync(file, 'utf8'));
+    return j && typeof j === 'object' && j.entries ? j : { version: 1, entries: {} };
+  } catch { return { version: 1, entries: {} }; }
+}
+
+export function saveHistory(file, hist) {
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify(hist, null, 2) + '\n', 'utf8');
+}
+
+/** 把当前扫描结果并进历史。
+ *
+ *  **「已回答」的判据是「该会话不再以未回答的问句结尾」，不是「这次没扫到」。**
+ *  后者会把「被 minHours 门槛过滤掉」也算成已回答——实测产生了 0 小时的假延迟。
+ *
+ *  stillAsking: Map<sessionId, boolean>，由 scanAll 提供。
+ *  缺失时（老调用方）保守处理：不做回答判定，只更新 lastSeenAt。 */
+export function mergeHistory(hist, found, { nowMs = Date.now(), stillAsking = null } = {}) {
+  const iso = new Date(nowMs).toISOString();
+  const seen = new Set();
+  let added = 0;
+
+  for (const it of found) {
+    const sid = sessionIdOf(it.filePath);
+    const key = questionKey(sid, it.question);
+    seen.add(key);
+    const e = hist.entries[key];
+    if (!e) {
+      hist.entries[key] = {
+        sessionId: sid,
+        project: it.project,
+        question: it.question.slice(-200),
+        kind: it.kind,
+        firstSeenAt: iso,
+        lastSeenAt: iso,
+        seenCount: 1,
+        answeredAt: null,
+        answerLatencyHours: null,
+      };
+      added++;
+    } else {
+      e.lastSeenAt = iso;
+      e.seenCount = (e.seenCount || 0) + 1;
+      // 之前判过已回答、现在又出现 → 那不是回答，撤销
+      if (e.answeredAt) { e.answeredAt = null; e.answerLatencyHours = null; e.reopenedAt = iso; }
+    }
+  }
+
+  let answered = 0;
+  if (stillAsking) {
+    for (const [key, e] of Object.entries(hist.entries)) {
+      if (e.answeredAt) continue;
+      // 只有明确知道该会话「不再以问句结尾」才判已回答。用 === false 而不是 !get(...)：
+      // Map 里没有这个会话时返回 undefined，那表示「不知道」，不能当成「已不再问」——
+      // 否则一个刚被删掉的 transcript 会被记成已回答，污染延迟统计。
+      // （不需要额外排除本次仍扫到的：那种情况下 stillAsking 恒为 true。）
+      if (stillAsking.get(e.sessionId) === false) {
+        e.answeredAt = iso;
+        const first = Date.parse(e.firstSeenAt || '');
+        e.answerLatencyHours = Number.isFinite(first)
+          ? Math.round(((nowMs - first) / 3600e3) * 10) / 10 : null;
+        answered++;
+      }
+    }
+  }
+  return { added, answered, total: Object.keys(hist.entries).length };
+}
+
+/** 历史统计。回答「这东西有没有用」。 */
+export function historyStats(hist, { nowMs = Date.now() } = {}) {
+  const all = Object.values(hist.entries || {});
+  const answered = all.filter((e) => e.answeredAt);
+  const pending = all.filter((e) => !e.answeredAt);
+  const lat = answered.map((e) => e.answerLatencyHours).filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+  const q = (x) => (lat.length ? lat[Math.min(lat.length - 1, Math.floor(lat.length * x))] : null);
+  // 超过 24 小时仍未回答的：由实测分布，99% 的回复在 24h 内，所以这些基本是被忘了
+  const stale = pending.filter((e) => {
+    const first = Date.parse(e.firstSeenAt || '');
+    return Number.isFinite(first) && (nowMs - first) > 24 * 3600e3;
+  });
+  return {
+    total: all.length,
+    answered: answered.length,
+    pending: pending.length,
+    stalePending: stale.length,
+    latency: lat.length ? { p50: q(0.5), p90: q(0.9), min: lat[0], max: lat[lat.length - 1] } : null,
+  };
+}
+
+/** 历史文件位置。与 watch.mjs 同源规则：**绝不写仓库**。
+ *  和 watch 的状态目录放一起，这样备份/清理时是一份东西。 */
+export function historyPath(env = process.env) {
+  if (env.OVERWATCH_STATE_DIR) return join(env.OVERWATCH_STATE_DIR, 'asked-history.json');
+  if (process.platform === 'win32') {
+    const base = env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local');
+    return join(base, 'Overwatch', 'asked-history.json');
+  }
+  const xdg = env.XDG_STATE_HOME || join(homedir(), '.local', 'state');
+  return join(xdg, 'overwatch', 'asked-history.json');
+}
+
+export function formatHistory(st) {
+  if (!st.total) {
+    return '历史：空。还没有记录过任何问题。\n' +
+      '（每次运行 `node scripts/asked.mjs` 都会自动记录，不需要额外操作。）';
+  }
+  const lines = [`历史：累计 ${st.total} 条问题`];
+  lines.push(`  已回答 ${st.answered} 条 · 仍待回答 ${st.pending} 条`);
+  if (st.stalePending) {
+    lines.push(`  其中 ${st.stalePending} 条已超过 24 小时——由实测分布，99% 的回复在 24h 内，`);
+    lines.push('  这些基本是被忘了，而不是还在考虑。');
+  }
+  if (st.latency) {
+    lines.push('');
+    lines.push('从发现到被回答的延迟：');
+    lines.push(`  p50 ${st.latency.p50}h · p90 ${st.latency.p90}h（最短 ${st.latency.min}h，最长 ${st.latency.max}h）`);
+    lines.push('');
+    lines.push('这是判断「该不该继续提醒」的依据：延迟远小于提醒门槛，说明提醒没在解决真问题。');
+  }
+  return lines.join('\n');
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────
 
 function main(argv) {
   const json = argv.includes('--json');
+  const showHistory = argv.includes('--history');
+  const noSave = argv.includes('--no-save');
   const hi = argv.indexOf('--hours');
   const minHours = hi >= 0 ? Number(argv[hi + 1]) : DEFAULT_MIN_HOURS;
   if (argv.includes('--help') || argv.includes('-h')) {
-    console.log('用法：node scripts/asked.mjs [--json] [--hours N]');
+    console.log('用法：node scripts/asked.mjs [--json] [--hours N] [--history] [--no-save]');
     console.log('  找出「AI 问了具体问题，人还没回答」的会话。不依赖宿主状态。');
     console.log(`  --hours N   只看停了 N 小时以上的（默认 ${DEFAULT_MIN_HOURS}）`);
+    console.log('  --history   看历史统计：发现多少、被回答多少、平均多久回');
+    console.log('  --no-save   只查不记（默认每次运行都会更新历史）');
+    console.log(`  历史文件：${historyPath()}`);
     return 0;
   }
-  const result = scanAll({ nowMs: Date.now(), minHours: Number.isFinite(minHours) ? minHours : DEFAULT_MIN_HOURS });
+
+  const nowMs = Date.now();
+  const histFile = historyPath();
+
+  if (showHistory) {
+    const hist = loadHistory(histFile);
+    const st = historyStats(hist, { nowMs });
+    if (json) {
+      console.log(JSON.stringify({ generatedAt: new Date().toISOString(), ...st }, null, 2));
+    } else {
+      console.log(formatHistory(st));
+    }
+    return 0;
+  }
+
+  const result = scanAll({ nowMs, minHours: Number.isFinite(minHours) ? minHours : DEFAULT_MIN_HOURS });
+
+  let merged = null;
+  if (!noSave) {
+    const hist = loadHistory(histFile);
+    merged = mergeHistory(hist, result.found, { nowMs, stillAsking: result.stillAsking });
+    try { saveHistory(histFile, hist); } catch { /* 记不了历史不影响本次输出 */ }
+  }
+
   if (json) {
-    console.log(JSON.stringify({ generatedAt: new Date().toISOString(), ...result }, null, 2));
+    console.log(JSON.stringify({ generatedAt: new Date().toISOString(), ...result, history: merged }, null, 2));
   } else {
     console.log(formatResult(result));
+    if (merged) {
+      console.log('');
+      console.log(`历史：新记 ${merged.added} 条，判定已回答 ${merged.answered} 条，累计 ${merged.total} 条。`);
+      console.log('（看整体统计用 --history）');
+    }
   }
   return 0;
 }
