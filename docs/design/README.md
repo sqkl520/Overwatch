@@ -15,6 +15,7 @@
 | [`hosted-mode.md`](hosted-mode.md) | **Proposed** | §2 停止分类器、§4.2 去重键、§4.3 三层轮询、§4.4 限额、§4.5 通知降级 —— 见下方对照 | §1 策略 schema（分级 L1–L5、`when` 表达式）、§3 投递组件、§5 分阶段实施 |
 | [`intent-contract.md`](intent-contract.md) | **已裁决否决** | — | 全部。边际贡献仅 2.7pp，且方法与目标正交 |
 | [`verdict-intent-contract.md`](verdict-intent-contract.md) | **裁决记录** | — | 本身不是方案，是三方的裁决过程与结论 |
+| [`frontend-and-shape.md`](frontend-and-shape.md) | **Proposed** | — | 前端三层形态、策略文件 schema、自动接力的分级与用户规则。**技术前提已实测**（命名管道可达），但「接收方会不会执行 AI 发的指令」尚未验证 |
 
 ## `hosted-mode.md` 的已实现 / 未实现对照
 
