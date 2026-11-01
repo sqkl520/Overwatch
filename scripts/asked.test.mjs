@@ -111,7 +111,9 @@ test('scanAll：跳过 subagents 目录，按新旧排序', () => {
   const dir = tmp();
   try {
     const now = Date.now();
-    writeTranscript(join(dir, 'proj-a'), 'old', [assistant('要不要先做 A？', now - 50 * HOUR)]);
+    // 50 小时会被上限排除（实测 244 小时的 English 误报就是这么来的），
+    // 这条测试只关心「跳过 subagents + 按新旧排序」，所以用窗口内的时长。
+    writeTranscript(join(dir, 'proj-a'), 'old', [assistant('要不要先做 A？', now - 20 * HOUR)]);
     writeTranscript(join(dir, 'proj-b'), 'new', [assistant('要不要先做 B？', now - 5 * HOUR)]);
     // subagents 必须被跳过：那是子 agent，不是人的会话
     writeTranscript(join(dir, 'proj-a', 'subagents'), 'sub', [assistant('要我做吗？', now - 99 * HOUR)]);
@@ -332,4 +334,57 @@ test('formatHistory：积压单独说明，且数字引用常量不写死', () =
 
 test('historyStats：空历史时 backlogHours 也有值', () => {
   assert.equal(historyStats({ entries: {} }).backlogHours, BACKLOG_HOURS);
+});
+
+// ── 上限：太老的问题不该通知（2026-11-01 实收误报）──────────────────
+
+import { MAX_QUESTION_HOURS } from './asked.mjs';
+
+test('MAX_QUESTION_HOURS 是 24——与实测回复分布一致', () => {
+  assert.equal(MAX_QUESTION_HOURS, 24);
+});
+
+test('inspectTranscript：超过 24 小时的问题跳过，标 too-old', () => {
+  // 2026-11-01 实收一条「Let's learn English! 问了没答」，而那个会话文件
+  // 244 小时（10 天）没动过。通知一个 10 天前的问句是谎报：
+  // 它所在的会话早就结束了，你根本没机会回答。
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    const f = writeTranscript(dir, 'old', [assistant('要我做这个吗？', now - 244 * HOUR)]);
+    const r = inspectTranscript(f, { nowMs: now, minHours: 1 });
+    assert.equal(r.skipped, 'too-old', `244 小时前的问题应跳过，实际：${JSON.stringify(r)}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('inspectTranscript：边界内（22 小时）仍要报', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    const f = writeTranscript(dir, 'fresh', [assistant('要我做这个吗？', now - 22 * HOUR)]);
+    const r = inspectTranscript(f, { nowMs: now, minHours: 1 });
+    assert.ok(r && !r.skipped, '22 小时前仍在窗口内');
+    assert.equal(r.kind, 'decision');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('scanAll：tooOld 单独计数，不与其它跳过混在一起', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    writeTranscript(join(dir, 'p1'), 'old1', [assistant('要我做 A 吗？', now - 100 * HOUR)]);
+    writeTranscript(join(dir, 'p2'), 'old2', [assistant('要我做 B 吗？', now - 200 * HOUR)]);
+    writeTranscript(join(dir, 'p3'), 'fresh', [assistant('要我做 C 吗？', now - 2 * HOUR)]);
+    writeTranscript(join(dir, 'p4'), 'greet', [assistant('今天想做点什么呢？', now - 2 * HOUR)]);
+    const r = scanAll({ projectsRoot: dir, nowMs: now, minHours: 1 });
+    assert.equal(r.found.length, 1, '只有 2 小时那条该报');
+    assert.equal(r.skipped.tooOld, 2);
+    assert.equal(r.skipped.greeting, 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('formatResult：空结果说明「超过 24 小时」而不是含糊带过', () => {
+  const out = formatResult({ found: [], scanned: 10, skipped: { greeting: 1, tooRecent: 0, tooOld: 4 } });
+  assert.ok(out.includes('超过 24 小时'), `应说明超时排除：\n${out}`);
+  assert.ok(out.includes('会话多半已结束'), '要解释为什么不再提醒');
 });

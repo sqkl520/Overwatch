@@ -52,6 +52,16 @@ export const DEFAULT_MIN_HOURS = 1;
  */
 export const BACKLOG_HOURS = 24;
 
+/** 超过这么久的问题不再**通知**（仍会出现在 --history 的积压里）。
+ *
+ *  为什么必须有上限：2026-11-01 实收一条「Let's learn English! 问了没答」的通知，
+ *  而那个会话文件 **244 小时（10 天）没动过**。它的问句是真的，但会话早就结束了——
+ *  你不会去回答它，被打断只有损失。**没答 ≠ 该提醒。**
+ *
+ *  24 小时和 BACKLOG_HOURS 一致：实测 99% 的真实回复都在 24 小时内，
+ *  超过一天还没答的，提醒也来不及了。 */
+export const MAX_QUESTION_HOURS = 24;
+
 /** 会话开场的客套话。这些永远没人回，也不该提醒。 */
 export const GREETING = /今天想做什么|想从哪里开始|有什么需要帮忙|有什么可以帮|吩咐我就好|一声令下|告诉我.{0,6}需求|想做点什么呢|随时准备帮你|想让我帮|需要我做什么/;
 
@@ -98,7 +108,7 @@ export function classifyQuestion(text) {
 }
 
 /** 从 transcript 文件判定一个会话。返回 null 表示没有可报的东西。 */
-export function inspectTranscript(filePath, { nowMs = Date.now(), minHours = DEFAULT_MIN_HOURS } = {}) {
+export function inspectTranscript(filePath, { nowMs = Date.now(), minHours = DEFAULT_MIN_HOURS, maxHours = MAX_QUESTION_HOURS } = {}) {
   let raw;
   try { raw = readFileSync(filePath, 'utf8'); } catch { return null; }
   const records = [];
@@ -115,6 +125,15 @@ export function inspectTranscript(filePath, { nowMs = Date.now(), minHours = DEF
   if (!Number.isFinite(ts)) return null;
   const hours = (nowMs - ts) / 3600e3;
   if (hours < minHours) return { skipped: 'too-recent', filePath, hours };
+  // **上限同样重要，而且我一开始漏了。**
+  //
+  // 2026-11-01 你收到一条「Let's learn English! 问了没答」——那个会话文件
+  // **244 小时（10 天）没动过**。通知一个 10 天前的问句是谎报：
+  // 它所在的会话早就结束了，你根本没机会回答，也不该被打断。
+  //
+  // `BACKLOG_HOURS` 之前只用在 history 统计上，没用在「要不要通知」上——
+  // 两件事都得有上限。
+  if (hours > maxHours) return { skipped: 'too-old', filePath, hours };
   return {
     filePath,
     hours: Math.round(hours * 10) / 10,
@@ -125,7 +144,7 @@ export function inspectTranscript(filePath, { nowMs = Date.now(), minHours = DEF
 }
 
 /** 扫所有主 transcript（跳过 subagents）。 */
-export function scanAll({ projectsRoot, nowMs = Date.now(), minHours = DEFAULT_MIN_HOURS } = {}) {
+export function scanAll({ projectsRoot, nowMs = Date.now(), minHours = DEFAULT_MIN_HOURS, maxHours = MAX_QUESTION_HOURS } = {}) {
   const root = projectsRoot || join(homedir(), '.claude', 'projects');
   if (!existsSync(root)) return { found: [], scanned: 0, skipped: { greeting: 0, tooRecent: 0 } };
   const files = [];
@@ -141,13 +160,13 @@ export function scanAll({ projectsRoot, nowMs = Date.now(), minHours = DEFAULT_M
   walk(root);
 
   const found = [];
-  const skipped = { greeting: 0, tooRecent: 0 };
+  const skipped = { greeting: 0, tooRecent: 0, tooOld: 0 };
   // 每个会话当前「是否仍以未回答的问句结尾」。
   // 判定「已回答」必须靠它，而不是靠「这次没出现在结果里」——
   // 后者会把「被 minHours 门槛过滤掉」也算成已回答，产生 0 小时假延迟（实测过）。
   const stillAsking = new Map();
   for (const f of files) {
-    const r = inspectTranscript(f, { nowMs, minHours });
+    const r = inspectTranscript(f, { nowMs, minHours, maxHours });
     const sid = sessionIdOf(f);
     // 注意：这里是「该会话现在是否仍以未回答的问句结尾」，**与 minHours 门槛无关**。
     // 早期写成 Boolean(r && !r.skipped)，于是被门槛过滤的也被记成 false，
@@ -156,6 +175,7 @@ export function scanAll({ projectsRoot, nowMs = Date.now(), minHours = DEFAULT_M
     if (!r) continue;
     if (r.skipped === 'greeting') { skipped.greeting++; continue; }
     if (r.skipped === 'too-recent') { skipped.tooRecent++; continue; }
+    if (r.skipped === 'too-old') { skipped.tooOld++; continue; }
     found.push(r);
   }
   found.sort((a, b) => a.hours - b.hours); // 最近的排前面
@@ -165,12 +185,22 @@ export function scanAll({ projectsRoot, nowMs = Date.now(), minHours = DEFAULT_M
 export function formatResult(result) {
   const { found, scanned, skipped } = result;
   if (!found.length) {
-    return `没有待回答的问题（扫了 ${scanned} 个 transcript）。\n` +
-      `已排除：开场客套 ${skipped.greeting} 个，刚问完不到门槛 ${skipped.tooRecent} 个。`;
+    const bits = [];
+    if (skipped.greeting) bits.push(`开场客套 ${skipped.greeting}`);
+    if (skipped.tooRecent) bits.push(`刚问完 ${skipped.tooRecent}`);
+    if (skipped.tooOld) bits.push(`超过 ${MAX_QUESTION_HOURS} 小时 ${skipped.tooOld}（会话多半已结束）`);
+    return `没有待回答的问题（扫了 ${scanned} 个 transcript）。
+` +
+      (bits.length ? `已排除：${bits.join('，')}。` : '');
   }
   const lines = [`${found.length} 个会话在等你回答（扫了 ${scanned} 个 transcript）`];
-  if (skipped.greeting || skipped.tooRecent) {
-    lines.push(`已排除：开场客套 ${skipped.greeting} 个，刚问完 ${skipped.tooRecent} 个。`);
+  if (skipped.greeting || skipped.tooRecent || skipped.tooOld) {
+    const bits = [];
+    if (skipped.greeting) bits.push(`开场客套 ${skipped.greeting}`);
+    if (skipped.tooRecent) bits.push(`刚问完 ${skipped.tooRecent}`);
+    // 太老的单列并说明原因——用户看到「没答」会以为是漏报，其实是会话结束了
+    if (skipped.tooOld) bits.push(`超过 ${MAX_QUESTION_HOURS} 小时 ${skipped.tooOld}（会话多半已结束，不再提醒）`);
+    lines.push(`已排除：${bits.join('，')}。`);
   }
   for (const it of found) {
     const age = it.hours < 48 ? `${it.hours} 小时` : `${(it.hours / 24).toFixed(1)} 天`;

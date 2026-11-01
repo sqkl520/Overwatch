@@ -522,7 +522,8 @@ test('限额常量与规格一致', () => {
   assert.equal(__internals.PER_SESSION_MAX_24H, 2);
   assert.equal(__internals.GLOBAL_MAX_24H, 8);
   assert.equal(__internals.GLOBAL_MIN_GAP, 10 * MIN);
-  assert.equal(__internals.JOBS_INTERVAL, 1 * MIN);
+  // 15 秒而不是 60：实测用户抱怨「等了好一会才弹窗」，探针只要 23ms，值得。
+  assert.equal(__internals.JOBS_INTERVAL, 15 * 1000);
   assert.equal(__internals.PROBE_INTERVAL, 5 * MIN);
   assert.equal(__internals.FULL_INTERVAL, 30 * MIN);
   assert.equal(__internals.LOG_MAX_BYTES, 1024 * 1024);
@@ -1733,8 +1734,8 @@ test('healthCheck：抓得住「进程活着但六小时没扫描」——这正
 test('healthCheck：超过 1 个周期但不超 3 个 → 仍算健康（单次 tick 变慢是正常的）', () => {
   const now = Date.now();
   const r = healthCheck({
-    lastJobsScanAt: new Date(now - 2 * 60_000).toISOString(),   // 2 个周期
-    lastProbeAt: new Date(now - 10 * 60_000).toISOString(),     // 2 个周期
+    lastJobsScanAt: new Date(now - 30_000).toISOString(),       // 2 个周期（15s × 2）
+    lastProbeAt: new Date(now - 10 * 60_000).toISOString(),     // 2 个周期（5min × 2）
   }, { nowMs: now });
   assert.equal(r.healthy, true, '2 个周期不该误报——扫描慢会把 tick 推后');
 });

@@ -50,7 +50,11 @@ export const DAY = 24 * HOUR;
 /** 实测回复延迟 p50 是 50 分钟，1 小时内人可能正在看，不该催。 */
 const ASKED_MIN_HOURS = 1;
 
-const JOBS_INTERVAL = 1 * MINUTE;
+// 15 秒，不是 60。2026-11-01 实感：「shapez 停下来问我问题时，等了好一会才出现弹窗」——
+// 实测延迟 45 秒（L-fast 60 秒周期 + 探测相位）。
+// 两个探针合计只要 23ms，15 秒周期每天多花约 100 秒 CPU（0.15% 单核），
+// 换来的是把「等了好一会」变成「几乎立刻」。这个交换明显值得。
+const JOBS_INTERVAL = 15 * 1000;
 const PROBE_INTERVAL = 5 * MINUTE;
 const FULL_INTERVAL = 30 * MINUTE;
 
