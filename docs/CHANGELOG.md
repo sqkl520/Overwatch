@@ -1011,6 +1011,36 @@ notified ASKED PerfScope ... candidates=5 sent=1 suppressed=4 observed=5(ASKED:5
 **本机从未发生过一次真实投递。** 所以规格里「接收方会不会执行 AI 发来的指令」
 这条验证**没有历史数据可用**，只能实测，已写进规格的「必须先验证」清单。
 
+### Added / Changed（跨会话投递验证：`auto` 模式被证伪）
+
+按方向要先验证「自动接力做不做得到」，结论是**默认配置下做不到**。
+
+**能做的（实测）**：8 个会话全部注册 `messagingSocketPath`，命名管道 **8/8 连接成功**，
+`peerToken` 全部可读，协议全是 v1。**通道本身是通的。**
+
+**做不到的（真实投递）**：向 idle 会话发一条测试消息 → **没有任何回音，接收方状态无变化**。
+
+逆向 `claude.exe` 2.1.270 找到原因：
+
+```
+Your "crossSessionInbound" setting is "hold";
+set it to "accept" to deliver held messages.
+```
+
+**默认 `hold`：所有入站消息被扣住等人批准，不送达会话。**
+更硬的一条：`[that session runs in the same permission class as this one]`
+——权限类必须一致，而 `permissionMode` **不在 `sessions/*.json` 里**（实测 8 个全部无此字段），
+**发送方无法从外部判断能否送达**。
+
+**所以规格里的 `auto` 删掉**，只保留 `confirm`（一键确认，以用户身份发出，不走跨会话通道）
+和 `never`（只通知）。用户可自定义的范围相应收窄。
+
+**将来切换的三个条件**（缺一不做）：`crossSessionInbound` 默认 accept 或可检测 /
+权限类可从外部读取 / 投递有送达回执。
+
+新增 `scripts/probe-relay.mjs`（可复现上面全部结论）与
+`docs/research/2026-11-01-relay-delivery-probe.md`（完整证据）。
+
 ### Notes（已知且不打算近期修）
 
 1. **在线停止分类 95.4% 判 `UNCLASSIFIABLE`** —— 结构性，分类器需要「下一句」而在线时下一句还没发生。

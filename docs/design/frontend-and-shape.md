@@ -175,18 +175,44 @@ export async function deliver(sessionId, text, { peerTokenPath, timeoutMs = 5000
 
 **「投递成功」不等于「问题解决」**——这个区别必须写进 UI，否则又会造出一个假的成功率。
 
-## 6. 必须先验证的（写代码之前）
+## 6. 验证结果（2026-11-01 已完成）
 
-| # | 问题 | 怎么验 |
+> **本节的结论推翻了 §3.4 的 `auto` 设计。** 完整证据见
+> [`docs/research/2026-11-01-relay-delivery-probe.md`](../research/2026-11-01-relay-delivery-probe.md)。
+
+**实测**：向 idle 会话投递一条测试消息 → **没有任何回音，接收方状态无变化**。
+
+**原因（逆向 claude.exe 2.1.270 得到）**：
+
+```
+Your "crossSessionInbound" setting is "hold";
+set it to "accept" to deliver held messages.
+
+this session holds ALL inbound peer traffic (crossSessionInbound: hold),
+so it will only be logged here, not delivered to you
+```
+
+**默认策略是 `hold`**——所有入站消息被扣住等人批准，不送达会话。
+
+**还有一条更硬的**：`[that session runs in the same permission class as this one]`
+——收发双方权限类必须一致。而 `permissionMode` **不在 `sessions/*.json` 里**
+（实测 8 个会话全部无此字段），发送方**无法从外部判断**能否送达。
+
+### 修正
+
+| action | 原设计 | 实际 |
 |---|---|---|
-| 1 | 投递的消息真的会被接收方处理吗？ | 造一个测试会话，投递一条，看它是否响应 |
-| 2 | 权限模式对等检查会不会拦？ | 实测不同 permissionMode 的组合 |
-| 3 | 接收方看到「AI 发的」之后会怎么做？ | **本仓库找不到任何真实投递记录**（45 条疑似命中全是子 agent 系统提示的快照，不是投递）。只能实测：造一个测试会话投递一条，观察它是否执行。 |
+| `auto` | 直接投递 | ❌ **技术做不到**，删掉 |
+| `confirm` | 一键确认 | ✓ 保留——你按一次，以**用户身份**发出，不走跨会话通道 |
+| `never` | 只通知 | ✓ 保留 |
 
-**第 3 条最重要**：如果接收方一律拒绝执行 AI 发来的指令，那么 `auto` 模式就是无效功能，
-应当在规格里降级为 `confirm`，而不是硬做一个用不了的东西。
+**`auto` 一栏在当前宿主能力下应当移除。** 用户可自定义的仍然保留——
+但只能在 `confirm` 与 `never` 之间选，以及用规则决定**哪些进 confirm、哪些只通知**。
 
-> 2026-11-01 核查：我用全语料搜「真实的 cross-session 投递」，**45 条命中全是误报**——
-> 它们出现在子 agent 的系统提示快照里，因为我们发给子 agent 的 prompt 本身就描述了
-> 这个机制。**本机从未发生过一次真实的跨会话投递。** 所以这条验证没有历史数据可用，
-> 只能实测。
+### 将来若宿主支持，切换条件
+
+1. `crossSessionInbound` 默认 `accept`，或可被发送方检测
+2. 权限类可从 `sessions/*.json` 外部读取
+3. 投递有明确的送达回执（现在没有回音）
+
+**三者同时满足才能做 `auto`。缺一条就不做。**

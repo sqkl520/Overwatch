@@ -446,6 +446,8 @@ function checkUnregisteredExports() {
     'inspectTranscript', 'scanAll', 'formatResult', 'GREETING', 'DEFAULT_MIN_HOURS',
     'questionKey', 'sessionIdOf', 'loadHistory', 'saveHistory', 'mergeHistory',
     'historyStats', 'historyPath', 'formatHistory', 'BACKLOG_HOURS', 'MAX_QUESTION_HOURS',
+    // probe-relay.mjs
+    'listSessions', 'readPeerToken', 'canConnect', 'buildFrame', 'sendFrame', 'interpretReply',
     // validate-run.mjs
     'validateGraph', 'validateFile', 'CAPABILITIES', 'SHAPES', 'REQUIRED_FOR_COMPLEX', 'MIN_SUBTREES',
     // install-watcher.mjs
