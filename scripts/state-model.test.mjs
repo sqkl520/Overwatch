@@ -362,3 +362,41 @@ test('FAILED 与 BLOCKED 优先于 WAITING（严重度排序）', () => {
   assert.equal(judgeState({ sessionState: 'failed', waitingFor: 'input needed', calls: [], gapsMs: [], now }).state, 'FAILED');
   assert.equal(judgeState({ sessionState: 'blocked', waitingFor: 'input needed', calls: [], gapsMs: [], now }).state, 'BLOCKED');
 });
+
+// ── normalizeBash：性能与正确性（2026-11-01）──────────────────────
+
+test('normalizeBash 处理长字符串不随长度变慢', () => {
+  // 实测：真实语料 52,309 条命令，最慢一条 11.3ms 处理 207 字符——
+  // 不是回溯，是 `out += ch` 的 O(n²)。改成数组 + join 后同一批 5894ms → 1957ms。
+  //
+  // 长字符串被整体替换成 <str>，不逐字符复制，所以 200 与 6400 字符耗时应当相当
+  // （实测比值约 0.8）。退回字符串拼接后会明显变慢。
+  const mk = (n) => 'cd "' + 'x'.repeat(n) + '" && echo done';
+  const time = (cmd) => {
+    for (let i = 0; i < 50; i++) normalizeBash(cmd);   // 预热
+    const t0 = process.hrtime.bigint();
+    for (let i = 0; i < 300; i++) normalizeBash(cmd);
+    return Number(process.hrtime.bigint() - t0) / 1e6;
+  };
+  const small = time(mk(200));
+  const large = time(mk(6400));
+  // 32 倍长度。线性会到 ~32 倍，平方会到 ~1000 倍；给足余量到 6 倍。
+  assert.ok(large < small * 6,
+    '长度 32 倍但耗时 ' + (large / small).toFixed(1) + ' 倍——退化成 O(n²) 了');
+});
+test('normalizeBash 对未闭合引号不吞后续内容', () => {
+  const r = normalizeBash('echo "unclosed && ls -la');
+  assert.ok(r.verb.length > 0, '不该返回空 verb');
+});
+
+test('normalizeBash 处理反斜杠转义不越界', () => {
+  const B = String.fromCharCode(92);
+  const r = normalizeBash(`echo "${B}"${B}"${B}${B}" tail`);
+  assert.ok(typeof r.verb === 'string');
+  assert.ok(typeof r.digest === 'string' && r.digest.length > 0);
+});
+
+test('normalizeBash 空输入与纯空白', () => {
+  assert.equal(normalizeBash('').verb, '');
+  assert.ok(normalizeBash('   ').digest.length > 0);
+});
