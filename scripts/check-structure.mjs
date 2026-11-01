@@ -441,6 +441,9 @@ function checkUnregisteredExports() {
     'buildInbox', 'formatInbox', 'healthCheck', 'formatHealth', 'HEALTH_PERIODS',
     'statusToState', 'liveToRow', 'mergeLiveSessions', 'listRow', 'detailLines', 'pendingLines',
     'claimOwnership', 'readOwner', 'ownerPath',
+    // asked.mjs
+    'lastAssistantText', 'endsWithQuestion', 'classifyQuestion',
+    'inspectTranscript', 'scanAll', 'formatResult', 'GREETING', 'DEFAULT_MIN_HOURS',
     // validate-run.mjs
     'validateGraph', 'validateFile', 'CAPABILITIES', 'SHAPES', 'REQUIRED_FOR_COMPLEX', 'MIN_SUBTREES',
     // install-watcher.mjs
@@ -673,6 +676,10 @@ function checkInboxWiring() {
   if (existsSync(skill)) {
     let t = '';
     try { t = readFileSync(skill, 'utf8'); } catch { /* ignore */ }
+    if (!t.includes('asked.mjs')) {
+      fail('.claude/skills/oversight/SKILL.md',
+        '调度入口没有引用 asked.mjs —— 宿主不报的「问了没答」会话会被完全漏掉');
+    }
     if (!t.includes('validate-run.mjs')) {
       fail('.claude/skills/oversight/SKILL.md',
         '规划阶段没有引用 validate-run.mjs —— planner 的产物没人校验（硬约束 4/8）');
