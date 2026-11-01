@@ -285,18 +285,26 @@ function extractCalls(records) {
 
 /** 解析 jsonl。返回 { records, badLines } —— 坏行数必须随数据一起传递，
  *  不能挂在数组属性上（tailRecords 的 slice 会把它丢掉）。见 DF-005。 */
-function parseJsonl(path) {
+/** 解析 jsonl。`maxBytes` 控制只读尾部多少字节。
+ *
+ *  **为什么需要参数而不是写死 4MB**：主 transcript 和子 agent 的需求差一个数量级。
+ *  实测本机语料：主 transcript 1.2GB，子 agent 文件 **5.2GB / 3518 个**，
+ *  而每个会话最多展开 100 个子文件——最坏情况每会话读 **400MB**。
+ *  但子 agent 只需要最近 MAX_CALLS_PER_SESSION 条调用参与判定，
+ *  读 4MB 尾部是浪费。给它 512KB 就够，实测覆盖远超 400 条记录。
+ */
+export function parseJsonl(path, maxBytes = MAX_READ_BYTES) {
   const empty = { records: [], badLines: 0 };
   if (!existsSync(path)) return empty;
   let raw;
   try {
     const size = statSync(path).size;
-    if (size > MAX_READ_BYTES) {
+    if (size > maxBytes) {
       // 真正从尾部按偏移读，而不是先整读再切片：实测单文件可达 59MB
-      const buf = Buffer.allocUnsafe(MAX_READ_BYTES);
+      const buf = Buffer.allocUnsafe(maxBytes);
       const fd = openSync(path, 'r');
       try {
-        readSync(fd, buf, 0, MAX_READ_BYTES, size - MAX_READ_BYTES);
+        readSync(fd, buf, 0, maxBytes, size - maxBytes);
       } finally {
         closeSync(fd);
       }
@@ -368,7 +376,9 @@ function scanSessionDir(dir) {
   const truncated = Math.max(0, candidates.length - MAX_SUBAGENTS);
   for (const cand of candidates.slice(0, MAX_SUBAGENTS)) {
     const agentId = cand.name.replace(/\.jsonl$/, '');
-    const parsed = parseJsonl(cand.path);
+    // 子文件只读尾部 512KB：它只需要最近 MAX_CALLS_PER_SESSION 条调用参与判定。
+    // 实测能覆盖远超 400 条记录，而读取量从 4MB 降到 512KB（每会话最多 100 个子文件）。
+    const parsed = parseJsonl(cand.path, SUBAGENT_READ_BYTES);
     badLines += parsed.badLines;
     const metaPath = cand.path.replace(/\.jsonl$/, '.meta.json');
     let meta = {};
@@ -422,6 +432,9 @@ const MAX_CALLS_PER_SESSION = 400;
  *  只让少数巨无霸变慢。超过时由 subagentsTruncated 显式暴露，不静默。
  */
 const MAX_SUBAGENTS = 100;
+/** 子 agent 文件只读尾部这么多字节。它们只贡献最近 MAX_CALLS_PER_SESSION 条调用，
+ *  读 4MB 是浪费——实测 3518 个子文件共 5.2GB，最坏情况每会话要读 400MB。 */
+export const SUBAGENT_READ_BYTES = 512 * 1024;
 
 function findTranscriptRoot() {
   const root = join(homedir(), '.claude', 'projects');

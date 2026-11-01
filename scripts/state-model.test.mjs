@@ -18,8 +18,9 @@ import {
   isPersistentChange,
   heartbeatThreshold,
   judgeState,
+  parseJsonl,
+  SUBAGENT_READ_BYTES,
 } from './scan-sessions.mjs';
-
 const MIN = 60_000;
 const now = Date.now();
 const callAt = (cmd, ts) => ({
@@ -399,4 +400,34 @@ test('normalizeBash 处理反斜杠转义不越界', () => {
 test('normalizeBash 空输入与纯空白', () => {
   assert.equal(normalizeBash('').verb, '');
   assert.ok(normalizeBash('   ').digest.length > 0);
+});
+
+// ── 子 agent 读取上限（2026-11-01）────────────────────────────────
+
+test('parseJsonl 按 maxBytes 只读尾部，512KB 覆盖远超 400 条记录', async () => {
+  // 实测语料：主 transcript 1.2GB，子 agent 5.2GB / 3518 个文件。
+  // 每会话最多展开 100 个子文件，若每个读 4MB，最坏 400MB/会话。
+  // 子 agent 只贡献最近 MAX_CALLS_PER_SESSION 条调用，512KB 就够。
+  const fs = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const dir = fs.mkdtempSync(join(tmpdir(), 'ow-pj-'));
+  try {
+    const lines = [];
+    for (let i = 0; i < 3000; i++) {
+      lines.push(JSON.stringify({ type: 'assistant', timestamp: new Date(1700000000000 + i * 1000).toISOString(),
+        message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: `/f${i}`, pad: 'x'.repeat(200) } }] } }));
+    }
+    const f = join(dir, 'a.jsonl');
+    fs.writeFileSync(f, lines.join('\n') + '\n');
+    assert.ok(fs.statSync(f).size > 512 * 1024);
+
+    const big = parseJsonl(f);                       // 默认 4MB：读全部
+    const small = parseJsonl(f, SUBAGENT_READ_BYTES);// 子 agent：512KB
+    assert.ok(small.records.length >= 400,
+      `512KB 应覆盖至少 400 条，实际 ${small.records.length}`);
+    assert.ok(small.records.length < big.records.length,
+      '小上限应确实少读一些');
+    assert.equal(small.badLines, 0, '截断首行必须被丢弃，不能算坏行');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

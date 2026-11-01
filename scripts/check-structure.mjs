@@ -422,7 +422,7 @@ function checkUnregisteredExports() {
   if (!existsSync(dir)) return;
   const REGISTERED = new Set([
     'parseArgs', 'parseKeys', 'parseKeysWithRest', 'judgeState', 'noveltyOf',
-    'signatureOf', 'normalizeBash', 'heartbeatThreshold', 'isPersistentChange',
+    'signatureOf', 'normalizeBash', 'heartbeatThreshold', 'isPersistentChange', 'parseJsonl', 'SUBAGENT_READ_BYTES',
     'displayWidth', 'padDisplay', 'paint', 'badge', 'colorEnabled', 'stripAnsi',
     'sanitize', 'truncateToWidth', 'wrapToWidth', 'buildDraft', 'detailLines',
     'stripLongStrings', 'collectSubagentFiles', 'stateCounts', 'listRow',
