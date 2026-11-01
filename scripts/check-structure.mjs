@@ -440,7 +440,7 @@ function checkUnregisteredExports() {
     'traceability', 'readJobStates', 'probeWaiting', 'readLiveSessionStates',
     'buildInbox', 'formatInbox', 'healthCheck', 'formatHealth', 'HEALTH_PERIODS',
     'statusToState', 'liveToRow', 'mergeLiveSessions', 'listRow', 'detailLines', 'pendingLines',
-    'claimOwnership', 'readOwner', 'ownerPath',
+    'claimOwnership', 'readOwner', 'ownerPath', 'askedCandidates',
     // asked.mjs
     'lastAssistantText', 'endsWithQuestion', 'classifyQuestion',
     'inspectTranscript', 'scanAll', 'formatResult', 'GREETING', 'DEFAULT_MIN_HOURS',

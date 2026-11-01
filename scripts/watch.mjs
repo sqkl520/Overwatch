@@ -38,12 +38,17 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { classifyStop } from './classify-stop.mjs';
+import { sessionIdOf } from './asked.mjs';
 
 // ── 常量 ──────────────────────────────────────────────────────────────
 
 export const MINUTE = 60_000;
 export const HOUR = 60 * MINUTE;
 export const DAY = 24 * HOUR;
+
+/** asked 层门槛：只报停了这么久以上的问题。1 小时——*/
+/** 实测回复延迟 p50 是 50 分钟，1 小时内人可能正在看，不该催。 */
+const ASKED_MIN_HOURS = 1;
 
 const JOBS_INTERVAL = 1 * MINUTE;
 const PROBE_INTERVAL = 5 * MINUTE;
@@ -52,6 +57,10 @@ const FULL_INTERVAL = 30 * MINUTE;
 /** 限额（AC6） */
 const PER_SESSION_MAX_24H = 2;
 const GLOBAL_MAX_24H = 8;
+/** ASKED 独立额度：每天最多几条。每条对应一个「你该拍板的事」。 */
+const ASKED_MAX_24H = 6;
+/** ASKED 的最小间隔：一次扫描可能同时产出好几条，不能同时炸出来。 */
+const ASKED_MIN_GAP = 30 * MINUTE;
 const GLOBAL_MIN_GAP = 10 * MINUTE;
 
 const LOG_MAX_BYTES = 1024 * 1024;
@@ -76,7 +85,7 @@ const ACTIVE_WINDOW = 24 * HOUR;
  *  锐评的原话：「通知只能由宿主事实触发」。剩下的判定能力等于
  *  `claude agents --json` 的 busy/idle/blocked 加一次 Write 检测 —— 这是诚实的边界。
  */
-export const NOTIFY_STATES = ['WAITING', 'FAILED', 'BLOCKED'];
+export const NOTIFY_STATES = ['WAITING', 'BLOCKED', 'FAILED', 'ASKED'];
 
 const SCAN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'scan-sessions.mjs');
 /** 本仓库根目录。用于归属检查：判断是否被另一个克隆共用数据目录。 */
@@ -192,7 +201,11 @@ export function claimOwnership(stateDir, repoPath, { nowMs = Date.now() } = {}) 
     firstSeenAt: conflict ? (prev.firstSeenAt || new Date(nowMs).toISOString()) : (prev?.firstSeenAt || new Date(nowMs).toISOString()),
     lastSeenAt: new Date(nowMs).toISOString(),
     // 冲突时保留上一个仓库，让人能看到是谁在抢
-    alsoUsedBy: conflict ? [...new Set([...(prev.alsoUsedBy || []), prev.repo])].filter(Boolean) : (prev?.alsoUsedBy || []),
+    // 只记**别的**仓库。早版本把 prev.repo 也塞进来，而冲突时 prev.repo 就是别人，
+    // 但去掉冲突后它仍留在列表里，于是自己出现在「还被这些仓库用过」里——读数时误导。
+    alsoUsedBy: conflict
+      ? [...new Set([...(prev.alsoUsedBy || []), prev.repo])].filter((x) => x && x !== me)
+      : (prev?.alsoUsedBy || []).filter((x) => x && x !== me),
   };
   try {
     mkdirSync(String(stateDir), { recursive: true });
@@ -442,12 +455,32 @@ function within(list, nowMs, windowMs) {
  * 不能发不等于丢弃——调用方把边沿留在 state 里（notifyCount 仍为 0），
  * 下一轮预算松开时会补发。这就是「全局 10 分钟内 ≤1 条」的突发合并。
  */
-export function canNotify(state, sessionId, nowMs) {
+export function canNotify(state, sessionId, nowMs, kind = null) {
   if (state.muteUntil) {
     const until = Date.parse(state.muteUntil);
     if (Number.isFinite(until) && nowMs < until) return { ok: false, why: 'muted' };
   }
   const sentLog = within(state.budget.sentLog || [], nowMs, DAY);
+
+  // ASKED 单独计额。
+  //
+  // 2026-11-01 实测：一次 asked 扫描就产出 5 条（本机 5 个真待决策会话），
+  // 而全局上限是 8 条/24h——这批一进来就把当天额度吃掉大半，
+  // 之后真正的 FAILED 反而发不出去。
+  //
+  // 不调高全局上限（那会让通知变吵），而是给 ASKED 一个**独立的小额度**：
+  // 它每条都对应一个「你该拍板的事」，不该被别的通知挤掉，也不该挤掉别的。
+  const askedLog = within((state.budget.askedLog || []), nowMs, DAY);
+  if (kind === 'ASKED') {
+    if (askedLog.length >= ASKED_MAX_24H) return { ok: false, why: 'asked-24h' };
+    // ASKED 仍受最小间隔约束，避免一次 5 条同时炸出来
+    if (askedLog.length) {
+      const last = Math.max(...askedLog.map((iso) => Date.parse(iso)));
+      if (nowMs - last < ASKED_MIN_GAP) return { ok: false, why: 'asked-gap' };
+    }
+    return { ok: true, why: null };
+  }
+
   if (sentLog.length >= GLOBAL_MAX_24H) return { ok: false, why: 'global-24h' };
 
   const mine = within((state.budget.perSession || {})[sessionId] || [], nowMs, DAY);
@@ -460,7 +493,7 @@ export function canNotify(state, sessionId, nowMs) {
   return { ok: true, why: null };
 }
 
-export function recordSent(state, sessionId, nowMs = Date.now()) {
+export function recordSent(state, sessionId, nowMs = Date.now(), kind = null) {
   const iso = new Date(nowMs).toISOString();
   state.budget = state.budget || { day: null, sent: 0, sentLog: [], perSession: {} };
   state.budget.sentLog = [...within(state.budget.sentLog || [], nowMs, DAY), iso];
@@ -470,6 +503,10 @@ export function recordSent(state, sessionId, nowMs = Date.now()) {
   // 顺带把「今天的计数」维护成文档里的形状
   state.budget.day = iso.slice(0, 10);
   state.budget.sent = state.budget.sentLog.filter((s) => s.startsWith(String(state.budget.day))).length;
+  // ASKED 走独立额度（见 canNotify 注释），单独记一份
+  if (kind === "ASKED") {
+    state.budget.askedLog = [...within(state.budget.askedLog || [], nowMs, DAY), iso];
+  }
   return state;
 }
 
@@ -786,7 +823,7 @@ export const NOTIFY_KINDS = Object.freeze([
  *  而是宿主自己的结论。拿分类器再判一遍，只会把确定信号降级成不确定的。
  *  ——实测：WAITING 候选会被 classifyCandidate 判成 UNCLASSIFIABLE + classify:error
  *  （sessions/ 里没有对应停止点），然后撞上 5 分钟时间门被抑制。 */
-export const HOST_FACT_STATES = Object.freeze(['WAITING', 'FAILED', 'BLOCKED']);
+export const HOST_FACT_STATES = Object.freeze(['WAITING', 'BLOCKED', 'FAILED', 'ASKED']);
 
 /** `UNCLASSIFIABLE` 的最短观察期，秒。默认 5 分钟。
  *
@@ -1260,6 +1297,7 @@ export function notifyTitle(c) {
       ? `✋ ${where} · 正在等你（${what}）`
       : `✋ ${where} · 正在等你`;
   }
+  if (c.state === 'ASKED') return `❓ ${where} · 问了没答`;
   if (c.state === 'BLOCKED') return `⏸ ${where} · 受阻`;
   if (c.state === 'FAILED') return `✖ ${where} · 宿主报失败`;
 
@@ -1451,7 +1489,7 @@ export async function dispatchCandidates(candidates, {
     }
     const rec = state.notified[key];
 
-    const gate = canNotify(state, c.sessionId, nowMs);
+    const gate = canNotify(state, c.sessionId, nowMs, c.state);
     if (!gate.ok) {
       rec.suppressedBy = gate.why;
       summary.suppressed.push({ key, sessionId: c.sessionId, why: gate.why });
@@ -1476,7 +1514,7 @@ export async function dispatchCandidates(candidates, {
       rec.kind = c.kind || null;
       delete rec.suppressedBy;
       rec.delivery = 'submitted';
-      recordSent(state, c.sessionId, nowMs);
+      recordSent(state, c.sessionId, nowMs, c.state);
       summary.sent.push({ key, sessionId: c.sessionId, kind: c.kind || null });
       if (obs) summary.observations.push({ ...obs, notified: true, why: null });
       if (logger) logger.info(`notified ${c.state} ${c.project || ''} kind=${c.kind || '-'} key=${key} session=${c.sessionId}`);
@@ -1645,6 +1683,28 @@ export async function runTick({
           summary.errors = [...(summary.errors || []), e];
           log.error(`scan-failed project=${project}: ${e.message}`);
         }
+      }
+    }
+    // asked 层：找出「AI 问了、没人答」的会话。**和宿主无关**，所以宿主不报的也能抓到。
+    //
+    // 成本实测：全量扫描 18.9 秒（171 个 transcript）。**绝不能放进 L-fast**（60 秒一次）。
+    // 放在这一层（5 分钟一次），并且只在项目 mtime 真的变了、或从没扫过时才跑。
+    // probeMtime 只要 60ms 而且已经算好了 changed，直接复用——没有变化时这一层成本为 0。
+    const askedDue = forceFull || changed.length > 0 || !state.lastAskedScanAt;
+    if (askedDue && !firstProbe) {
+      try {
+        const { scanAll } = await import('./asked.mjs');
+        const t0 = process.hrtime.bigint();
+        const asked = scanAll({ projectsRoot: join(root, 'projects'), nowMs, minHours: ASKED_MIN_HOURS });
+        summary.ran.push('asked');
+        summary.timings.askedMs = Math.round(Number(process.hrtime.bigint() - t0) / 1e6);
+        const ac = askedCandidates(asked, { nowMs });
+        candidates = candidates.concat(ac);
+        summary.askedFound = ac.length;
+        state.lastAskedScanAt = new Date(nowMs).toISOString();
+      } catch (e) {
+        summary.errors = [...(summary.errors || []), e];
+        log.error(`asked-scan-failed: ${e.message}`);
       }
     }
   }
@@ -2049,6 +2109,48 @@ export function formatHealth(result) {
     lines.push('这恰恰是 DF-023 记的那类故障：看起来在跑，实际没在跑。');
   }
   return lines.join('\n');
+}
+
+/** 把 asked.mjs 的结果转成 watch 的候选。
+ *
+ *  ASKED 与 WAITING 的区别：WAITING 是宿主说「它在等」；ASKED 是**我们从 transcript
+ *  看出来的**——最后一条 assistant 是问句，之后没有真人回复。所以宿主不报的场景也能覆盖。
+ *
+ *  evidenceFingerprint 用**问题文本**而不是时间：时间每轮都在走，会让去重失效
+ *  （同一件事每 5 分钟提醒一次）。这是 df-022 之后学到的那条规则。 */
+export function askedCandidates(askedResult, { nowMs = Date.now() } = {}) {
+  void nowMs;
+  const out = [];
+  for (const it of (askedResult && askedResult.found) || []) {
+    // 不用 split(/[/]/)：路径里是单个反斜杠（\\ 在 JS 字符串里是转义），
+    // 那个字符类匹配不到，结果整个路径成了 sessionId（实测通知里就是你本机的完整路径）。
+    // sessionIdOf 用 lastIndexOf 剥离目录，对所有分隔符都成立。
+    const sid = sessionIdOf(it.filePath || '');
+    if (!sid) continue;
+    out.push({
+      sessionId: sid,
+      state: 'ASKED',
+      reason: `asked:${it.kind}`,
+      // asked 的项目名是完整目录 slug（D--Server-MCServers-Server-plugin-PerfScope），
+      // 直接进标题会撑爆。取最后一段，和 probeJobs/probeWaiting 的做法一致。
+      // slug 形如 D--Server-MCServers-Server-plugin-PerfScope：用 -- 切只有一段。
+      // 取最后一个 - 之后的部分（即真正的项目名），太长时再截断。
+      project: (() => {
+        const raw = String(it.project || '');
+        const last = raw.split('-').filter(Boolean).pop();
+        const name = last || raw;
+        return name.length > 24 ? name.slice(0, 24) + '…' : name;
+      })(),
+      detail: it.question,
+      needs: String(it.question || '').slice(-200),
+      suggestedReply: null,
+      idleSec: Math.round((it.hours || 0) * 3600),
+      updatedAt: null,
+      evidenceFingerprint: String(it.question || '').slice(-60),
+      source: 'asked',
+    });
+  }
+  return out;
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────

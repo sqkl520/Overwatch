@@ -875,6 +875,41 @@ macOS 的 launchd plist、Linux 的 systemd user unit，以及「不配守护进
 24h 阈值恒 false → 1 红。另外发现 `seen.has(key)` 那条守卫是**冗余的**
 （`stillAsking` 已覆盖），删掉并注释说明为什么不需要它。
 
+### Added（ASKED 接进 watch.mjs 轮询）
+
+`asked.mjs` 不再只能手动跑——它现在是 `watch.mjs` 的一层，会自己提醒。
+
+**成本决定了放哪一层。** 实测全量扫描 **18.9 秒**（171 个 transcript），
+**绝不能放进 L-fast**（60 秒一次）。放在 L-mid（5 分钟），且**只在项目 mtime 变了、
+或从没扫过时才跑**——`probeMtime` 只要 60ms 而且已经算好了 `changed`，直接复用，
+没有变化时这一层成本为 0。
+
+**识别与去重**：`ASKED` 与 `WAITING` 分开，因为前者是**从 transcript 看出来的**
+（最后一条 assistant 是问句），宿主不报的场景也能覆盖。
+`evidenceFingerprint` 用**问题文本**而非时间——时间每轮都在走，会让去重失效。
+
+**额度必须分开。** 实测一次 asked 扫描产出 5 条，而全局上限是 8 条/24h——
+这批一进来就把当天额度吃掉大半，之后真正的 `FAILED` 反而发不出去。
+不调高全局上限（那会变吵），而是给 ASKED **独立额度**：6 条/24h + 最小间隔 30 分钟。
+两边互不挤占，测试里双向验证过。
+
+**端到端实测**：
+
+```
+notified ASKED PerfScope ... candidates=5 sent=1 suppressed=4 observed=5(ASKED:5)
+```
+
+5 个候选，发 1 条，4 条被 30 分钟间隔正确地压后。
+
+**跑起来才发现的两个 bug**：
+- `sessionId` 成了**完整绝对路径**——`split(/[\/]/)` 匹配不到单个反斜杠，
+  通知里直接泄露出本机路径。改用 `sessionIdOf`（`lastIndexOf` 剥离目录）。
+- 项目名是完整 slug（`D--Server-MCServers-Server-plugin-PerfScope`），标题撑爆。
+  取最后一段。
+
+**变异验证**：去掉独立额度 → 2 红；指纹换成时间 → 1 红；去掉 ASKED 标题 → 1 红；
+`sessionId` 回到 split 写法 → 1 红。
+
 ### Notes（已知且不打算近期修）
 
 1. **在线停止分类 95.4% 判 `UNCLASSIFIABLE`** —— 结构性，分类器需要「下一句」而在线时下一句还没发生。

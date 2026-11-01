@@ -25,7 +25,7 @@ import {
   findStopPoint, readTranscriptTail, classifyCandidate, createObservationLog,
   observationStats, formatStats, readObservationRows, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
   traceability, readJobStates, probeWaiting, readLiveSessionStates, buildInbox, formatInbox, healthCheck, formatHealth, HEALTH_PERIODS,
-  claimOwnership, readOwner, ownerPath, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
+  claimOwnership, readOwner, ownerPath, askedCandidates, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -1857,4 +1857,81 @@ test('claimOwnership：末尾斜杠不影响判定', () => {
     claimOwnership(dir, '/repo/a', { nowMs: now });
     assert.equal(claimOwnership(dir, '/repo/a/', { nowMs: now + 1 }).conflict, false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── ASKED 接入轮询（2026-11-01）────────────────────────────────────
+
+test('askedCandidates：把 asked.mjs 的结果转成候选，指纹用问题文本', () => {
+  const now = Date.now();
+  const cs = askedCandidates({
+    found: [{ filePath: '/p/abc.jsonl', project: 'D--S-Plugin-PerfScope', kind: 'decision',
+      question: '要我做这个吗？', hours: 5 }],
+  }, { nowMs: now });
+  assert.equal(cs.length, 1);
+  assert.equal(cs[0].state, 'ASKED');
+  assert.equal(cs[0].sessionId, 'abc');
+  assert.equal(cs[0].project, 'PerfScope', '项目名要短，不能撑爆标题');
+  assert.ok(cs[0].evidenceFingerprint.includes('要我做这个吗'), '指纹用问题文本');
+});
+
+test('askedCandidates：指纹稳定——同一问题两轮相同，不会重复通知', () => {
+  const r = { found: [{ filePath: '/p/a.jsonl', project: 'X', kind: 'decision', question: '要做吗？', hours: 5 }] };
+  const a = askedCandidates(r, { nowMs: 1000 })[0];
+  const b = askedCandidates(r, { nowMs: 999999 })[0];
+  assert.equal(a.evidenceFingerprint, b.evidenceFingerprint, '时间不该进指纹');
+});
+
+test('notifyTitle：ASKED 说「问了没答」，不是「未分类」', () => {
+  const t = notifyTitle({ state: 'ASKED', project: 'demo' });
+  assert.ok(t.includes('问了没答'), `应说问了没答：${t}`);
+  assert.ok(!t.includes('未分类'));
+});
+
+test('ASKED 在 NOTIFY_STATES 与 HOST_FACT_STATES 里', () => {
+  assert.ok(NOTIFY_STATES.includes('ASKED'), '要能通知');
+  assert.ok(HOST_FACT_STATES.includes('ASKED'), '要跳过分类门——它的判据比分类器更直接');
+});
+
+test('ASKED 有独立额度：全局满额时仍可发，反之亦然', () => {
+  const now = Date.now();
+  const full = emptyState();
+  full.budget.sentLog = Array.from({ length: 8 }, (_, i) => new Date(now - i * 60e3).toISOString());
+  assert.equal(canNotify(full, 's', now, 'FAILED').ok, false, '全局已满');
+  assert.equal(canNotify(full, 's', now, 'ASKED').ok, true, 'ASKED 不该被全局额度挤掉');
+
+  const askedFull = emptyState();
+  askedFull.budget.askedLog = Array.from({ length: 6 }, (_, i) => new Date(now - (i + 1) * 3600e3).toISOString());
+  assert.equal(canNotify(askedFull, 's', now, 'ASKED').ok, false, 'ASKED 自己的额度满了');
+  assert.equal(canNotify(askedFull, 's', now, 'FAILED').ok, true, 'ASKED 也不该挤掉别的');
+});
+
+test('ASKED 有最小间隔：不能一次 5 条同时炸出来', () => {
+  const now = Date.now();
+  const st = emptyState();
+  st.budget.askedLog = [new Date(now - 60e3).toISOString()];   // 1 分钟前刚发过
+  const g = canNotify(st, 's', now, 'ASKED');
+  assert.equal(g.ok, false);
+  assert.equal(g.why, 'asked-gap');
+});
+
+test('recordSent 把 ASKED 记进独立额度', () => {
+  const now = Date.now();
+  const st = emptyState();
+  recordSent(st, 's', now, 'ASKED');
+  assert.equal(st.budget.askedLog.length, 1);
+  recordSent(st, 's', now, 'FAILED');
+  assert.equal(st.budget.askedLog.length, 1, 'FAILED 不该计入 ASKED 额度');
+});
+
+test('askedCandidates：sessionId 必须是 uuid，不是完整路径', () => {
+  // 实测 bug：用 split(/[\/]/) 剥目录，而真实路径里是单个反斜杠，
+  // 匹配不到 → 整个绝对路径成了 sessionId，通知里直接泄露本机路径。
+  const B = String.fromCharCode(92);
+  const cs = askedCandidates({
+    found: [{ filePath: `C:${B}Users${B}u${B}.claude${B}projects${B}proj${B}abc-123.jsonl`,
+      project: 'proj', kind: 'decision', question: '要做吗？', hours: 5 }],
+  });
+  assert.equal(cs[0].sessionId, 'abc-123', `必须是 uuid，实际：${cs[0].sessionId}`);
+  assert.ok(!cs[0].sessionId.includes(B), '不得含路径分隔符');
+  assert.ok(!cs[0].sessionId.includes('Users'), '不得泄露本机目录');
 });
