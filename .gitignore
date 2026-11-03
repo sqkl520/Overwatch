@@ -12,8 +12,21 @@ tasks/runs/
 node_modules/
 *.log
 tmp/
+.tmp-analysis/
+.tmp-*
 .DS_Store
 Thumbs.db
+
+# ── 本机专有的研究方向文档（脱敏后仍不剩公开价值）──────────
+# 这五份记录的是本机宿主/第三方网关的可编程接口逆向、令牌与 ACL 暴露面、
+# 命名管道协议细节、GUI 自动化实测。它们对复现「本机为什么会这样」有价值，
+# 但公开等于给攻击者画地图（端口、协议帧、令牌位置、沙箱读权限）。
+# 文件本身保留在磁盘上，第一行带 `<!-- PRIVATE: 不在公开范围内 -->`。
+docs/research/2026-11-02-host-interfaces.md
+docs/research/2026-11-02-path-a-ipc.md
+docs/research/2026-11-02-path-a-recount.md
+docs/research/2026-11-02-path-b-gateway.md
+docs/research/2026-11-02-path-b-recount.md
 
 # 安装器生成的启动器：内容依赖本机仓库路径，模板才是版本控制的真源。
 # 模板 scripts/install/start-watch.vbs.template 必须提交；

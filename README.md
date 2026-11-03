@@ -61,12 +61,12 @@ node scripts/scan-sessions.mjs --days 3
 OmniSight 会话扫描 · 最近 3 天 · 23 个有活动的会话
 liveness: reconstructed（事后重建，非实时上报）
 
-宿主注册的活跃会话 8 个：
-  idle  dsh-fcl-android-launcher           可投递(带来源标注)
-  busy  OmniSight 跨对话监督调度                  可投递(带来源标注)
+宿主注册的活跃会话 2 个：
+  idle  <session-A>                        可投递(带来源标注)
+  busy  <session-B>                        可投递(带来源标注)
 
-[PRODUCING] Projects/Overwatch   calls= 2465 sub=     28 depth=1 novelty=0.96 hb=0s/120s     idle=6s    persistent-change-in-window
-[EXPLORING] Server/MCServers/Server/   calls=  185 sub=      0 depth=0 novelty=1.00 hb=91s/900s    idle=326.9h dormant
+[PRODUCING] Projects/<repo>      calls= 2465 sub=     28 depth=1 novelty=0.96 hb=0s/120s     idle=6s    persistent-change-in-window
+[EXPLORING] Projects/<repo-2>     calls=  185 sub=      0 depth=0 novelty=1.00 hb=91s/900s    idle=326.9h dormant
 ```
 
 `dormant` 的会话不告警——它们只是结束了，不是坏了。
@@ -232,7 +232,7 @@ Overwatch/
 
 ## 参考与致谢
 
-目录结构的组织方式参考了 [Let's Learn English](https://github.com/sqkl520/Minecraft-server-plugin-Let-s-learn-English) 的双层工作区模式，但**刻意不照搬**：
+目录结构的组织方式参考了一个同类项目的双层工作区模式，但**刻意不照搬**：
 
 - **借鉴**：控制层与发布层分离、四件套证据纪律、两本台账、机器可读的验收标准、agent 工具白名单限制写权限。
 - **丢弃**：`versions/` 提交二进制、`tasks/` 占 42% 跟踪文件、`agent-memory` 多份分叉副本、硬编码本机路径、单版本 449 行的 CHANGELOG。

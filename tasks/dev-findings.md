@@ -33,7 +33,7 @@
 
 - **发现于**：验收 run（AC7），验收 Agent 实测
 - **位置**：`scripts/scan-sessions.mjs` 的 `normalizeBash`
-- **证据**：原实现 `/(["'])(?:\\.|(?!\1).){40,}\1/g` 在 `'` + 连续反斜杠输入上不可终止。实测 `'` + 60 个反斜杠 → **90 秒超时**；真实语料中一条 472 字符的 `grep` 命令单次归一化 17,897ms。`--days 3` 与 `--project MCServers` 均在 60s 超时（exit 124）。
+- **证据**：原实现 `/(["'])(?:\\.|(?!\1).){40,}\1/g` 在 `'` + 连续反斜杠输入上不可终止。实测 `'` + 60 个反斜杠 → **90 秒超时**；真实语料中一条 472 字符的 `grep` 命令单次归一化 17,897ms。`--days 3` 与 `--project <project>` 均在 60s 超时（exit 124）。
 - **影响**：README 的 30 秒上手命令直接挂住；产品唯一的「眼睛」在真实数据上不可用。
 - **修复**：改为手写线性状态机 `stripLongStrings()`，O(n)。病态输入现为 0.3–4.2ms，`--days 3` 全量扫描 13s。
 - **回归测试**：`state-model.test.mjs` 的「归一化在病态输入上是线性的」
@@ -42,7 +42,7 @@
 
 - **发现于**：修复 DF-001 后重跑全量扫描
 - **位置**：`judgeState()` 的 FAILED 分支
-- **证据**：`[FAILED] Projects/rea calls=2483 ... hb=515s/120s idle=72.3h`。该会话末次间隔 515s 超过 p95=120s，但整体已空闲 72.3 小时——它是结束了，不是失败了。
+- **证据**：`[FAILED] Projects/<project-A> calls=2483 ... hb=515s/120s idle=72.3h`。该会话末次间隔 515s 超过 p95=120s，但整体已空闲 72.3 小时——它是结束了，不是失败了。
 - **影响**：假警报。用户会去「重跑」一个早就完成的会话。
 - **修复**：加 `DORMANT_MS = 1h` 新鲜度闸门，超时判 `EXPLORING` + `reason: dormant` + `liveness: stale`
 - **回归测试**：`state-model.test.mjs` 的「长时间无活动的会话判休眠，不判 FAILED」
@@ -89,7 +89,7 @@
 
 - **发现于**：红队 run
 - **位置**：`scanSessionDir()` 只遍历 `subDir` 的直接文件
-- **证据**：3220 个 jsonl 中 **1190 个**在 `subagents/workflows/<wf-id>/` 下。会话 `3068431b` 报 `sub=28`，实际远多于此。
+- **证据**：3220 个 jsonl 中 **1190 个**在 `subagents/workflows/<wf-id>/` 下。会话 `<session-id>` 报 `sub=28`，实际远多于此。
 - **修复**：新增递归 `collectSubagentFiles()`；同时输出 `subagentsTotal` 与 `subagentsTruncated`，终端显示为 `30/272~` 而非骗人的 `30`。
 
 ### DF-009 [fixed] 硬门不检查脚本能否被 Node 解析

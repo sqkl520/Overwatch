@@ -25,10 +25,10 @@ OmniSight 会话扫描 · 最近 3 天 · 19 个有活动的会话
 liveness: reconstructed（事后重建，非实时上报）
 
 宿主注册的活跃会话 8 个：
-  idle  Let's learn English!               可投递(带来源标注)
+  idle  <session-A>               可投递(带来源标注)
 
-[PRODUCING] Projects/Overwatch         calls=  988 sub=     13 depth=1 novelty=0.97 hb=0s/120s     idle=5s    persistent-change-in-window
-[EXPLORING] Projects/dsh/fcl/android   calls= 5840 sub=100/272~ depth=1 novelty=1.00 hb=0s/120s     idle=67.5h dormant
+[PRODUCING] Projects/<this-repo>         calls=  988 sub=     13 depth=1 novelty=0.97 hb=0s/120s     idle=5s    persistent-change-in-window
+[EXPLORING] Projects/<project-D>   calls= 5840 sub=100/272~ depth=1 novelty=1.00 hb=0s/120s     idle=67.5h dormant
 
 汇总：EXPLORING=16  PRODUCING=3
 ```
@@ -47,8 +47,8 @@ node scripts/oversight-tui.mjs
 OmniSight · 会话列表 · 最近 3 天 · liveness stale=16 reconstructed=3
 纯文本快照（交互界面需在终端运行）
   状态        项目                     calls       novelty  idle        reason
-  ● PRODUCING Projects/dsh/fcl/androi… calls= 1415 nov=0.80 idle=50s    persistent-change-in-window
-  ○ EXPLORING Server/MCServers/Server… calls=  201 nov=1.00 idle=45.7d  dormant
+  ● PRODUCING Projects/<project-D>… calls= 1415 nov=0.80 idle=50s    persistent-change-in-window
+  ○ EXPLORING Server/<project-E>/Server… calls=  201 nov=1.00 idle=45.7d  dormant
 
 汇总：PRODUCING=3 EXPLORING=16
 ```
@@ -95,18 +95,18 @@ check-structure · 仓库结构硬门
 
 所以判定链里有一条休眠闸门：最后一次调用距今超过 1 小时，直接判 `EXPLORING` + `reason: dormant` + `liveness: stale`，不再往下比。它必须排在宿主报 `failed` 之后——宿主明确报过失败的会话，不该因为时间久被降级成「只是睡着了」。
 
-真实例子（`--days 3`，本机）：`Projects/rea` 空闲 3.7 天，上一次两调用间隔 515 秒，阈值 120 秒。没有这条闸门，它会被判 `FAILED`，然后你会去「重跑」一个三天前就结束的会话。
+真实例子（`--days 3`，本机）：`Projects/<project-C>` 空闲 3.7 天，上一次两调用间隔 515 秒，阈值 120 秒。没有这条闸门，它会被判 `FAILED`，然后你会去「重跑」一个三天前就结束的会话。
 
 ## 4. 读懂输出
 
 ```
-[PRODUCING] Projects/Overwatch   calls=  988 sub=     13 depth=1 novelty=0.97 hb=0s/120s   idle=5s   persistent-change-in-window
+[PRODUCING] Projects/<this-repo>   calls=  988 sub=     13 depth=1 novelty=0.97 hb=0s/120s   idle=5s   persistent-change-in-window
 ```
 
 | 字段 | 含义 |
 |---|---|
 | `[PRODUCING]` | 五态之一，宽度固定，方便竖着扫 |
-| 项目名 | 目录名还原（`D--Projects-Overwatch` → `Projects/Overwatch`），超 24 列截断 |
+| 项目名 | 目录名还原（`<this-repo-slug>` → `Projects/<this-repo>`），超 24 列截断 |
 | `calls` | 扫到的工具调用总数，含子 agent。为控制耗时，每个文件只读末尾 4 MB；主 transcript 取末尾 1200 条记录，每个子 agent 取末尾 400 条 |
 | `sub` | 子 agent 数量，`100/272~` 见下 |
 | `depth` | 派生树最大层深 |
@@ -145,8 +145,8 @@ node scripts/oversight-tui.mjs --days 1 --interval 15 --plain
 真实输出（某 `BLOCKED` 会话，80 列。实际还多 `目录`、`lastActivity` 两行，派生树部分有 30 行 `◇ 子 agent #n`，这里省略）：
 
 ```
-  项目         Server/MCServers/Server/plugin/Hilltop/Village
-  sessionId    7710fbdb-06a6-44c1-8925-c76a25a39edb
+  项目         <project-A>
+  sessionId    <session-H>
   state        ? BLOCKED
   reason       host-reported-blocked
   liveness     reconstructed
@@ -176,9 +176,9 @@ node scripts/oversight-tui.mjs --days 1 --interval 15 --plain
 选中会话（`BLOCKED` 最可能有草稿）→ 按 `c` → 看到 `已复制到剪贴板` → 切到目标会话粘贴、回车。复制出的内容分两段：
 
 ```
-把实测单发给我
+把回执发给我
 
-（目标会话正在等待：要我现在就把用户实测单交给你，还是你先看这四份测试报告？）
+（目标会话正在等待：要我现在就把用户回执交给你，还是你先看这四份报告？）
 ```
 
 **`c` 只对宿主提供了 `needs` / `suggestedReply` 的会话有效**，即 `~/.claude/jobs/` 里有记录的 `BLOCKED` 会话。`STALLED` / `FAILED` 按 `c` 会提示「该会话没有 needs / suggestedReply，无草稿可复制」，那类要走 §6 的编队路径写草稿。
@@ -237,25 +237,25 @@ NO_COLOR=1 node scripts/oversight-tui.mjs   # 仍交互，但无色
 **before**（`--days 30`，本机真实记录）：
 
 ```
-[BLOCKED  ] d//Server/MCServers/Serv   calls= 2038 sub= 30/31~ depth=1 novelty=1.00 hb=38s/211s    idle=527.5h host-reported-blocked tok=3476k
-            等待输入：要我现在就把用户实测单交给你，还是你先看这四份测试报告？
-            建议回复：把实测单发给我
+[BLOCKED  ] <project-E-slug>   calls= 2038 sub= 30/31~ depth=1 novelty=1.00 hb=38s/211s    idle=527.5h host-reported-blocked tok=3476k
+            等待输入：要我现在就把用户回执交给你，还是你先看这四份报告？
+            建议回复：把回执发给我
 ```
 
-最后一条 AI 消息是一份完成汇报（「三件事都做完了喵」，列了四份测试报告路径），结尾抛了个二选一的问题，然后停住 22 天。它没坏，是在等人。
+最后一条 AI 消息是一份完成汇报（「三件事都做完了」，列了四份测试报告路径），结尾抛了个二选一的问题，然后停住 22 天。它没坏，是在等人。
 
-**你做的**：TUI 选中它，按 `c`，粘到那个会话，回车。或者直接手打「把实测单发给我」。
+**你做的**：TUI 选中它，按 `c`，粘到那个会话，回车。或者直接手打「把回执发给我」。
 
 **after**：会话继续干。下一次扫描时 `state` 不再是 `BLOCKED`——要么 `PRODUCING`（开始写），要么 `EXPLORING`（开始读）。**系统不会自动确认你发没发**，`sent` 只有你自己能置。
 
 反面例子，同一批数据里另一个 `BLOCKED`：
 
 ```
-[BLOCKED  ] d//Server/MCServers/Serv   calls= 1340 ... host-reported-blocked tok=1331k
+[BLOCKED  ] <project-E-slug>   calls= 1340 ... host-reported-blocked tok=1331k
             等待输入：API unavailable — retry · API Error: 503 No available channel ...
 ```
 
-它没有 `suggestedReply`，因为等的是 API 恢复，不是等你回话。按 `c` 只能复制到「（目标会话正在等待：API unavailable…）」。正确的动作是**检查推理网关**（`127.0.0.1:15721`）或换模型，然后自己发一句让它重试——不是催它。
+它没有 `suggestedReply`，因为等的是 API 恢复，不是等你回话。按 `c` 只能复制到「（目标会话正在等待：API unavailable…）」。正确的动作是**检查本机推理网关**或换模型，然后自己发一句让它重试——不是催它。
 
 ## 7. 跑编队（进阶）
 

@@ -26,6 +26,7 @@ import {
   observationStats, formatStats, readObservationRows, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
   traceability, readJobStates, probeWaiting, readLiveSessionStates, buildInbox, formatInbox, healthCheck, formatHealth, HEALTH_PERIODS,
   claimOwnership, readOwner, ownerPath, askedCandidates, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
+  requestIdTime, lastTimelineStateTime, resolveJobEventTime, BLOCKED_MAX_AGE,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -306,20 +307,230 @@ test('AC3 L-fast：从 jobs 目录识别 failed/blocked，且不读 claude agent
       mkdirSync(join(root, name), { recursive: true });
       writeFileSync(join(root, name, 'state.json'), JSON.stringify(body));
     };
-    mk('a', { state: 'failed', sessionId: 'sa', updatedAt: new Date(now).toISOString(), cwd: 'D:\\Projects\\X' });
-    mk('b', { state: 'blocked', sessionId: 'sb', updatedAt: new Date(now).toISOString(), cwd: 'D:\\Projects\\Y', needs: '等授权' });
-    mk('c', { state: 'done', sessionId: 'sc', updatedAt: new Date(now).toISOString() });
-    mk('d', { state: 'failed', sessionId: 'sd', updatedAt: new Date(now - 48 * 3600_000).toISOString() });
+    // 事件时刻必须来自 firstTerminalAt / timeline / request id 三者之一。
+    // 只给 updatedAt 的 fixture 现在会被判「定不了时」并 fail-closed（见下方专门用例）。
+    const at = new Date(now - 60_000).toISOString();
+    mk('a', { state: 'failed', sessionId: 'sa', firstTerminalAt: at, updatedAt: at, cwd: 'D:\\Projects\\X' });
+    mk('b', { state: 'blocked', sessionId: 'sb', firstTerminalAt: at, updatedAt: at, cwd: 'D:\\Projects\\Y', needs: '等授权' });
+    mk('c', { state: 'done', sessionId: 'sc', firstTerminalAt: at, updatedAt: at });
+    mk('d', { state: 'failed', sessionId: 'sd', firstTerminalAt: new Date(now - 48 * 3600_000).toISOString() });
     mkdirSync(join(root, 'broken'), { recursive: true });
     writeFileSync(join(root, 'broken', 'state.json'), '{half');
 
-    const r = probeJobs(root);
+    const r = probeJobs(root, { nowMs: now });
     const ids = r.found.map((f) => f.sessionId).sort();
     assert.deepEqual(ids, ['sa', 'sb'], '只报活跃窗口内的 failed/blocked');
     assert.equal(r.found.find((f) => f.sessionId === 'sa').state, 'FAILED');
     assert.equal(r.found.find((f) => f.sessionId === 'sb').state, 'BLOCKED');
     assert.ok(r.elapsedMs >= 0);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// ── BLOCKED 误报：事件时刻 ≠ 文件元数据时刻（2026-11-02 生产缺陷）──
+//
+// 旧实现拿 `job.updatedAt` 当「阻塞发生时刻」，而宿主会在启动时重写 state.json
+// （补 respawnFlags / name / providerEnv），把 updatedAt 刷到当下。
+// 实测 a9fa4c62：阻塞发生于 2026-10-05，updatedAt 是 2026-11-01——差 27.8 天。
+// 判定器把 27 天前的 503 当新鲜阻塞报出来，还编了个 idle=916m 写进正文。
+
+const mkJob = (root, name, body, timeline) => {
+  mkdirSync(join(root, name), { recursive: true });
+  writeFileSync(join(root, name, 'state.json'), JSON.stringify(body));
+  if (timeline) {
+    writeFileSync(join(root, name, 'timeline.jsonl'),
+      timeline.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  }
+};
+
+test('BLOCKED：27 天前的阻塞不产生候选，且记为 blocked-expired', () => {
+  const root = tmp();
+  try {
+    const now = Date.now();
+    const eventAt = new Date(now - 27.8 * 86400_000).toISOString();
+    mkJob(root, 'old', {
+      state: 'blocked', sessionId: 'old-sess', cwd: 'D:\\P\\hilltop',
+      detail: 'API Error: 503 (request id: 202610051557008747741508268d9d6fVaOO9eq)',
+      // 宿主昨天重写过这个文件——旧实现就是被这一行骗了
+      updatedAt: new Date(now - 15 * 3600_000).toISOString(),
+    }, [{ at: eventAt, state: 'working' }, { at: eventAt, state: 'blocked' }]);
+
+    const r = probeJobs(root, { nowMs: now });
+    assert.equal(r.found.length, 0, '27 天前的阻塞不得产生候选');
+    assert.equal(r.expired.length, 1, '必须单独记一笔，否则「为什么没通知」查不出来');
+    assert.equal(r.expired[0].jobId, 'old');
+    assert.ok(r.expired[0].ageMs / 86400_000 > 27, `age 应约 27.8 天：${r.expired[0].ageMs}`);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('BLOCKED：核心用例——updatedAt 很新但事件时间很旧，判过期', () => {
+  // 这就是 a9fa4c62 的形态。旧实现据此算出 idle≈15.3h 并发出通知。
+  const root = tmp();
+  try {
+    const now = Date.parse('2026-11-02T10:00:00.000Z');
+    mkJob(root, 'a9fa4c62', {
+      state: 'blocked', sessionId: 'a9fa4c62-9616-4058-83be-1e613e50edab',
+      cwd: 'D:\\Server\\MCServers\\Server plugin\\Hilltop Village',
+      detail: 'API Error: 503 (request id: 202610051557008747741508268d9d6fVaOO9eq)',
+      updatedAt: '2026-11-01T18:41:21.066Z',   // 15.3 小时前，看起来「很新鲜」
+      firstTerminalAt: '2026-09-12T12:09:41.462Z',
+    }, [{ at: '2026-10-05T15:53:17.254Z', state: 'working' },
+        { at: '2026-10-05T15:57:02.483Z', state: 'blocked' }]);
+
+    const r = probeJobs(root, { nowMs: now });
+    assert.equal(r.found.length, 0, 'updatedAt 新不能让它变成新鲜阻塞');
+    assert.equal(r.expired.length, 1);
+    // 两个时间源都指向 10-05：request id 15:57:00（秒精度）比 timeline 15:57:02.483 早 2.5 秒，
+    // 取更旧的 → request-id。差 2.5 秒对「27 天还是 27 天」没有影响，重要的是两者都不看 updatedAt。
+    assert.equal(r.expired[0].source, 'request-id', '更旧的那条胜出');
+    assert.equal(r.expired[0].atMs, Date.parse('2026-10-05T15:57:00.000Z'));
+    assert.ok(r.expired[0].ageMs / 86400_000 > 27.7, `应约 27.75 天：${r.expired[0].ageMs}`);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('BLOCKED：6 天前的阻塞仍产生候选，idleSec 从事件时刻算', () => {
+  const root = tmp();
+  try {
+    const now = Date.now();
+    const eventAt = new Date(now - 6 * 86400_000).toISOString();
+    mkJob(root, 'six', {
+      state: 'blocked', sessionId: 'six-sess', cwd: 'D:\\P\\p',
+      updatedAt: new Date(now - 60_000).toISOString(),   // 刚从元数据重写完
+    }, [{ at: eventAt, state: 'blocked' }]);
+
+    const r = probeJobs(root, { nowMs: now });
+    assert.equal(r.found.length, 1, '6 天前的阻塞仍在 7 天窗口内');
+    assert.equal(r.expired.length, 0);
+    const c = r.found[0];
+    assert.equal(c.state, 'BLOCKED');
+    assert.ok(c.idleSec >= 6 * 86400 - 60 && c.idleSec <= 6 * 86400 + 60,
+      `idleSec 必须是 6 天，不是 1 分钟：${c.idleSec}`);
+    assert.equal(c.eventSource, 'timeline');
+    assert.equal(c.eventAt, eventAt);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('BLOCKED：7 天边界——差 1 秒有效，过 1 秒过期', () => {
+  const root = tmp();
+  try {
+    const now = Date.now();
+    const just = new Date(now - (7 * 86400_000 - 1000)).toISOString();
+    const past = new Date(now - (7 * 86400_000 + 1000)).toISOString();
+    mkJob(root, 'just', { state: 'blocked', sessionId: 'a' }, [{ at: just, state: 'blocked' }]);
+    mkJob(root, 'past', { state: 'blocked', sessionId: 'b' }, [{ at: past, state: 'blocked' }]);
+    const r = probeJobs(root, { nowMs: now });
+    assert.deepEqual(r.found.map((f) => f.sessionId), ['a']);
+    assert.deepEqual(r.expired.map((e) => e.jobId), ['past']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('BLOCKED：事件时间无法确定时 fail-closed，不通知但留痕', () => {
+  const root = tmp();
+  try {
+    const now = Date.now();
+    // 只有一个被刷新的 updatedAt，没有 timeline、detail 里没有 request id、
+    // 也没有 firstTerminalAt —— 旧实现会拿 updatedAt 凑数并通知。
+    mkJob(root, 'undated', {
+      state: 'blocked', sessionId: 'u1', cwd: 'D:\\P\\x',
+      updatedAt: new Date(now - 60_000).toISOString(),
+    });
+    const r = probeJobs(root, { nowMs: now });
+    assert.equal(r.found.length, 0, '定不了时就不打扰人');
+    assert.equal(r.undated.length, 1);
+    assert.equal(r.undated[0].jobId, 'undated');
+    assert.equal(r.undated[0].why, 'no-event-time');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('BLOCKED：request id 可单独定时（timeline 缺失时）', () => {
+  const root = tmp();
+  try {
+    const now = Date.parse('2026-11-02T10:00:00.000Z');
+    mkJob(root, 'rid-only', {
+      state: 'blocked', sessionId: 'r1',
+      detail: 'API Error: 503 ... (request id: 202610051557008747741508268d9d6fVaOO9eq)',
+      updatedAt: '2026-11-01T18:41:21.066Z',
+    });
+    const r = probeJobs(root, { nowMs: now });
+    assert.equal(r.found.length, 0);
+    assert.equal(r.expired.length, 1);
+    assert.equal(r.expired[0].source, 'request-id');
+    assert.equal(new Date(r.expired[0].atMs).toISOString(), '2026-10-05T15:57:00.000Z');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('BLOCKED：timeline 与 request id 都可用时取更旧的（只会少发不会多发）', () => {
+  const root = tmp();
+  try {
+    const now = Date.now();
+    // timeline 比 request id 早 60 秒：两者都在 7 天内，都足以让 job 有效，
+    // 断言取更旧的那条——它是「事件更可能在此时发生」的保守下界。
+    const ridAt = now - 3 * 86400_000;
+    const tlAt = ridAt - 60_000;
+    // request id 只有秒级精度，构造时把毫秒截掉，断言才不会差那 27ms
+    const ridStr = new Date(Math.floor(ridAt / 1000) * 1000).toISOString().replace(/\D/g, '').slice(0, 14);
+    mkJob(root, 'both', {
+      state: 'blocked', sessionId: 'b1',
+      detail: `x (request id: ${ridStr}abc)`,
+    }, [{ at: new Date(tlAt).toISOString(), state: 'blocked' }]);
+    const r = probeJobs(root, { nowMs: now });
+    assert.equal(r.found.length, 1);
+    assert.equal(r.found[0].eventSource, 'timeline', '更旧的那条胜出');
+    assert.equal(r.found[0].eventAt, new Date(tlAt).toISOString());
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('requestIdTime：解析形如 20261005155700 的请求 id，非法值返回 null', () => {
+  assert.equal(
+    new Date(requestIdTime('(request id: 202610051557008747741508268d9d6fVaOO9eq)')).toISOString(),
+    '2026-10-05T15:57:00.000Z');
+  assert.equal(requestIdTime('没有时间戳的一句话'), null);
+  assert.equal(requestIdTime(''), null);
+  assert.equal(requestIdTime(null), null);
+  // 看起来是 14 位数字但月份 13 —— Date.UTC 会滚到次年 1 月，必须挡住
+  assert.equal(requestIdTime('request id: 20261305155700xxxx'), null);
+});
+
+test('timeline 解析：只认同状态记录——先 failed 后 blocked，取 blocked 那条', () => {
+  const root = tmp();
+  try {
+    const now = Date.now();
+    mkJob(root, 'mixed', { state: 'blocked', sessionId: 'm1' }, [
+      { at: new Date(now - 30 * 3600_000).toISOString(), state: 'failed' },
+      { at: new Date(now - 2 * 3600_000).toISOString(), state: 'blocked' },
+    ]);
+    const r = probeJobs(root, { nowMs: now });
+    assert.equal(r.found.length, 1);
+    assert.equal(r.found[0].eventSource, 'timeline');
+    assert.ok(r.found[0].idleSec < 3 * 3600, '必须是最后那条 blocked，不是更早的 failed');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('probeJobs：runTick 会为过期记录写 blocked-expired 日志', async () => {
+  const dir = tmp();
+  const claude = tmp();
+  try {
+    const now = Date.now();
+    mkdirSync(join(claude, 'jobs'), { recursive: true });
+    mkdirSync(join(claude, 'projects'), { recursive: true });
+    mkJob(join(claude, 'jobs'), 'stale', { state: 'blocked', sessionId: 's-old' }, [
+      { at: new Date(now - 27.8 * 86400_000).toISOString(), state: 'blocked' },
+    ]);
+    const logs = [];
+    const r = await runTick({
+      dir, claudeDir: claude, nowMs: now,
+      notifier: async () => { throw new Error('不该发通知'); },
+      logger: { info: (m) => logs.push(m), warn: () => {}, error: () => {} },
+      scan: async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 }),
+    });
+    assert.equal(r.sent.length, 0);
+    assert.equal(r.jobsExpired, 1);
+    const line = logs.find((l) => l.startsWith('blocked-expired:'));
+    assert.ok(line, `必须留下过期日志：${logs.join(' | ')}`);
+    assert.ok(/blocked-expired: stale age=27\.8d/.test(line), `日志格式：${line}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(claude, { recursive: true, force: true });
+  }
 });
 
 test('AC3 L-mid：mtime 探针不递归子目录，diff 只报变化的项目', () => {
@@ -470,7 +681,7 @@ test('runTick 的 dry-run 会算出候选但不发通知', async () => {
     const now = Date.now();
     mkdirSync(join(claude, 'jobs', 'j1'), { recursive: true });
     writeFileSync(join(claude, 'jobs', 'j1', 'state.json'), JSON.stringify({
-      state: 'failed', sessionId: 's1', updatedAt: new Date(now).toISOString(), cwd: 'D:\\P\\demo',
+      state: 'failed', sessionId: 's1', firstTerminalAt: new Date(now - 60_000).toISOString(), updatedAt: new Date(now).toISOString(), cwd: 'D:\\P\\demo',
     }));
     mkdirSync(join(claude, 'projects'), { recursive: true });
     let notified = 0;
@@ -495,7 +706,7 @@ test('L-fast 与 L-full 报同一事件时只发一条（三层共享去重）',
     const now = Date.now();
     mkdirSync(join(claude, 'jobs', 'j1'), { recursive: true });
     writeFileSync(join(claude, 'jobs', 'j1', 'state.json'), JSON.stringify({
-      state: 'failed', sessionId: 'dup', updatedAt: new Date(now).toISOString(), cwd: 'D:\\P\\demo',
+      state: 'failed', sessionId: 'dup', firstTerminalAt: new Date(now - 60_000).toISOString(), updatedAt: new Date(now).toISOString(), cwd: 'D:\\P\\demo',
     }));
     mkdirSync(join(claude, 'projects'), { recursive: true });
 
@@ -612,7 +823,7 @@ test('分类：UNCLASSIFIABLE 停够 5 分钟才放行（判不了就当需要�
     mkdirSync(join(root, 'jobs', 'j1'), { recursive: true });
     // 10 分钟前就失败了：过了时间门槛，必须放行
     writeFileSync(join(root, 'jobs', 'j1', 'state.json'), JSON.stringify({
-      state: 'failed', sessionId: sid, updatedAt: new Date(now - 600_000).toISOString(), cwd: 'D:\\Projects\\proj-b',
+      state: 'failed', sessionId: sid, firstTerminalAt: new Date(now - 600_000).toISOString(), cwd: 'D:\\Projects\\proj-b',
     }));
 
     let n = 0;
@@ -1078,7 +1289,7 @@ test('dry-run 不写 state.json——否则会和真身抢锁', async () => {
     const now = Date.now();
     mkdirSync(join(claude, 'jobs', 'j1'), { recursive: true });
     writeFileSync(join(claude, 'jobs', 'j1', 'state.json'), JSON.stringify({
-      state: 'failed', sessionId: 's1', updatedAt: new Date(now).toISOString(), cwd: 'D:\P\demo',
+      state: 'failed', sessionId: 's1', firstTerminalAt: new Date(now - 60_000).toISOString(), cwd: 'D:\P\demo',
     }));
     mkdirSync(join(claude, 'projects'), { recursive: true });
     await runTick({
@@ -1888,9 +2099,62 @@ test('notifyTitle：ASKED 说「问了没答」，不是「未分类」', () => 
   assert.ok(!t.includes('未分类'));
 });
 
-test('ASKED 在 NOTIFY_STATES 与 HOST_FACT_STATES 里', () => {
+test('ASKED 在 NOTIFY_STATES 里，但**不在** HOST_FACT_STATES 里', () => {
   assert.ok(NOTIFY_STATES.includes('ASKED'), '要能通知');
-  assert.ok(HOST_FACT_STATES.includes('ASKED'), '要跳过分类门——它的判据比分类器更直接');
+  // 2026-11-02 修正：ASKED 曾在这张表里，让它绕过了分类门与时间门，
+  // 于是静默 10.5 小时的问句照样弹了通知。它是**从 transcript 推断出来的**，
+  // 不是宿主写下的结论——按定义就不该和 WAITING/BLOCKED/FAILED 同组。
+  assert.ok(!HOST_FACT_STATES.includes('ASKED'),
+    'ASKED 是推断出来的，不能继承宿主事实的门禁豁免');
+});
+
+test('HOST_FACT_STATES 只有宿主真正写下的三个状态', () => {
+  // 守的是「这张表的定义」：宿主下的结论才进来。多一个推断状态就是一次分类错误，
+  // 而它的后果不是少发一条，是**绕过之后所有的门**。
+  assert.deepEqual([...HOST_FACT_STATES].sort(), ['BLOCKED', 'FAILED', 'WAITING']);
+  for (const inferred of ['ASKED', 'EXPLORING', 'PRODUCING', 'STALLED']) {
+    assert.ok(!HOST_FACT_STATES.includes(inferred), `${inferred} 是推断的，不该豁免门禁`);
+  }
+});
+
+test('回归：ASKED 不再绕过时间门与分类门', async () => {
+  // 这是本次缺陷的**防复发测试**。把 ASKED 加回 HOST_FACT_STATES，这条必须变红。
+  //
+  // 当年它绕过的两道门：
+  //   kind 门 —— 分类器说 COMPLETION_REPORT 也照发
+  //   时间门 —— idleSec=0 也照发
+  const now = Date.now();
+  const hostile = () => ({
+    ts: new Date(now).toISOString(), sessionId: 's', state: 'ASKED', idleSec: 0,
+    kind: 'COMPLETION_REPORT', autoAnswerable: false, reason: 'x', confidence: null,
+    notified: false, classify: 'ok', why: 'completion-report-suppressed',
+  });
+  const r = await dispatchCandidates([{
+    sessionId: 's-asked', state: 'ASKED', reason: 'asked:decision', project: 'p',
+    idleSec: 0, lastActivity: new Date(now).toISOString(), evidenceFingerprint: '1',
+  }], {
+    state: emptyState(), nowMs: now, notifier: async () => { throw new Error('不该发'); },
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    classify: hostile,
+  });
+  assert.equal(r.sent.length, 0, 'ASKED 必须重新受分类门约束');
+  assert.equal(r.suppressed.length, 1);
+  assert.equal(r.suppressed[0].why, 'kind-not-notifiable');
+});
+
+test('回归：ASKED 的分类结果会被真实分类器写下来，不再标成 classify=host', async () => {
+  // 观察日志把推断信号标成 'host' 会让事后复盘误判「这是宿主说的」。
+  const now = Date.now();
+  let seen = null;
+  await dispatchCandidates([{
+    sessionId: 's-asked2', state: 'ASKED', reason: 'asked:decision', project: 'p',
+    idleSec: 3600, lastActivity: new Date(now).toISOString(), evidenceFingerprint: '1',
+  }], {
+    state: emptyState(), nowMs: now, notifier: async () => {},
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    classify: (c) => { seen = c.state; return { kind: 'ASKED_UNANSWERED', classify: 'ok', idleSec: 3600 }; },
+  });
+  assert.equal(seen, 'ASKED', 'ASKED 候选必须经过分类器——它不再是宿主事实');
 });
 
 test('ASKED 有独立额度：全局满额时仍可发，反之亦然', () => {

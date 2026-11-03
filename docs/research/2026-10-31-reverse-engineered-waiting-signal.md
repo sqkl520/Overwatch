@@ -1,7 +1,7 @@
 # 逆向 Claude Code 的「等待用户」信号
 
 - 日期：2026-10-31
-- 目标：`claude.exe` 2.1.270（`%LOCALAPPDATA%\Claude-3p\claude-code\2.1.270\2afb47ea1b1f\`，227 MB，Bun 打包）
+- 目标：`claude.exe` 2.1.270（本机安装目录下的 `<ver>\<build-hash>\claude.exe`，227 MB，Bun 打包）
 - 方法：字符串扫描 + 上下文转储（`readSync` 分块 + `indexOf`），未反编译字节码
 - 结论：**宿主一直有一个明确的 `waiting` 状态，而我此前完全没读它**
 
@@ -132,13 +132,13 @@ grep post_turn_summary 全部 transcript → 只在 2 条 user 记录里出现�
 
 ```json
 { "status": "waiting", "waitingFor": "input needed", "statusUpdatedAt": 1793451144381,
-  "name": "dsh-fcl-android-launcher" }
+  "name": "<project-D>" }
 ```
 
 而 `scan-sessions.mjs` 把它判成：
 
 ```
-[EXPLORING] dsh-fcl-android-launcher ... idle=326.9h dormant
+[EXPLORING] <project-D> ... idle=326.9h dormant
 ```
 
 **它已经等了 23 天，系统输出「它只是休眠了，不干预」。**

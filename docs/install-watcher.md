@@ -94,7 +94,7 @@ tail -5 "%LOCALAPPDATA%\Overwatch\runner.log"
 真正发通知时的样子：
 
 ```
-[INFO] notified FAILED D--Projects-rea-Project-work-shapez key=6da2fa52… session=5ead31fa-…
+[INFO] notified FAILED <project-C-slug> key=<dedupe-key>… session=<session-F>-…
 ```
 
 > ⚠ 本文件此前在这里展示过 `suppressed FAILED kind=WAITING_SUBAGENT`，并称「子 Agent 完成通知的停止占真实停止的约 68%」。

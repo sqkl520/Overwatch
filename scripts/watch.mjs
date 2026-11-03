@@ -76,6 +76,17 @@ const STATE_RENAME_RETRIES = 4;
  *  首轮跑起来会把它们全当新边沿，一次刷屏 20 条。 */
 const ACTIVE_WINDOW = 24 * HOUR;
 
+/** `blocked` 记录的有效期：**超过 7 天算过期，不再通知**（2026-11-02 用户明确选择的口径）。
+ *
+ *  为什么 blocked 是 7 天而不是 24 小时：宿主把那条 blocked 永久留在 job 的 state.json 里，
+ *  实测 20 个 job 目录里 14 个停在 blocked / failed。一个 3 天前就卡住、进程还在的后台作业
+ *  仍然值得人看一眼；一个 27 天前的 503 不值得。7 天是用户划的线，不是拍的。 */
+export const BLOCKED_MAX_AGE = 7 * DAY;
+
+/** `timeline.jsonl` 只读尾部这么多字节。实测本机最长 141 KB（e461a939），256 KB 覆盖全文件。
+ *  被截断且尾部找不到同状态记录时按「事件时间无法确定」处理（fail-closed）。 */
+const TIMELINE_TAIL_BYTES = 256 * 1024;
+
 /** 需要通知的终态。
  *
  *  **只有宿主明确报的两种。** 删掉 STALLED 和推断来的 FAILED 是 2026-10-31 的决定，
@@ -605,14 +616,123 @@ export function probeWaiting(sessionsRoot, { nowMs = Date.now() } = {}) {
   };
 }
 
-export function probeJobs(jobsRoot, { nowMs = Date.now() } = {}) {
+/** 从 `detail` 文本里解析分布式请求 id 里的时间戳，形如 `20261005155700`（UTC）。
+ *
+ *  这是**唯一由错误本身携带**的时间：宿主写 503 的正文时把 id 一起写下了，
+ *  之后无论记录被重写多少次，这个串都不变。返回 ms；解析不出返回 null。 */
+export function requestIdTime(text) {
+  const m = String(text || '').match(/request id:\s*(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s] = m;
+  // Date.UTC 的月份从 0 起；逐段验回读，挡住 20261332259900 这种看起来合法的乱码
+  const ms = Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
+  if (!Number.isFinite(ms)) return null;
+  const back = new Date(ms);
+  if (back.getUTCFullYear() !== +y || back.getUTCMonth() !== +mo - 1 || back.getUTCDate() !== +d) return null;
+  return ms;
+}
+
+/** 读 `timeline.jsonl` 尾部，返回**最后一条** `state === terminal` 记录的 `at`（ms）。
+ *
+ *  为什么只认同状态的记录：一个 job 可能先 failed 后 blocked。最后一条 blocked
+ *  才是「这次阻塞何时发生」，取任意最后一条会让先失败后阻塞的记录时刻被失败时刻顶替。
+ *
+ *  被截断（文件大于尾部预算）且尾部找不到同状态记录时返回 null —— 此时**不能**断言
+ *  「没有这条事件」，只能说「尾部没有」。调用方按 fail-closed 处理。 */
+export function lastTimelineStateTime(jobsDir, terminal, maxBytes = TIMELINE_TAIL_BYTES) {
+  const p = join(String(jobsDir), 'timeline.jsonl');
+  let raw;
+  let truncated = false;
+  try {
+    const size = statSync(p).size;
+    const n = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : TIMELINE_TAIL_BYTES;
+    if (size > n) {
+      const buf = Buffer.allocUnsafe(n);
+      const fd = openSync(p, 'r');
+      try { readSync(fd, buf, 0, n, size - n); } finally { closeSync(fd); }
+      raw = buf.toString('utf8');
+      const firstNl = raw.indexOf('\n');
+      if (firstNl >= 0) raw = raw.slice(firstNl + 1);
+      truncated = true;
+    } else {
+      raw = readFileSync(p, 'utf8');
+    }
+  } catch {
+    return { atMs: null, truncated: false, found: false };
+  }
+  const lines = raw.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; } // 坏行不影响其余记录
+    if (!rec || rec.state !== terminal) continue;
+    const at = Date.parse(rec.at || '');
+    return { atMs: Number.isFinite(at) ? at : null, truncated, found: true };
+  }
+  return { atMs: null, truncated, found: false };
+}
+
+/** 判定一条宿主终态记录的**事件时刻**，返回 `{ atMs, source, why }`。
+ *
+ *  ⚠ 绝不能拿 `job.updatedAt` 当事件时刻。它是**文件元数据时间**：宿主在启动、
+ *  补写 `respawnFlags` / `name` / `providerEnv` 时都会重写这个 json，把它刷新到当下。
+ *  2026-11-02 实测的假阳性正是这么来的（`a9fa4c62`）：
+ *
+ *      state: "blocked"，detail 里的 request id 是 2026-10-05T15:57:00Z
+ *      timeline.jsonl 末条  {"at":"2026-10-05T15:57:02.483Z","state":"blocked"}
+ *      updatedAt:            "2026-11-01T18:41:21.066Z"   ← 重写记录的时刻
+ *
+ *  **差 27.8 天。** 判定器把 27 天前的 503 当成新鲜阻塞，还据此算出 idle=916m
+ *  写进通知正文——那个数字是编造的。
+ *
+ *  取数优先级（越靠前越接近「事件发生」）：
+ *    1. `timeline.jsonl` 末条同状态记录的 `at` —— 宿主自己的事件流水，最强的证据
+ *    2. `detail` 里 request id 的时间戳      —— 由那次错误本身携带，不会被重写
+ *    3. `firstTerminalAt`                    —— 宿主写的「首次进入终态」，只在下两条都没有时兜底
+ *  三者都拿不到 → `atMs: null`，调用方 **fail-closed 不通知**。
+ *  不退回 `updatedAt`：宁可漏报一条无法定时的旧记录，也不把重写时刻当事件时刻。
+ *
+ *  两条都用时取**更旧**的那条。理由：两者都是真实事件时刻，更旧的那条离「现在」更远，
+ *  按它判过期只会少发不会多发。取新的会把一条其实早就死掉的记录续命。 */
+export function resolveJobEventTime(job, jobsDir) {
+  const terminal = job && job.state === 'failed' ? 'failed' : 'blocked';
+  const candidates = [];
+
+  const tl = lastTimelineStateTime(jobsDir, terminal);
+  if (Number.isFinite(tl.atMs)) candidates.push({ atMs: tl.atMs, source: 'timeline' });
+
+  const rid = requestIdTime(job && (job.detail || job.needs));
+  if (Number.isFinite(rid)) candidates.push({ atMs: rid, source: 'request-id' });
+
+  if (!candidates.length) {
+    const ft = Date.parse(job && job.firstTerminalAt || '');
+    // firstTerminalAt 是「首次进入终态」——它可能早于这次终态（先 failed 后 blocked），
+    // 所以只在没有更强证据时用，且它偏旧，只会让判过期更保守。
+    if (Number.isFinite(ft)) candidates.push({ atMs: ft, source: 'first-terminal' });
+  }
+
+  if (!candidates.length) {
+    return {
+      atMs: null,
+      source: null,
+      why: tl.truncated ? 'timeline-truncated-no-match' : 'no-event-time',
+    };
+  }
+  candidates.sort((a, b) => a.atMs - b.atMs);
+  return { atMs: candidates[0].atMs, source: candidates[0].source, why: null };
+}
+
+export function probeJobs(jobsRoot, { nowMs = Date.now(), blockedMaxAge = BLOCKED_MAX_AGE } = {}) {
   const started = process.hrtime.bigint();
   const found = [];
+  const expired = [];
+  const undated = [];
   let scanned = 0;
   let skipped = 0;
   const target = asPath(jobsRoot);
   if (!target || !existsSync(target)) {
-    return { found, scanned, skipped, elapsedMs: 0 };
+    return { found, expired, undated, scanned, skipped, elapsedMs: 0 };
   }
   let dirs;
   try {
@@ -621,7 +741,8 @@ export function probeJobs(jobsRoot, { nowMs = Date.now() } = {}) {
     throw new Error(`读取 jobs 目录失败：${target}：${e.message}`);
   }
   for (const name of dirs) {
-    const p = join(target, name, 'state.json');
+    const dir = join(target, name);
+    const p = join(dir, 'state.json');
     let job;
     try {
       job = JSON.parse(readFileSync(p, 'utf8'));
@@ -632,25 +753,57 @@ export function probeJobs(jobsRoot, { nowMs = Date.now() } = {}) {
     scanned++;
     if (job.state !== 'failed' && job.state !== 'blocked') { skipped++; continue; }
     const sessionId = job.sessionId || job.resumeSessionId || name;
-    const updated = Date.parse(job.updatedAt || job.lastTerminalAt || job.createdAt || '');
-    if (!Number.isFinite(updated) || nowMs - updated > ACTIVE_WINDOW) { skipped++; continue; }
+    const state = job.state === 'failed' ? 'FAILED' : 'BLOCKED';
+
+    // 事件时刻，不是文件元数据时刻。见 resolveJobEventTime 的注释。
+    const ev = resolveJobEventTime(job, dir);
+    if (!Number.isFinite(ev.atMs)) {
+      // fail-closed：不知道它多久前发生的，就不打扰人。但要留痕，
+      // 否则「为什么这条从来没通知过」会变成一个查不出来的问题。
+      undated.push({ jobId: name, sessionId, state, why: ev.why });
+      skipped++;
+      continue;
+    }
+    const ageMs = nowMs - ev.atMs;
+
+    // 新鲜度门槛按状态分口：
+    //   FAILED  → 沿用 24 小时活跃窗口（不动它：本任务只修 BLOCKED 误报）
+    //   BLOCKED → 用户指定的 7 天。24 小时会把「3 天前卡住、进程还在」的真问题挡掉；
+    //             7 天则是「27.8 天前的一次 503」和「昨天卡住」之间的分界线。
+    // 事件时间在未来（时钟回拨 / request id 乱码）不算新鲜：负 age 直接跳过，
+    // 免得一个坏时间戳换来一条永不过期的候选。
+    const maxAge = state === 'BLOCKED' ? blockedMaxAge : ACTIVE_WINDOW;
+    if (!Number.isFinite(ageMs) || ageMs < -HOUR) { skipped++; continue; }
+    if (ageMs > maxAge) {
+      if (state === 'BLOCKED') {
+        expired.push({ jobId: name, sessionId, state, atMs: ev.atMs, source: ev.source, ageMs });
+      }
+      skipped++;
+      continue;
+    }
+
     found.push({
       sessionId,
-      state: job.state === 'failed' ? 'FAILED' : 'BLOCKED',
+      state,
       reason: job.state === 'failed' ? 'host-reported-failed' : 'host-reported-blocked',
       project: job.cwd ? job.cwd.split(/[\\/]/).pop() : null,
       detail: job.detail || null,
       needs: job.needs || null,
       suggestedReply: job.suggestedReply || null,
       updatedAt: job.updatedAt || null,
-      // 时间门槛需要「停/失败了多久」。jobs 的权威时间戳是 updatedAt，
-      // 上面已经保证它可解析且在活跃窗口内，所以这里一定拿得到。
-      idleSec: Math.round((nowMs - updated) / 1000),
+      // 事件时刻：通知正文里的时长、去重指纹都从它算，不再用 updatedAt。
+      eventAt: new Date(ev.atMs).toISOString(),
+      eventSource: ev.source,
+      // 「已经这样多久了」。从事件时刻算，不再从文件重写时刻算——
+      // 旧实现把 27.8 天算成 15.3 小时，并写进通知正文（idle=916m）。
+      idleSec: Math.max(0, Math.round(ageMs / 1000)),
       source: 'jobs',
     });
   }
   return {
     found,
+    expired,
+    undated,
     scanned,
     skipped,
     elapsedMs: Number(process.hrtime.bigint() - started) / 1e6,
@@ -823,11 +976,30 @@ export const NOTIFY_KINDS = Object.freeze([
 
 /** 由宿主直接写下、不经过 transcript 推断的状态。
  *
- *  这三者对「分类门 / 时间门」免疫，理由相同：它们不是「这次停止是问句还是结束」的猜测，
+ *  **这三者**对「分类门 / 时间门」免疫，理由相同：它们不是「这次停止是问句还是结束」的猜测，
  *  而是宿主自己的结论。拿分类器再判一遍，只会把确定信号降级成不确定的。
  *  ——实测：WAITING 候选会被 classifyCandidate 判成 UNCLASSIFIABLE + classify:error
- *  （sessions/ 里没有对应停止点），然后撞上 5 分钟时间门被抑制。 */
-export const HOST_FACT_STATES = Object.freeze(['WAITING', 'BLOCKED', 'FAILED', 'ASKED']);
+ *  （sessions/ 里没有对应停止点），然后撞上 5 分钟时间门被抑制。
+ *
+ *  ⚠ **`ASKED` 曾经在这张表里，2026-11-02 移出。**那不是疏忽，是一次分类错误，
+ *  后果是生产环境的一条误报（PerfScope `d48b776b`，静默 10.5 小时的问句照样弹了通知）：
+ *
+ *  - `ASKED` 是**从 transcript 文本推断出来的**（`asked.mjs` 文件头第一句就是
+ *    「不依赖宿主」），不是宿主写下的结论。把它和宿主事实放进同一组豁免，
+ *    等于让一个猜测继承确定信号的待遇。
+ *  - 进了这张表就绕过了**全部门禁**：分类门、时间门，以及后来加的任何一道。
+ *    而且观察日志会把它标成 `classify: 'host'`——一个推断信号的来源被记成宿主，
+ *    连事后复盘都会被误导。
+ *  - 数组是四个、注释却写「这三者」，是这件事留下的痕迹：加进去的时候
+ *    没人去核对「这张表的定义是什么」，只看到「它也是通知源」。
+ *
+ *  现在 `ASKED` 走和其它推断状态一样的路：分类器判（`classify-stop.mjs` 会把
+ *  这类停止判成 `ASKED_UNANSWERED`，那是 `NOTIFY_KINDS` 里的一员），
+ *  并且**在候选生成阶段就先把「还值不值得提醒」判掉**（见 `asked.mjs` 的 `assessAsked`）。
+ *
+ *  判断一个状态该不该进这张表，只问一句：**这个结论是谁下的？**
+ *  宿主下的结论 → 进。我们从文本猜的 → 不进。 */
+export const HOST_FACT_STATES = Object.freeze(['WAITING', 'BLOCKED', 'FAILED']);
 
 /** `UNCLASSIFIABLE` 的最短观察期，秒。默认 5 分钟。
  *
@@ -1322,7 +1494,15 @@ function describe(c) {
   const where = c.project ? `${c.project}` : (c.sessionId || '').slice(0, 8);
   const bits = [where, c.reason];
   if (c.kind) bits.push(c.kind);
-  if (c.idleSec != null) bits.push(`idle=${Math.round(c.idleSec / 60)}m`);
+  // 时长必须从**事件时刻**算，且必须能读。
+  // 旧实现对 jobs 候选拿 `updatedAt`（文件重写时刻）当起点，于是通知正文写着
+  // `idle=916m`，而那个阻塞发生在 27.8 天前——一个精确到分钟、完全错误的数字。
+  // 现在：短时长保持 `idle=42m`，长时长改用「天」，并且 jobs 候选额外标出事件时刻，
+  // 让人能当场核对它是不是从正确的地方算的。
+  if (c.idleSec != null) {
+    bits.push(c.idleSec < 90 * 60 ? `idle=${Math.round(c.idleSec / 60)}m` : `idle=${fmtAge(c.idleSec * 1000)}`);
+  }
+  if (c.source === 'jobs' && c.eventAt) bits.push(`事件 ${String(c.eventAt).slice(0, 16).replace('T', ' ')}Z`);
   if (c.needs) bits.push(`等：${String(c.needs).slice(0, 80)}`);
   return bits.filter(Boolean).join(' · ');
 }
@@ -1547,6 +1727,11 @@ export async function dispatchCandidates(candidates, {
 
 // ── 一次轮询 ──────────────────────────────────────────────────────────
 
+/** 已经写进日志的 job 旁注（过期 / 定不了时）。进程级去重：
+ *  L-fast 是 15 秒一层，20 个旧 job 每轮各写一行会把 1 MiB 的日志在半分钟内转掉。
+ *  键里带事件时刻，所以同一个 job 真的重新阻塞时还会再记一次。 */
+const jobsReported = new Set();
+
 /**
  * 跑一次「到期的层」。返回本次汇总，可被测试直接断言。
  *
@@ -1641,6 +1826,22 @@ export async function runTick({
     summary.ran.push('jobs');
     summary.timings.jobsMs = Math.round(jobs.elapsedMs);
     candidates = candidates.concat(jobs.found);
+    summary.jobsExpired = jobs.expired.length;
+    summary.jobsUndated = jobs.undated.length;
+    // 过期与「定不了时」都必须留痕，否则「为什么这条从来没通知过」查不出来。
+    // **但每个 job 只记一次**：L-fast 是 15 秒一层，20 个旧 job 每轮各写一行
+    // 会把 1 MiB 的日志在半分钟内转掉，把真正的证据冲走（DF-021 那类事故）。
+    const say = (key, line) => {
+      if (jobsReported.has(key)) return;
+      jobsReported.add(key);
+      log.info(line);
+    };
+    for (const e of jobs.expired) {
+      say(`expired|${e.jobId}|${e.atMs}`, `blocked-expired: ${e.jobId} age=${(e.ageMs / DAY).toFixed(1)}d source=${e.source}`);
+    }
+    for (const u of jobs.undated) {
+      say(`undated|${u.jobId}|${u.state}|${u.why}`, `blocked-undated: ${u.jobId} state=${u.state} why=${u.why}（fail-closed，不通知）`);
+    }
     try {
       const waiting = probeWaiting(join(root, 'sessions'), { nowMs });
       summary.ran.push('waiting');
@@ -1699,7 +1900,15 @@ export async function runTick({
       try {
         const { scanAll } = await import('./asked.mjs');
         const t0 = process.hrtime.bigint();
-        const asked = scanAll({ projectsRoot: join(root, 'projects'), nowMs, minHours: ASKED_MIN_HOURS });
+        // `sessionsRoot` 必须给：`asked.mjs` 从「只看文本结尾」升级为「做现状对账」后，
+        // 静默过久 / 宿主已不在等 / 同项目别处已回应 这三类都在这一层被拦掉。
+        // 不给的话它退化成老行为（`freshness: 'host-unknown'`）——那正是 2026-11-02 误报的形态。
+        const asked = scanAll({
+          projectsRoot: join(root, 'projects'),
+          sessionsRoot: join(root, 'sessions'),
+          nowMs,
+          minHours: ASKED_MIN_HOURS,
+        });
         summary.ran.push('asked');
         summary.timings.askedMs = Math.round(Number(process.hrtime.bigint() - t0) / 1e6);
         const ac = askedCandidates(asked, { nowMs });

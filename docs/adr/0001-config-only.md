@@ -49,7 +49,7 @@
 **实测事实**：
 
 - 普通 `--resume` 对运行中的后台会话是**拒绝**，不是产生副本：
-  `Error: That session is running in the background (070eb93f). … Add --fork-session to branch off a copy instead.`
+  `Error: That session is running in the background (<job-D>). … Add --fork-session to branch off a copy instead.`
   只有显式 `--fork-session` 才分叉。
 - 但 `--resume` 本来就不是接力通道。真正的通道是**跨会话消息**：`~/.claude/sessions/<pid>.json`
   里的 `messagingSocketPath`（Windows 命名管道）+ `<pid>.<sha>.key` 里的 `peerToken`，

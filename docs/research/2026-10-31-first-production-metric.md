@@ -45,11 +45,11 @@
 通知条数：5
 job 文件：16（failed/blocked：3）
 
-[UNTRACEABLE] 2026-10-30T18:08:28Z state=FAILED  session=5ead31fa  → no job file
-[UNTRACEABLE] 2026-10-30T20:01:37Z state=FAILED  session=d48b776b  → no job file
-[UNTRACEABLE] 2026-10-30T20:24:13Z state=FAILED  session=d48b776b  → no job file
-[UNTRACEABLE] 2026-10-30T20:53:08Z state=FAILED  session=5ead31fa  → no job file
-[UNTRACEABLE] 2026-10-30T23:05:36Z state=FAILED  session=70ea7c06  → no job file
+[UNTRACEABLE] 2026-10-30T18:08:28Z state=FAILED  session=<session-F>  → no job file
+[UNTRACEABLE] 2026-10-30T20:01:37Z state=FAILED  session=<session-B>  → no job file
+[UNTRACEABLE] 2026-10-30T20:24:13Z state=FAILED  session=<session-B>  → no job file
+[UNTRACEABLE] 2026-10-30T20:53:08Z state=FAILED  session=<session-F>  → no job file
+[UNTRACEABLE] 2026-10-30T23:05:36Z state=FAILED  session=<session-G>  → no job file
 
 可追溯率：0.0%  (0/5)
 判定：FAIL

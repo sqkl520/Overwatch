@@ -23,7 +23,7 @@
 **实际情况**（Agent 2 在真实后台会话上实测，引用了完整错误文本）：
 
 ```
-Error: That session is running in the background (070eb93f). Run `claude attach …` to open it,
+Error: That session is running in the background (<job-D>). Run `claude attach …` to open it,
 or `claude stop …` first to resume it here. Add --fork-session to branch off a copy instead.
 ```
 

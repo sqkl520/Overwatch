@@ -21,6 +21,125 @@
 
 ---
 
+## [Unreleased] - 2026-11-02（ASKED 误报：一个推断信号继承了宿主事实的门禁豁免）
+
+> 承接 `docs/research/2026-11-02-false-positive-diagnosis.md` 的根因 B。同一天早上收到第二条
+> 「❓ <project-B> · 问了没答」，而那个问句已经**静默 10.5 小时**，人早在同一项目的另一个会话里
+> 用别的方式回应过了。两件事都要修：**判定缺现状对账** + **`ASKED` 被错误归进 `HOST_FACT_STATES`**。
+> 修复说明见 `docs/research/2026-11-02-fix-asked.md`。
+
+### Fixed（`ASKED` 从 `HOST_FACT_STATES` 移出：分类错误，不是阈值问题）
+
+- **根因**：`scripts/watch.mjs` 的 `HOST_FACT_STATES` 是
+  `['WAITING','BLOCKED','FAILED','ASKED']`，而紧邻注释写的是「**这三者**对分类门/时间门免疫」。
+  `ASKED` 是后加进去的，加进去之后它**绕过了所有门禁**——分类门、时间门，以及此后加的任何一道。
+  更糟的是观察日志把它标成 `"classify":"host"`：一个**从 transcript 文本推断出来**的信号
+  （`asked.mjs` 文件头第一句就是「不依赖宿主」）被记成宿主写的结论，事后复盘也会被误导。
+- **改法**：`HOST_FACT_STATES` 收窄为 `['WAITING','BLOCKED','FAILED']`，注释重写并写明判据：
+  **这个结论是谁下的？** 宿主下的 → 进；我们从文本猜的 → 不进。`ASKED` 现在走和其它推断状态
+  一样的路（分类器会判出 `ASKED_UNANSWERED`，那是 `NOTIFY_KINDS` 的一员），并在候选生成阶段
+  先做「还值不值得提醒」的判定。
+- **防复发**：新增 4 条测试，把 `ASKED` 加回数组会**4 条全红**（实测，见下）。
+
+### Added（`asked.mjs` 的现状对账：三个可离线复算的判据）
+
+诊断结论是「缺少『现在还值不值得提醒』的判断」。新增 `assessAsked()`，判定顺序有讲究：
+
+1. **静默过久** `silent-too-long` —— 问句之后一直没动静超过 `ASKED_MAX_SILENCE_HOURS = 8`。
+2. **会话自己继续过** `continued` —— 问句之后有带 `message` 的记录（`tool_use` / 后续输出）。
+3. **同 cwd 别处已回应** `answered-elsewhere` —— 同项目另一个会话里，问句之后有真人说过话。
+4. **宿主说已不在等** `host-not-idle` —— `sessions/*.json` 的 `status !== 'idle'`。
+5. **idle 早于问句** `host-idle-before-question` —— 那次 idle 与这个问句无关。
+
+第 1 条排在最前是有意的：它不依赖宿主、不依赖跨会话，**本次误报单独靠它就拦下了**。
+排在后面的话，一条「宿主读不到 + 没有兄弟会话」的会话会绕过它。
+
+- **为什么 24 小时不够**：`MAX_QUESTION_HOURS = 24` 是拿**回复延迟分布**标定的（p90 = 15.4h），
+  回答的是「多久没答算积压」，不是「现在还值不值得打断人」。本次问句在 24h 窗口内（10.5h）。
+- **8 小时怎么来的**（本机 241 个 transcript、**411 个问句结尾的 turn**，实测恢复间隔累计分布）：
+
+  | 问句后到下一条记录的间隔 | ≤1h | ≤2h | ≤4h | **≤8h** | ≤12h | ≤24h |
+  |---|---|---|---|---|---|---|
+  | 累计占比 | 77% | 86% | 89% | **93%** | 95% | 100% |
+
+  取 8h = 「93% 该恢复的都恢复了」那条线。**代价可量化**：同一组样本回推，8h 门槛会拦掉
+  32/411 条（7.8%），其中 28 条后来确实被人回答——**主动选择漏报 6.8%，换取不再误报**。
+  不取 12h/24h：本次问句静默了 10.5 小时，12h 拦不住它，24h 原样放过，等于没修。
+- **跨会话证据的结构**：索引必须覆盖**全部**会话，不能只覆盖候选。误报里说话的那个会话
+  （`<session-E>`）当时自己已经继续干活了，**根本不是候选**。为此 `scanAll` 分成两遍：
+  第一遍读每份 transcript、登记真人消息、挑出候选；第二遍才做对账。
+  单遍会有一个隐蔽 bug——**结果取决于目录遍历顺序**（测试当场抓到，见 `scanAll：跨会话证据与目录遍历顺序无关`）。
+- **只索引时间戳，不留记录**：本机 transcript 合计 1.3 GB，单份最大 117 MB。
+  `humanIndex` 只存 `{ at, text }`，记录在那一轮之后即可回收；结果对象里也剥掉 `records`。
+  实测 `scanAll` 全量 **34 秒**（244 份）。
+- **判「人话」不看文本**：`type === 'user'` 且 `origin.kind === 'human'`。用正则猜会把 `tool_result`
+  也算成人话（它也是 `user` 记录），每一轮工具回执都变成「人类已答复」。
+- **fail-open 的边界**：读不到宿主状态时**不因此拦截**（`host-unknown`），因为采集缺失不是证据。
+  但静默门槛不依赖宿主，所以那种情况下它仍然生效。
+
+### 实测（数字全部可复算）
+
+- **修复前会报、修复后不报**：`<session-B>` 的问句是真的（`2026-11-01T23:31:45.824Z`），
+  宿主 `statusUpdatedAt` 是 `23:31:46.007Z`（**晚 183 毫秒**——问完那一秒就 idle 了），
+  之后只有一条 `+96ms` 的 `stop_hook_summary`（宿主簿记，**不算**会话继续），再无记录。
+  10.5 小时后静默门槛拦下。修复前它进了通知。
+- **同 cwd 的另一句话**：`<session-E>` 里真人在 `2026-11-01T19:38:45.566Z` 说过
+  「你不需要提交，只需要将自己的工作全部做完」——在问句**之前** 3.9 小时，
+  所以不算对这条问句的回应。但它证明了「单文件判定看不到这句话」这个结构问题：
+  跨会话索引现在能看到它，只是时间戳判定为「不是回应」。
+- **全量扫描**：本机 244 份 transcript、`found=0`，`skipped={greeting:3, tooRecent:1, tooOld:4}`。
+- **测试**：`418/418`（基线 375）。本次新增 **33 条**（`asked.test.mjs` 38→68，+30；
+  `watch.test.mjs` 新增 3 条 + 改写 1 条）。其余新增条目属 BLOCKED 那一阶段的改动。
+  **负向验证**（两组，都实测跑过）：
+  - 把 `ASKED` 加回 `HOST_FACT_STATES` → **4 条变红**（含 2 条防复发回归）。
+  - 把 `ASKED_MAX_SILENCE_HOURS` 从 8 改成 24 → **5 条变红**，其中就是本次 bug 的核心用例。
+
+---
+
+> 承接 `docs/research/2026-11-02-false-positive-diagnosis.md` 的根因 A。用户当天早上收到一条
+> 「⏸ <project-A> · 受阻 · idle=916m」，实际是 **27.8 天前**一次已死进程的 503。
+> 诊断已把根因钉死，本阶段只做修复——**口径由用户指定：超过 7 天的 blocked 直接标过期，不再通知。**
+> 修复说明见 `docs/research/2026-11-02-fix-blocked.md`。
+
+### Fixed（`probeJobs` 的事件时刻：一个字段用错，编出一个精确的假数字）
+
+- **根因**：`scripts/watch.mjs` 的 `probeJobs()` 拿 `job.updatedAt` 当「阻塞发生时刻」，并据此
+  ①过 24 小时新鲜度门槛 ②算 `idleSec` 写进通知正文。`updatedAt` 是**文件元数据时间**：宿主启动、
+  补写 `respawnFlags` / `name` / `providerEnv` 时会重写这个 json，把它刷到当下。
+  实测 `~/.claude/jobs/<session-A>/state.json`：`state:"blocked"`，`detail` 里 request id 是
+  `<request-id-1>`，`timeline.jsonl` 末条 `{"at":"2026-10-05T15:57:02.483Z","state":"blocked"}`，
+  而 `updatedAt` 是 `2026-11-01T18:41:21.066Z`——**差 27.8 天**。`timeline.jsonl` 里 2026-11 的记录数 = 0。
+- **改法**：新增 `resolveJobEventTime()`，按可靠性取事件时刻，**绝不退回 `updatedAt`**：
+  1. `timeline.jsonl` 末条**同状态**记录的 `at`（宿主自己的事件流水，最强证据）
+  2. `detail`/`needs` 里 request id 的时间戳（由那次错误本身携带，重写记录不会改它）
+  3. `firstTerminalAt`（只在前两者都没有时兜底，且它偏旧，只会让判过期更保守）
+  两者都可用时**取更旧的**——都是真实事件时刻，更旧的离现在更远，按它判过期只会少发不会多发。
+- **7 天过期规则**：`BLOCKED_MAX_AGE = 7 * DAY`（用户指定）。超过即不产生候选，并写一行
+  `blocked-expired: <jobId> age=27.8d source=<timeline|request-id|first-terminal>`。
+  日志**按 job × 事件时刻进程级去重**：L-fast 是 15 秒一层，20 个旧 job 每轮各写一行会把
+  1 MiB 日志在半分钟内转掉（DF-021 那类事故）。`FAILED` 沿用原 24 小时口径，未改。
+- **编造的时长**：`idleSec` 改从事件时刻算。`describe()` 里短时长仍是 `idle=42m`，
+  超过 90 分钟改用天（`idle=27.8 天`），jobs 候选额外带 `事件 2026-10-05 15:57Z`，让人当场能核对。
+- **fail-closed**：三个时间源都拿不到时**不通知**，记 `blocked-undated: <jobId> why=no-event-time`。
+  宁可漏报一条无法定时的旧记录，也不把重写时刻当事件时刻。
+- **时钟可注入**：`probeJobs(jobsRoot, { nowMs, blockedMaxAge })`——`blockedMaxAge` 可注入，
+  测试用固定时钟（`Date.parse('2026-11-02T10:00:00.000Z')`）复现原 bug 现场。
+
+### 实测（数字全部可复算）
+
+- **本机 19 个 job 目录**（`~/.claude/jobs/`）：修复后 `found=0 expired=2 undated=0`。
+  `<session-A>` 由 `request-id` 判出 **28.77 天**，`<session-H>` 由 `timeline` 判出 **26.03 天**。
+  旧实现把 `<session-A>` 报成 15.3 小时并通知；现在不通知。
+- **成本**：`probeJobs` 热态 **14.6–15.3 ms**（5 次），修前约 12 ms。多出的 3 ms 来自 19 个
+  `timeline.jsonl` 的尾部读（单个 0.34–6.42 ms，合计 43.6 ms 冷缓存 / 15 ms 热态）。
+  L-fast 是 15 秒一层，每天多付约 17 秒 CPU（0.02% 单核）。
+- **`timeline.jsonl` 大小**：本机最长 141 KB（`<job-E>`），尾部预算 256 KB 覆盖全部，
+  实测 0 次截断——但截断分支仍然实现并 fail-closed，因为别的机器不一定这么小。
+- **测试**：`385/385`（基线 375 + 新增 10）。**负向验证**：把判定行换回
+  `Date.parse(job.updatedAt …)`，10 条测试变红，其中 7 条是本次新增的 BLOCKED 用例。
+
+---
+
 ## [0.1.0] - 2026-10-30（骨架落地，commit `28c85ae`）
 
 > **一次提交装下整个产品**：35 个文件、3682 行。12 个角色定义、五份规格 + 一份上游设计稿、2 个 ADR、
@@ -84,11 +203,11 @@
 - **DF-001：`normalizeBash` 正则指数回溯，扫描脚本挂死**。原实现
   `/(["'])(?:\\.|(?!\1).){40,}\1/g` 在 `'` + 连续反斜杠上不可终止：实测 `'` + 60 个反斜杠 →
   **90 秒超时**；真实语料里一条 472 字符的 `grep` 单次归一化 **17,897ms**；`--days 3` 与
-  `--project MCServers` 均 60s 超时（exit 124）。README 的 30 秒上手命令直接挂住——产品唯一的
+  `--project <project-E>` 均 60s 超时（exit 124）。README 的 30 秒上手命令直接挂住——产品唯一的
   「眼睛」在真实数据上不可用。
   改为手写线性状态机 `stripLongStrings()`，O(n)：病态输入 0.3–4.2ms，`--days 3` 全量扫描 13s。
   回归测试「归一化在病态输入上是线性的」保留在 `state-model.test.mjs`。
-- **DF-002：休眠会话被误判为 FAILED**。实测反例 `[FAILED] Projects/rea ... hb=515s/120s idle=72.3h`：
+- **DF-002：休眠会话被误判为 FAILED**。实测反例 `[FAILED] Projects/<project-C> ... hb=515s/120s idle=72.3h`：
   末次间隔超过 p95=120s，但整体已空闲 72.3 小时——它是结束了，不是失败了。判 FAILED 会触发一次
   毫无意义的重跑，而且是假警报。
   加 `DORMANT_MS = 1h` 新鲜度闸门：超时判 `EXPLORING` + `reason: dormant` + `liveness: stale`。
@@ -138,7 +257,7 @@
   新增 `BLOCKED` 态（等输入既不是失败也不是探索，按 EXPLORING 处理会让用户以为它还在干活）。
   验证：`--days 30` 输出 `BLOCKED=2 FAILED=1`，此前为 0。
 - **DF-007：子 agent 漏掉 37%**。`scanSessionDir()` 只遍历 `subDir` 的直接文件，
-  3220 个 jsonl 中 **1190 个**在 `subagents/workflows/<wf-id>/` 下。会话 `3068431b` 报 `sub=28`，
+  3220 个 jsonl 中 **1190 个**在 `subagents/workflows/<wf-id>/` 下。会话 `<session-P>` 报 `sub=28`，
   实际远多于此——派生树是残缺的，而 `maxDepth`、`tree_gain` 都建立在这棵树上。
   改为递归 `collectSubagentFiles()`；同时输出 `subagentsTotal` 与 `subagentsTruncated`，
   终端显示 `30/272~` 而不是骗人的 `30`。**截断可以存在，静默截断不行。**
@@ -159,8 +278,8 @@
   规格 §7 同步改写：前台交互会话仍需估算并标 `est:`；能关联 job 的会话显示真实数字。
   **用估算值替代已有的精确值是倒退**，会让整条状态行显得比实际更不可信。
 - **blocked 会话的 `needs` / `suggestedReply` 进入 CLI 输出**。宿主已经在 `state.json` 里写好了
-  「在等什么」与「建议怎么回」（实测原文：「要我现在就把用户实测单交给你，还是你先看这四份测试报告？」
-  /「把实测单发给我」）。Relay Agent 不必从零发明草稿，只需**补全 + 结构化**宿主已有的半成品。
+  「在等什么」与「建议怎么回」（实测原文：「要我现在就把用户回执交给你，还是你先看这四份报告？」
+  /「把回执发给我」）。Relay Agent 不必从零发明草稿，只需**补全 + 结构化**宿主已有的半成品。
   CLI 现在把这两个字段原样打印。
 
 ### Notes
@@ -896,7 +1015,7 @@ macOS 的 launchd plist、Linux 的 systemd user unit，以及「不配守护进
 **端到端实测**：
 
 ```
-notified ASKED PerfScope ... candidates=5 sent=1 suppressed=4 observed=5(ASKED:5)
+notified ASKED <project-B> ... candidates=5 sent=1 suppressed=4 observed=5(ASKED:5)
 ```
 
 5 个候选，发 1 条，4 条被 30 分钟间隔正确地压后。
@@ -904,7 +1023,7 @@ notified ASKED PerfScope ... candidates=5 sent=1 suppressed=4 observed=5(ASKED:5
 **跑起来才发现的两个 bug**：
 - `sessionId` 成了**完整绝对路径**——`split(/[\/]/)` 匹配不到单个反斜杠，
   通知里直接泄露出本机路径。改用 `sessionIdOf`（`lastIndexOf` 剥离目录）。
-- 项目名是完整 slug（`D--Server-MCServers-Server-plugin-PerfScope`），标题撑爆。
+- 项目名是完整 slug（`<project-B-slug>`），标题撑爆。
   取最后一段。
 
 **变异验证**：去掉独立额度 → 2 红；指纹换成时间 → 1 红；去掉 ASKED 标题 → 1 红；
@@ -969,14 +1088,14 @@ notified ASKED PerfScope ... candidates=5 sent=1 suppressed=4 observed=5(ASKED:5
 
 **1. 「等了 45 秒才弹窗」——L-fast 周期 60 秒。**
 
-实测那条 shapez 通知：`idle=45s` 才发出。轮询周期是 60 秒，所以最坏要等一分钟。
+实测那条 <project-C> 通知：`idle=45s` 才发出。轮询周期是 60 秒，所以最坏要等一分钟。
 
 两个探针合计只要 **23ms**，15 秒周期每天多花约 100 秒 CPU（**0.15% 单核**）。
 改成 **15 秒**——把「等了好一会」换成「几乎立刻」，这个交换明显值得。
 
-**2. 「Let's learn English! 谎报军情」——通知了一个 10 天前的问句。**
+**2. 「<session-A> 谎报军情」——通知了一个 10 天前的问句。**
 
-实测那条：session `2f9f2b39` 的文件 **244 小时（10 天）没动过**。
+实测那条：session `<session-O>` 的文件 **244 小时（10 天）没动过**。
 问句是真的，但会话早就结束了——你根本没机会回答，被打断只有损失。
 
 **根因**：`BACKLOG_HOURS` 只用在 **history 统计**上，没用在本该用的地方——**要不要通知**。
@@ -1049,9 +1168,66 @@ set it to "accept" to deliver held messages.
 4. **12 个 agent 角色（743 行）中只有 2 个引用 `scan-sessions.mjs`，零个引用 `watch.mjs`** ——
    监控与调度两半仍未接上。锐评指出「970 行设计文档对应 0 行代码」，本阶段没有解决。
 
-## 版本对照
+## [Unreleased] - 2026-11-02（UIA 驱动桌面版：能读，不能安全写）
 
-| 版本 | 日期 | commit | 一句话 |
+> 承接 `5c37ba3`（接力探针判定 auto 模式在此宿主上不可建）。既然跨会话通道默认 `hold` 且权限类不可判，
+> 下一假设是「用 Windows UI Automation 直接驱动桌面版窗口」。本阶段把这条路做成**能跑的脚本**并实测其风险。
+> **结论：读可行且零打扰，写不可安全自动化。** 详见 `docs/research/2026-11-02-uia-driver.md`。
+
+### Added
+
+- **`scripts/uia-probe.ps1`**（45.6 KB，PowerShell 5.1 + `UIAutomationClient`）。七个子命令：
+  `enum-windows` / `list-sessions` / `get-status` / `read-prompt` / `write-prompt` / `clear-prompt` / `dry-run-send`。
+  **不含真实发送**：`dry-run-send` 只报告「会点哪个按钮」，返回体固定 `"sent": false`，全文件无 Send 的 `InvokePattern`。
+  - **零硬编码坐标**。会话按名字解析，匹配阶梯为 精确 → 标题前缀 → 中止，中段子串直接拒绝。
+  - **找不到就中止**：`exit 2` 不写；歧义 `exit 5` 不写；当前会话与 `-Match` 不符 `exit 2` 不写。
+  - **无 `param()` 块**，手写 argv 解析。PS 5.1 的 `-File` 绑定在本机表现为 switch 参数偶发误绑并吞掉脚本自身
+    stdout，且参数名支持前缀匹配（新增字段可能被认为满足某个参数名）。守护进程调用的 CLI 不能有这个不确定性。
+- **`docs/research/2026-11-02-uia-driver.md`**：全部实测数字、三种 UIA 失效形态、两次现场事故。
+
+### 实测（数字全部可复算）
+
+- **耗时**：冷启动 `enum-windows` 均值 **14.0s**、`list-sessions` **19.0s**、`get-status` **25.8s**（各 5 次）。
+  单进程内计时分解：`Add-Type` C# 编译 **7694 ms（占 63%）**，首次 `FromHandle` 另加 **~494 ms**。
+  **热进程内 10 轮完整枚举均值 195 ms**（min 171 / max 322）——**相差约 100 倍**。
+  结论：任何自动化必须长驻，不能每次起 CLI。
+- **焦点**：只读操作 **72/72 次前台采样未变**，窗口保持最小化；`write-prompt` 一次就把前台从
+  `hwnd <hwnd-a> (pid <pid-a>)` 切到 `hwnd <hwnd-b> (Claude)` 并取消了最小化。**读不抢焦点，写抢。**
+- **并发**：4 进程同时 `list-sessions`，4/4 成功、无污染（纯读）。
+- **坐标漂移**：同一个会话行，侧边栏 x 从 **8 → 297**、y 从 **376 → 556**；列表顺序同时变化。
+- **多窗口**：**23 个 `claude` 进程**，其中 **3 个窗口标题都是 `Claude`**（2 个隐藏、1 个可见）。
+  仅按标题匹配会挑到隐藏窗口；决定性判据是 UIA 子树里同时有 `Group[Sidebar]` 和 `Edit[Prompt]`。
+- **重试**：瞬时错误 3 次内成功；永久错误耗尽后 `exit 7`；**逻辑错误（找不到）1 次即抛，不重试**。
+- **句柄失效**：缓存 20 个句柄静置 **45 秒 → 0 次失效**。失效由**渲染事件**触发，不由时间触发；
+  表现为「元素还在、子树空了」（`sidebar=True, buttons=0, children=0`）而**不是**抛异常。
+
+### Fixed（本阶段自己抓到的四个缺陷）
+
+- **`.Count` 在 StrictMode 下对空结果抛错**：`get-status` 直接 `$rows.Count`，`$rows` 为 0 时
+  `The property 'Count' cannot be found`，整个命令 `exit 7`。改为 `$rows = @(...)` 后再取 `.Count`。
+- **侧边栏「空」被当成「不存在」**：`Find-SidebarElement` 原本要求 ≥3 个按钮子孙，否则返回 `$null`。
+  实测侧边栏会在渲染重建期间短暂为空，于是**健康窗口被整个排除**，报 `no Sidebar group in UIA subtree`。
+  负向证据：修前 `list-sessions` 稳定 `exit 6`，修后同一条命令正常返回。
+- **`Invoke-WithRetry` 不重试瞬时状态**：原实现把所有带 `ProbeExitCode` 的异常当逻辑错误立即抛出，
+  导致「子树还没建好」一次都不重试。新增 `-Retryable` 标记后，实测从 **1 次**变为 **10 次**尝试（`attempts: 11`，7639 ms）。
+- **`SetValue` 是异步的，固定延时读回会误判**：用 `Start-Sleep 60ms` 读回得到 `verdict=mismatch, intended 8, actual 1`，
+  而紧接着直接查询输入框里**就是那 8 个字符**。若按 mismatch 去回滚，会把**已成功的写入回滚成空**。
+  改为轮询读回（预算 2500 ms，报告 `settle_ms`）。
+
+### Notes（阻断项，按严重度）
+
+1. **写入抢焦点**（实测）。用户在别的应用打字时会被弹走。
+2. **最小化窗口写入静默失败**（实测）。`SetValue` 不抛异常但不生效（`intended 288 → actual 1`）。
+3. **异步**（实测）。固定延时读回会误判并触发错误回滚。
+4. **UIA 调用会挂死**（实测）。作业后期多次出现 PowerShell 进程 >120s 无返回，连 `echo` 都卡住。
+5. **性能**（实测）。冷启动 12–30s，必须长驻，而长驻放大第 4 条。
+6. **UI 状态会变**（实测）。观测到 `470 个按钮、0 个会话行`、而侧边栏与输入框都在的状态。
+   此时"尽力而为"会把指令送进不确定的上下文；当前实现选择报错（`exit 7` / `session_view: false`）。
+
+**两次现场事故（如实记录）**：误覆盖用户 47 字符草稿（已按字节精确还原，`exact match: true`）；
+误调 `Hide sidebar`（侧边栏实际未受影响，20 行完好）。**全程未调用 Send，全树搜索探测串 0 命中。**
+
+
 |---|---|---|---|
 | `0.1.0` | 2026-10-30 | `28c85ae` | 骨架 + 五份规格 + 两个脚本；三条判据被 2021 个 transcript 推翻 |
 | `0.1.1` | 2026-10-30 | `2d38a93`、`78f8f2b` | 数据层三个字段不再撒谎；硬门开始检查「脚本能不能解析」 |

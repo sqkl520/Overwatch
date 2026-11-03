@@ -298,7 +298,18 @@ const PROBE_ARGS = {
   lastPermissionMode: '[]', parseAskAnswers: '""', relevanceOf: '["a", ["b"]]',
   answerIsNegative: '""', findEarlierMatch: '["a", ["b"]]', classifyStop: '[{}]',
   findStopPoint: '[[]]', formatStats: '[{}]',
-  unclassifiableMinIdleSec: '[]', tooRecentToNotify: '["UNCLASSIFIABLE", 60, 300]',
+  // asked.mjs 的现状对账（2026-11-02）。参数取最小可构造输入：
+  // 空记录 / 缺失路径 / 空白时间戳，只要能跑通就算登记完成。
+  // 这些函数都是纯的（readRecords/readHostSessions 读路径失败时返回 null/[]，不抛）。
+  inspectRecords: '[[], {}]', readRecords: '["/nonexistent"]',
+  lastCwd: '[[]]', readHostSessions: '["/nonexistent"]',
+  continuedAfterQuestion: '[[], "2026-11-01T23:31:45.824Z"]',
+  humanSpokeElsewhere: '[[], "2026-11-01T23:31:45.824Z"]',
+  assessAsked: '[{}]',  unclassifiableMinIdleSec: '[]', tooRecentToNotify: '["UNCLASSIFIABLE", 60, 300]',
+  // watch.mjs：BLOCKED 事件时刻解析（2026-11-02 假阳性修复）。
+  // 参数取最小可构造输入：空串 / 不存在的路径 / 空对象都必须安全返回，不抛。
+  requestIdTime: '[""]', lastTimelineStateTime: '["/nonexistent", "blocked"]',
+  resolveJobEventTime: '[{}, "/nonexistent"]',
   // replay-observe.mjs：回放脚本的纯函数。参数取最小可构造输入，
   // 目的是让「导出但调用即炸」（ReferenceError）在结构门就暴露。
   nextTick: '[0, 0]', callsUpTo: '[[0, 1], 0]', gapsOf: '[[]]',
@@ -308,6 +319,15 @@ const PROBE_ARGS = {
   observeStop: '[{ ts: [], calls: [] }, { t0: 0, after: [] }, 0]',
   corpusSummary: '[[]]', runDelayModel: '[[], {}]', runPollModel: '[[], {}]',
   rewatchSuppressed: '[[], {}]', renderStats: '[[]]',
+  // stop-signals.mjs：判据全部是纯函数，参数取最小可构造输入。
+  // 目的同上——让「导出但调用即炸」在结构门就暴露，而不是等到报告写完才发现。
+  readSlice: '["/nonexistent", 0, 8]', parseRecords: '""',
+  readTail: '["/nonexistent"]', readHead: '["/nonexistent"]',
+  endsWithoutToolUse: '[[]]', errorOf: '[{}]', hasRecentError: '[[]]',
+  toolFingerprint: '["Read", {}]', toolCallSequence: '[[]]', detectLoop: '[[]]',
+  contextPressure: '[[]]', isHumanMessage: '[{}]', humanMessages: '[[]]',
+  originalGoalFrom: '[[]]', questionAnswered: '[[]]', lastTextIsQuestion: '[[]]',
+  classifySession: '[{}]', summarize: '[[]]', listTranscripts: '["/nonexistent"]',
 };
 
 /** 需要临时目录的导出，参数由探针注入 `_sandbox` */
@@ -422,6 +442,11 @@ function checkUnregisteredExports() {
   if (!existsSync(dir)) return;
   const REGISTERED = new Set([
     'parseArgs', 'parseKeys', 'parseKeysWithRest', 'judgeState', 'noveltyOf',
+    // stop-signals.mjs（判据与汇总）
+    'readSlice', 'parseRecords', 'readTail', 'readHead', 'endsWithoutToolUse',
+    'errorOf', 'hasRecentError', 'toolFingerprint', 'toolCallSequence', 'detectLoop',
+    'contextPressure', 'isHumanMessage', 'humanMessages', 'originalGoalFrom',
+    'questionAnswered', 'lastTextIsQuestion', 'classifySession', 'summarize',
     'signatureOf', 'normalizeBash', 'heartbeatThreshold', 'isPersistentChange', 'parseJsonl', 'SUBAGENT_READ_BYTES',
     'displayWidth', 'padDisplay', 'paint', 'badge', 'colorEnabled', 'stripAnsi',
     'sanitize', 'truncateToWidth', 'wrapToWidth', 'buildDraft', 'detailLines',
@@ -441,11 +466,17 @@ function checkUnregisteredExports() {
     'buildInbox', 'formatInbox', 'healthCheck', 'formatHealth', 'HEALTH_PERIODS',
     'statusToState', 'liveToRow', 'mergeLiveSessions', 'listRow', 'detailLines', 'pendingLines',
     'claimOwnership', 'readOwner', 'ownerPath', 'askedCandidates',
+    'requestIdTime', 'lastTimelineStateTime', 'resolveJobEventTime', 'BLOCKED_MAX_AGE',
     // asked.mjs
     'lastAssistantText', 'endsWithQuestion', 'classifyQuestion',
     'inspectTranscript', 'scanAll', 'formatResult', 'GREETING', 'DEFAULT_MIN_HOURS',
     'questionKey', 'sessionIdOf', 'loadHistory', 'saveHistory', 'mergeHistory',
     'historyStats', 'historyPath', 'formatHistory', 'BACKLOG_HOURS', 'MAX_QUESTION_HOURS',
+    // asked.mjs 的现状对账（2026-11-02）。这些都会被 PROBE_ARGS 实际调用，
+    // 所以「调用一个不存在的函数」在这道门就会暴露。
+    'inspectRecords', 'readRecords', 'lastCwd', 'readHostSessions',
+    'continuedAfterQuestion', 'humanSpokeElsewhere', 'assessAsked',
+    'ASKED_FRESHNESS', 'ASKED_MAX_SILENCE_HOURS',
     // probe-relay.mjs
     'listSessions', 'readPeerToken', 'canConnect', 'buildFrame', 'sendFrame', 'interpretReply',
     // validate-run.mjs
@@ -466,6 +497,10 @@ function checkUnregisteredExports() {
     'NOTIFY_STATES', '__internals',
     // 这两个要读真实 transcript 目录（1GB），不能塞进结构门；由 CLI 自测覆盖。
     'parseTranscript', 'listTranscripts', 'loadCorpus',
+    // stop-signals.mjs 的常量与汇总扫描：scanAll 要读 186 个 transcript（1.4GB），
+    // 同样不能塞进结构门；判据本身已逐条登记在 PROBE_ARGS 里。
+    'TAIL_BYTES', 'HEAD_BYTES', 'LOOP_WINDOW', 'LOOP_REPEAT', 'CONTEXT_NEAR_FULL_RATIO',
+    'scanAll', 'KINDS',
   ]);
 
   const files = readdirSync(dir).filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs') && !CLI_SCRIPTS.has(f));
