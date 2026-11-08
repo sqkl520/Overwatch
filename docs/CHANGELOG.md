@@ -21,6 +21,71 @@
 
 ---
 
+## [Unreleased] - 2026-11-03（`verify-claims`：把「AI 说它做完了」做成可运行的判据，并修掉它自己的两处假阴性）
+
+> 新增 `scripts/verify-claims.mjs`（+ `scripts/verify-claims.test.mjs`）：从 transcript 的
+> tool_use/tool_result 里核「完成性断言有没有证据」。实测报告见
+> `docs/research/2026-11-03-verify-claims.md`。此前同一天已落地过一版骨架（未在本文件记账，
+> 今回溯补记），本轮补的是**真实测量 + 两个真 bug**。
+
+### Added
+
+- **`scripts/verify-claims.mjs`：三层纯函数。** `detectClaims` 从最后一条 assistant 文本认断言 →
+  `findEvidence` 在记录里找该族的调用与退出码 → `classifyEvidence` 用「最后一次**源码**编辑」
+  这条时间线判四档（`SUPPORTED` / `STALE_ONLY` / `FAILED_ONLY` / `NO_EVIDENCE` + `UNKNOWN`）。
+  6 个可核对族（`test-count` / `build` / `commit` / `push-remote` / `pr-ci` / `file-count`），
+  `todos` 等无证据源的族单列 `UNCHECKABLE`，**不混进四档比例**。
+- **全量语料实测（228 个主 transcript / 1.58 GB）**：含可核对断言 25 个会话、31 条断言；
+  四档 `SUPPORTED 26 / STALE_ONLY 1 / FAILED_ONLY 0 / NO_EVIDENCE 1 / UNKNOWN 3`。
+  全量耗时 **2.9–5.6 s**，读盘 320 MB（约全量 20%）。需回溯的 25 个会话里 **0 个触到 24 MB 上限**
+  —— 本语料没有一次「因为读不下去而可能漏证据」的截断。
+- **`--include-subagents`**：子 agent 的证据只用来把 `NO_EVIDENCE` 降级成 `UNKNOWN`，
+  **从不**升级成 `SUPPORTED` —— 子 agent 的调用不在主时间线上，无法确认它发生在编辑之后。
+
+### Fixed（两处假阴性，都是实测出来的，都加了负向测试）
+
+- **shell 编辑的 kind 恒为源码。** 旧代码
+  `const k = /\.(?:[a-z0-9]+)\b/i.test(use.cmd) ? 'unknown' : 'code'` 两边都不返回 `'doc'`，
+  而时间线判据是 `e.kind !== 'doc'` 才算源码改动 —— 于是 `cp *.jar backups/`、`cat > docs/x.md`
+  这类写入会**作废掉之前的测试证据**。实测把 `bdf7a413`（`cp versions/*.jar`）和
+  `9daa6a00`（编辑 `.gitignore`）两次真的 `SUPPORTED` 判成 `STALE_ONLY`。
+  改法：按**实际写入目标**的扩展名定 kind（`shellEditKind`），并新增 `NON_SOURCE_FILES`
+  把 `.gitignore` / `.gitattributes` 一类当文档；判不出来时按文档处理。
+  负向测试：装回旧代码，4 条新测试变红。
+- **`tests=29 failures=0` 被读成 29 个失败。** 旧 `FAIL_OUTPUT_RE`
+  的 `\b[1-9]\d*\s+(?:failing|failed|failures?|errors?)\b` 命中了「29 failures」，
+  让 `36b92630` 一次真的 `BUILD SUCCESS` 被记成失败调用；全语料 266 处、35 个会话受影响。
+  改法：加否定前瞻 `(?![=:\s]*0\b)`。回归验证：丢掉 266 处匹配，**没有一处是真失败**。
+  负向测试：删掉前瞻，2 条新测试变红。
+
+### Changed
+
+- **`scripts/check-structure.mjs`**：`NON_SOURCE_FILES` 登记进 `PROBE_ARGS` 的数据常量表，
+  消除「导出未登记」提示。
+
+### 与前序研究的对照（数字冲突，以本轮实测为准）
+
+- `docs/research/2026-11-02-redteam-deterministic.md` §3.2 的「23 个 test-count 会话里
+  **15 个完全无测试调用**」**今天复现不出来**。两处原因已定位：
+  ① 该节脚本的测试命令正则是 `mvn\s+[^\n]*(test|verify)`，**匹配不到 `mvn.cmd`**（本机 Maven
+  就是 `mvn.cmd`），只改这一处，`无任何测试调用` 从 **13 降到 9**，`证据充分` 从 **5 升到 9**；
+  `db46051b` 有 2 次成功 `mvn.cmd … test`（`Tests run: 547, Failures: 0`）在最后一次编辑之后。
+  ② 该节称那 15 个会话「全部为 0 个子 agent」，今天实测 `3b390f6e` 有 **51** 个、`84419879` 有 **36** 个。
+  **旧数字错在测试命令正则，不在结论方向**：本轮唯一一条 `NO_EVIDENCE`（`3b390f6e`）
+  经逐条核查确实只跑过 `mvn clean compile` 与 `mvn clean package -DskipTests`，`Tests run:` 出现 0 次，
+  该判为真。
+
+### 精度（诚实标注）
+
+- 人工抽检 13 条（全部非 `SUPPORTED` + 每族至少 1 条 `SUPPORTED`），回到原始输出逐条裁决：
+  **11 对 2 错，精度约 84.6%**（样本小，只能当量级）。
+  两条错：`64460e7d` 的 `STALE_ONLY` 假阳性（临时脚手架目录 `_backup-extract/*.mjs` 被当源码改动 +
+  跨仓库比较）；`3b390f6e` 的 `NO_EVIDENCE` 在 `--include-subagents` 后降级为 `UNKNOWN`。
+- 已知未修局限（报告中 §4 全列）：断言只认最后一条文本、`file-count` 语义歧义、
+  脚手架目录未排除、跨仓库串线、不核断言里的数量、`echo "EXIT=$?"` 拿到的是管道尾部命令的退出码。
+
+---
+
 ## [Unreleased] - 2026-11-02（ASKED 误报：一个推断信号继承了宿主事实的门禁豁免）
 
 > 承接 `docs/research/2026-11-02-false-positive-diagnosis.md` 的根因 B。同一天早上收到第二条

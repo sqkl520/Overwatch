@@ -328,6 +328,17 @@ const PROBE_ARGS = {
   contextPressure: '[[]]', isHumanMessage: '[{}]', humanMessages: '[[]]',
   originalGoalFrom: '[[]]', questionAnswered: '[[]]', lastTextIsQuestion: '[[]]',
   classifySession: '[{}]', summarize: '[[]]', listTranscripts: '["/nonexistent"]',
+  // verify-claims.mjs：断言 vs 证据配对。全部是纯函数，参数取最小可构造输入。
+  // 目的是让「导出但调用即炸」在结构门暴露，而不是等到对 1.5 GB 语料跑完才发现。
+  detectClaims: '""', findEvidence: '[[], "test-count"]', classifyEvidence: '[{}]',
+  splitSentences: '""', stripQuoted: '""', isNegated: '""', isInterrogative: '""',
+  isSpeculative: '""', lastAssistantText: '[[]]', buildEvidenceIndex: '[[]]',
+  claimedCount: '""', readBack: '["/nonexistent"]', readTailRecords: '["/nonexistent"]',
+  listSessions: '["/nonexistent"]', enoughForClaim: '[[]]', enoughForClaims: '[[], []]',
+  evidenceSufficient: '[{}, {}]', normalizeCommand: '""', isTestCommand: '""',
+  isBuildCommand: '""', isMutatingCommand: '""', editKindOf: '""', resultText: '[{}]',
+  parseLines: '""', subagentFiles: '[{}]', summarizeClaims: '[[]]',
+  scanSession: '[{"path":"/nonexistent","project":"p","sessionId":"s","mtimeMs":0,"size":0}]',
 };
 
 /** 需要临时目录的导出，参数由探针注入 `_sandbox` */
@@ -490,6 +501,20 @@ function checkUnregisteredExports() {
     'originKindOf', 'pct', 'buildSessionStops', 'sliceStops', 'stateAt', 'observeStop',
     'corpusSummary', 'runDelayModel', 'runPollModel', 'rewatchSuppressed', 'renderStats',
     'POLL_INTERVAL_MS', 'DEFAULT_MIN_IDLE_SWEEP', 'DEFAULT_DELAYS_SEC',
+    // verify-claims.mjs：断言 vs 证据配对（2026-11-03）。纯函数逐个进了 PROBE_ARGS。
+    'detectClaims', 'findEvidence', 'classifyEvidence', 'splitSentences', 'stripQuoted',
+    'isNegated', 'isInterrogative', 'isSpeculative', 'lastAssistantText', 'buildEvidenceIndex',
+    'claimedCount', 'readBack', 'readTailRecords', 'listSessions', 'enoughForClaim',
+    'enoughForClaims', 'evidenceSufficient', 'normalizeCommand', 'isTestCommand',
+    'isBuildCommand', 'isMutatingCommand', 'editKindOf', 'resultText', 'parseLines',
+    'subagentFiles', 'summarizeClaims', 'scanSession',
+    // verify-claims.mjs 的常量与正则。都是数据，不是函数；函数已逐条登记在 PROBE_ARGS 里。
+    'CLAIM_TAIL_BYTES', 'DEFAULT_BACKTRACK_BYTES', 'BACKTRACK_STEPS', 'EVIDENCE_STATUS',
+    'EDIT_TOOLS', 'SHELL_TOOLS', 'CLAIM_FAMILIES', 'NEGATION_RE', 'INTERROGATIVE_RE',
+    'SPECULATIVE_RE', 'FENCED_CODE_RE', 'BLOCKQUOTE_LINE_RE', 'TEST_CMD_RE', 'BUILD_CMD_RE',
+    'COMMIT_CMD_RE', 'PUSH_CMD_RE', 'CI_CMD_RE', 'SYNC_CHECK_CMD_RE', 'RUNTIME_CMD_RE',
+    'FAIL_OUTPUT_RE', 'COMMIT_OK_RE', 'PUSH_OK_RE', 'PUSH_REJECT_RE', 'SKIP_TESTS_RE',
+    'GIT_READONLY_RE', 'BASH_MUTATION_RE', 'CODE_EXTS', 'DOC_EXTS', 'NON_SOURCE_FILES',
   ]);
   const INTENTIONALLY_PROBED_FREE = new Set([
     'main', 'printPlain', 'copyToClipboard', 'startWatch', 'runTick',
