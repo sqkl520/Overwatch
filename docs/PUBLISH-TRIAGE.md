@@ -41,7 +41,7 @@
 | `docs/design/frontend-and-shape.md` | SANITIZE | 前端三层形态与策略 schema | 未改内容。`messagingSocketPath` / `peerToken` 只作为字段名出现；实测数字（9 个会话、6/6、8/8）是泛化统计 |
 | `docs/design/intent-contract.md` | SANITIZE | 方向约定设计（已裁决否决） | 上一轮把一条引用的用户原话从「提交并发布 1.2.1」改成「x.y.z」（去掉真实版本号），并修正错别字 |
 | `docs/design/verdict-intent-contract.md` | PUBLIC | 三方裁决过程，方法论价值高 | 未改 |
-| `docs/design/continuation-engine.md` | SANITIZE | 续接引擎设计，实测数字价值高 | **本轮修了真实泄漏**：§3.2 的 `file-history-delta` 样例里有 `<project-D>\FCL\src\main\java\...\LocaleUtils.java`，其中 `FCL` 是真实项目模块名 → 改成 `<project-D>\<module>\src\main\java\...`。另把 F-10 里的 `ow-inject-test`（本机临时目录名）改成 `<scratch-repo>` |
+| `docs/design/continuation-engine.md` | SANITIZE | 续接引擎设计，实测数字价值高 | **本轮修了真实泄漏**：§3.2 的 `file-history-delta` 样例里，一个真实项目模块名出现在 Java 包路径中 → 改成 `<project-D>\<module>\src\main\java\...`（反斜杠因 shell 转义在此处显示不出，原文是标准的 Windows 路径分隔形态）。另把一个本机临时目录名（`ow-` 前缀）改成 `<scratch-repo>` |
 | `docs/research/2026-10-30-hosted-automation.md` | SANITIZE | 「能投递但标注改不掉」的核心调研 | 上一轮把 job id `070eb93f` 换成 `<job-D>`。第 58 行「`from-name` 实测写 `sqcola` 能过」保留——那是 GitHub 账号，README 已公开 |
 | `docs/research/2026-10-30-stop-signals.md` | SANITIZE | 结构化停止信号的三条实测 | 上一轮把 `AskUserQuestion` 的真实问答原文（含「源码仓」「ea 快照仓库」「APK」等私有业务语境）改成泛化措辞；本轮复核确认无残留 |
 | `docs/research/2026-10-31-first-production-metric.md` | SANITIZE | 第一个生产指标（可追溯率 0/5），方法论价值最高的一份 | 上一轮把 5 条 session 短 ID 换成 `<session-F>` / `<session-B>` / `<session-G>`；本轮复核确认无残留 |
@@ -51,7 +51,7 @@
 | `docs/research/2026-10-31-rollback-executed.md` | SANITIZE | 回滚决策与「理由被推翻却不回滚」的自我批评 | 上一轮把三个 session 短 ID 换成 `<session-F>` / `<session-B>` / `<session-G>` |
 | `docs/research/2026-11-01-dispatch-chain-audit.md` | SANITIZE | 派发链路普查，两个断点的方法论 | 未改内容。含 `tasks/runs/2026-10-30-p0/task-graph.json` 这一 run id——它是台账路径而非会话 ID，且 `tasks/runs/` 已 gitignore，保留无害 |
 | `docs/research/2026-11-01-ground-truth-first.md` | PUBLIC | 「停久了是常态」这个翻转性结论 | 未改 |
-| `docs/research/2026-11-01-relay-delivery-probe.md` | SANITIZE | 投递探针（`auto` 模式被证伪的决定性证据） | 上一轮把 `PerfScope` 换成 `<project-B>`；**本轮**又把 `pid 14568` 换成 `<pid-01>`。`peerToken` 只作字段名出现，无实际值 |
+| `docs/research/2026-11-01-relay-delivery-probe.md` | SANITIZE | 投递探针（`auto` 模式被证伪的决定性证据） | 上一轮把一个真实项目名换成 `<project-B>`；**本轮**又把本机 `pid` 换成 `<pid-01>`。`peerToken` 只作字段名出现，无实际值 |
 | `docs/research/2026-11-02-deterministic-signals.md` | SANITIZE | 确定性判据能做到什么程度 | **本轮**把 §8 的 `AppData\Local\Programs` 具体应用清单（opencode / Lunar Client / Termius）与 GPU 型号（RTX 2070 SUPER）改成泛化描述——它们组合起来是本机指纹。`.tmp-analysis/*.mjs` 的脚本名保留（目录已 gitignore，脚本名本身不含信息） |
 | `docs/research/2026-11-02-false-positive-diagnosis.md` | SANITIZE | 两条误报的根因诊断，全项目最扎实的一份排障记录 | **本轮修了两处**：①§二标题原为 `"hilltop village" 是哪个会话`——真实项目名直接写在标题里，改成「这条通知对应的是哪个会话」；②三处 `deepseek-v4.1-flash` 上游模型名改成 `<upstream-model>`。另把 `pid 14568`/`41192` 换 `<pid>`，`uuid=72285974-...` 换 `<uuid-A>` |
 | `docs/research/2026-11-02-fix-asked.md` | SANITIZE | ASKED 误报修复记录，含 411 个样本的阈值推导 | 未改内容（复核确认无本机标识）。项目名已被上一轮换成 `<project-B>` / `<session-E>` |
