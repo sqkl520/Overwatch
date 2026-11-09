@@ -214,12 +214,21 @@ function checkAgents() {
 
 // ── 检查 5：无空目录 ──────────────────────────────────────────────────
 
+/** 只检查「会被提交的」目录。
+ *
+ *  gitignore 里的目录根本进不了仓库，对它报「clone 后会消失」是没有意义的：
+ *  它 clone 后本来就不存在，不是消失。真实误报：`.tmp-analysis/` 下某个第三方
+ *  仓库的 `vendor/<pkg>` 是空的，硬门直接判红，而那一整棵树都在 `.gitignore` 里。
+ *
+ *  跳过整棵被忽略的子树（而不是只跳过报错的那一层）—— 既省掉数千个文件的遍历，
+ *  也让「临时目录里有什么」不再影响结构门。 */
 function checkEmptyDirs(dir = ROOT, depth = 0) {
   if (depth > 6 || !existsSync(dir)) return;
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     if (['.git', 'node_modules', '.gitkeep'].includes(entry.name)) continue;
     const full = join(dir, entry.name);
+    if (depth > 0 && isGitignored(rel(full))) continue;
     const children = readdirSync(full);
     if (children.length === 0) {
       fail(rel(full), '空目录不会被 git 跟踪，clone 后会消失——要么放文件，要么别建');
