@@ -21,6 +21,74 @@
 
 ---
 
+## [Unreleased] - 2026-11-09（通知系统三个已确诊缺陷：噪声桶、去重键恒等、`lastSeenAt` 不刷新）
+
+> 用户原话：「先修目前的漏洞」。三个缺陷都已由多个 Agent 独立实测确认，数字是真的。
+> 验收标准先于实现写成：`docs/spec/2026-11-04-notify-fix-acceptance.md`（526 行）。
+> 完整取证与负向实验记录：`docs/research/2026-11-04-fix-notify-dedup.md`。
+
+### Fixed
+
+- **`permission prompt` 是噪声桶，不再产生通知（但照样写观察记录）。**
+  实测（n=75 个宿主翻转事件）`waitingFor === 'input needed'` 9/9 = 100% 真、
+  `'permission prompt'` 66/66 = 0% 真。根因是 `requires_action` 一律映射成 `waiting`，
+  只有 `AskUserQuestion` 才写 `input needed`，其余全塞进 `permission prompt` 兜底桶
+  （66 个里 46 个卡在会话自己写的 `Bash(sleep 840~900)` 上）。
+  位置：`scripts/watch.mjs` `dispatchCandidates` 开头。判据同时看 `waitingFor` 与 `reason`
+  —— `scan-sessions --json` 的 `sessions[]` 没有 `waitingFor` 字段，只看前者会让这道门
+  在 scan 路径上失效，而 67/72 条记录来自那条路。`input needed` 链路一个字未动。
+  观测记录保留（`why: 'noise-bucket-permission-prompt'`），因为删掉状态就无法验证
+  误报真的消失，也答不出宿主多久这样一次。
+
+- **去重键：WAITING 改用 transcript 里未闭合的等待型 `tool_use_id` 作锚点。**
+  修复前 `probeWaiting` 与 `probeJobs` 的指纹恒为空串，而 `reasonClass` 把
+  `waiting:input needed` / `waiting:permission prompt` 压成同一个 `waiting` ——
+  同一会话的多次等待共用一个键。实测 `<session-S>` 一个键吞掉 11-08 的 **4 次真实等待**，
+  `watch.log` 连续 **2213 个 tick（585 分钟）`already=1`**（全日志 `already=1` 共 5413 次）。
+  位置：新增 `classify-stop.mjs` 的 `openWaitingToolUseIds()` + `watch.mjs` 的 `waitingAnchor()`；
+  `probeWaiting` / `candidatesFromScan` / `probeJobs` 三处产键点统一走它。
+  **不用 `statusUpdatedAt` 单独当键**：实测它在 waiting 期间只写一次、18 分钟不动
+  （`watch.mjs` 的 `docs/research/2026-11-04-dedup-key-analysis.md` §4.2），
+  用它 = 一次等待只值一个键 = 保留今天这种永久静默；它只作取不到 transcript 时的退化值，
+  且带 `host:` 前缀、候选上标 `anchorSource`，让覆盖率可统计。
+
+- **`lastSeenAt` 正常刷新，TTL 改按 `lastSeenAt` 计时。**
+  实测 72/72（现场取证 73/73）条记录 `lastSeenAt === firstSeenAt`，而 `pruneNotified`
+  从 `firstSeenAt` 算 24h TTL —— 一次持续超过 24h 的等待会在第 25 小时被清掉，
+  然后**同一个等待被重新通知一次**。位置：`dispatchCandidates` 命中路径 + `pruneNotified`。
+  两处必须一起改：只刷新不算 lastSeenAt、只改 TTL 而不刷新，都修不好。
+
+### Added
+
+- **负向测试 11 条**（`scripts/watch.test.mjs` 末尾「通知修复」段）。当前套件对
+  「同一次等待跨路径同键」「不同次等待不同键」这两条核心性质**零覆盖** ——
+  把 scan 指纹改成空串，修复前的 497 条依然全绿。新增用例逐个做了变异验证：
+  把 bug 装回去时**必然变红**，6 个变异的红/绿记录见研究报告 §3。
+- `scripts/check-structure.mjs` 的 `PROBE_ARGS` 登记 `openWaitingToolUseIds` / `waitingAnchor`，
+  于是「导出但调用即炸」在这道门就会暴露。
+
+### Changed
+
+- **修掉一条说谎的测试**：`watch.test.mjs` 原「L-fast 与 L-full 报同一事件时只发一条
+  （三层共享去重）」——实测挡住第二条的是 `GLOBAL_MIN_GAP=10min`（`canNotify`），
+  两个键根本不相等。改名为「……但挡住第二条的是限额，不是键相等」，并加断言
+  `suppressed[0].why === 'global-10min'` 把真实机制钉住；另补一条真正测去重的用例
+  （跨 11 分钟两个 tick、每轮清空额度，只发一条）。
+
+### 测试数字
+
+508 条全绿（基线 497 + 新增 11）。`check-structure.mjs` 现已全绿。
+
+**关于硬门那 1 项既有违规的处置（不掩盖）**：本次改动**之前** `check-structure.mjs` 已报
+`[docs/design/README.md] 2026-11-04-next-phase-plan.md 没有被索引提到`。验收标准
+§5 第 1 条允许「让这一项消失或明确分账（既有的不许当作本次失败，也不许顺手改掉掩盖问题）」。
+本次选择**让它消失**，动作只有一处：在 `docs/design/README.md` 的状态表里补一行
+（标 `Proposed`、`零行实现`），与该文件的其它条目格式一致。
+这不是「顺手改掉掩盖问题」——那份规划文档本来就该在索引里；不复述它的任何内容，
+也不声称它被实现。记录在此，是为了让「谁在什么时候让这一项转绿」可查。
+
+---
+
 ## [Unreleased] - 2026-11-03（`verify-claims`：把「AI 说它做完了」做成可运行的判据，并修掉它自己的两处假阴性）
 
 > 新增 `scripts/verify-claims.mjs`（+ `scripts/verify-claims.test.mjs`）：从 transcript 的

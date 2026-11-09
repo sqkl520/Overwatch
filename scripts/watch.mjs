@@ -37,7 +37,7 @@ import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { classifyStop } from './classify-stop.mjs';
+import { classifyStop, openWaitingToolUseIds } from './classify-stop.mjs';
 import { sessionIdOf } from './asked.mjs';
 
 // ── 常量 ──────────────────────────────────────────────────────────────
@@ -382,13 +382,21 @@ export function loadState(dir, { logger = null } = {}) {
 export const NOTIFIED_TTL_HOURS = 24;
 
 /** 原地删除过期的已通知条目，返回移除数。
- *  年龄从 firstSeenAt 算；时间不可解析的也删掉——那说明条目本身是坏的。 */
+ *  年龄从 **`lastSeenAt`（退回 `firstSeenAt`）** 算；时间不可解析的也删掉——那说明条目本身是坏的。
+ *
+ *  ⚠ 2026-11-09 修：以前只看 `firstSeenAt`，而 `dispatchCandidates` 的命中路径从不刷新
+ *  `lastSeenAt`（实测 72/72 条 `lastSeenAt === firstSeenAt`）。于是 TTL 的语义变成了
+ *  「第一次看到它是多久以前」，而不是「多久没再看到它」——**一次持续超过 24 小时的等待
+ *  会在第 25 小时被清掉，然后同一个等待被重新通知一次**。
+ *
+ *  两处必须一起修：只刷新 `lastSeenAt` 而不改这里，TTL 仍然按首次发现计时，重复通知照旧；
+ *  只改这里而不刷新 `lastSeenAt`，所有条目都会在第 24 小时被清（刷新点不存在）。 */
 export function pruneNotified(notified, nowMs = Date.now()) {
   if (!notified || typeof notified !== 'object') return { removed: 0 };
   const cutoff = nowMs - NOTIFIED_TTL_HOURS * 3600_000;
   let removed = 0;
   for (const [k, v] of Object.entries(notified)) {
-    const t = Date.parse(v && v.firstSeenAt);
+    const t = Date.parse((v && (v.lastSeenAt || v.firstSeenAt)) || '');
     if (!Number.isFinite(t) || t < cutoff) {
       delete notified[k];
       removed++;
@@ -448,12 +456,61 @@ export function reasonClass(reason) {
 
 /** AC2：`sessionId | state | reasonClass | evidenceFingerprint` 的 SHA-256 前 16 位。
  *  - `reasonClass` 剥掉会漂移的数字
- *  - `evidenceFingerprint` 是最后一条 assistant 记录 uuid 的短哈希，让「卡在别处」能被区分 */
+ *  - `evidenceFingerprint` 是**事件级**锚点：WAITING 用 transcript 里未闭合的等待型
+ *    `tool_use_id`（见 `waitingAnchor`），其余状态沿用最后一条记录的短哈希。
+ *
+ *  ⚠ 2026-11-09 修：以前 WAITING 候选的指纹恒为 `''`，而 `reasonClass` 把
+ *  `waiting:input needed` / `waiting:permission prompt` 压成同一个 `waiting` ——
+ *  于是**同一会话的多次等待共用一个键**，第二次起永久静默。实测 `<session-S>`
+ *  一个键吞掉 4 次真实等待，`watch.log` 连续 2213 个 tick `already=1`（585 分钟）。
+ *  见 `docs/research/2026-11-04-dedup-key-analysis.md` §2.2、§4.4。 */
 export function dedupeKey(sessionId, state, reason, evidenceFingerprint = '') {
   return createHash('sha256')
     .update(`${sessionId}|${state}|${reasonClass(reason)}|${evidenceFingerprint}`)
     .digest('hex')
     .slice(0, 16);
+}
+
+/** 等待锚点：**这次**等待的唯一标识，用作 `dedupeKey` 的第四个参数。
+ *
+ *  取 transcript 里最后一个未闭合的 `AskUserQuestion` / `ExitPlanMode` 的 `tool_use_id`。
+ *  为什么是它：闭合（收到 `tool_result`）就是这次等待结束，下一次等待必然是新 id ——
+ *  这正是「一次等待一个值、不同等待不同值」。
+ *
+ *  **不能用 `statusUpdatedAt` 单独当键**：它是「状态最后一次变化」，waiting 期间
+ *  只写一次（实测 18 分钟一动不动），还可能被宿主无规律重写（33 / 54 分钟各一次）。
+ *  用它当键 = 一次等待只值一个键 = 保留今天这种永久静默。
+ *  它在这里只作为**取不到 transcript 时的退化值**，且必须带 `host:` 前缀，
+ *  免得和 `wait:<id>` 撞上。
+ *
+ *  返回 `wait:<tool_use_id>` / null。null 由调用方按 `host:<statusUpdatedAt>` 退化。 */
+const anchorCache = new Map();
+
+export function waitingAnchor(projectsRoot, sessionId, projectHint, nowMs = Date.now()) {
+  const root = asPath(projectsRoot);
+  if (!root || !sessionId) return null;
+  const path = resolveTranscriptPath(root, sessionId, projectHint, nowMs);
+  if (!path) return null;
+  let mtimeMs = 0;
+  let size = 0;
+  try { const st = statSync(path); mtimeMs = st.mtimeMs; size = st.size; } catch { return null; }
+  const cached = anchorCache.get(path);
+  if (cached && cached.mtimeMs === mtimeMs && cached.size === size && mtimeMs > 0) return cached.anchor;
+  let anchor = null;
+  try {
+    const { records } = readTranscriptTail(path);
+    const ids = openWaitingToolUseIds(records);
+    // 取最后一个：tail 里可能同时有多个未闭合的（例如连续两次提问都被截断），
+    // 最新那次才是「此刻在等的是哪一次」。
+    anchor = ids.length ? `wait:${ids[ids.length - 1]}` : null;
+  } catch { anchor = null; }
+  if (anchorCache.size >= CACHE_MAX) {
+    const oldest = anchorCache.keys().next().value;
+    if (oldest !== undefined) anchorCache.delete(oldest);
+  }
+  // mtime/size 为 0（stat 失败）时不缓存，避免把一次读失败钉成永久结论
+  if (mtimeMs > 0) anchorCache.set(path, { mtimeMs, size, anchor });
+  return anchor;
 }
 
 // ── 限额 ──────────────────────────────────────────────────────────────
@@ -572,7 +629,7 @@ export function readLiveSessionStates(claudeDir = null) {
   return out;
 }
 
-export function probeWaiting(sessionsRoot, { nowMs = Date.now() } = {}) {
+export function probeWaiting(sessionsRoot, { nowMs = Date.now(), projectsRoot = null } = {}) {
   const started = process.hrtime.bigint();
   const found = [];
   let scanned = 0;
@@ -594,16 +651,27 @@ export function probeWaiting(sessionsRoot, { nowMs = Date.now() } = {}) {
     if (!Number.isFinite(updated) || updated <= 0) { skipped++; continue; }
     // 和其他状态用同一个活跃窗口：一个 20 天前就 waiting 的记录不是新闻
     if (nowMs - updated > ACTIVE_WINDOW) { skipped++; continue; }
+    const project = s.cwd ? s.cwd.split(/[\\/]/).pop() : (s.name || null);
+    // 事件指纹 = 这一次等待的锚点。取不到 transcript 时退化成 `host:<statusUpdatedAt>`：
+    // 那个值在 waiting 期间只写一次，所以一次等待仍然只发一次（不比修复前差），
+    // 但它区分不开两次等待 —— 候选上标 `anchorSource` 让覆盖率可统计。
+    const anchor = projectsRoot
+      ? waitingAnchor(projectsRoot, s.sessionId, project, nowMs)
+      : null;
     found.push({
       sessionId: s.sessionId,
       state: 'WAITING',
       reason: s.waitingFor ? `waiting:${s.waitingFor}` : 'host-reported-waiting',
       waitingFor: s.waitingFor || null,
-      project: s.cwd ? s.cwd.split(/[\\/]/).pop() : (s.name || null),
+      project,
       detail: s.waitingFor || null,
       needs: typeof s.needs === 'string' ? s.needs : null,
       suggestedReply: null,
       updatedAt: new Date(updated).toISOString(),
+      // 宿主写的「这次状态从何时开始」——只用作退化的去重指纹，不当事件时刻用。
+      hostStatusAt: new Date(updated).toISOString(),
+      evidenceFingerprint: anchor || `host:${new Date(updated).toISOString()}`,
+      anchorSource: anchor ? 'transcript' : 'host-time',
       idleSec: Math.round((nowMs - updated) / 1000),
       source: 'sessions',
     });
@@ -794,6 +862,12 @@ export function probeJobs(jobsRoot, { nowMs = Date.now(), blockedMaxAge = BLOCKE
       // 事件时刻：通知正文里的时长、去重指纹都从它算，不再用 updatedAt。
       eventAt: new Date(ev.atMs).toISOString(),
       eventSource: ev.source,
+      // 去重指纹：jobs 路径原先恒为 `''`，于是同一个 job 只能报一次（不管中间走掉又回来）。
+      // 用**事件时刻**而不是 `updatedAt`：后者是文件重写时刻，host 每次启动/补写元数据都会刷新它，
+      // 拿它当键会让同一件事在每次重写后重新通知一遍。事件时刻来自 timeline / request-id /
+      // firstTerminalAt（见 resolveJobEventTime），同一事件的来源稳定。
+      evidenceFingerprint: `job:${new Date(ev.atMs).toISOString()}`,
+      anchorSource: `jobs-${ev.source}`,
       // 「已经这样多久了」。从事件时刻算，不再从文件重写时刻算——
       // 旧实现把 27.8 天算成 15.3 小时，并写进通知正文（idle=916m）。
       idleSec: Math.max(0, Math.round(ageMs / 1000)),
@@ -921,13 +995,34 @@ export function runScan({ project = null, days = 3, timeoutMs = 180_000, nodePat
   });
 }
 
-/** 把扫描结果转成通知候选。只看「最近还有活动」的会话，见 ACTIVE_WINDOW。 */
-export function candidatesFromScan(sessions, { nowMs = Date.now(), states = NOTIFY_STATES } = {}) {
+/** 把扫描结果转成通知候选。只看「最近还有活动」的会话，见 ACTIVE_WINDOW。
+ *
+ *  `projectsRoot` 给了的时候，WAITING 候选的指纹改成**与 `probeWaiting` 同一个锚点**
+ *  （transcript 里未闭合的等待型 `tool_use_id`）。不给时退回旧行为（lastActivity 数字位）。
+ *  为什么要统一：两条路径对同一次等待算出不同键，同一次等待就会发两条 ——
+ *  实测 `<session-U>` 的 sessions 键 `3679ed23e2930d88` 与 scan 键 `4181354ebb8ac70c` 不相等，
+ *  相隔 18 分钟弹了两次。见 `docs/research/2026-11-04-dedup-key-analysis.md` §2.1。 */
+export function candidatesFromScan(sessions, { nowMs = Date.now(), states = NOTIFY_STATES, projectsRoot = null } = {}) {
   const out = [];
   for (const s of sessions || []) {
     if (!states.includes(s.state)) continue;
     const activity = Date.parse(s.lastActivity || '');
     if (Number.isFinite(activity) && nowMs - activity > ACTIVE_WINDOW) continue;
+    // 证据指纹：WAITING 用「这次等待」的锚点（与 probeWaiting 一致）；
+    // 其余状态沿用 lastActivity —— 会话静止时它稳定，真的「卡在别处」时它会变。
+    // 不用 idleSec：那是每轮都在走的，会让去重失效。
+    let fingerprint = String(s.lastActivity || '').replace(/\D/g, '').slice(-10);
+    let anchorSource = 'last-activity';
+    if (s.state === 'WAITING' && projectsRoot) {
+      const anchor = waitingAnchor(projectsRoot, s.sessionId, s.project, nowMs);
+      if (anchor) { fingerprint = anchor; anchorSource = 'transcript'; }
+      // scan 行没有 `statusUpdatedAt`（只有 `live[]` 有，而 `runScan` 只取 `parsed.sessions`），
+      // 所以这条退化分支在现状下基本不触发，退化后仍然用 lastActivity 的指纹。
+      // 这是一个**已知残留**：取不到 transcript 时两路键仍可能不等。要彻底统一需要
+      // 先改 `scan-sessions` 的输出契约（把 `live[]` 按 sessionId join 进 `sessions[]`），
+      // 属于跨文件契约变更，不在本次修复的边界内。见研究报告 §7 第 1 条。
+      else if (s.statusUpdatedAt) { fingerprint = `host:${new Date(Number(s.statusUpdatedAt)).toISOString()}`; anchorSource = 'host-time'; }
+    }
     out.push({
       sessionId: s.sessionId,
       state: s.state,
@@ -940,9 +1035,8 @@ export function candidatesFromScan(sessions, { nowMs = Date.now(), states = NOTI
         ? s.idleSec
         : (Number.isFinite(activity) ? Math.round((nowMs - activity) / 1000) : null),
       lastActivity: s.lastActivity,
-      // 证据指纹：会话静止时 lastActivity 稳定；真的「卡在别处」时它会变。
-      // 不用 idleSec——那是每轮都在走的，会让去重失效。
-      evidenceFingerprint: String(s.lastActivity || '').replace(/\D/g, '').slice(-10),
+      evidenceFingerprint: fingerprint,
+      anchorSource,
       suggestedReply: s.suggestedReply || null,
       source: 'scan',
     });
@@ -1536,6 +1630,54 @@ export async function dispatchCandidates(candidates, {
   for (const candidate of candidates) {
     const c = { ...candidate };
 
+    // ── 噪声桶门：`waitingFor === 'permission prompt'` 永不通知 ──
+    //
+    // 实测（`docs/research/2026-11-04-host-status-reliability.md` §2.2，n=75 个宿主翻转事件）：
+    //
+    //     waitingFor === 'input needed'      9/9   = 100% 真
+    //     waitingFor === 'permission prompt' 66/66 =   0% 真
+    //
+    // 这不是统计相关，是**定义性**的：宿主只在 `tool_name === AskUserQuestion`（或 `dialog:` 前缀）
+    // 时写 `input needed`，其余一律写 `permission prompt` —— 它是个兜底桶，不是「有人要你点批准」。
+    // 66 个里 46 个卡在会话自己写的 `Bash(sleep 870)` 上：它在等自己派的活儿，不是在等人。
+    //
+    // 修法：**不产生通知候选，但照常写观察记录**。直接把它从状态里删掉会让这类
+    // 「自己在等」的情况彻底不可见 —— 那既不能验证「误报真的消失了」，也不能
+    // 回答「宿主多久这样一次」。所以是「不通知」，不是「不记录」。
+    //
+    // 只作用于 WAITING：`input needed` 的通知链路一个字都没动（那条 100% 精确）。
+    //
+    // 判据同时看 `waitingFor` 与 `reason`：scan 路径的候选不带 `waitingFor` 字段
+    // （`scan-sessions --json` 的 `sessions[]` 没有它），但 `judgeState` 把同一个值
+    // 写进了 reason（`waiting:permission prompt`）。只看 `waitingFor` 会让这条门
+    // 在 scan 路径上失效 —— 那正好是 67/72 条记录来的那条路。
+    const waitingForText = String(c.waitingFor || String(c.reason || '').replace(/^waiting:/, ''));
+    const noiseBucket = c.state === 'WAITING' && waitingForText === 'permission prompt';
+    if (noiseBucket) {
+      const key = dedupeKey(c.sessionId, c.state, c.reason, c.evidenceFingerprint);
+      summary.suppressed.push({ key, sessionId: c.sessionId, why: 'noise-bucket-permission-prompt', waitingFor: c.waitingFor });
+      // 观察记录必须留下：这是 P0 唯一的数据来源，也是「修复没有把真阳性一起关掉」的反证基础。
+      const noiseObs = {
+        ts: new Date(nowMs).toISOString(),
+        sessionId: c.sessionId,
+        state: c.state,
+        idleSec: Number.isFinite(c.idleSec) ? c.idleSec : null,
+        kind: c.state,
+        autoAnswerable: false,
+        reason: c.reason || `host-fact:${c.state}`,
+        confidence: null,
+        notified: false,
+        why: 'noise-bucket-permission-prompt',
+        classify: 'host',
+        fingerprint: c.evidenceFingerprint || '',
+        source: c.source || null,
+        waitingFor: c.waitingFor || null,
+      };
+      summary.observations.push(noiseObs);
+      if (logger) logger.info(`suppressed WAITING noise-bucket=permission-prompt session=${c.sessionId}`);
+      continue;
+    }
+
     // ── 停止分类 ──
     // 宿主事实状态**不调用分类器**。
     //
@@ -1608,6 +1750,15 @@ export async function dispatchCandidates(candidates, {
 
     const key = dedupeKey(c.sessionId, c.state, c.reason, c.evidenceFingerprint);
     const entry = state.notified[key];
+
+    // 这条等待**此刻仍然被看到** → 刷新 lastSeenAt。
+    //
+    // 2026-11-09 修：以前只在条目创建时写一次 lastSeenAt，命中路径从不刷新
+    // （实测 72/72 条 lastSeenAt === firstSeenAt）。而 `pruneNotified` 的 TTL 从
+    // firstSeenAt 算 —— 于是一次持续超过 24 小时的等待会在第 25 小时被清掉，
+    // 然后**同一个等待被重新通知一次**。TTL 的语义应该是「多久没再看到它」，
+    // 不是「第一次看到它是多久以前」。
+    if (entry) entry.lastSeenAt = new Date(nowMs).toISOString();
 
     // 边沿已经处理过 → 永不再发。
     // `delivery: 'failed'` 也算「处理过」：发送失败退回仅记录，**不重试**。
@@ -1843,7 +1994,7 @@ export async function runTick({
       say(`undated|${u.jobId}|${u.state}|${u.why}`, `blocked-undated: ${u.jobId} state=${u.state} why=${u.why}（fail-closed，不通知）`);
     }
     try {
-      const waiting = probeWaiting(join(root, 'sessions'), { nowMs });
+      const waiting = probeWaiting(join(root, 'sessions'), { nowMs, projectsRoot });
       summary.ran.push('waiting');
       summary.timings.waitingMs = Math.round(waiting.elapsedMs);
       candidates = candidates.concat(waiting.found);
@@ -1881,7 +2032,7 @@ export async function runTick({
       for (const project of changed.slice(0, 5)) {
         try {
           const r = await scan({ project, days: 3 });
-          candidates = candidates.concat(candidatesFromScan(r.sessions, { nowMs }));
+          candidates = candidates.concat(candidatesFromScan(r.sessions, { nowMs, projectsRoot }));
           summary.timings.incrementalMs = Math.round(r.elapsedMs);
           summary.ran.push(`scan:${project}`);
         } catch (e) {
@@ -1939,7 +2090,7 @@ export async function runTick({
   if (forceFull) {
     try {
       const r = await scan({ project: null, days: 3 });
-      candidates = candidates.concat(candidatesFromScan(r.sessions, { nowMs }));
+      candidates = candidates.concat(candidatesFromScan(r.sessions, { nowMs, projectsRoot }));
       summary.timings.fullMs = Math.round(r.elapsedMs);
       summary.ran.push('full');
       state.lastFullScanAt = new Date(nowMs).toISOString();

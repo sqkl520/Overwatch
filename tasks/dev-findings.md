@@ -302,4 +302,20 @@
   超过 N 个周期就标红。`state.lastJobsScanAt` 已经存在，只是没人拿它跟现在比。
 - **处置（2026-10-31 已修）**：`watch.mjs --health`，按各层周期 ×3 判 stale。
   接进 `install-watcher.mjs status` 与 `SKILL.md` §0；结构门守住引用不被删。
+### DF-024 [open] 同一 tick 内 WAITING 与 ASKED 可能对同一会话各发一条（跨路径收敛未做）
+
+- **发现于**：2026-11-04-notify-fix / 修复 Agent F3（修去重键时顺带发现，**不在本次任务范围内**）
+- **位置**：`watch.mjs` 的 `runTick` 去重收敛块（`seen` 集合），与 `askedCandidates`
+- **证据**：`runTick` 用 `dedupeKey(sessionId, state, reasonClass, fingerprint)` 收敛**同 state**
+  的重复候选，所以 WAITING 与 ASKED 天然是不同键（state 不同）。验收标准 R7 要求
+  「同一会话同一 tick 内既有 WAITING 又有 ASKED 时只发一条，宿主事实 WAITING 优先」，
+  当前代码里没有这个优先级。
+- **影响**：一个会话停在 `AskUserQuestion` 上时，`probeWaiting`（WAITING）与 `asked.mjs`
+  （ASKED，门槛 1 小时）会在同一 tick 各产一条候选。`GLOBAL_MIN_GAP=10min` 挡住第二条，
+  但 10 分钟后的下一个 tick 它会照发 —— 用户收到两条说同一件事的通知。
+- **为什么不顺手修**：本次任务边界是「三个已确诊缺陷」，改这条要动 `runTick` 的收敛逻辑，
+  属于验收标准 §2.6 明确划在「跨 tick 的重复发送不在此次修复范围内」的那一类。
+  验收标准的 R7 是**修完之后才要核**的条目，不是本次的修复目标。
+- **建议归属**：独立任务，与标题统一（§2.1 的标签真源）一起做。
+
 _（新增条目追加在此行上方）_

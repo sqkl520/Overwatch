@@ -298,6 +298,9 @@ const PROBE_ARGS = {
   lastPermissionMode: '[]', parseAskAnswers: '""', relevanceOf: '["a", ["b"]]',
   answerIsNegative: '""', findEarlierMatch: '["a", ["b"]]', classifyStop: '[{}]',
   findStopPoint: '[[]]', formatStats: '[{}]',
+  // classify-stop.mjs / watch.mjs：未闭合等待型 tool_use 的锚点（2026-11-09 去重修复）。
+  // 两者都是纯的：空记录返回 []、不存在的路径返回 null。
+  openWaitingToolUseIds: '[[]]', waitingAnchor: '["/nonexistent", "sid", null, 0]',
   // asked.mjs 的现状对账（2026-11-02）。参数取最小可构造输入：
   // 空记录 / 缺失路径 / 空白时间戳，只要能跑通就算登记完成。
   // 这些函数都是纯的（readRecords/readHostSessions 读路径失败时返回 null/[]，不抛）。
@@ -488,6 +491,8 @@ function checkUnregisteredExports() {
     'inspectRecords', 'readRecords', 'lastCwd', 'readHostSessions',
     'continuedAfterQuestion', 'humanSpokeElsewhere', 'assessAsked',
     'ASKED_FRESHNESS', 'ASKED_MAX_SILENCE_HOURS',
+    // classify-stop.mjs / watch.mjs 的等待锚点（2026-11-09）。两个都已进 PROBE_ARGS 实际调用。
+    'WAITING_TOOL_NAMES', 'openWaitingToolUseIds', 'waitingAnchor',
     // probe-relay.mjs
     'listSessions', 'readPeerToken', 'canConnect', 'buildFrame', 'sendFrame', 'interpretReply',
     // validate-run.mjs

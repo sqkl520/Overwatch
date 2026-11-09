@@ -40,6 +40,25 @@ var wS = { running: "busy", requires_action: "waiting", idle: "idle" };
 `waitingFor` 由 `bVo()` 判定，取值包括 `input needed` / `dialog open` / `permission prompt` /
 `worker request` / `sandbox request` / `goal proposal`。
 
+**⚠ `permission prompt` 不是「有人要你点批准」，是 `requires_action` 的兜底桶 —— 它不产生通知（2026-11-09）。**
+
+按「宿主翻转状态的事件」逐条回放 transcript（n=75，见
+[`../research/2026-11-04-host-status-reliability.md`](../research/2026-11-04-host-status-reliability.md) §2.2）：
+
+| `waitingFor` | 事件数 | 真有悬空 `AskUserQuestion` | 精确率 |
+|---|---|---|---|
+| `input needed` | 9 | 9 | **100%** |
+| `permission prompt` | 66 | 0 | **0%** |
+
+这不是统计相关，是定义性的：宿主只在 `tool_name === 'AskUserQuestion'`（或 `dialog:` 前缀）时
+写 `input needed`，其余一律写 `permission prompt`。66 个里 46 个卡在会话自己写的
+`Bash(sleep 840~900)` 上 —— 它在等自己派的活儿，不是在等人。
+
+所以 `dispatchCandidates` 对 `waitingFor === 'permission prompt'` 的 WAITING 候选**不通知**，
+但**照常写观察记录**（`why: 'noise-bucket-permission-prompt'`）。删掉这个状态会让
+「自己在等」彻底不可见，既无法验证误报真的消失，也答不出宿主多久这样一次。
+`input needed` 的通知链路一个字未动。
+
 **修复前 `readLiveSessions()` 的注释写死「busy / idle」，`waiting` 从未被读出来。**
 后果实测：一个 `status:"waiting"`, `waitingFor:"input needed"` 的会话等了 23 天，
 被 `judgeState` 判成 `EXPLORING / dormant` —— **它在等人，系统说它在睡觉。**

@@ -159,3 +159,105 @@ node --test scripts/*.test.mjs       # 418 / 418 通过
    才会真正不再进仓——这是 git 操作，本任务禁止，留给用户决定。
 3. **`docs/PUBLISH-TRIAGE.md` 本身（本文件）判 PUBLIC**：它只写档位与理由，不含新增的本机信息；
    引用的敏感样例（模型名、项目名、令牌格式）均已在上文脱敏。
+
+---
+
+## 七、2026-11-04 批次（12 份新增文档）的判定与脱敏记录
+
+判定日期：2026-11-09（分拣 Agent S3）。判定依据同上，另加一条本轮新用的尺度：
+
+> **含本机标识 ≠ 必须 PRIVATE。** 判 PRIVATE 的门槛仍是 §五那四条（可执行攻击面 / 可构造的协议细节 /
+> 可被利用的权限事实 / 本机宿主的口子清单）。一份文档只要脱敏后**仍是一份可复用的排障与设计推理**，
+> 就判 SANITIZE，而不是因为出现了本机路径就整篇下架。
+
+### 7.1 逐份判定
+
+| 文件 | 档位 | 理由 | 改了什么 |
+|---|---|---|---|
+| `docs/research/2026-11-04-competitive-landscape.md` | **PUBLIC** | 竞品与失败案例调研。来源全部是公开官网、arXiv、HN Algolia、GitHub REST API，不含任何本机数据 | 未改。文中 `Agent E3` 是内部角色代号，非身份信息 |
+| `docs/research/2026-11-04-dsh-superagent-analysis.md` | **PUBLIC** | 对 `deepseek-ai/dsh-superagent-prototype` 的公开仓库逐行阅读，全部是对方代码路径与行号 | 未改 |
+| `docs/research/2026-11-04-external-harness-protocols.md` | **SANITIZE** | 协议调研，方法论与实测结论价值高；含一处本机 opencode 的 `session/new` 返回值 | 把那个**本机 opencode 会话 UUID** 换成 `<session-Y-uuid>`。其余（工具版本号、23 个 MCP 工具名）是公开协议事实 |
+| `docs/research/2026-11-04-orchestration-patterns.md` | **PUBLIC** | 七个框架的机制清单，每条带公开出处（`ccsub.md:300`、`mast.txt:169` 等） | 未改 |
+| `docs/research/2026-11-04-dedup-key-analysis.md` | **SANITIZE** | 去重键的五处产键点与变异实验，是全批**方法论最扎实**的一份；但通篇用真实会话键与真实项目目录做论据 | 会话短 ID → `<session-S/T/U/V/W>`；项目目录 slug → `<project-J-dir>`；`%LOCALAPPDATA%` 保留（环境变量，非路径）。**去重键的 16 位 hex 值保留**——它是 `sha256(sessionId|state|reasonClass|fingerprint)` 的前 16 位，会话 ID 已换、原值不可逆推，且这些值在已公开的 `docs/research/2026-11-02-*.md` 里也以同样形态存在 |
+| `docs/research/2026-11-04-fix-notify-dedup.md` | **SANITIZE** | 修复报告，含 508 条测试、6 个变异、真实回放 14357 条记录 | 项目目录 slug → `<project-J-slug>`；会话 ID → `<session-S>`；守护进程 PID → `<pid-A>`；临时盘根目录 → `<盘符>` |
+| `docs/research/2026-11-04-host-status-reliability.md` | **SANITIZE** | `waiting` 准确率 12% / 78% 的量化实测，结论价值极高；但含**一张 10 个真实会话名的表**（本批最大的集中泄漏） | 10 个会话显示名与 slug 全部换成 `<project-A…L>`；会话 ID → `<session-*>`；`AnthropicPBC.Claude_<pkg-hash>` 保留占位形态、抹掉真实包哈希 |
+| `docs/research/2026-11-04-notification-system-critique.md` | **SANITIZE** | 「该重做而不是修」的设计批判，四条判据画像与存活曲线是全项目最有价值的方法论之一 | 会话 ID、项目 slug 换占位符；「真实项目 51 个，最多的是 `<project-A>` 13 / Overwatch 10 / `<project-H-dir>` 9」保留数字、去掉名字 |
+| `docs/research/2026-11-04-redteam-notify-fix.md` | **SANITIZE** | 红队攻击，**本批泄漏最重的一份**：C2 那一段把 5 个真实项目名一次性列全，C3 的碰撞表还带 7 个本机临时目录名 | ①§0/C1 的 `name ↔ cwd` 对照表全部换占位符（`<project-B>` / `<project-J>` / `<project-I>` / `<project-E>` 等）；②C2 的「5 个不同项目」名单换成 `<project-A…E>`，那串 `C--Users-<user>-A…` 换 `<tmp-slug-prefix>`；③C3 的 4 组碰撞表逐条换（含 7 个 `ow-*` 临时目录 → `<scratch-dir-1…7>`）；④A3 的 `session <uuid> (<pid>.json)` 与 `cwd="…"` 换占位符；⑤§6 复现命令里的 `.tmp-rt2/` 保留（目录已 gitignore，名字本身不含信息） |
+| `docs/research/2026-11-04-waiting-notification-diagnosis.md` | **SANITIZE** | 45 秒迟到那条事故的完整时间线，是验收标准 F1 的证据来源 | 会话快照的 `sessionId` / `hostSessionId` / `cwd` / `pid` / `pidDomain` 全部换占位符（`pidDomain` 原本含主机名）；日志行的 slug 换 `<project-J-slug>`；Toast 载荷里的项目名换占位符 |
+| `docs/research/2026-11-04-watcher-silent-failure.md` | **SANITIZE** | 见 7.3 的专项说明——本批唯一一份**脱敏后仍值得公开**的本机诊断 | 用户目录下的 `AppData\Local\Overwatch` 绝对路径 → `<user-home>\AppData\Local\Overwatch`；仓库根绝对路径 → `<repo>`；MSIX 包哈希 → `<pkg-hash>`；进程链三个 PID → `<pid-A/B/C>`；NTFS 文件 ID → `<file-id-A>` |
+| `docs/spec/2026-11-04-notify-fix-acceptance.md` | **SANITIZE** | 预先声明的验收标准，方法论价值最高（它自己的 §8 就有一份「污染披露」）。判 SANITIZE 而非 PRIVATE 的理由与 `2026-11-02-autorelay-acceptance.md` 相同：通篇是「什么算修好了」，不含任何通道或凭据 | 示例 slug / 中文会话名 / `cwd` 样例换占位符。**因为这份文件自带「不许事后改标准」的硬规则**，改动以 §7 的「修订 1」形式追加，明写「改的是示例取值、判定规则一字未动、发出时未看到修复结论」 |
+| `docs/design/2026-11-04-next-phase-plan.md` | **SANITIZE** | 下一阶段规划的完整推演，含五个 Agent 的可用 prompt 骨架；用户原话已由作者抽象成「让工具中的 AI 能读到对话的具体内容…」这类非业务表述 | `%LOCALAPPDATA%\Overwatch\…` 保留（环境变量）；守护进程 PID → `<pid-A>`；一处会话显示名 → `<project-J-name>` |
+
+**本批统计**：共 **13 份**（任务清单列了 12 份，另加 `docs/spec/2026-11-04-notify-fix-acceptance.md` —— 它也是本批新增、且是修复报告引用的验收标准，必须一并判定）。其中 `PUBLIC` 3 份，`SANITIZE` 10 份，`PRIVATE` **0 份**。
+
+### 7.2 为什么本批没有 PRIVATE
+
+上一批 5 份 PRIVATE 的共同点是**给出了可执行的东西**：帧格式、免认证端点、ACL 面、令牌位置、宿主口子清单。
+本批 12 份没有一份具备其中任一条：
+
+- 三份对手/协议调研的「对象」是公开仓库与公开文档，泄漏面为零。
+- 其余九份的对象是**本仓库自己的守护进程逻辑**（`watch.mjs` 的探针、去重、派发、TTL）。
+  这类内容的敏感度只有一层：**它引用了哪台机器上的哪些会话**。把这层换掉，剩下的就是
+  「通知系统为什么会误报」这类任何做 cron 告警的人都能用上的推理。
+- 唯一擦边的是 `watcher-silent-failure.md`：它详细写了 MSIX 虚拟化怎么骗过诊断工具。但它给的是
+  **判别方法**（`\\?\` 前缀、WMI 起非虚拟化进程、fsutil 按文件 ID 反查），不是**攻击方法**——
+  这三条都是微软公开文档里的常规排障手段，且它们的用途是「读到自己机器上的真实文件」，
+  不是「读到别人机器上的文件」。所以判 SANITIZE。
+
+### 7.3 `watcher-silent-failure` 的单独说明（任务里点名要求判断）
+
+任务问「含本机路径的，要看脱敏后还剩多少价值」。答案是**剩得很多**，理由三条：
+
+1. **它是一个可复用的排障范式**：现象（进程活着但文件不动）→ 三个候选根因 → 逐条判定 →
+   一个 5 分钟可跑的判别实验。落在这类坑里的不只是 Overwatch，任何「在 Claude/Codex 会话里
+   读 `%LOCALAPPDATA%` 的监控脚本」都会中招。
+2. **它推翻了一个看起来很硬的结论**：主线程当时报的三条「已确认事实」全部不成立，
+   而报告把「我前半段也在影子视角里取证」写在结论里，而不是藏起来。
+3. **它的敏感部分是「这台机器有两个目录」这个事实**，而这个事实的本机指认（主机名、包哈希、
+   文件 ID、PID 链）已经全部换成占位符。剩下的「MSIX 会重定向 `%LOCALAPPDATA%`」是微软公开行为。
+
+代价是它读起来比原来费劲一点（占位符多了），但**技术结论、实测数字（41857 vs 606090 字节）、
+实验步骤一个字未改**。
+
+### 7.4 本轮实际替换的敏感项清单（复核用）
+
+| 类别 | 实例（脱敏前的**形态**，具体取值不再转录） | 换成 |
+|---|---|---|
+| 绝对路径 | `<用户目录>\AppData\Local\Overwatch`、`<盘符>:\Projects\<repo>`、`<盘符>:\Projects\<某父目录>\…` | `<user-home>` / `<repo>` / `<盘符>:\\<project-J-parent>` |
+| 机器/包指纹 | `AnthropicPBC.Claude_<15 位包哈希>`、NTFS `Parent FileRef#`（16 位 hex） | `<pkg-hash>`、`<file-id-A>` |
+| 进程 ID | 守护进程、其父 `cmd`、`wscript`、会话宿主共 5 个 | `<pid-A>` … `<pid-E>` |
+| 会话 UUID / 短 ID | 4 个完整 UUID（含一个 `local_` 前缀的宿主会话 ID）、5 个 8 位短 ID | `<session-S/T/Y-uuid>`、`<host-session-uuid>`、短 ID `<session-S…X>` |
+| 真实项目名 | 12 个会话显示名 + 它们对应的目录名（含一个中文名、一个带感叹号的英文名、一个 `dsh-` 前缀名） | `<project-A…L>` 及其 `-name` / `-slug` / `-dir` 变体 |
+| 临时目录名 | 7 个 `ow-*` / `*probe` 形态的盘根临时目录 | `<scratch-dir-1…7>` |
+| 主机名 | `pidDomain` 字段里的 `win32:<主机名>` | 保留占位形态，主机名原值抹掉 |
+
+> **这一节不再列出原值。** 上一节的「替换前」列原本按类别抄了实例，那本身就是二次泄漏——
+> 同一批名字已经在被脱敏的文档里被清掉，没有理由在清单里再写一遍。
+> 需要逐个核对原值时，查 `git show <这次提交之前的 HEAD>:docs/research/2026-11-04-*.md`（本机可读）。
+
+**未替换、且有意保留的**：
+- `%LOCALAPPDATA%` / `%TEMP%` / `%USERPROFILE%`——环境变量，不是本机路径。
+- `OmniSight` / `Overwatch`——本仓库自己的名字，README 首行就有。
+- `sqkl520`——GitHub 账号，clone URL 已公开。
+- 去重键的 16 位 hex 与 `tool_use_id`——见 7.1 表格里 `dedup-key-analysis` 那行的理由。
+- 各工具的版本号（`2.1.289` / `2.1.308` / `1.19.2` / `0.163.0`）——公开的版本标识，
+  且它们是「这条实测是在哪版上做的」的必要限定语。
+
+### 7.5 两个怪文件的复核
+
+任务点名的两个根目录文件：
+
+```
+D:ProjectsOverwatchtasksruns2026-11-02-path-b-recountdbdump2.out.txt
+D:ProjectsOverwatchtasksruns2026-11-02-path-b-recountlatency10.out.txt
+```
+
+**它们已经不在了。** 复核方式：`ls -1 | grep -i ProjectsOverwatch` 返回空；
+`find . -maxdepth 2 -name '*.out.txt'` 在仓库根命中 0 个；`git ls-files | grep ProjectsOverwatch` 也返回空。
+它们由上一轮（`§二`）删除，本轮确认删除状态仍然成立、没有被任何工具重新生成。
+
+> 顺带核到一件更重要的事：`tasks/runs/2026-11-02-path-b-recount/` 里**同名的正常产物**
+> （`dbdump2.out.txt` / `latency10.out.txt`）**含真敏感内容**——它们是第三方网关的探针矩阵，
+> 带完整端点 URL、`providers` 表、认证失败原文。**该目录已 gitignore，本次不提交**，
+> 但这一条值得写下来：上一轮删掉的只是「路径拼接失败」的垃圾，正主还在 `tasks/runs/` 里。
+

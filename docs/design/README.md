@@ -17,6 +17,7 @@
 | [`verdict-intent-contract.md`](verdict-intent-contract.md) | **裁决记录** | — | 本身不是方案，是三方的裁决过程与结论 |
 | [`frontend-and-shape.md`](frontend-and-shape.md) | **Proposed** | — | 前端三层形态、策略文件 schema、自动接力的分级与用户规则。**技术前提已实测**（命名管道可达），但「接收方会不会执行 AI 发的指令」尚未验证 |
 | [`continuation-engine.md`](continuation-engine.md) | **Proposed** | — | 读 transcript 还原需求与进度、按证据分级判断达没达到、产出「继续」而非「重来」的指令草稿。**未实现**。结论：前两件可做且廉价（有效上下文 p50≈315 token），第三件受 ADR-0001 约束，只能产草稿 |
+| [`2026-11-04-next-phase-plan.md`](2026-11-04-next-phase-plan.md) | **Proposed** | — | 下一阶段的优先级判定与任务拆解（五件事、为什么是这五件）。**零行实现**，是规划产物，不是能力说明 |
 
 ## `hosted-mode.md` 的已实现 / 未实现对照
 

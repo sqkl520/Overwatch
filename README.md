@@ -1,244 +1,149 @@
-# Overwatch · OmniSight
+# Overwatch
 
-> **Omni（全）+ Sight（看见），双关 Oversight（监督）。**
-> 它看见的不是一个会话，而是所有 AI 对话的全景。
-> **Oversight —— 无处不在的监督，而不是无处不在的干预。**
+**把所有 AI 会话压成一张表，在会话等你时叫醒你，并把「AI 说它做完了」变成一句可核对的断言。**
+
+零 npm 依赖（仓库里没有 `package.json`），只要 Node ≥ 18。不安装、不登录、不配置。
 
 ---
 
-## ⚠ 能力边界（先读这一段）
+## 它解决什么问题
 
-**本库不能自动接力。**
+同时开五六个会话已经很常见。真正的摩擦不是切窗口，而是几小时后回来时记不清**哪个在干什么、哪个卡住了、哪个一直在等你**：一个会话三小时前抛了个二选一的问题，你没看见；另一个说「修好了」，其实只是把报错吞了；其余几个在跑，但你不知道它们是在推进还是在原地打转。
 
-Relay 会产出接力草稿，但**需要你复制并发送**。原因是宿主的注入语义：
+Overwatch 给这三件事可见性：扫全部 transcript → 判状态 → 只在真的需要你时通知。它不替你决策，也不往运行中的会话里写东西。
 
-> `claude --help` 中 `--bg --resume <session-id>` 的原文：
-> continues that session in the background under the same ID, **or starts a copy and says so when the session is already running**
+## 30 秒上手
 
-目标会话正在运行时，注入落到副本上，你的窗口里不会出现任何东西。宿主虽有跨会话消息通道（本机 8 个交互会话全部注册了 `messagingSocketPath`），但投递必须标注来源，无法做到「无痕模仿用户」。
+```bash
+git clone https://github.com/sqkl520/Overwatch.git
+cd Overwatch
+node scripts/scan-sessions.mjs --days 3
+```
 
-**因此本库无法独立满足原始设计稿 §1「会话写入不可降级」的要求。** 我们选择如实声明，而不是假装满足。完整推演见 [ADR-0001](docs/adr/0001-config-only.md) 与 [ADR-0002](docs/adr/0002-honest-degradation.md)。
+真实输出格式（项目名已替换）：
 
-### 它实际能做什么
+```
+OmniSight 会话扫描 · 最近 3 天 · 19 个有活动的会话
+liveness: reconstructed（事后重建，非实时上报）
 
-**一句话：把 30 个会话压成一张表，并在会话等你时叫醒你。**
+[PRODUCING] Projects/<repo>     calls=  988 sub=    13 depth=1 novelty=0.97 hb=0s/120s    idle=5s   persistent-change-in-window
+[EXPLORING] Projects/<repo-2>   calls= 5840 sub=100/272~ depth=1 novelty=1.00 hb=0s/120s  idle=67.5h dormant
+```
 
-| 能 | 不能 |
+`--days 3` 一次全量实测约 **33 秒**。`dormant` 不告警——会话只是结束了，不是坏了。
+
+```bash
+node scripts/oversight-tui.mjs            # 面板：列表 → Enter 详情 → c 复制接力草稿
+node scripts/watch.mjs --inbox            # 一次性看谁在等你
+node scripts/install-watcher.mjs install  # 开机自启 + 桌面通知
+```
+
+Windows 有开机自启和 Toast；macOS / Linux 给出 launchd / systemd 配置但没有通知通道，退回写 `runner.log`。**没有通知通道时不会静默丢弃**，`--inbox` 随时能看。
+
+## 核心能力
+
+| 能做 | 不能做 |
 |---|---|
-| 扫描所有会话，压成一张可排序的表 | 实时干预运行中的会话 |
-| 透传宿主自己写好的 `needs` / `suggestedReply`（「它在等什么」「建议回什么」） | 自动把回复发进目标会话 |
-| 检出写入动作（`Write`/`Edit`/写命令），区分「在改东西」和「在读东西」 | 判断改得对不对 |
-| 在会话等你时发桌面通知（宿主 `status: waiting`） | 从「它停了很久」推断失败——**已实测删除该推断** |
-| 告诉你它在等什么（`input needed` / `dialog open` / `permission prompt` 等） | 读完普通对话就能知道所有细节 |
-| 生成带具体下一步的接力草稿，由你复制发送 | 自动接力 |
+| 扫全部会话，压成一张可排序的表 | 实时干预运行中的会话 |
+| 透传宿主的 `needs` / `suggestedReply`（它在等什么、建议回什么） | 自动把回复发进目标会话 |
+| 检出持久化变更（`Write`/`Edit`/写命令），区分「在改东西」和「在读东西」 | 判断改得对不对 |
+| 会话等你时弹桌面通知（宿主 `status: waiting`） | 从「停了很久」推断失败——**实测后已删除该推断** |
+| 把完成声明与支持它的工具调用配对，判四档（见下） | 保证 AI 没在别处撒谎 |
+| 生成带具体下一步的接力草稿，由你复制发送 | 自动接力（见下） |
 
-**关于「四态」**：代码里确实有 `PRODUCING` / `EXPLORING` / `STALLED` / `FAILED` / `BLOCKED`，但它们在真实数据里极不均衡。2026-10-31 实测 129 个会话的末态：
+### 关于「四态」
+
+代码里有 `EXPLORING` / `PRODUCING` / `STALLED` / `FAILED` / `BLOCKED` / `WAITING`，但在真实数据里极不均衡。2026-10-31 实测 129 个会话的末态：
 
 | 状态 | 命中 | 说明 |
 |---|---|---|
 | `EXPLORING` | 122 | 绝大多数会话的末态 |
 | `PRODUCING` | 4 | 窗口内有真实写入 |
-| `BLOCKED` | 2 | 宿主报的，不是推的 |
-| `FAILED` | 1 | 宿主报的，不是推的 |
-| `WAITING` | 0–1 | 宿主报的实时状态，用户一回话就消失，所以抓不到末态 |
+| `BLOCKED` / `FAILED` | 2 / 1 | 宿主报的，不是推的 |
+| `WAITING` | 0–1 | 宿主实时状态，你一说话就消失，抓不到末态 |
 | `STALLED` | **0** | 全语料 56,809 个滑窗里命中 10 次（0.018%），末态从未命中 |
 
-**所以不要把它当「状态机」用。** 它是一张表加一个宿主事实触发器。`STALLED` 已经不参与通知（见下一节），`FAILED` 只认宿主上报。
+**不要把它当状态机用。** 真正能驱动动作的只有宿主上报的那几个。会发通知的是 `WAITING` / `BLOCKED` / `FAILED` / `ASKED`；前三个的判据来自宿主文件、不来自推断，`ASKED` 是从 transcript 文本推的，走另一套更严的门。
 
----
+## 和官方 `claude agents` 是什么关系
 
-## 30 秒上手
-
-```bash
-git clone https://github.com/sqcola/Overwatch.git
-cd Overwatch
-node scripts/scan-sessions.mjs --days 3
-```
-
-输出示例（本机实跑，节选）：
+`claude agents --json` 已经能列出所有会话、按状态分组、可派发可回复。**它把「看清有哪些会话」这件事原生做完了**，这一点直说。两者回答不同的问题：
 
 ```
-OmniSight 会话扫描 · 最近 3 天 · 23 个有活动的会话
-liveness: reconstructed（事后重建，非实时上报）
-
-宿主注册的活跃会话 2 个：
-  idle  <session-A>                        可投递(带来源标注)
-  busy  <session-B>                        可投递(带来源标注)
-
-[PRODUCING] Projects/<repo>      calls= 2465 sub=     28 depth=1 novelty=0.96 hb=0s/120s     idle=6s    persistent-change-in-window
-[EXPLORING] Projects/<repo-2>     calls=  185 sub=      0 depth=0 novelty=1.00 hb=91s/900s    idle=326.9h dormant
+claude agents --json  →  宿主注册了哪些会话，此刻 busy / idle / blocked
+scan-sessions.mjs     →  这些会话在干什么、有没有卡住、卡在哪儿
 ```
 
-`dormant` 的会话不告警——它们只是结束了，不是坏了。
+同一次运行实测：前者给 10 条（blocked=2 busy=4 idle=4），`scan --days 3` 给 19 条（PRODUCING=3 EXPLORING=16）。`claude agents` 看不到 `failed`，也没有 novelty、idle 时长、派生树、token 用量；`scan` 则要从 transcript 重建，天生有延迟。**两个都用**：`scan` 判断「该不该管」，`claude agents` 确认「这个会话是否真的注册着、能不能投递」。
 
-零依赖，只需 Node ≥ 18。
-### 在别处运行
+本仓库超出这一层的地方只有一处：**断言与证据的核对**。其余能力官方在覆盖，开源侧也有几千个同类项目——不假装这是蓝海。
 
-```bash
-git clone <repo> && cd Overwatch
-node scripts/scan-sessions.mjs --days 3      # 不需要安装，直接能跑
-node scripts/watch.mjs --inbox                # 看有没有会话在等你
-```
+## 为什么不能自动接力
 
-**零依赖**，只要 Node ≥ 18。
+**这不是本库的缺陷，是平台的安全边界。**
 
-想让它常驻并弹通知：
+官方文档写明：来自另一个会话的消息**永远不算你的同意**——不能替你回答权限提示、不能改配置、消息里的斜杠命令不会被执行。`claude --help` 对 `--bg --resume <session-id>` 的原文也是「或者在会话已在运行时启动一个副本并说明这一点」：你以为接上了，实际另一个副本在跑。
 
-```bash
-node scripts/install-watcher.mjs install
-```
+所以 `relay.deliver` 只有一个合法值：`manual`。草稿由 TUI 按 `c` 复制，或由 Relay Agent 写好经 Safety Agent 过红线，**粘贴和回车这两步永远是你的**。往这个方向加自动化，等于和平台的安全模型对打。
 
-| 平台 | 开机自启 | 桌面通知 |
+## 通知系统：三个修掉的真 bug
+
+2026-11-04 的修复，每一个都有真实日志与负向测试（把 bug 装回去测试必然变红）。
+
+| 缺陷 | 实测 | 修复后 |
 |---|---|---|
-| Windows | ✓ 启动文件夹 | ✓ Toast |
-| macOS | 给出 launchd 配置 | ✗ 退回终端输出 |
-| Linux | 给出 systemd user unit | ✗ 退回终端输出 |
+| `permission prompt` 是噪声桶 | **66/66 = 0% 真阳性**（`input needed` 是 9/9 = 100%） | 不再通知，但照常写观察记录 |
+| 去重键恒等 | 会话 `<session-S>` 的 **8 次真实等待挤成 1 个键**，一次都收不到 | 8 次等待 → 8 个键 |
+| `lastSeenAt` 从不刷新 | 现场 **73/73 条**记录 `lastSeenAt === firstSeenAt`，超过 24h 的等待在第 25 小时被重新通知 | TTL 改按 `lastSeenAt` 计时 |
 
-没有通知通道时，通知会写进 `runner.log` 并标为正常投递——
-**不会静默丢弃**，你可以定期 `--inbox` 看。
+真实日志里 `already=1` 出现 **5413 次**，其中连续 **2213 个 tick（585 分钟）**在同一个键上空转——这就是键恒等的形状。
 
-#### 同一台机器跑两份
+更早一次删代码同样值得记：初版会推断「末次调用间隔超自适应 p95 且停够 60 秒 → `FAILED`」。全语料实测后删掉——真实运行发了 5 条通知，**5 条全是它发明的 `FAILED`**，对应会话分别在 13 / 151 / 411 秒后继续干活，最离谱的一条在报「失败」时正在跑 `sleep 240`。删掉之后脚本从「猜 5 次全错」变成「不猜」。
 
-数据目录默认是固定路径（`%LOCALAPPDATA%\Overwatch` / `~/.local/state/overwatch`），
-**两份克隆会共用它**。检测到会报 `state-shared` 并把冲突的仓库路径写进日志。
-要隔离就显式指定：
+## 唯一站得住的差异：断言 vs 证据
 
-```bash
-OVERWATCH_STATE_DIR=/path/to/my-state node scripts/watch.mjs
+Agent 报「修好了」而实际只是把报错吞了——HN 长贴上反复出现的词是 **「sanitised optimism」**，有用户的说法是「现在我总让它先证明真的生效了再往下走」。Cognition 2026 的实测方向一致：独立的干净上下文 review agent 平均每个 PR 抓 2 个 bug，约 58% 是严重的。
+
+`scripts/verify-claims.mjs` 把这件事做成可运行的判据：从最后一条 assistant 文本认出可核对的完成性断言（测试通过 / 构建成功 / 已提交 / 已推送 / 文件数 / hash），在 transcript 的 tool_use / tool_result 里找支持它的调用，再按「最后一次源码编辑」这条时间线判四档：
+
+```
+SUPPORTED / STALE_ONLY / FAILED_ONLY / NO_EVIDENCE   （另有 UNKNOWN = 读不全，不当「没有」）
 ```
 
+全量实测（228 个主 transcript、31 条断言）：`SUPPORTED 26 / STALE_ONLY 1 / FAILED_ONLY 0 / NO_EVIDENCE 1 / UNKNOWN 3`。人工抽检 13 条：11 条判对、2 条判错，**精度约 84.6%**（样本小，只能当量级看）。全量耗时 2.9–5.6 秒。
 
----
+同仓库还有两个确定性判据：`stop-signals.mjs`（停机原因的结构判定：错误停机、死循环、上下文压力、原始目标提取，全部不读语义）和 `asked.mjs`（从文本判断「问了没答」，不依赖宿主）。都能直接跑，例如 `node scripts/verify-claims.mjs --days 3`、`node scripts/stop-signals.mjs`。
 
-## 目录地图
+## 目录
 
 ```
 Overwatch/
-├─ .claude/
-│  ├─ agents/          12 个角色定义（唯一真源，宿主直接加载）
-│  └─ skills/oversight/  调度入口 /oversight
-├─ docs/
-│  ├─ GUIDE.md         使用手册：你会看到什么、该做什么
-│  ├─ CHANGELOG.md     改了什么，按工作阶段记录
-│  ├─ spec/            七份规格：状态模型 / 派发契约 / 证据纪律 / 接力协议 / 输出格式 / TUI 视觉 / 原始设计稿
-│  └─ adr/             两个决策记录：为什么纯配置库、为什么诚实降级
-├─ scripts/
-│  ├─ scan-sessions.mjs    「眼睛」：扫描会话并判定状态
-│  ├─ watch.mjs            「守夜人」：三层轮询，在会话等你或失败时通知
-│  ├─ oversight-tui.mjs    终端界面：列表 / 详情 / 帮助 / 草稿
-│  ├─ tui-theme.mjs        状态字形与配色（单一真源）
-│  ├─ check-structure.mjs  结构硬门
-│  └─ *.test.mjs           190 条回归测试
-├─ tasks/
-│  ├─ dev-findings.md      范围外发现（不许自行修）
-│  └─ accepted-deviations.md  已知不修（不计入判定）
-└─ templates/          派发 / 验收标准 / 接力消息 / findings 模板
+├─ .claude/agents/       12 个角色定义（宿主直接加载）
+├─ docs/                 GUIDE 使用手册 · spec 规格 · adr 决策 · research 实测报告
+│                        design/ 全是未实现的设计推演，状态见 docs/design/README.md
+├─ scripts/              scan / watch / verify-claims / stop-signals / TUI / 硬门
+└─ tasks/                两本台账：范围外发现、已知偏差
 ```
 
-**每个目录都有真实内容，没有占位目录。** `scripts/check-structure.mjs` 会验证这一点。
+改动后必跑 `node scripts/check-structure.mjs`（结构硬门）与 `node --test scripts/*.test.mjs`（508 条回归测试）。
 
----
+## 已知局限
 
-## 三个脚本
+这些不是待办，是知道但选择不做的：
 
-| 命令 | 用途 |
-|---|---|
-| `node scripts/oversight-tui.mjs` | **主界面**。列表 → `Enter` 详情 → `c` 复制接力草稿。非 TTY 自动降级纯文本 |
-| `node scripts/scan-sessions.mjs --days 3` | 一次性快照，输出纯文本或 `--json` |
-| `node scripts/scan-sessions.mjs --recalibrate --days 7` | 重算 novelty 权重（换机器或工作方式变了就跑一次） |
-
-完整说明见 **[docs/GUIDE.md](docs/GUIDE.md)**。
-
----
-
-## 核心概念
-
-### 通知只由宿主事实触发
-
-最初的版本会推断：**末次调用间隔超过自适应 p95、且停够 60 秒 → 判 `FAILED`**。
-
-2026-10-31 全语料实测后删掉了这条推断。真实运行发了 5 条通知，**5 条全是它发明的 `FAILED`**——对应的会话在 13 秒 / 151 秒 / 411 秒后继续干活。最离谱的一条，报「失败」时那个会话正在跑 `sleep 240`。
-
-删除后 `NOTIFY_STATES = ['FAILED', 'BLOCKED']`，两者都只认 `~/.claude/jobs/*/state.json` 里宿主写的 `state` 字段。**它不再猜。**
-
-这是我做过的改动里唯一一条「删代码比加代码更有用」的：脚本从「猜 5 次全错」变成「不猜」。
-
-### 状态判定（不是状态机）
-
-代码保留了有序互斥判定，首个命中即返回：
-
-| 状态 | 判据 | 处置 |
+| 局限 | 实测 | 为什么不修 |
 |---|---|---|
-| `FAILED` | **仅**宿主 `jobs.state === 'failed'` | 全量重跑（唯一允许重跑的状态） |
-| `BLOCKED` | **仅**宿主 `jobs.state === 'blocked'` | 看它 `needs` 写了什么 |
-| `WAITING` | **仅**宿主 `sessions.status === 'waiting'` | **回它**。`waitingFor` 说明在等什么 |
-| `EXPLORING` | 只读工具 / 长期休眠 | **不干预**，只做预算管理 |
-| `PRODUCING` | 窗口内有**持久化变更**（`Write`/`Edit`/写命令） | 不干预，等验收 |
-| `STALLED` | 连续 3 窗 novelty < 0.2 且无变更 | 实测 0.018% 命中，**不触发通知** |
-
-判定是**有序互斥**的，首个命中即返回。完整定义见 [docs/spec/state-model.md](docs/spec/state-model.md)。
-
-**为什么 `PRODUCING` 只认持久化变更**：`ls` / `grep` / `git status` 都走 Bash，如果把 Bash 一概算作「在产出」，纯探索会被判 `PRODUCING`，状态机没有出口。
-
-### 为什么心跳阈值不是固定值
-
-实测本机 3,354 个 transcript、1,386,846 个调用间隔（2026-10-31 复算）：
-
-- 至少出现一次 >180s 间隔的会话占 **52.7%**
-- 全部间隔中 >180s 占 **1.95%**，p95 = 70.7s，p99 = 331.6s
-
-按固定 180s 判失败，一半以上的会话会被误判至少一次。所以阈值取**每个会话自身的 p95**（夹在 120s–900s）。
-
-> ⚠ 这三个数字此前写作「63.1% / 9.72% / p99=1444s」，已确认无法从当前语料复现，上面的数字是重算结果。README 曾长期引用未复算的数字，这正是本次重写的起因之一。
-
----
-
-## 设计原则
-
-1. **主线程只做三件事**：拆解、派发、汇总。不亲自检索、分析、编码、写作。
-2. **锐评与验收是两道独立的门**：锐评管「好不好」，验收管「过不过」。混了就变成一个人的左右手。
-3. **只读靠工具白名单，不靠 prompt**：`acceptor` / `review` / `redteam` / `critic` / `safety` / `probe` 的 `tools` 中没有 `Edit`。`check-structure.mjs` 会验证。
-4. **禁止静默共识**：多个 Agent 结论相同时，必须至少一个被要求找反面证据。找不到反面证据 ≠ 结论正确。
-5. **token 充足不意味着可以跳过辩论**，只意味着辩论可以更深、更狠。
-6. **看不见的东西不告警。** 通知只能由宿主事实（`jobs.state`）触发，不由推断触发。宁可漏报，不可误报——误报通知会让人开始忽略通知。
-
----
-
-## 已知局限（不打算近期修）
-
-这些不是待办，是我知道但选择不做的：
-
-| 局限 | 实测数据 | 为什么不修 |
-|---|---|---|
-| 在线停止分类基本失效 | 在线路径 **95.4%** 判 `UNCLASSIFIABLE` | 结构性：分类器需要「下一句」才能判断这次停止是问句还是结束，而在线时下一句还没发生 |
-| 抑制准确率无法自测 | 无自动测量手段 | 需要人标注「这条通知该不该发」，没有基准 |
+| 在线停止分类基本失效 | 在线路径 **95.4%** 判 `UNCLASSIFIABLE` | 结构性：要判这次停止是问句还是结束得看下一句，而在线时下一句还没发生 |
+| 通知抑制准确率无法自测 | 无自动测量手段 | 需要人标注「这条该不该发」，没有基准 |
 | `needs` 覆盖稀疏 | 16 个 job 里只有 2 个带 `needs`、1 个带 `suggestedReply` | 宿主只在阻塞时写，取决于用法 |
-| 四态里 `STALLED` 近乎不可达 | 全语料 0.018% | 见上文「状态判定」 |
+| `STALLED` 近乎不可达 | 全语料 0.018% | 见上文「四态」 |
 
-**够用与否的判断**：如果你要的是「30 个会话里哪个在等我」，够用。如果你要的是「自动接力、自动决策」，**不够用，而且我知道缺什么**——见 [ADR-0001](docs/adr/0001-config-only.md)。
+两条和本库无关但影响你怎么用它：
 
-### 关于 `docs/design/` 里的 970 行
+- **多 agent 不是免费的。** Anthropic 自述多 agent 系统比 chat 多烧约 **15×** token，且 token 用量单独解释 **80%** 的性能方差——收益主要来自花更多 token，不是架构更聪明。MAST 论文（1600+ 轨迹）实测「改进角色规格」和「增强协调」两种干预效果不充分；本仓库 `.claude/agents/` 的方法论属于后一类，别指望它能单独把结果变好。
+- **扫描是事后重建，不是实时。** 每个文件只读末尾 4 MB，主 transcript 取末尾 1200 条记录。要确认某个会话此刻的真实状态，最可靠的办法是打开它看一眼。
 
-仓库里有一批设计文档，描述的是**分级升级、意图契约、自动投递**这些能力。
-
-**它们一行代码都没实现。**
-
-保留是因为里面有实测数据（可代答率 **2.5%**、子 Agent 信号误判 **70.9%** 等），删了要重做。
-但**不要按它们实施**——其中「自动投递」在 [ADR-0001](docs/adr/0001-config-only.md) 里已被证明做不到。
-
-逐份状态与「哪节已实现」的对照见 [docs/design/README.md](docs/design/README.md)。
-
----
-
-## 参考与致谢
-
-目录结构的组织方式参考了一个同类项目的双层工作区模式，但**刻意不照搬**：
-
-- **借鉴**：控制层与发布层分离、四件套证据纪律、两本台账、机器可读的验收标准、agent 工具白名单限制写权限。
-- **丢弃**：`versions/` 提交二进制、`tasks/` 占 42% 跟踪文件、`agent-memory` 多份分叉副本、硬编码本机路径、单版本 449 行的 CHANGELOG。
-- **警惕**：那个项目的 `.gitignore` 忽略了 `.claude/`、`rules/`、`tasks/`——对它是正确的（只发布 `src/`），对**本仓库是致命的**，照抄会让 `git add -A` 静默什么都不加。`check-structure.mjs` 专门检查这条。
-
----
+**够用与否**：要「这几个会话里哪个在等我、哪个在报假完成」，够用；要「自动接力、自动决策」，**不够用**，而原因是平台的墙，不是缺一个 feature。
 
 ## License
 

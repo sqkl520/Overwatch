@@ -699,7 +699,15 @@ test('runTick 的 dry-run 会算出候选但不发通知', async () => {
   }
 });
 
-test('L-fast 与 L-full 报同一事件时只发一条（三层共享去重）', async () => {
+test('L-fast 与 L-full 报同一事件时只发一条 —— 但挡住第二条的是限额，不是键相等', async () => {
+  // ⚠ 2026-11-09 更正：这条测试原来的标题是「三层共享去重」，**它在说谎**。
+  // 实测（docs/research/2026-11-04-dedup-key-analysis.md §2.1）：两个候选的键**不相等**
+  // （jobs 用事件时刻、scan 用 lastActivity），第一个发出后第二个撞上
+  // `GLOBAL_MIN_GAP = 10min`（canNotify，watch.mjs）被抑制。把间隔调成 0 就会看到两条。
+  //
+  // 所以这条测的是「限额挡住了重复」，不是「去重键统一了」。真正的跨层去重测试是
+  // 下面那条 `真正测去重：同一 WAITING 事件跨两个 tick 只发一条（不靠限额）`。
+  // 本用例保留原名描述的行为（同一 tick 内不重复发），但标题必须说实话。
   const dir = tmp();
   const claude = tmp();
   try {
@@ -723,6 +731,48 @@ test('L-fast 与 L-full 报同一事件时只发一条（三层共享去重）',
     });
     assert.equal(n, 1, '同一事件只能发一条');
     assert.equal(r.already + r.sent.length, 1);
+    // 把真正的机制也钉住：第二条第 why 是 global-10min，不是 already-notified。
+    // 这条断言就是「测试靠限额通过」的直接证据——将来键真的统一了，它会变红并提示改名。
+    assert.equal(r.suppressed.length, 1, '第二条应被限额挡下');
+    assert.equal(r.suppressed[0].why, 'global-10min', '挡下它的是最小间隔，不是去重键');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(claude, { recursive: true, force: true });
+  }
+});
+
+test('真正测去重：同一 WAITING 事件跨两个 tick 只发一条（不靠限额）', async () => {
+  // 与上一条互补：两个 tick 相隔 11 分钟（跨过 GLOBAL_MIN_GAP），每次都清空额度，
+  // 于是「只发一条」只可能来自去重键相等。修复前 WAITING 候选的指纹恒为空串，
+  // 这条是绿的；一旦指纹改成每轮都变的量（比如 idleSec / lastActivity），它会红。
+  const dir = tmp();
+  const claude = tmp();
+  try {
+    const now = Date.parse('2026-11-08T20:10:00.000Z');
+    const projectsRoot = join(claude, 'projects');
+    mkdirSync(join(projectsRoot, 'p-demo'), { recursive: true });
+    mkdirSync(join(claude, 'sessions'), { recursive: true });
+    mkdirSync(join(claude, 'jobs'), { recursive: true });
+    writeWaitingTranscript(join(projectsRoot, 'p-demo', 'sess-dedupe.jsonl'), [{ id: 'call_ONCE' }]);
+    mkSession(join(claude, 'sessions'), 1, {
+      pid: 1, sessionId: 'sess-dedupe', status: 'waiting', waitingFor: 'input needed',
+      statusUpdatedAt: now, cwd: 'D:\\P\\demo',
+    });
+
+    let n = 0;
+    const notifier = async () => { n++; };
+    const logger = { info: () => {}, warn: () => {}, error: () => {} };
+    const scan = async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 });
+
+    await runTick({ dir, claudeDir: claude, nowMs: now, notifier, logger, scan });
+    // 清额度：否则「只发一条」可能是限额挡的
+    const st1 = loadState(dir).state;
+    st1.budget.sentLog = [];
+    st1.budget.perSession = {};
+    saveState(dir, st1);
+
+    await runTick({ dir, claudeDir: claude, nowMs: now + 11 * MIN, notifier, logger, scan });
+    assert.equal(n, 1, `同一次等待跨 tick 只能通知一次，实际 ${n} 次`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(claude, { recursive: true, force: true });
@@ -2199,4 +2249,281 @@ test('askedCandidates：sessionId 必须是 uuid，不是完整路径', () => {
   assert.equal(cs[0].sessionId, 'abc-123', `必须是 uuid，实际：${cs[0].sessionId}`);
   assert.ok(!cs[0].sessionId.includes(B), '不得含路径分隔符');
   assert.ok(!cs[0].sessionId.includes('Users'), '不得泄露本机目录');
+});
+
+// ── 通知修复：三个已确诊缺陷的负向测试（2026-11-09）─────────────────
+//
+// 这三组测试是针对**已经发生的事故**写的，不是针对实现形状写的。
+// 每条都在把 bug 装回去时会变红 —— 验证记录见
+// docs/research/2026-11-04-fix-notify-dedup.md §3。
+
+/** 造一个 transcript 文件：给若干等待型 tool_use，可指定哪些已经有 tool_result。 */
+function writeWaitingTranscript(path, entries) {
+  const recs = [{ type: 'user', uuid: 'u0', message: { role: 'user', content: '开始' } }];
+  for (const e of entries) {
+    recs.push({
+      type: 'assistant', uuid: 'a-' + e.id, timestamp: e.ts || '2026-11-08T20:00:00.000Z',
+      message: {
+        id: 'm-' + e.id, role: 'assistant', stop_reason: 'tool_use',
+        content: [{ type: 'tool_use', id: e.id, name: e.name || 'AskUserQuestion', input: { questions: [] } }],
+      },
+    });
+    if (e.closed) {
+      recs.push({
+        type: 'user', uuid: 'r-' + e.id,
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: e.id, content: '好的' }] },
+      });
+    }
+  }
+  writeFileSync(path, recs.map((r) => JSON.stringify(r)).join('\n') + '\n');
+}
+
+test('缺陷2：同一会话的两次等待必须算出不同的键（<session-S> 的 4 次等待曾被一个键吞掉）', () => {
+  // 回归来源：probeWaiting 的指纹恒为空串，而 reasonClass 把
+  // waiting:input needed / waiting:permission prompt 压成同一个 waiting
+  // → 同一会话第二次等待算出同一个键 → 永久静默（实测连续 2213 tick already=1）。
+  const claude = tmp();
+  try {
+    const now = Date.parse('2026-11-08T20:10:00.000Z');
+    const projectsRoot = join(claude, 'projects');
+    const proj = join(projectsRoot, 'p-demo');
+    mkdirSync(proj, { recursive: true });
+    mkdirSync(join(claude, 'sessions'), { recursive: true });
+
+    // 第一次等待：一个未闭合的 AskUserQuestion
+    writeWaitingTranscript(join(proj, 'sess-2wait.jsonl'), [
+      { id: 'call_A', name: 'AskUserQuestion' },
+    ]);
+    mkSession(join(claude, 'sessions'), 1, {
+      pid: 1, sessionId: 'sess-2wait', status: 'waiting', waitingFor: 'input needed',
+      statusUpdatedAt: now, cwd: 'D:' + String.fromCharCode(92) + 'P' + String.fromCharCode(92) + 'demo',
+    });
+    const r1 = probeWaiting(join(claude, 'sessions'), { nowMs: now, projectsRoot });
+    assert.equal(r1.found.length, 1);
+    const k1 = dedupeKey(r1.found[0].sessionId, r1.found[0].state, r1.found[0].reason, r1.found[0].evidenceFingerprint);
+
+    // 第二次等待：前一个已闭合，出现一个新的 AskUserQuestion
+    writeWaitingTranscript(join(proj, 'sess-2wait.jsonl'), [
+      { id: 'call_A', name: 'AskUserQuestion', closed: true },
+      { id: 'call_B', name: 'AskUserQuestion' },
+    ]);
+    const r2 = probeWaiting(join(claude, 'sessions'), { nowMs: now + 30 * MIN, projectsRoot });
+    const k2 = dedupeKey(r2.found[0].sessionId, r2.found[0].state, r2.found[0].reason, r2.found[0].evidenceFingerprint);
+
+    assert.notEqual(k1, k2, '两次不同的等待必须得到不同的键——否则第二次等待永久静默');
+    assert.equal(r1.found[0].anchorSource, 'transcript');
+    assert.ok(String(r1.found[0].evidenceFingerprint).startsWith('wait:call_A'));
+    assert.ok(String(r2.found[0].evidenceFingerprint).startsWith('wait:call_B'));
+  } finally {
+    rmSync(claude, { recursive: true, force: true });
+  }
+});
+
+test('缺陷2：同一次等待反复观测必须算出同一个键（不能每轮都通知）', () => {
+  const claude = tmp();
+  try {
+    const now = Date.parse('2026-11-08T20:10:00.000Z');
+    const projectsRoot = join(claude, 'projects');
+    const proj = join(projectsRoot, 'p-demo');
+    mkdirSync(proj, { recursive: true });
+    mkdirSync(join(claude, 'sessions'), { recursive: true });
+    writeWaitingTranscript(join(proj, 'sess-once.jsonl'), [{ id: 'call_X', name: 'AskUserQuestion' }]);
+    mkSession(join(claude, 'sessions'), 1, {
+      pid: 1, sessionId: 'sess-once', status: 'waiting', waitingFor: 'input needed',
+      statusUpdatedAt: now, cwd: 'D:' + String.fromCharCode(92) + 'P' + String.fromCharCode(92) + 'demo',
+    });
+    const a = probeWaiting(join(claude, 'sessions'), { nowMs: now, projectsRoot }).found[0];
+    const b = probeWaiting(join(claude, 'sessions'), { nowMs: now + 5 * MIN, projectsRoot }).found[0];
+    assert.equal(a.evidenceFingerprint, b.evidenceFingerprint, '同一次等待的锚点必须稳定');
+    assert.equal(
+      dedupeKey(a.sessionId, a.state, a.reason, a.evidenceFingerprint),
+      dedupeKey(b.sessionId, b.state, b.reason, b.evidenceFingerprint),
+    );
+  } finally { rmSync(claude, { recursive: true, force: true }); }
+});
+
+test('缺陷2：两条路径（probeWaiting 与 candidatesFromScan）对同一次等待必须算出同一个键', () => {
+  // 实测 F2 的完整机制：同一次等待，sessions 键 3679ed23e2930d88、scan 键 4181354ebb8ac70c，
+  // 相隔 18 分钟弹了两次标题不同的通知。根因是两路指纹的源字段不同。
+  const claude = tmp();
+  try {
+    const now = Date.parse('2026-11-08T21:39:00.000Z');
+    const projectsRoot = join(claude, 'projects');
+    const proj = join(projectsRoot, 'p-demo');
+    mkdirSync(proj, { recursive: true });
+    mkdirSync(join(claude, 'sessions'), { recursive: true });
+    writeWaitingTranscript(join(proj, 'sess-both.jsonl'), [{ id: 'call_SAME', name: 'AskUserQuestion' }]);
+    mkSession(join(claude, 'sessions'), 1, {
+      pid: 1, sessionId: 'sess-both', status: 'waiting', waitingFor: 'input needed',
+      statusUpdatedAt: now, cwd: 'D:' + String.fromCharCode(92) + 'P' + String.fromCharCode(92) + 'demo',
+    });
+
+    const w = probeWaiting(join(claude, 'sessions'), { nowMs: now, projectsRoot }).found[0];
+    const sc = candidatesFromScan([{
+      project: 'p-demo', sessionId: 'sess-both', state: 'WAITING',
+      reason: 'waiting:input needed', lastActivity: new Date(now).toISOString(),
+    }], { nowMs: now, projectsRoot })[0];
+
+    assert.equal(
+      dedupeKey(w.sessionId, w.state, w.reason, w.evidenceFingerprint),
+      dedupeKey(sc.sessionId, sc.state, sc.reason, sc.evidenceFingerprint),
+      '两条路径对同一次等待必须同键，否则同一次等待会发两条',
+    );
+  } finally { rmSync(claude, { recursive: true, force: true }); }
+});
+
+test('缺陷2：取不到 transcript 时退回 (sessionId, WAITING, statusUpdatedAt)，且标记来源', () => {
+  // 退化路径必须可检测：候选上标 anchorSource，避免「以为修好了、实际全是退化值」。
+  const dir = tmp();
+  const empty = tmp();
+  try {
+    const now = Date.parse('2026-11-08T20:10:00.000Z');
+    mkSession(dir, 1, {
+      pid: 1, sessionId: 'no-transcript', status: 'waiting', waitingFor: 'input needed',
+      statusUpdatedAt: now, cwd: 'D:' + String.fromCharCode(92) + 'P' + String.fromCharCode(92) + 'demo',
+    });
+    const r = probeWaiting(dir, { nowMs: now, projectsRoot: join(empty, 'nope') });
+    assert.equal(r.found.length, 1);
+    assert.equal(r.found[0].anchorSource, 'host-time', '取不到 transcript 必须标退化');
+    assert.equal(r.found[0].evidenceFingerprint, 'host:' + new Date(now).toISOString());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(empty, { recursive: true, force: true });
+  }
+});
+
+test('缺陷1：permission prompt 不产生通知，但必须留下观察记录', async () => {
+  // 实测（n=75 个宿主翻转事件）：input needed 9/9 真、permission prompt 66/66 假。
+  // permission prompt 是 requires_action 的兜底桶（66 个里 46 个卡在自己的 sleep 上）。
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    let calls = 0;
+    const st = emptyState();
+    const r = await dispatchCandidates([{
+      sessionId: 'noise', state: 'WAITING', reason: 'waiting:permission prompt',
+      waitingFor: 'permission prompt', project: 'demo', idleSec: 300,
+      evidenceFingerprint: 'wait:call_noise', source: 'sessions',
+    }], {
+      state: st, nowMs: now, notifier: async () => { calls++; },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      observations: createObservationLog(dir),
+    });
+    assert.equal(calls, 0, 'permission prompt 不得弹通知');
+    assert.equal(r.sent.length, 0);
+    assert.equal(r.suppressed.length, 1);
+    assert.equal(r.suppressed[0].why, 'noise-bucket-permission-prompt');
+    assert.equal(Object.keys(st.notified).length, 0, '不通知就不该占用去重表额度');
+
+    const rows = readObservationRows(dir);
+    assert.equal(rows.length, 1, '状态不能删掉——观测记录必须留下');
+    assert.equal(rows[0].waitingFor, 'permission prompt');
+    assert.equal(rows[0].notified, false);
+    assert.equal(rows[0].why, 'noise-bucket-permission-prompt');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('缺陷1：input needed 的通知链路完好——不能把真阳性一起关掉', async () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    const st = emptyState();
+    let calls = 0;
+    const r = await dispatchCandidates([{
+      sessionId: 'real', state: 'WAITING', reason: 'waiting:input needed',
+      waitingFor: 'input needed', project: 'demo', idleSec: 10,
+      evidenceFingerprint: 'wait:call_real', source: 'sessions',
+    }], {
+      state: st, nowMs: now,
+      notifier: async (n) => { calls++; assert.ok(n.title.includes('正在等你'), '标题：' + n.title); },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    assert.equal(calls, 1, 'input needed 必须照常通知');
+    assert.equal(r.sent.length, 1);
+    assert.equal(r.suppressed.length, 0);
+    assert.equal(Object.values(st.notified)[0].notifyCount, 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('缺陷1：scan 路径的 waiting:permission prompt 同样被挡（候选不带 waitingFor 字段）', async () => {
+  // scan-sessions 的 sessions[] 没有 waitingFor，只有 judgeState 写进 reason 的那份。
+  // 只看 waitingFor 会让这道门在 scan 路径上失效 —— 而 67/72 条记录来自那条路。
+  const now = Date.now();
+  let calls = 0;
+  const r = await dispatchCandidates([{
+    sessionId: 'scan-noise', state: 'WAITING', reason: 'waiting:permission prompt',
+    project: 'p-demo', idleSec: 600, evidenceFingerprint: 'job:2026-11-08T20:00:00.000Z', source: 'scan',
+  }], {
+    state: emptyState(), nowMs: now, notifier: async () => { calls++; },
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+  });
+  assert.equal(calls, 0, 'scan 路径的 permission prompt 也不得通知');
+  assert.equal(r.suppressed[0].why, 'noise-bucket-permission-prompt');
+});
+
+test('缺陷3：lastSeenAt 必须随每次观测刷新（72/72 条曾是 firstSeenAt 的副本）', async () => {
+  const now = Date.parse('2026-11-08T20:00:00.000Z');
+  const st = emptyState();
+  const cand = [{
+    sessionId: 's1', state: 'WAITING', reason: 'waiting:input needed',
+    project: 'demo', idleSec: 5, evidenceFingerprint: 'wait:call_1', source: 'sessions',
+  }];
+  await dispatchCandidates(cand, {
+    state: st, nowMs: now, notifier: async () => {},
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+  });
+  const key = dedupeKey('s1', 'WAITING', 'waiting:input needed', 'wait:call_1');
+  assert.equal(st.notified[key].lastSeenAt, new Date(now).toISOString());
+
+  // 20 小时后再观测（同一次等待，键不变）→ lastSeenAt 必须推进
+  const later = now + 20 * 60 * MIN;
+  await dispatchCandidates(cand, {
+    state: st, nowMs: later, notifier: async () => {},
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+  });
+  assert.equal(st.notified[key].lastSeenAt, new Date(later).toISOString(), '命中路径必须刷新 lastSeenAt');
+  assert.equal(st.notified[key].firstSeenAt, new Date(now).toISOString(), 'firstSeenAt 不得被覆盖');
+});
+
+test('缺陷3：持续 25 小时的等待不得在第 25 小时被重新通知', async () => {
+  // 回归来源：TTL 从 firstSeenAt 算 + lastSeenAt 从不刷新 →
+  // 条目在第 24 小时被 pruneNotified 清掉，同一个等待重新弹一次。
+  const t0 = Date.parse('2026-11-08T00:00:00.000Z');
+  const st = emptyState();
+  const cand = [{
+    sessionId: 'long', state: 'WAITING', reason: 'waiting:input needed',
+    project: 'demo', idleSec: 5, evidenceFingerprint: 'wait:call_long', source: 'sessions',
+  }];
+  let calls = 0;
+  for (let h = 0; h <= 25; h += 1) {
+    const now = t0 + h * 60 * MIN;
+    // 每一轮都模拟 loadState → pruneNotified → 派发 → saveState 的完整循环
+    pruneNotified(st.notified, now);
+    await dispatchCandidates(cand, {
+      state: st, nowMs: now, notifier: async () => { calls++; },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    // 清额度：否则「只发一次」可能是限额挡的，而不是去重挡的
+    st.budget.sentLog = [];
+    st.budget.perSession = {};
+  }
+  assert.equal(calls, 1, '同一次等待只能通知一次，实际 ' + calls + ' 次');
+});
+
+test('缺陷3：pruneNotified 按 lastSeenAt 计时，老但仍在被看到的条目不得被清', () => {
+  const now = Date.parse('2026-11-09T00:00:00.000Z');
+  const notified = {
+    still: {
+      firstSeenAt: new Date(now - 30 * 3600_000).toISOString(),
+      lastSeenAt: new Date(now - 60_000).toISOString(),
+    },
+    gone: {
+      firstSeenAt: new Date(now - 2 * 3600_000).toISOString(),
+      lastSeenAt: new Date(now - 30 * 3600_000).toISOString(),
+    },
+  };
+  const r = pruneNotified(notified, now);
+  assert.equal(r.removed, 1, '按 lastSeenAt 计时，只清真正久未出现的');
+  assert.ok(notified.still, '30 小时前首次发现、但刚刚还在的条目必须保留');
+  assert.equal(notified.gone, undefined);
 });

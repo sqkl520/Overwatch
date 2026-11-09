@@ -196,6 +196,50 @@ function findToolResult(after, toolUseId) {
   return null;
 }
 
+/** 「等待型」工具：调用它们等于会话明确停下来等人。
+ *
+ *  为什么是这两个而不是「任何未闭合的 tool_use」：实测一次 `permission prompt` 的等待里
+ *  悬空的多半是会话自己写的 `Bash(sleep 840)` —— 那是它在等自己派的活儿，不是在等人
+ *  （`docs/research/2026-11-04-host-status-reliability.md` §3.2：66 个 permission prompt
+ *  事件里 46 个卡在 sleep 上，0 个有真的待批工具）。拿它当锚点会把「自己在等」注册成等待。 */
+export const WAITING_TOOL_NAMES = Object.freeze(['AskUserQuestion', 'ExitPlanMode']);
+
+/** transcript 里**还没闭合**的等待型 `tool_use_id`，按出现顺序返回。
+ *
+ *  这是「一次等待」的天然锚点（去重键的一半，见 `watch.mjs` 的 `dedupeKey` 调用点）：
+ *  AskUserQuestion / ExitPlanMode 各代表一次明确的「我停下来等你」，收到对应
+ *  `tool_result` 就是这次等待结束，**下一次等待必然是一个新 id**。
+ *  对比之下 `statusUpdatedAt` 是「状态最后一次变化」，waiting 期间只写一次、
+ *  还可能被宿主无规律重写（实测 33 / 54 分钟各一次），既不能区分第几次等待，也不稳定。
+ *
+ *  实测（`docs/research/2026-11-04-dedup-key-analysis.md` §4.4）：同一个 id 在 3 个不同
+ *  transcript 文件里逐字相同；同一 `tool_use` 会以两行出现（一行带 timestamp、一行
+ *  `timestamp: undefined`，重写留下的），两行的 id 相同 —— 所以按 id 去重，不按行数。
+ *
+ *  `tool_result` 可能在 tail 之前就被截掉了（`readTranscriptTail` 只读尾部 1MB）。
+ *  找不到闭合时**不猜测**：返回的 id 照常作为锚点，它仍然唯一标识这次等待。 */
+export function openWaitingToolUseIds(records) {
+  const arr = Array.isArray(records) ? records : [];
+  const seen = new Set();
+  const order = [];
+  const closed = new Set();
+  for (const rec of arr) {
+    for (const b of contentBlocks(rec)) {
+      if (b.type === 'tool_result') {
+        if (typeof b.tool_use_id === 'string') closed.add(b.tool_use_id);
+        continue;
+      }
+      if (b.type !== 'tool_use') continue;
+      if (!WAITING_TOOL_NAMES.includes(b.name)) continue;
+      if (typeof b.id !== 'string' || !b.id) continue;
+      if (seen.has(b.id)) continue;
+      seen.add(b.id);
+      order.push(b.id);
+    }
+  }
+  return order.filter((id) => !closed.has(id));
+}
+
 /** 取**最后一条**带 permissionMode 的记录 [S§2.1]。
  *  取第一条会把「中途切到 plan 模式」的会话读成它启动时的模式，是本任务 AC6 明确禁止的错误。 */
 export function lastPermissionMode(records) {
