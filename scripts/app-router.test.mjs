@@ -58,10 +58,19 @@ const SESSIONS = [
     subagentsTruncated: 0, maxDepth: 0, hbThresholdSec: 120, lastGapSec: 5, badLines: 0 },
 ];
 
-/** 喂完数据，让 App 进入可交互状态 */
+/** 喂完数据，让 App 进入可交互状态。
+ *
+ *  2026-11-10：主屏改成三段分区后，`live: []` 意味着「宿主说一条活的都没有」，
+ *  于是 s3（PRODUCING）会落进「已停」段并被折叠成一行计数 —— 光标只有 2 行可走。
+ *  这个文件测的是**键位路由**，不是分区，所以夹具必须给出「它活着」这一步事实，
+ *  否则测的就不是路由而是分区了。三条会话分别落在需动作(2)与在跑(1)。
+ */
 async function ready(sessions = SESSIONS) {
   const ctx = makeApp(sessions);
-  ctx.app.data = { sessions, live: [] };
+  ctx.app.data = {
+    sessions,
+    live: sessions.map((s) => ({ sessionId: s.sessionId, status: 'busy' })),
+  };
   ctx.app.render = () => {};              // 渲染不是本文件的测试对象
   return ctx;
 }
@@ -149,6 +158,33 @@ test('列表：无 needs 时 c 不崩', async () => {
   const { app } = await ready([SESSIONS[2]]);
   app.showNotice = () => {};
   assert.doesNotThrow(() => app.onKey('c'));
+});
+
+test('列表：c 复制的正文里不含 needs 旁白（用户实测的那个 bug）', async () => {
+  // 用户按 c 复制到的曾是：
+  //   「把实测单发给我」+「（目标会话受阻，在等：要我现在就把用户实测单交给你…）」
+  // 第二段粘进对话框就是一句奇怪的话。
+  //
+  // copyDraft 内部是 buildDraft(session, {nowMs}) → copyToClipboard(draft) 一行直传，
+  // 中间没有任何加工，所以 buildDraft 的输出就是剪贴板内容。
+  // 这里用 App 真实的取数链（currentSession → 同一个 now）重放它。
+  const hilltop = {
+    project: 'Hilltop', sessionId: 'hilltop', state: 'BLOCKED',
+    idleSec: 120, hasTranscript: false,
+    needs: '要我现在就把用户实测单交给你，还是你先看这四份测试报告？',
+    suggestedReply: '把实测单发给我',
+  };
+  const { app } = await ready([hilltop]);
+  const { buildDraft } = await import('./oversight-tui.mjs');
+  const s = app.currentSession();
+  assert.ok(s, '需要一条可复制的会话');
+  const draft = buildDraft(s, { nowMs: app.now() });
+  assert.ok(draft, `应能给出一份草稿（夹具 sessionId=${s.sessionId}）`);
+  for (const bad of ['目标会话', '（', '要我现在就把用户实测单交给你']) {
+    assert.ok(!draft.includes(bad), `剪贴板内容含旁白 ${bad}：${JSON.stringify(draft)}`);
+  }
+  // 草稿必须就是 suggestedReply 本身，不得被加料
+  assert.equal(draft, s.suggestedReply, `草稿不得被加料：${JSON.stringify(draft)}`);
 });
 
 // ── 详情视图 ──────────────────────────────────────────────────────────

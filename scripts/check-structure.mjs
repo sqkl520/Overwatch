@@ -53,8 +53,12 @@ function walk(dir, out = []) {
 
 const rel = (p) => relative(ROOT, p).replace(/\\/g, '/');
 
-/** 只作为 CLI 运行、不导出函数的脚本。它们被 import 会执行副作用。 */
-const CLI_SCRIPTS = new Set(['check-structure.mjs', 'check-links.mjs']);
+/** 只作为 CLI 运行、不导出函数的脚本。它们被 import 会执行副作用。
+ *
+ *  `verify-bugfix-negatives.mjs` 会**改写源码再还原**（负向验证），必须只当 CLI 用，
+ *  绝不能被结构门自动 import 并调用。`gen-width-table.mjs` 不在此列：它的解析/渲染
+ *  函数是纯的，测试直接 import 它们做对照，所以下面照常登记。 */
+const CLI_SCRIPTS = new Set(['check-structure.mjs', 'check-links.mjs', 'verify-bugfix-negatives.mjs', 'verify-tui-negatives.mjs', 'verify-claim-fix-negatives.mjs']);
 
 /** 解析 frontmatter：支持 YAML 多行块（| 与 >），否则多行 description 会被误判为空 */
 function parseFrontmatter(fm) {
@@ -249,8 +253,55 @@ function checkCapabilityDisclosure() {
   }
 }
 
-// ── 检查 7：脚本必须能被 Node 解析 ────────────────────────────────────
+// ── 检查 6.5：文档里的测试数必须与实测一致 ────────────────────────────
 
+/** 回归测试数曾同时存在四个值：README 508 / CLAUDE 192 / GUIDE·CI 81 / 设计稿 588，
+ *  实测 793。四份文件四个值，而 CI 里那个 81 停在一年前的量级。
+ *
+ *  这不是笔误，是**同类缺陷的结构性复发**：只要数字是手写的，下一次加测试又会漂。
+ *  所以这里不写死任何一个数字，而是**数源码**（`^\s*test(` 的条数）再与文档比对。
+ *  文档里写错了硬门直接红 —— 那种红是好事：它把「改文档」变成一次必做的动作。
+ *
+ *  为什么数源码而不是跑 `node --test`：硬门要能在一秒内跑完，且不能因为某条测试
+ *  真的挂了就报「数字不对」。测试是不是全绿由 CI 的 Tests 那一步负责，两件事分开。 */
+function checkTestCount() {
+  const dir = join(ROOT, 'scripts');
+  if (!existsSync(dir)) return;
+  let actual = 0;
+  for (const f of readdirSync(dir).filter((f) => f.endsWith('.test.mjs'))) {
+    let text = '';
+    try { text = readFileSync(join(dir, f), 'utf8'); } catch { continue; }
+    actual += (text.match(/^\s*test\(/gm) || []).length;
+  }
+  if (!actual) return;
+
+  // 每份文档里「N 条回归测试」这一句的取数位置。只查**声明基线**的那一处，
+  // 不查历史条目（CHANGELOG 与 research 里的旧数字是事实记录，不该被改）。
+  const sites = [
+    ['README.md', /（(\d+)\s*条回归测试/],
+    ['CLAUDE.md', /全量回归测试（(\d+)\s*条/],
+    ['docs/GUIDE.md', /(\d+)\s*项全绿/],
+    ['.github/workflows/validate.yml', /全部回归测试（(\d+)\s*条/],
+  ];
+  for (const [file, re] of sites) {
+    const p = join(ROOT, file);
+    if (!existsSync(p)) continue;
+    let text = '';
+    try { text = readFileSync(p, 'utf8'); } catch { continue; }
+    const m = text.match(re);
+    if (!m) {
+      fail(file, `找不到回归测试数声明（应形如「${actual} 条」）—— 删掉声明等于没人再核它`);
+      continue;
+    }
+    const claimed = Number(m[1]);
+    if (claimed !== actual) {
+      fail(file, `回归测试数写的是 ${claimed}，源码实测 ${actual}。改成 ${actual}，`
+        + '或先确认新加的测试真的被注册了');
+    }
+  }
+}
+
+// ── 检查 7：脚本必须能被 Node 解析 ────────────────────────────────────
 /** 硬门不覆盖「脚本能不能跑」是一个真实漏洞：
  *  曾把 `const WINDOW = ;` 写进 scan-sessions.mjs，整个文件不可解析，
  *  但 check-structure 照样返回「全部通过」。语法检查必须进硬门。 */
@@ -299,6 +350,52 @@ const PROBE_ARGS = {
   usage: '[]', fmtDur: '[1]', fmtNovelty: '[0.5]', projectLabel: '["a-b"]',
   glyphOf: '[{}]', stateOf: '[{}]',
   reasonClass: '["novelty=0.1"]', dedupeKey: '["a", "STALLED", "novelty=0.1", "x"]',
+  // measure-interventions.mjs（2026-11-11 人工介入基线）：全部纯函数，参数取最小可构造输入。
+  // eachLine / analyzeTranscript / formatReport 读盘，用不存在的路径——空文件返回 0 行，
+  // 不存在的路径在 analyzeTranscript 里会抛，外面 checkImportable 会吞掉（它只关心 ReferenceError）。
+  userText: '[{}]', humanTurnText: '[{}]', isInterrupt: '[{}]', assistantStop: '[{}]',
+  askedUser: '[{}]', isAskAnswer: '[{}]', classifyHumanMessage: '"继续"',
+  avoidabilityOf: '[{ type: "nudge", text: "继续", afterStop: "end_turn" }]',
+  percentile: '[[1, 2, 3], 0.5]',
+  eachLine: '["/nonexistent-ow-probe", (l) => l]',
+  analyzeTranscript: '["/nonexistent-ow-probe"]',
+  formatReport: '[{ days: 1, root: "/x", summary: { totals: { sessions: 0, humanTurns: 0, assistantStops: 0, interventions: 0, byType: {}, byAvoidability: {} }, distribution: { all: {}, active: {} }, rates: {}, sessionsWithIntervention: 0, perSession: [] } }]',
+  defaultRoot: '[]',
+  // project-commands.mjs / stop-verify-hook.mjs（2026-11-12 Stop hook 验证闸）。
+  // 参数一律取最小可构造输入：不存在的路径 / 空对象 / 空串。目的是让「导出但调用即炸」
+  // 在结构门就暴露 —— 这比等到 hook 在真实会话里崩掉再发现便宜得多。
+  // 记账函数（appendLog / bumpBlockCount / …）在这里只会走到「读完发现没东西就返回」，
+  // 不会写进用户的 %LOCALAPPDATA%：它们各自的 env 覆盖参数取不到真实路径。
+  readCapped: '["/nonexistent-ow-probe", 64]',
+  pickNpmScripts: '""', pickMaven: '""', pickGradle: '""', pickCargo: '""', pickGo: '""',
+  pickPython: '[{}]', pickDotnet: '[false, false]',
+  detectProjectCommands: '["/nonexistent-ow-probe"]', commandHint: '[{}]',
+  modeOf: '[{}]', parseHookInput: '""', resolveAssistantText: '[{}, []]',
+  decide: '[{ input: {}, records: [] }]', buildReason: '[{}]',
+  logPathFor: '[{}]', statePathFor: '[{}]', readBlockCount: '["s", { env: {} }]',
+  resetBlockCount: '["s", { env: {} }]',
+  appendLog: '[{}, { OVERWATCH_STOP_VERIFY_LOG: "/nonexistent-dir-ow/x.jsonl" }]',
+  bumpBlockCount: '["s", { env: { OVERWATCH_STOP_VERIFY_STATE: "/nonexistent-dir-ow/x.json" } }]',
+  runHook: '[{ input: { session_id: "probe", last_assistant_message: "" }, env: {} }]',
+  // readStdin 要一个 stream。给一个「已 EOF」的最小替身：setEncoding/on 是空操作，
+  // readableEnded 为 true 让它在第一拍就 resolve 空串 —— 不会挂住结构门，也不需要
+  // 在 ESM 探针脚本里 import('node:stream')。
+  readStdin: '[{ setEncoding() {}, on() {}, readableEnded: true }, 64]',
+  loadRecords: '["/nonexistent-ow-probe", {}]',
+  loadSubagentRecords: '["/nonexistent-ow-probe"]',
+  // 放行样本记录（2026-11-13）。样本层是**纯记账**，探针只要证明它不抛：
+  // 空 records / 空文本 / 不可写路径都必须安全返回。sampleLogEnabled 读命令行，
+  // 给空 argv 走默认「开」。
+  SAMPLE_TEXT_LIMIT: '[]', samplePathFor: '[{}]', sampleLogEnabled: '[{}, []]',
+  toolSummaryOf: '[[]]', rawFamilyHits: '""',
+  buildSample: '[{}]', appendSample: '[{}, { OVERWATCH_STOP_VERIFY_SAMPLES: "/nonexistent-dir-ow/s.jsonl" }]',
+  // analyze-hook-samples.mjs（2026-11-13）：放行样本的分布分析。全部只读，探针取最小输入。
+  // 读盘的两个用不存在的路径 —— 返回空样本是它的正常路径，正好验「空文件不报错」。
+  COLON_COMPLETION_RE: '[]', COMPLETION_ANY_RE: '[]',
+  completionShapeOf: '""', clusterOf: '[{}]', suspectOf: '[{}]', strongSuspectOf: '[{}]',
+  formatReport: '[{}, {}]', topSuspects: '[{}, 0]', defaultSamplesPath: '[{}]',
+  parseSampleLines: '""', loadSamples: '["/nonexistent-ow-samples.jsonl"]',
+  statLine: '["x", 0, ""]',
   emptyState: '[]', recordSent: '[{}, "sid", 0]',
   diffProbe: '[{}, {}]', foldProbe: '[{}, {}]',
   canNotify: '[{}, "sid", 0]', candidatesFromScan: '[[]]',
@@ -350,7 +447,100 @@ const PROBE_ARGS = {
   evidenceSufficient: '[{}, {}]', normalizeCommand: '""', isTestCommand: '""',
   isBuildCommand: '""', isMutatingCommand: '""', editKindOf: '""', resultText: '[{}]',
   parseLines: '""', subagentFiles: '[{}]', summarizeClaims: '[[]]',
+  // 三个断言识别缺陷的修复（2026-11-13）：假设/间接疑问判据 + 中文族名。
+  // 探针取最小输入 —— 空字符串、空匹配，要求「不抛且给出人话」。
+  matchesOf: '[/x/, ""]', clauseAt: '["", 0]', isHypotheticalMatch: '["", null]',
+  familyName: '""', activityName: '""',
   scanSession: '[{"path":"/nonexistent","project":"p","sessionId":"s","mtimeMs":0,"size":0}]',
+  // verify-claims.mjs 的产品化层（2026-11-05）：CLI 参数、输出渲染、时间线。
+  // 这一层的职责只是「把已经判好的结论说成人话」，**不许改判**；
+  // 探针照样逐条实际调用，让「导出了但调用即炸」在结构门就暴露。
+  timeOf: '[[], 0]', attemptTimes: '[[], []]', evidenceTimeline: '[{}, []]',
+  fmtClock: '""', verdictIcon: '""', evidenceSentence: '[{}]', adviceFor: '[{}]',
+  // 「该重跑什么」的溯源链（2026-11-13）。probe 用空对象：没有 claim / evidence 时
+  // 必须走到「认不出」那一档而不是抛异常 —— 这正是它对坏输入的唯一要求。
+  recoveryCommandFor: '[{}]', actualCommandFor: '[{}, "test-count"]', shortenCommand: '["", null]',
+  // 「笼统完成声明」的验证判据（2026-11-13）。和 isTestCommand / isBuildCommand 同一层：
+  // 给一条命令，答「它算不算做过一次检查」。冒烟输入取一条只读命令，必须返回 false。
+  isVerificationCommand: '"ls -la"',
+  renderSessionBlock: '[{}]', attemptTime: '[{}, 0]', renderMarkdown: '[[]]',
+  exitCodeFor: '[{}]', renderSummary: '[{}]', renderDetail: '[{}, { claim: {} }]',
+  parseArgs: '[[]]', resolveSession: '["/nonexistent", "abc"]', flattenResults: '[[]]',
+  // tui-theme.mjs 的宽度算法（2026-11-05 宽度表修复）：Unicode 官方数据 + grapheme 聚类。
+  // 参数取最小可构造输入，让「导出了但调用即炸」在结构门就暴露。
+  codePointWidth: '"a"', truncateDisplay: '["x", 5]', hasColor: '"red"',
+  segmenterAvailable: '[]', unknownColors: '[]', resetUnknownColors: '[]',
+  setColorWarn: '[null]',
+  // scan-sessions.mjs 的三源合并（2026-11-05）：--days 判据改为 transcript 内部时间。
+  lastActivityOf: '[[]]', jobStateToState: '"blocked"', jobToRow: '[{}, 0]',
+  mergeJobRows: '[[], [], 0]', windowLabel: '[3]',
+  // 跨层去重的两个纯函数：空参数必须安全返回，不抛。
+  scanCrossLayerFingerprint: '[{}]', hostFieldsOf: '[null]',
+  // gen-width-table.mjs：从 scripts/data 下的 Unicode 原始数据生成宽度表。
+  // 纯函数，参数取空输入即可跑通（readData 读的是仓库内已提交的数据文件）。
+  parseUcdRanges: '""', parseEastAsianWidth: '""', parseEmojiPresentation: '""',
+  mergeRanges: '[[]]', countCovered: '[[]]', renderModule: '[{}]',
+  tableStats: '[{}]', readData: '[]',
+  // tui-layout.mjs（2026-11-10 TUI 重做）：布局数学。参数取最小可构造输入，
+  // 目的是让「导出了但调用即炸」在结构门就暴露 —— 这正是这次重构的主要收益之一。
+  fmtSpan: '[1]', fmtAgeMs: '[1]', fmtScanAge: '[1]',
+  truncateWithDisclosure: '["abc", 10]', alignRight: '["a", 3]',
+  layoutRow: '[[], 10]', joinWithin: '[["a"], 10]',
+  windowOf: '[{ count: 0, cursor: 0, area: 1 }]',
+  resolveLayout: '[{ cols: 80, rows: 24 }]', layoutStages: '[]',
+  binaryOf: '[{}]', partitionRows: '[{}]', verdictParts: '[{}]',
+  // tui-layout.mjs（2026-11-11 需动作老化）：阈值两侧的纯函数。
+  // 参数取最小可构造输入：空对象 / null 时钟都必须安全返回，不抛。
+  ageLimitOf: '[{}]', ageSecOf: '[{}, null]', staleOf: '[{}]',
+  stoppedSummary: '[[]]', sectionTitle: '["x", 0]',
+  checklistRows: '[{}]', footerParts: '[{}]', actionCell: '[{}]', nearText: '[{}]',
+  titleOf: '[{}]', shortPath: '""', runningColumns: '[80, {}]',
+  runningRowOf: '[{}, { cols: 80 }]', actionRowOf: '[{}, { cols: 80 }]',
+  sectionHeaderLine: '["x", 0, 80, ""]', checklistLine: '[{}, { cols: 80 }]',
+  verdictLine: '[[], 80, ""]',
+  // tui-layout.mjs（2026-11-11 检查表去表头）：句子 / 收尾句 / 零值压行。
+  checklistSentence: '[{}]', checklistSummaryLine: '[4]',
+  checklistLines: '[[], { cols: 80 }]', isQuietRow: '[{}]',
+  footerLine: '[[], 80]', composeListScreen: '[{ cols: 80, rows: 24 }]',
+  // tui-meta.mjs（2026-11-10）：有界读取与缓存。file 不存在时必须安全返回，不抛。
+  projectsRoot: '[{}]', transcriptPathFor: '[{}, "/nonexistent"]',
+  metaFromRecords: '[[]]', readTailRecords: '["/nonexistent"]',
+  createMetaCache: '[{}]', lastSpeakerOf: '[[]]', pendingQuestionOf: '[[], {}]',
+  // oversight-tui.mjs（2026-11-10）：三段视图与证据档位。
+  viewOf: '[{}, null]', actionViewOf: '[{}]', buildSections: '[{}]',
+  askedCountOf: '[{}]', waitingCountOf: '[{}]', claimsTally: '[[]]',
+  scanAgeText: '[0, 0]',
+  // tui-theme.mjs 的二值状态（2026-11-10）。
+  binaryMark: '["running", false]', binaryColor: '["running"]',
+  // claim-ledger.mjs（2026-11-13）：产出对账。判定层全部纯函数，参数取最小可构造输入。
+  // 读盘的三个（readLedger / probeDisk / sha256File）一律给不存在的路径 —— 返回「没有」
+  // 正是它们的正常空分支。appendRows 传空数组，它在建目录之前就返回 0，
+  // 不会往仓库里写任何东西。
+  makeNonce: '[]', findNonce: '["", []]',
+  observedWrites: '[[]]', compareClaim: '[{}, {}]', foldRows: '[[]]',
+  // Bash 写入识别（2026-11-13）：三个都是纯函数。探针给「一条判得出的命令 + 一个字面量 cwd」，
+  // 目的是让「导出了但调用即炸」在结构门就暴露；判得对不对由 claim-ledger.test.mjs 守着。
+  // 不用空字符串当探针：那会走「立即返回空数组」的分支，等于什么都没调。
+  bashWrites: '["echo x > out.txt", "/repo"]',
+  bashWriteScan: '["echo x > out.txt", "/repo"]',
+  observedWriteScan: '[[], { cwd: "/repo" }]',
+  reconcile: '[{ rows: [] }]', readLedger: '["/nonexistent-ow-ledger.jsonl"]',
+  appendRows: '["/nonexistent-ow-dir/claims.jsonl", []]',
+  ledgerPath: '["/x", "r"]', pathKey: '["a", "/x"]', resolvePath: '["a", "/x"]',
+  // validate-run.mjs 的 outputs 判据（2026-11-13）。checkOutputs 用一份合法图调用，
+  // 另外两个用合法输入调用——非法分支由 validate-run.test.mjs 覆盖（这里只保证
+  // 「导出的函数真的能被调起来」）。合法/非法两条路径都覆盖，才不会出现
+  // 「把校验改成恒真，结构门却照样绿」。
+  checkOutputs: '[{ shape: "artifact", outputs: ["docs/a.md"] }]',
+  outputPathError: '"docs/a.md"', outputPathKey: '"docs/a.md"',
+  makeExpect: '[{ run: "r", task: "T", paths: ["a"] }]',
+  makeClaim: '[{ run: "r", task: "T", path: "a" }]',
+  makeObserve: '[{ run: "r", task: "T", path: "a" }]',
+  makeConsume: '[{ run: "r", task: "T" }]',
+  probeDisk: '["/nonexistent-ow-probe"]', sha256File: '["/nonexistent-ow-probe"]',
+  subagentTranscriptsOf: '["/nonexistent-ow-probe"]',
+  collectSubagentTranscripts: '["/nonexistent-ow-probe"]',
+  readHeadText: '["/nonexistent-ow-probe", 8]', nonceOwners: '[[]]',
 };
 
 /** 需要临时目录的导出，参数由探针注入 `_sandbox` */
@@ -358,10 +548,10 @@ const SANDBOX_ARGS = {
   loadState: '[_sandbox]', saveState: '[_sandbox, {}]',
   probeJobs: '[_sandbox]', probeMtime: '[_sandbox]',
   createLogger: '[_sandbox]', defaultStateDir: '{}', defaultNotifyDir: '{}',
+  readLogHealth: '[_sandbox]', logHealthPath: '["/nonexistent"]',
   createObservationLog: '[_sandbox]', observationStats: '[_sandbox]',
   classifyCandidate: '[{}]', readTranscriptTail: '["/nonexistent"]',
 };
-
 /** `node --check` 只查语法，查不到「调用了一个不存在的函数」。
  *  曾把 wrapToWidth 的循环变量改了一半，语法全绿、结构门全绿，
  *  但按 ? 打开帮助就抛 ReferenceError。
@@ -487,9 +677,18 @@ function checkUnregisteredExports() {
     'unclassifiableMinIdleSec', 'tooRecentToNotify', 'UNCLASSIFIABLE_MIN_IDLE_SEC', 'IDLE_BUCKETS',
     'traceability', 'readJobStates', 'probeWaiting', 'readLiveSessionStates',
     'buildInbox', 'formatInbox', 'healthCheck', 'formatHealth', 'HEALTH_PERIODS',
+  // watch.mjs 的日志健康旁挂文件（2026-11-12）。readLogHealth 已进 PROBE_ARGS
+  // （用 `_sandbox` 真的调一次）；logHealthPath 是纯路径拼接，也进 PROBE_ARGS；
+  // LOG_HEALTH_FILE 是数据（文件名常量），不是函数。
+  'readLogHealth', 'logHealthPath', 'LOG_HEALTH_FILE',
     'statusToState', 'liveToRow', 'mergeLiveSessions', 'listRow', 'detailLines', 'pendingLines',
     'claimOwnership', 'readOwner', 'ownerPath', 'askedCandidates',
     'requestIdTime', 'lastTimelineStateTime', 'resolveJobEventTime', 'BLOCKED_MAX_AGE',
+  // job-event-time.mjs（2026-11-10 抽出）：跨层去重的地基。
+  // 三个函数已进 PROBE_ARGS 实际调用；常量是数据，不是函数。
+  'TIMELINE_TAIL_BYTES',
+  // scan-sessions.mjs（2026-11-10 跨层去重）：宿主字段摊平与 job 指纹的唯一实现。
+  'scanCrossLayerFingerprint', 'hostFieldsOf',
     // asked.mjs
     'lastAssistantText', 'endsWithQuestion', 'classifyQuestion',
     'inspectTranscript', 'scanAll', 'formatResult', 'GREETING', 'DEFAULT_MIN_HOURS',
@@ -506,6 +705,10 @@ function checkUnregisteredExports() {
     'listSessions', 'readPeerToken', 'canConnect', 'buildFrame', 'sendFrame', 'interpretReply',
     // validate-run.mjs
     'validateGraph', 'validateFile', 'CAPABILITIES', 'SHAPES', 'REQUIRED_FOR_COMPLEX', 'MIN_SUBTREES',
+    // validate-run.mjs 的 outputs 判据（2026-11-13）：每个子树必须声明「磁盘上会多出什么」。
+    // checkOutputs 走 PROBE_ARGS 真实调用一次（登记在下面）；另外两个是它内部的纯判据，
+    // 由 validate-run.test.mjs 的合法/非法两组用例覆盖，这里按数据登记。
+    'SHAPES_REQUIRING_OUTPUTS', 'checkOutputs', 'outputPathError', 'outputPathKey',
     // install-watcher.mjs
     'launcherPath', 'templatePath', 'stateDirFor', 'startupDir', 'shortcutPath',
     'renderLauncher', 'needsRegenerate', 'createShortcut', 'autostartAdvice', 'witnessPath', 'writeWitness', 'readWitness', 'checkStateIntegrity', 'HOST_FACT_STATES',
@@ -522,6 +725,12 @@ function checkUnregisteredExports() {
     'enoughForClaims', 'evidenceSufficient', 'normalizeCommand', 'isTestCommand',
     'isBuildCommand', 'isMutatingCommand', 'editKindOf', 'resultText', 'parseLines',
     'subagentFiles', 'summarizeClaims', 'scanSession',
+    // verify-claims.mjs 的产品化层（2026-11-05）。函数已进 PROBE_ARGS 实际调用。
+    'timeOf', 'attemptTimes', 'evidenceTimeline', 'fmtClock', 'verdictIcon',
+    'evidenceSentence', 'adviceFor', 'renderSessionBlock', 'attemptTime',
+    'recoveryCommandFor', 'actualCommandFor', 'shortenCommand',
+    'renderMarkdown', 'exitCodeFor', 'renderSummary', 'renderDetail',
+    'resolveSession', 'flattenResults',
     // verify-claims.mjs 的常量与正则。都是数据，不是函数；函数已逐条登记在 PROBE_ARGS 里。
     'CLAIM_TAIL_BYTES', 'DEFAULT_BACKTRACK_BYTES', 'BACKTRACK_STEPS', 'EVIDENCE_STATUS',
     'EDIT_TOOLS', 'SHELL_TOOLS', 'CLAIM_FAMILIES', 'NEGATION_RE', 'INTERROGATIVE_RE',
@@ -529,6 +738,98 @@ function checkUnregisteredExports() {
     'COMMIT_CMD_RE', 'PUSH_CMD_RE', 'CI_CMD_RE', 'SYNC_CHECK_CMD_RE', 'RUNTIME_CMD_RE',
     'FAIL_OUTPUT_RE', 'COMMIT_OK_RE', 'PUSH_OK_RE', 'PUSH_REJECT_RE', 'SKIP_TESTS_RE',
     'GIT_READONLY_RE', 'BASH_MUTATION_RE', 'CODE_EXTS', 'DOC_EXTS', 'NON_SOURCE_FILES',
+    // 笼统完成声明族（2026-11-13）：一条正则 + 一条否决条件 + 一条验证命令判据。
+    'COMPLETION_RE', 'COMPLETION_VETO_RE', 'VERIFY_CMD_RE',
+    // 三个断言识别缺陷的修复（2026-11-13）：假设/间接疑问判据 + 中文族名。
+    // 函数进 PROBE_ARGS 实际调用；正则与冻结表是数据。
+    'matchesOf', 'clauseAt', 'isHypotheticalMatch', 'familyName', 'activityName',
+    'HYPOTHETICAL_LEAD_RE', 'HYPOTHETICAL_MARK_RE', 'HYPOTHETICAL_BRIDGE_RE',
+    'INVERSION_QUESTION_RE', 'FAMILY_NAMES', 'ACTIVITY_NAMES',
+    // 三个断言识别缺陷的修复（2026-11-13）：假设/间接疑问判据 + 中文族名表。
+    // 都是数据（正则 / 冻结表），函数已逐条登记在 PROBE_ARGS 里。
+    'HYPOTHETICAL_LEAD_RE', 'HYPOTHETICAL_MARK_RE', 'HYPOTHETICAL_BRIDGE_RE',
+    'INVERSION_QUESTION_RE', 'FAMILY_NAMES', 'ACTIVITY_NAMES',
+    // verify-claims.mjs 产品化层的常量与帮助文本。
+    'HELP_TEXT', 'ALERT_STATUS',
+    // tui-theme.mjs 的宽度算法（2026-11-05）。宽度表来自 Unicode 官方数据，
+    // 由 gen-width-table.mjs 生成；这些导出保证「表与算法」都有探针。
+    'truncateDisplay', 'codePointWidth', 'hasColor', 'segmenterAvailable',
+    'unknownColors', 'resetUnknownColors', 'setColorWarn',
+    // scan-sessions.mjs 的三源合并（2026-11-05）：--days 改用 transcript 内部时间，
+    // 并从 jobs/*/state.json 补入没有 transcript 的会话。
+    'lastActivityOf', 'jobStateToState', 'jobToRow', 'mergeJobRows', 'windowLabel',
+    // gen-width-table.mjs：从 scripts/data 下的 Unicode 原始数据生成宽度表。
+    'parseUcdRanges', 'parseEastAsianWidth', 'parseEmojiPresentation',
+    'mergeRanges', 'countCovered', 'renderModule', 'tableStats', 'readData',
+    'DATA_DIR', 'OUT_PATH',
+    // oversight-tui.mjs（2026-11-05）：光标身份、来源标签、空列表的诚实文案。
+    'sessionKey', 'sourceLabel', 'emptyLines',
+    // tui-layout.mjs（2026-11-10 TUI 重做）：列表页的布局数学，全部是纯函数。
+    // 抽出它们的目的就是「可单测」，所以每一条都必须进 PROBE_ARGS 被真实调用一次。
+    'TIERS', 'NEVER_DROP', 'fmtSpan', 'fmtAgeMs', 'fmtScanAge', 'truncateWithDisclosure',
+    'alignRight', 'layoutRow', 'joinWithin', 'windowOf', 'resolveLayout', 'layoutStages',
+    'ACTION_STATES', 'binaryOf', 'partitionRows', 'verdictParts', 'stoppedSummary',
+    'sectionTitle', 'checklistRows', 'footerParts', 'actionCell', 'nearText', 'titleOf',
+    'shortPath', 'runningColumns', 'runningRowOf', 'actionRowOf', 'sectionHeaderLine',
+    'checklistLine', 'checklistSentence', 'checklistSummaryLine', 'checklistLines', 'isQuietRow',
+    'verdictLine', 'footerLine', 'composeListScreen',
+    // tui-meta.mjs（2026-11-10）：标题 / 末条 assistant 的有界读取与 mtime 缓存。
+    'META_TAIL_BYTES', 'projectsRoot', 'transcriptPathFor', 'metaFromRecords',
+    'readTailRecords', 'createMetaCache', 'lastSpeakerOf', 'pendingQuestionOf',
+    // oversight-tui.mjs（2026-11-10 TUI 重做）：分段视图与证据档位。
+    'viewOf', 'actionViewOf', 'buildSections', 'askedCountOf', 'waitingCountOf',
+    'claimsTally', 'scanAgeText', 'defaultClaimsScan',
+    // 2026-11-11：草稿可复制性说明（剪贴板里只能有能直接发出去的文字）。
+    'buildDraft', 'draftHintOf',
+    'ACTION_MAX_AGE_SEC', 'ageLimitOf', 'ageSecOf', 'staleOf',
+    // width-table.mjs：由 gen-width-table.mjs 生成的纯数据表（不是函数，无需探针）。
+    'EAW_WIDE', 'EMOJI_PRESENTATION',
+    // tui-theme.mjs 的二值状态表（2026-11-10）：彩色下统一 `•`，无色下换形状。
+    'BINARY', 'binaryMark', 'binaryColor',
+    // measure-interventions.mjs（2026-11-11）：人工介入测量。判据全部是纯函数，
+    // 参数取最小可构造输入；读盘的两个（eachLine / analyzeTranscript）用不存在的路径。
+    'MAX_CLASSIFY_LEN', 'CORRECTION_MAX_LEN', 'INTERRUPT_RE', 'AVOIDABILITY',
+    'userText', 'humanTurnText', 'isInterrupt', 'assistantStop', 'askedUser',
+    'isAskAnswer', 'classifyHumanMessage', 'avoidabilityOf', 'percentile',
+    'eachLine', 'analyzeTranscript', 'formatReport', 'defaultRoot',
+    // project-commands.mjs（2026-11-12 Stop hook 验证闸）：项目类型探测。
+    // 纯函数逐个进 PROBE_ARGS；detectProjectCommands 读的是「一个不存在的目录」，
+    // 返回 unknown —— 这是它的正常路径，正好把「认不出」分支也验一遍。
+    'MAX_READ_BYTES', 'readCapped', 'pickNpmScripts', 'pickMaven', 'pickGradle',
+    'pickCargo', 'pickGo', 'pickPython', 'pickDotnet', 'detectProjectCommands', 'commandHint',
+    // stop-verify-hook.mjs（2026-11-12）：Stop hook 验证闸。判定层（decide / buildReason /
+    // resolveAssistantText / modeOf / parseHookInput）是纯的，参数取最小可构造输入；
+    // 记账层（appendLog / bumpBlockCount / readBlockCount / resetBlockCount / logPathFor /
+    // statePathFor）在有副作用前就返回，不会写进用户的 %LOCALAPPDATA%。
+    'BLOCKING_STATUS', 'DEFAULT_BACKTRACK_MB', 'DEFAULT_BUDGET_MS', 'ESCALATE_AT',
+    'MAX_BLOCKS', 'RESET_AFTER_MS', 'modeOf', 'parseHookInput', 'readStdin',
+    'resolveAssistantText', 'decide', 'buildReason', 'logPathFor', 'appendLog',
+    'statePathFor', 'bumpBlockCount', 'resetBlockCount', 'readBlockCount', 'runHook',
+    'loadRecords', 'loadSubagentRecords', 'SUBAGENT_TAIL_BYTES',
+    // stop-verify-hook.mjs 的放行样本记录（2026-11-13）。纯记账层：写入失败一律
+    // 吞掉，所以探针只需要证明「给了最小输入也不抛」。分析命令的导出同批登记。
+    'SAMPLE_TEXT_LIMIT', 'samplePathFor', 'sampleLogEnabled', 'toolSummaryOf',
+    'rawFamilyHits', 'buildSample', 'appendSample',
+    // analyze-hook-samples.mjs（2026-11-13）：放行样本的分布分析。全程只读，
+    // 空输入必须能跑 —— 一个空样本文件不该让分析命令报错。
+    'COLON_COMPLETION_RE', 'COMPLETION_ANY_RE', 'completionShapeOf', 'clusterOf',
+    'suspectOf', 'strongSuspectOf', 'summarize', 'formatReport', 'topSuspects',
+    'defaultSamplesPath', 'parseSampleLines', 'loadSamples', 'statLine',
+    // verify-claims.mjs 的「做过检查没有」判据（2026-11-13），已进 PROBE_ARGS。
+    'isVerificationCommand',
+    // claim-ledger.mjs（2026-11-13）：产出对账。判定层全是纯函数，参数取最小可构造输入；
+    // 读盘的三个（readLedger / probeDisk / sha256File）用不存在的路径——那正是它们
+    // 的「什么都没有」正常路径，正好把空分支也验一遍。appendRows 传空 rows，
+    // 它在建目录之前就返回 0，不会写进仓库。
+    'makeNonce', 'findNonce', 'observedWrites', 'compareClaim', 'foldRows',
+    'bashWrites', 'bashWriteScan', 'observedWriteScan',
+    'reconcile', 'readLedger', 'appendRows', 'ledgerPath', 'pathKey', 'resolvePath',
+    'makeExpect', 'makeClaim', 'makeObserve', 'makeConsume',
+    'probeDisk', 'sha256File', 'subagentTranscriptsOf', 'collectSubagentTranscripts',
+    'readHeadText', 'nonceOwners',
+    // 常量与枚举：都是数据，不是函数。
+    'LEDGER_VERSION', 'LEDGER_FILE', 'HASH_MAX_BYTES', 'SUBAGENT_HEAD_BYTES',
+    'OBSERVE_TAIL_BYTES', 'WRITE_TOOLS', 'ITEM_STATUS', 'TASK_VERDICT', 'FAILING_VERDICTS',
   ]);
   const INTENTIONALLY_PROBED_FREE = new Set([
     'main', 'printPlain', 'copyToClipboard', 'startWatch', 'runTick',
@@ -536,6 +837,12 @@ function checkUnregisteredExports() {
     'NOTIFY_STATES', '__internals',
     // 这两个要读真实 transcript 目录（1GB），不能塞进结构门；由 CLI 自测覆盖。
     'parseTranscript', 'listTranscripts', 'loadCorpus',
+    // measure-interventions.mjs：run 会全量扫 1.7GB transcript（实测 24s），不能进结构门；
+    // 它的正确性由 measure-interventions.test.mjs 里的小目录用例覆盖。
+    'run', 'COUNT_PER_STOP', 'INTERRUPT_MARKER',
+    // defaultClaimsScan 会 spawn verify-claims 子进程（实测 7.2s），不能塞进结构门；
+    // 它有独立的 `--plain` 端到端覆盖（见 tui-redesign.test.mjs）。
+    'defaultClaimsScan',
     // stop-signals.mjs 的常量与汇总扫描：scanAll 要读 186 个 transcript（1.4GB），
     // 同样不能塞进结构门；判据本身已逐条登记在 PROBE_ARGS 里。
     'TAIL_BYTES', 'HEAD_BYTES', 'LOOP_WINDOW', 'LOOP_REPEAT', 'CONTEXT_NEAR_FULL_RATIO',
@@ -867,6 +1174,219 @@ function checkAgentReachability() {
   }
 }
 
+// ── 检查 11：文档引用的路径必须存在 ────────────────────────────────────
+
+/** 「被文档引用的文件不存在」是同一类缺陷的反复复发：`dispatch-contract.md` 让所有
+ *  Agent 去读 `templates/baseline.md`，而那个文件从来没被创建过；设计稿里更是列了
+ *  一堆 `scripts/org.mjs` 这样的文件名，读者无法分辨「计划中的」和「已有的」。
+ *
+ *  只查**活文档**（README / CLAUDE / GUIDE / 现行 spec / adr / 两份索引）。历史报告与
+ *  CHANGELOG 是事实记录，里面的旧路径不该被改写，也不该被这道门拦。
+ *
+ *  计划中的路径必须**在同一行**标 `待建` / `未实现` / `不实现` 之类。
+ *  这个豁免不是后门：它逼作者在写下路径的当场就说清「这东西还不存在」，
+ *  而不是让读者自己去 `ls` 验证。 */
+const LIVING_DOCS = [
+  'README.md',
+  'CLAUDE.md',
+  'docs/README.md',
+  'docs/GUIDE.md',
+  'docs/CAPABILITIES.md',
+  'docs/design/README.md',
+  'docs/research/README.md',
+  'docs/spec/state-model.md',
+  'docs/spec/dispatch-contract.md',
+  'docs/spec/evidence-discipline.md',
+  'docs/spec/relay-protocol.md',
+  'docs/spec/output-format.md',
+  'docs/spec/tui-visual.md',
+  'docs/adr/0001-config-only.md',
+  'docs/adr/0002-honest-degradation.md',
+];
+
+/** 允许出现「尚不存在」路径的行标记。命中即跳过。 */
+const PLANNED_MARK = /待建|未实现|不实现|实现时|计划新增|零行实现|尚未创建/;
+
+/** `scripts/x.mjs` / `templates/x.md` / `.claude/...` 这类仓库相对路径。 */
+const DOC_PATH_RE = /(?:^|[\s`(+'"|])((?:scripts|templates|tasks|\.claude|docs)\/[A-Za-z0-9_./-]+\.(?:mjs|md|json|ps1|vbs|template|yml))/g;
+
+function checkDocReferences() {
+  for (const relPath of LIVING_DOCS) {
+    const p = join(ROOT, relPath);
+    if (!existsSync(p)) continue;
+    let text = '';
+    try { text = readFileSync(p, 'utf8'); } catch { continue; }
+    text.split('\n').forEach((line, i) => {
+      if (PLANNED_MARK.test(line)) return;
+      for (const m of line.matchAll(DOC_PATH_RE)) {
+        const target = m[1];
+        // 模板占位符与省略号是示意，不是路径
+        if (/[*<>]|\.\.\.|NNN|xxx|YYYY/.test(target)) continue;
+        if (!existsSync(join(ROOT, target))) {
+          fail(relPath, `第 ${i + 1} 行引用的文件不存在：${target}`
+            + '（若是有意保留的计划，请在该行标注「待建」/「未实现」）');
+        }
+      }
+    });
+  }
+}
+
+// ── 检查 12：文档里写的命令必须真的能跑 ────────────────────────────────
+
+/** `node scripts/xxx.mjs --flag` 里的脚本可能存在、但 `--flag` 不存在。
+ *  这种错误比死链更坏：读者会把它当命令敲，然后得到「未知参数」。
+ *
+ *  这里只做两件零成本的事：脚本文件存在、每个 `--flag` 在该脚本源码里出现过。
+ *  **不执行命令**——`scan-sessions.mjs --help` 会真的开扫（实测 78 秒），
+ *  `verify-bugfix-negatives.mjs` 会改写源码。把「跑一遍」放进硬门是灾难。 */
+function checkDocCommands() {
+  for (const relPath of LIVING_DOCS) {
+    const p = join(ROOT, relPath);
+    if (!existsSync(p)) continue;
+    let text = '';
+    try { text = readFileSync(p, 'utf8'); } catch { continue; }
+    text.split('\n').forEach((line, i) => {
+      if (PLANNED_MARK.test(line)) return;
+      for (const m of line.matchAll(/node\s+(scripts\/[A-Za-z0-9_.-]+\.mjs)([^\n`|)]*)/g)) {
+        const script = m[1];
+        if (!existsSync(join(ROOT, script))) {
+          fail(relPath, `第 ${i + 1} 行命令引用了不存在的脚本：${script}`);
+          continue;
+        }
+        let src = '';
+        try { src = readFileSync(join(ROOT, script), 'utf8'); } catch { continue; }
+        for (const f of new Set([...m[2].matchAll(/(--[a-z][a-z0-9-]*)/g)].map((x) => x[1]))) {
+          if (!src.includes(f)) {
+            fail(relPath, `第 ${i + 1} 行用了 ${script} 不支持的参数 ${f}`);
+          }
+        }
+      }
+    });
+  }
+}
+
+// ── 检查 13：文档写死的常量值必须与源码一致 ────────────────────────────
+
+/** 这是 `checkTestCount()` 的同类推广：数字只要靠手写就会漂。
+ *
+ *  只查**显式对照**形态 `` `MAX_SUBAGENTS = 100` ``——那种写法是在断言
+ *  「这个常量等于这个值」，一旦源码改了它就是一句假话。精确、零误报。
+ *
+ *  **不查散文里的数字**（「上限 100」）：那种句子要判断它指的是哪个常量，
+ *  语义歧义导致的误报会让人把整道门关掉，得不偿失。 */
+function checkDocConstants() {
+  const consts = new Map();
+  const dir = join(ROOT, 'scripts');
+  if (!existsSync(dir)) return;
+  for (const f of readdirSync(dir).filter((x) => x.endsWith('.mjs') && !x.endsWith('.test.mjs'))) {
+    let t = '';
+    try { t = readFileSync(join(dir, f), 'utf8'); } catch { continue; }
+    for (const m of t.matchAll(/^const ([A-Z][A-Z0-9_]{2,}) = (\d[\d_]*)(?:;|\s*\/\/|\s*$)/gm)) {
+      consts.set(m[1], { value: Number(m[2].replace(/_/g, '')), file: f });
+    }
+  }
+  if (!consts.size) return;
+
+  for (const relPath of LIVING_DOCS) {
+    const p = join(ROOT, relPath);
+    if (!existsSync(p)) continue;
+    let text = '';
+    try { text = readFileSync(p, 'utf8'); } catch { continue; }
+    text.split('\n').forEach((line, i) => {
+      for (const m of line.matchAll(/`([A-Z][A-Z0-9_]{2,}) = (\d[\d_]*)`/g)) {
+        const c = consts.get(m[1]);
+        if (!c) continue;
+        const claimed = Number(m[2].replace(/_/g, ''));
+        if (claimed !== c.value) {
+          fail(relPath, `第 ${i + 1} 行写 ${m[1]} = ${claimed}，`
+            + `而 scripts/${c.file} 里是 ${c.value}`);
+        }
+      }
+    });
+  }
+}
+
+// ── 检查 14：研究索引必须覆盖每一份报告 ────────────────────────────────
+
+/** 与 `checkDesignIndex()` 同形，理由也一样：62 份研究报告里只要有几份没进索引，
+ *  它们就等于不存在——没人会逐份点开一个没有目录的文件夹。
+ *
+ *  另外强制索引保留**状态标记**（有效 / 部分失效 / 已推翻 / 未验证）。
+ *  一份没有状态的研究报告不是结论，是原材料；索引若退化成纯文件列表，
+ *  「已推翻的结论仍被引用」这件事就会重新发生。 */
+function checkResearchIndex() {
+  const dir = join(ROOT, 'docs', 'research');
+  if (!existsSync(dir)) return;
+  const index = join(dir, 'README.md');
+  if (!existsSync(index)) {
+    fail('docs/research/README.md', '缺少研究索引——读者无法分辨哪些结论已被推翻');
+    return;
+  }
+  let idx = '';
+  try { idx = readFileSync(index, 'utf8'); } catch { /* ignore */ }
+  for (const marker of ['有效', '已推翻', '未验证']) {
+    if (!idx.includes(marker)) {
+      fail('docs/research/README.md', `索引缺少状态标记「${marker}」——没有状态的研究报告等于没有结论`);
+    }
+  }
+  const docs = readdirSync(dir).filter((f) => f.endsWith('.md') && f !== 'README.md');
+  const missing = docs.filter((f) => !idx.includes(f));
+  if (missing.length) {
+    fail('docs/research/README.md', `这些报告没有登记（新增报告必须写明状态与依据）：${missing.join(', ')}`);
+  }
+}
+
+// ── 检查 15：能力清单里的每条命令必须可执行 ────────────────────────────
+
+/** README 说「能做什么」是靠人相信的。`docs/CAPABILITIES.md` 把每条能力绑到
+ *  **一条可运行的命令**上，这道门只保证那些命令的脚本与参数真实存在。
+ *
+ *  它不能证明「命令输出能支持这句声称」——那需要人读。但它能挡住最坏的一种：
+ *  某条能力对应的脚本已经被删/改名，而 README 还在承诺。
+ *
+ *  同时要求 README 指向这份清单。理由同 design 索引：没有入口的清单等于没有。 */
+function checkCapabilities() {
+  const doc = join(ROOT, 'docs', 'CAPABILITIES.md');
+  if (!existsSync(doc)) {
+    fail('docs/CAPABILITIES.md', '缺少能力清单——README 的能力声称将无法被核对');
+    return;
+  }
+  let text = '';
+  try { text = readFileSync(doc, 'utf8'); } catch { return; }
+
+  let rows = 0;
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('|')) continue;
+    const cmd = line.match(/`(node scripts\/[A-Za-z0-9_.-]+\.mjs[^`]*)`/);
+    if (!cmd) continue;
+    rows++;
+    const m = cmd[1].match(/node\s+(scripts\/[A-Za-z0-9_.-]+\.mjs)([^\n`|)]*)/);
+    if (!m) continue;
+    if (!existsSync(join(ROOT, m[1]))) {
+      fail('docs/CAPABILITIES.md', `能力清单引用了不存在的脚本：${m[1]}`);
+      continue;
+    }
+    let src = '';
+    try { src = readFileSync(join(ROOT, m[1]), 'utf8'); } catch { continue; }
+    for (const f of new Set([...m[2].matchAll(/(--[a-z][a-z0-9-]*)/g)].map((x) => x[1]))) {
+      if (!src.includes(f)) fail('docs/CAPABILITIES.md', `${m[1]} 不支持参数 ${f}`);
+    }
+  }
+  if (!rows) {
+    fail('docs/CAPABILITIES.md', '能力清单里没有任何「能力 → 命令」行，这份文件退化成了一篇文章');
+  }
+
+  // 入口必须可达
+  const readme = join(ROOT, 'README.md');
+  if (existsSync(readme)) {
+    let r = '';
+    try { r = readFileSync(readme, 'utf8'); } catch { /* ignore */ }
+    if (!r.includes('docs/CAPABILITIES.md')) {
+      fail('README.md', '没有指向 docs/CAPABILITIES.md —— 读者无法核对「能做什么」');
+    }
+  }
+}
+
 // ── 运行 ──────────────────────────────────────────────────────────────
 
 console.log('check-structure · 仓库结构硬门\n');
@@ -877,6 +1397,7 @@ checkGitignoreSanity();
 checkAgents();
 checkEmptyDirs();
 checkCapabilityDisclosure();
+checkTestCount();
 checkSyntax();
 checkImportable();
 checkUnregisteredExports();
@@ -887,6 +1408,11 @@ checkLauncherPlacement();
 checkInboxWiring();
 checkDesignIndex();
 checkAgentReachability();
+checkDocReferences();
+checkDocCommands();
+checkDocConstants();
+checkResearchIndex();
+checkCapabilities();
 
 if (violations.length) {
   console.log(`✗ ${violations.length} 项违规：\n`);

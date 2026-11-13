@@ -20,6 +20,7 @@
 import { readFileSync, readdirSync, existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join, basename } from 'node:path';import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { resolveJobEventTime } from './job-event-time.mjs';
 
 // ── 常量（与 docs/spec/state-model.md 一一对应）────────────────────────
 
@@ -329,6 +330,49 @@ function tailRecords(records, n) {
   return records.length > n ? records.slice(-n) : records;
 }
 
+/**
+ * 从 transcript 记录里取「最后一条真实活动的时间戳」。
+ *
+ * **这是 --days 窗口的唯一判据，不再用文件 mtime。**
+ *
+ * 为什么不能信 mtime：宿主会往 transcript 尾部追加不含 timestamp 的小记录
+ * （`last-prompt` / `custom-title` / `mode` / `cost-state` / `atis-latch` …），
+ * 每一次都刷新文件 mtime，但**会话本身一步都没走**。实测（2026-11-05，241 个
+ * transcript）：
+ *
+ *   241 个文件里 **122 个**的 |mtime − 最后一条带时间戳的记录| > 24h；
+ *   最大偏差 194.7h(mtime) vs 1637.9h(内部时间) —— **相差 8.4 倍**；
+ *   另一个会话 idle=548.7h 而 mtime=4.9h，**相差 112 倍**。
+ *
+ * 后果不只是「列表里多几条」：一个闲置 23 天的会话因为一次 `mode` 写入而显得
+ * 「最近有活动」，于是它的 idle 被算成 5 小时，而它其实已经等了三周。
+ *
+ * 规则：
+ *   1. 从尾部往前找第一条**带 timestamp 字段**的记录，用它。
+ *   2. 没有 timestamp 的记录（title / mode / cost-state…）一律跳过——
+ *      它们不是活动，只是元数据。
+ *   3. 全文件都没有 timestamp（实测 1/241，386 字节的空壳）→ 返回 null，
+ *      由调用方标注 `lastActivity: null`，不假装知道。
+ *
+ * 注意 **不是**取最后一条工具调用：用户提问、助手回答同样是活动。
+ * 实测「最后记录 vs 最后工具调用」超过 24h 的只有 3/241，所以这两者几乎等价，
+ * 但 lastActivity 的语义应该是「这个会话最后一次有人说话」。
+ *
+ * @param {Array<object>} records
+ * @returns {number|null} epoch ms
+ */
+export function lastActivityOf(records) {
+  for (let i = records.length - 1; i >= 0; i--) {
+    const rec = records[i];
+    if (!rec || typeof rec !== 'object') continue;
+    const raw = rec.timestamp;
+    if (typeof raw !== 'string') continue;
+    const ts = Date.parse(raw);
+    if (Number.isFinite(ts)) return ts;
+  }
+  return null;
+}
+
 /** 递归收集子 agent transcript：直接子文件 + subagents/workflows 下的嵌套。
  *  实测 3220 个 jsonl 中有 1190 个在 workflows/<wf-id>/ 里，只扫直接子文件会漏掉 37%。 */
 function collectSubagentFiles(subDir) {
@@ -366,6 +410,9 @@ function scanSessionDir(dir) {
   const mainParsed = parseJsonl(mainPath);
   const mainRecs = tailRecords(mainParsed.records, MAX_CALLS_PER_SESSION * 3);
   const mainCalls = extractCalls(mainRecs);
+  // 会话内部的活动时间：来自 transcript 记录自身的 timestamp，与文件 mtime 无关。
+  // 子 agent 的调用也算活动，所以与 allCalls 一起取最大值（见下方 lastActivity）。
+  const mainLast = lastActivityOf(mainParsed.records);
   let badLines = mainParsed.badLines;
 
   // 子 agent：每个独立 transcript，.meta.json 回指父会话。
@@ -396,6 +443,14 @@ function scanSessionDir(dir) {
   for (const c of children) allCalls.push(...c.calls);
   allCalls.sort((a, b) => a.ts - b.ts);
 
+  // 会话最后活动时刻 = max(主 transcript 的最后一条记录, 任一子 agent 的最后一次调用)。
+  // 子 agent 在跑而主线程暂时没有新记录时，这个会话仍然「在动」——只取主记录会
+  // 把它算成静止。反过来，主记录里的提问/回答也是活动，不能只看工具调用。
+  let lastActivity = mainLast;
+  for (const c of allCalls) {
+    if (c.ts > (lastActivity ?? 0)) lastActivity = c.ts;
+  }
+
   return {
     mainPath,
     mainCalls,
@@ -403,6 +458,7 @@ function scanSessionDir(dir) {
     allCalls,
     gaps: gapsOf(allCalls),
     badLines,
+    lastActivity,
     subagentTotal: candidates.length,
     subagentTruncated: truncated,
   };
@@ -512,14 +568,34 @@ function readJobs() {
     if (!existsSync(p)) continue;
     try {
       const o = JSON.parse(readFileSync(p, 'utf8'));
+      // linkScanPath 里的 transcript id 与 state.json 的 sessionId **可能不同**：
+      // 实测 a9fa4c62（job.sessionId）对应的 transcript 是 af6779f8。两者都要留，
+      // 否则「同一个会话」在 jobs 与 transcript 两个源里看起来是两条。
+      const linkMatch = (o.linkScanPath || '').match(/([0-9a-f-]{36})\.jsonl$/);
+      const transcriptId = linkMatch ? linkMatch[1] : null;
+      // project 目录名从 linkScanPath 反推（…/projects/<dir>/<id>.jsonl），
+      // 这样没有 transcript 的 job 也能在列表里显示成可读的项目名。
+      const projMatch = (o.linkScanPath || '').replace(/\\/g, '/').match(/\/projects\/([^/]+)\//);
       out.push({
         jobId,
-        state: o.state ?? null,          // done / failed / blocked / running
+        state: o.state ?? null,          // done / failed / blocked / running / stopped
         detail: o.detail ?? null,
         tempo: o.tempo ?? null,
         linkScanPath: o.linkScanPath ?? null,
-        sessionId: (o.linkScanPath || '').match(/([0-9a-f-]{36})\.jsonl$/)?.[1] ?? null,
+        sessionId: o.sessionId ?? null,
+        transcriptId,
+        // 这个 job 的目录：`resolveJobEventTime` 要读同目录下的 `timeline.jsonl`。
+        // 不传它就只能退化到 firstTerminalAt，与 probeJobs 的结果可能不一致。
+        jobDir: join(dir, jobId),
+        project: projMatch ? projMatch[1] : null,
+        // 会话的显示名（bg job 的 -n / --name）。没有 transcript 时这是唯一的可读标识。
+        name: typeof o.name === 'string' ? o.name : null,
+        cwd: typeof o.cwd === 'string' ? o.cwd : null,
         updatedAt: o.updatedAt ?? null,
+        // 宿主写的「首次进入终态」。`resolveJobEventTime` 在 timeline 与
+        // request-id 都缺席时用它兜底——没有它，同一件事在 scan 层会被判成
+        // 「没有事件时刻」，而 probeJobs 层却算得出来，两路指纹又分叉。
+        firstTerminalAt: o.firstTerminalAt ?? null,
         // 宿主持有真实 token 计数（不是估算）。ADR-0001 曾断言「预算只能 est:」，
         // 对后台作业这条不成立——实测有 3,475,667 这样的绝对值。
         tokens: typeof o.tokens === 'number' ? o.tokens : null,
@@ -530,6 +606,165 @@ function readJobs() {
     } catch { /* 跳过坏文件 */ }
   }
   return out;
+}
+
+/**
+ * 宿主 job 的 state → 四态。
+ *
+ * 只映射**需要人处理**的三类：blocked / failed / running。
+ * `done` / `stopped` 不补进列表——它们没有可行动信息，补进来只是噪音，
+ * 而且会把「全部会话」撑成上百条历史作业。这条边界和 TUI 里
+ * `statusToState` 对 sessions/*.json 的处理一致。
+ *
+ * @param {string|null} jobState
+ * @returns {string|null}
+ */
+export function jobStateToState(jobState) {
+  if (jobState === 'blocked') return 'BLOCKED';
+  if (jobState === 'failed') return 'FAILED';
+  if (jobState === 'running') return 'PRODUCING';
+  return null;
+}
+
+/**
+ * 把「宿主实时状态」摊平成扫描行上的三个字段。
+ *
+ * 为什么单独成函数：这些字段**不是给人看的**，是 `watch.mjs` 算去重键的原料。
+ * 少一个，scan 侧就只能退回 `lastActivity`，而 sessions 侧退到
+ * `host:<statusUpdatedAt>` —— 同一次等待两个键，隔十几分钟发两条。
+ * 生产 `state.json` 实测两对这种重复（`f932d1d4` / `a80c452d`）。
+ * 单独成函数才能被测试直接钉住「字段有没有丢」，而不是等到线上重发才发现。
+ *
+ * @param {{ status?: string, waitingFor?: string, statusUpdatedAt?: number }|null} live
+ * @returns {{ waitingFor: string|null, statusUpdatedAt: number|null }}
+ */
+export function hostFieldsOf(live) {
+  const waitingFor = typeof live?.waitingFor === 'string' ? live.waitingFor : null;
+  const at = Number(live?.statusUpdatedAt);
+  return { waitingFor, statusUpdatedAt: Number.isFinite(at) && at > 0 ? at : null };
+}
+
+/**
+ * 从一条宿主 job 记录算出**跨层去重指纹**。返回 `{ fingerprint, anchorSource }` 或 null。
+ *
+ * 这是「jobs 源」与「scan 源」共用的**唯一**一处实现：`jobToRow`（只有 job 的行）
+ * 与主循环里「有 transcript 的 FAILED/BLOCKED 行」都调它。
+ * 只要两条路径都调它，`probeJobs` 与 `candidatesFromScan` 对同一次失败就必然同键——
+ * 这是跨层去重的全部要求。
+ *
+ * 拿不到事件时刻时返回 null，**不退回 `updatedAt`**：那是文件重写时刻，
+ * 宿主任意一次元数据写入都会把它推到当下（实测差 27.8 天），
+ * 用它做键等于给同一件事每次都换一个新键。调用方按 fail-closed 处理。
+ *
+ * @param {{ hostState: string|undefined, job: object|null }} args
+ * @returns {{ fingerprint: string, anchorSource: string }|null}
+ */
+export function scanCrossLayerFingerprint({ hostState, job }) {
+  if (hostState !== 'failed' && hostState !== 'blocked') return null;
+  if (!job || !job.jobDir) return null;
+  const ev = resolveJobEventTime(job, job.jobDir);
+  if (!Number.isFinite(ev.atMs)) return null;
+  return { fingerprint: `job:${new Date(ev.atMs).toISOString()}`, anchorSource: `jobs-${ev.source}` };
+}
+
+/**
+ * 把一个只有宿主 job 记录、没有 transcript 的会话转成列表行。
+ *
+ * 没有 transcript 就没有 calls / novelty / 心跳 —— 这些字段显式给 null，
+ * **不要假装是 0**。calls=0 会被读成「这个会话一次工具都没调用」，
+ * 而真相是「我们手里根本没有它的调用记录」。
+ *
+ * @param {object} job  readJobs() 的一项
+ * @param {number} nowMs
+ * @returns {object}
+ */
+export function jobToRow(job, nowMs = Date.now()) {
+  const updated = Number.isFinite(Date.parse(job?.updatedAt || '')) ? Date.parse(job.updatedAt) : null;
+  const hostState = job?.state ?? null;
+  // ── 事件时刻：与 watch.mjs 的 `probeJobs` 走**同一个**解析器 ──
+  //
+  // 这是跨层去重的关键。以前这里给它 `lastActivity: updated`（文件重写时刻），
+  // 而 `probeJobs` 用 timeline / request-id / firstTerminalAt 算事件时刻 ——
+  // 同一次失败在 jobs 层与 scan 层得到两个指纹，中间隔过 10 分钟限额就发两条。
+  // `updatedAt` 是元数据时间，宿主任意一次重写都会把它推到当下（实测差 27.8 天），
+  // 拿它当事件时刻本来也是错的（见 job-event-time.mjs 头注释）。
+  const cross = scanCrossLayerFingerprint({ hostState, job });
+  return {
+    project: job?.project ?? null,
+    sessionId: job?.sessionId ?? null,
+    hostSessionId: job?.sessionId ?? null,
+    transcriptId: job?.transcriptId ?? null,
+    // 名字是 bg job 的唯一可读标识（没有 transcript 时 project 也可能为空）
+    name: job?.name ?? null,
+    lastActivity: updated === null ? null : new Date(updated).toISOString(),
+    idleSec: updated === null ? null : Math.round((nowMs - updated) / 1000),
+    // 事件时刻与它派生的去重指纹。取不到就留 null，由调用方 fail-closed
+    // （`candidatesFromScan` 会退回到 lastActivity，且 anchorSource 会说出来）。
+    eventAt: cross ? cross.fingerprint.slice(4) : null,
+    eventSource: cross ? cross.anchorSource.replace(/^jobs-/, '') : null,
+    eventWhy: cross ? null : 'no-event-time',
+    evidenceFingerprint: cross ? cross.fingerprint : null,
+    anchorSource: cross ? cross.anchorSource : null,
+    calls: null,
+    hasTranscript: false,
+    subagents: 0,
+    subagentsTotal: 0,
+    subagentsTruncated: 0,
+    subagentsComplete: true,
+    maxDepth: 0,
+    novelty: null,
+    noveltyAll: null,
+    hbThresholdSec: null,
+    lastGapSec: null,
+    state: jobStateToState(hostState),
+    reason: hostState === 'blocked' ? 'host-reported-blocked' : `host-reported-${hostState}`,
+    liveness: 'host-job',
+    hostState,
+    jobDetail: job?.detail ?? null,
+    tokens: job?.tokens ?? null,
+    needs: job?.needs ?? null,
+    suggestedReply: job?.suggestedReply ?? null,
+    badLines: 0,
+    source: 'job',
+    lastCallAt: null,
+  };
+}
+
+/**
+ * 把宿主 job 合并进 transcript 结果集。**原地追加，返回追加的条数。**
+ *
+ * 去重键要处理「同一会话在不同源里 id 不同」这一实测事实：
+ *   job a9fa4c62… 的 linkScanPath 指向 transcript af6779f8…，两者是同一个会话。
+ * 所以一条 transcript 行同时登记 sessionId / hostSessionId / transcriptId 三个身份，
+ * 一个 job 也同时登记自己的 sessionId 与 transcriptId（别名）。任一命中即视为已覆盖。
+ *
+ * `done` / `stopped` 的 job 不补：它们没有可行动信息，补进来只是噪音。
+ *
+ * @param {Array<object>} rows  transcript 结果（原地修改）
+ * @param {Array<object>} jobs  readJobs() 的输出
+ * @param {number} nowMs
+ * @returns {number} 追加的条数
+ */
+export function mergeJobRows(rows, jobs, nowMs = Date.now()) {
+  const covered = new Set();
+  for (const r of rows) {
+    for (const key of [r?.sessionId, r?.hostSessionId, r?.transcriptId]) {
+      if (key) covered.add(key);
+    }
+  }
+  let added = 0;
+  for (const job of jobs || []) {
+    if (!job || !job.sessionId) continue;
+    if (covered.has(job.sessionId)) continue;
+    if (job.transcriptId && covered.has(job.transcriptId)) continue;
+    if (!jobStateToState(job.state)) continue;
+    const row = jobToRow(job, nowMs);
+    rows.push(row);
+    covered.add(job.sessionId);
+    if (job.transcriptId) covered.add(job.transcriptId);
+    added++;
+  }
+  return added;
 }
 
 /** 统计本机真实的工具分布，用于重估 novelty 权重（§3.5）。
@@ -552,6 +787,20 @@ export function recalibrateWeights(counts) {
 
 function main(argv) {
   const args = new Set(argv);
+  // `--now <ISO>`：**注入时钟**。默认取真实当前时间，行为与以前完全一致。
+  //
+  // 为什么需要它：扫描输出里的 `idleSec` / `--days` 窗口 / `mergeJobRows` 全部从
+  // 「现在」导出。纯命令行看不出问题，但 `runTick` 把 `nowMs` 一路传进来时，
+  // 如果 CLU 子进程自己取挂钟，同一轮里两段时间基准就会打架。
+  // 更直接的理由是测试：一个「结果随挂钟走动」的扫描器没法被固定时钟复现。
+  const nowMs = (() => {
+    const i = argv.indexOf('--now');
+    if (i >= 0) {
+      const t = Date.parse(argv[i + 1] || '');
+      if (Number.isFinite(t)) return t;
+    }
+    return Date.now();
+  })();
   const json = args.has('--json');
   const recalibrate = args.has('--recalibrate');
   const projectFilter = (() => {
@@ -560,8 +809,15 @@ function main(argv) {
   })();
   const days = (() => {
     const i = argv.indexOf('--days');
-    return i >= 0 ? Number(argv[i + 1]) || 7 : 7;
+    // `--days 0` 与 `--all` 都表示「不限窗口，全部会话」。
+    // 为什么需要：用户明确要求「所有会话都要显示」。窗口本身是有用的
+    // （全量扫描随语料线性变慢），但**不能有任何会话是「因为没加参数就永远看不见」**。
+    if (args.has('--all')) return 0;
+    if (i < 0) return 7;
+    const n = Number(argv[i + 1]);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 7;
   })();
+  const unbounded = days === 0;
 
   const root = findTranscriptRoot();
   if (!root) {
@@ -569,15 +825,30 @@ function main(argv) {
     process.exit(2);
   }
 
-  const cutoff = Date.now() - days * 86_400_000;
+  const cutoff = unbounded ? -Infinity : nowMs - days * 86_400_000;
   const results = [];
   const toolCounts = {};
   const jobs = readJobs();
   const jobBySession = new Map(jobs.filter((j) => j.sessionId).map((j) => [j.sessionId, j]));
+  // jobs 里有会话「别名」问题：实测 a9fa4c62 的 state.json 里 sessionId 是 a9fa4c62…，
+  // 而 linkScanPath 指向的 transcript 是 af6779f8… —— 同一个会话在两个源里 id 不同。
+  // 两条边都建索引，按任一 id 都能找到同一个 job。
+  const jobByAlias = new Map();
+  for (const j of jobs) {
+    if (!j) continue;
+    if (j.sessionId) jobByAlias.set(j.sessionId, j);
+    if (j.transcriptId) jobByAlias.set(j.transcriptId, j);
+  }
   // 宿主的实时状态（含 waiting）按 sessionId 索引，供判定使用。
   // 注意：sessions/*.json 里只有**当前还活着**的会话，历史会话查不到 —— 这是优势不是缺陷：
   // waiting 只在等待发生的那一刻为真，不会像 jobs 的 failed 那样留着陈旧值。
   const liveBySession = new Map(readLiveSessions().filter((s) => s.sessionId).map((s) => [s.sessionId, s]));
+  /** 已由 transcript 覆盖的会话 id（含 job 别名）——由 mergeJobRows 自己重建，
+   *  这里不再维护第二份集合。 */
+  /** 内部活动时间不可知的会话（transcript 全文件无 timestamp）——只统计，不猜 */
+  let unknownActivity = 0;
+  /** 看到过多少个 transcript 文件（窗口内外都算）。用来说明「检查了什么」。 */
+  let transcriptsSeen = 0;
 
   for (const projectDir of readdirSync(root)) {
     const projectPath = join(root, projectDir);
@@ -589,19 +860,39 @@ function main(argv) {
       if (!entry.endsWith('.jsonl')) continue;
       const sessionId = entry.replace(/\.jsonl$/, '');
       const filePath = join(projectPath, entry);
-      let mtime;
-      try { mtime = statSync(filePath).mtimeMs; } catch { continue; }
-      if (mtime < cutoff) continue;
+      transcriptsSeen++;
 
+      // ── --days 窗口：按 transcript 内部时间，不按文件 mtime ──────────
+      //
+      // 旧实现 `if (mtime < cutoff) continue`。实测 mtime 会因宿主写入
+      // 不含 timestamp 的元数据记录（last-prompt / custom-title / mode /
+      // cost-state …）而被刷新：241 个文件里 122 个的 mtime 与「最后一条真实
+      // 活动的记录」相差超过 24 小时，最大相差 8.4 倍（mtime 194.7h vs 内部 1637.9h）。
+      // **文件被碰过 ≠ 会话在跑。**
       const scanned = scanSessionDir(join(projectPath, sessionId));
-      if (!scanned || !scanned.allCalls.length) continue;
+      if (!scanned) continue;
+
+      const lastActivity = scanned.lastActivity;
+      if (lastActivity === null) {
+        // 整份 transcript 没有一条带时间戳的记录：无法判断它在不在窗口内。
+        // 不静默丢弃（那会让「监控看不见」和「它不在窗口内」变成一个样子），
+        // 计入 unknownActivity 并在输出里显式说明。
+        unknownActivity++;
+        continue;
+      }
+      // 没有任何工具调用也**不是**丢弃的理由：一个会话可能刚开、只在对话。
+      // 旧实现 `if (!scanned.allCalls.length) continue` 让它彻底消失。
+      // 判定（judgeState）对空 calls 有自己的分支（cold-start），不需要这里预先筛掉。
+      if (lastActivity < cutoff) continue;
+
       if (recalibrate) {
         for (const c of scanned.allCalls) toolCounts[c.name] = (toolCounts[c.name] || 0) + 1;
       }
 
       // 宿主权威状态：jobs 里的 failed/blocked 与 sessions 里的 waiting
-      // 都必须传进去，否则那些分支永远是死的
-      const job = jobBySession.get(sessionId);
+      // 都必须传进去，否则那些分支永远是死的。
+      // 用别名索引查：job 的 sessionId 与 transcript 文件名可能不同。
+      const job = jobByAlias.get(sessionId);
       const live = liveBySession.get(sessionId);
       const hostState = job?.state === 'failed' ? 'failed'
         : job?.state === 'blocked' ? 'blocked'
@@ -613,19 +904,41 @@ function main(argv) {
         waitingFor: live?.waitingFor ?? null,
         calls: scanned.allCalls,
         gapsMs: scanned.gaps,
+        now: nowMs,
       });
 
-      const lastCall = scanned.allCalls[scanned.allCalls.length - 1];
-      const lastIso = new Date(lastCall.ts).toISOString();
+      const lastCall = scanned.allCalls.length ? scanned.allCalls[scanned.allCalls.length - 1] : null;
       const threshold = heartbeatThreshold(scanned.gaps);
       const recent = scanned.allCalls.slice(-WINDOW);
+
+      // ── 跨层指纹：与 watch.mjs 的 `probeJobs` 同源 ──
+      //
+      // 只有 FAILED / BLOCKED 在这里给指纹：它们的唯一真相是宿主 job 记录，
+      // 而 `job-event-time.mjs` 的两个调用方（`probeJobs` 与这里）必须逐字同算法。
+      //
+      // **WAITING 故意不给**。它的最优锚点是 transcript 里未闭合的
+      // `tool_use_id`（`waitingAnchor`），那需要 projectsRoot 与尾部读取，
+      // 全部在 `watch.mjs` 的候选层。若这里抢着给一个 `host:<statusUpdatedAt>`，
+      // `candidatesFromScan` 会优先采用它、不再去算 wait 锚点 ——
+      // 于是 sessions 侧 `wait:call_X`、scan 侧 `host:<ts>`，**跨层又分叉了**。
+      // 这正是「统一」最容易做成「局部统一」的地方：两处都能算出指纹，
+      // 就必须指定唯一一处负责，另一处只提供原料（这里供 `statusUpdatedAt`）。
+      const crossLayer = scanCrossLayerFingerprint({ hostState, job });
+      const hostFields = hostFieldsOf(live);
 
       results.push({
         project: projectDir,
         sessionId,
-        lastActivity: lastIso,
-        idleSec: Math.round((Date.now() - lastCall.ts) / 1000),
+        // 会话 id 与 transcript 文件名不同时，把宿主 job 的 id 也带上，
+        // 否则「同一个会话」在不同数据源里看起来是两条。
+        hostSessionId: job?.sessionId ?? null,
+        transcriptId: job?.transcriptId ?? null,
+        // lastActivity / idleSec 用**内部活动时间**，与 --days 窗口同一个基准。
+        lastActivity: new Date(lastActivity).toISOString(),
+        idleSec: Math.round((nowMs - lastActivity) / 1000),
         calls: scanned.allCalls.length,
+        // 零调用会话必须标出来：calls=0 与「没扫到」在界面上是两件事。
+        hasTranscript: true,
         subagents: scanned.children.length,
         subagentsTotal: scanned.subagentTotal,
         subagentsTruncated: scanned.subagentTruncated,
@@ -638,6 +951,22 @@ function main(argv) {
         lastGapSec: scanned.gaps.length ? Math.round(scanned.gaps[scanned.gaps.length - 1] / 1000) : null,
         state: verdict.state,
         reason: verdict.reason,
+        // ── 宿主实时字段：**去重键需要它，缺了就必然跨层不同键** ──
+        //
+        // `candidatesFromScan` 与 `probeWaiting` 对同一次等待必须算出同一个键。
+        // 取不到 transcript 锚点时，两边都退化成 `host:<statusUpdatedAt>`——
+        // 而 `statusUpdatedAt` 只有 `sessions/*.json` 里有。以前这里不带它，
+        // 于是 scan 侧退化到 `lastActivity`（会话最后一次活动时刻），
+        // sessions 侧退化到 `host:<statusUpdatedAt>`（状态最后一次变化时刻），
+        // **同一次等待两个键 → 两条通知**。生产 `state.json` 实测有两对
+        // （f932d1d4 / a80c452d），见 docs/research/2026-11-05-dedup-test-failure.md §5。
+        waitingFor: hostFields.waitingFor,
+        statusUpdatedAt: hostFields.statusUpdatedAt,
+        // 跨层指纹（见上方 crossLayer 的计算）。null 表示这一行没有更强的锚点，
+        // 由 `candidatesFromScan` 回退到 `activity:<lastActivity>` —— 那是**已知残留**，
+        // 但 anchorSource 会把它说出来，不再假装统一。
+        evidenceFingerprint: crossLayer ? crossLayer.fingerprint : null,
+        anchorSource: crossLayer ? crossLayer.anchorSource : null,
         liveness: verdict.liveness ?? (threshold ? 'reconstructed' : 'insufficient-sample'),
         hostState: hostState ?? null,
         jobDetail: job?.detail ?? null,
@@ -645,12 +974,39 @@ function main(argv) {
         needs: job?.needs ?? null,
         suggestedReply: job?.suggestedReply ?? null,
         badLines: scanned.badLines,
+        source: 'transcript',
+        lastCallAt: lastCall ? new Date(lastCall.ts).toISOString() : null,
       });
     }
   }
 
-  results.sort((a, b) => b.idleSec - a.idleSec);
+  // ── 第二个来源：宿主 job（~/.claude/jobs/*/state.json）───────────────
+  //
+  // 有些会话**完全没有 transcript**：实测 7710fbdb（blocked，等 32 天）在全盘
+  // 找不到任何 .jsonl，任何 --days 都扫不到它。它的全部事实只在 jobs 里。
+  // 行的全集如果只来自 transcript，这类会话就永远不可见——而它们恰恰是
+  // 「需要人处理」的那一批。
+  //
+  // 合并逻辑抽在 mergeJobRows（纯函数）里，因为它必须能被测试：
+  // 「id 在不同源里不同」这件事没法靠肉眼确认。
+  mergeJobRows(results, jobs, nowMs);
+
+  // idleSec 可能是 null（job 没有 updatedAt）。null 排在最后，不参与比较。
+  results.sort((a, b) => (b.idleSec ?? -1) - (a.idleSec ?? -1));
   const live = readLiveSessions();
+  // 扫描覆盖度：让调用方能区分「确实没有会话」和「有文件但一条都没认出来」。
+  // 一个监控工具把「我没有数据」和「一切正常」显示成同一个词，用户就永远无法信任它。
+  const stats = {
+    generatedAt: new Date().toISOString(),
+    days,
+    transcriptsSeen: transcriptsSeen,
+    transcriptsInWindow: results.filter((r) => r.source === 'transcript').length,
+    transcriptsOutsideWindow: transcriptsSeen - results.filter((r) => r.source === 'transcript').length - unknownActivity,
+    transcriptsUnknownTime: unknownActivity,
+    jobsSeen: jobs.length,
+    jobsAdded: results.filter((r) => r.source === 'job').length,
+    liveSeen: live.length,
+  };
 
   if (recalibrate) {
     const r = recalibrateWeights(toolCounts);
@@ -676,9 +1032,9 @@ function main(argv) {
   }
 
   if (json) {
-    console.log(JSON.stringify({ generatedAt: new Date().toISOString(), days, live, sessions: results }, null, 2));
+    console.log(JSON.stringify({ generatedAt: new Date().toISOString(), days, live, stats, sessions: results }, null, 2));
   } else {
-    printHuman(results, live, days);
+    printHuman(results, live, days, stats);
   }
 
   const failed = results.filter((r) => r.state === 'FAILED').length;
@@ -691,9 +1047,33 @@ function fmtDur(sec) {
   return (sec / 3600).toFixed(1) + 'h';
 }
 
-function printHuman(results, live, days) {
-  const noun = (s) => s.replace(/^[A-Z]--/, '').replace(/-/g, '/');
-  console.log(`OmniSight 会话扫描 · 最近 ${days} 天 · ${results.length} 个有活动的会话`);
+/** 描述扫描窗口。`0` 表示不限窗口（--all），不能印成「最近 0 天」——那会被读成「没有窗口」。 */
+export function windowLabel(days) {
+  const n = Number(days);
+  if (!Number.isFinite(n) || n === 0) return '全部';
+  return `最近 ${n} 天`;
+}
+
+function printHuman(results, live, days, stats = {}) {
+  const noun = (s) => String(s ?? '').replace(/^[A-Z]--/, '').replace(/-/g, '/');
+  console.log(`OmniSight 会话扫描 · ${windowLabel(days)} · ${results.length} 个会话`);
+  // 把「检查了什么、数据多新」摆在第一屏。一个监控工具说「0 个会话」时，
+  // 用户必须能分辨这是「真的没有」还是「扫了但没认出来」。
+  if (Number.isFinite(stats.transcriptsSeen)) {
+    const inWin = stats.transcriptsInWindow ?? 0;
+    const outWin = stats.transcriptsOutsideWindow ?? 0;
+    const unk = stats.transcriptsUnknownTime ?? 0;
+    const parts = [`transcript ${stats.transcriptsSeen} 个：窗口内 ${inWin}`];
+    if (outWin > 0) parts.push(`窗口外 ${outWin}`);
+    if (unk > 0) parts.push(`时间未知 ${unk}`);
+    if (stats.jobsSeen) parts.push(`job ${stats.jobsSeen} 个（补入 ${stats.jobsAdded ?? 0}）`);
+    console.log(parts.join(' · '));
+  }
+  // 「时间未知」不是细节：那意味着这些文件里一条带时间戳的记录都没有，
+  // 我们无法判断它在不在窗口内。说成「窗口外」会撒谎。
+  if (stats.transcriptsUnknownTime > 0) {
+    console.log(`⚠ ${stats.transcriptsUnknownTime} 个 transcript 内部没有任何时间戳，无法判定是否在窗口内，未计入`);
+  }
   console.log(`liveness: reconstructed（事后重建，非实时上报）`);
   console.log('');
 

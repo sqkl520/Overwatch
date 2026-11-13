@@ -71,17 +71,22 @@ check-structure · 仓库结构硬门
 
 **什么时候用**：只在你要改这个仓库时。它检查：可发布区有没有本机绝对路径、`.gitignore` 是否误伤产品本体、agent frontmatter 与只读角色白名单、空目录、脚本能否解析与 import、README 的能力边界声明。任何改动后都必须跑。
 
-## 3. 读懂五态
+## 3. 读懂六态
 
-**是五种，不是四种。** `BLOCKED` 是后加的：它不在判定链上，是宿主直接报告的事实（会话在等人输入），优先级高于一切推断。另外四种由 transcript 计算，**有序互斥**：从上往下比，命中即返回。
+**是六种，不是四种。** 其中 `BLOCKED` 与 `WAITING` 是宿主直接报告的事实，不在判定链上算出来，优先级高于一切推断。其余四个由 transcript 计算，**有序互斥**：从上往下比，命中即返回。
 
 | 状态 | 大白话判据 | 你该做什么 |
 |---|---|---|
-| `BLOCKED` | 宿主说它在等输入：权限确认、API 报错、沙箱拦截 | 看 `needs`（在等什么）与 `suggestedReply`（建议怎么回），回一句 |
-| `FAILED` | 宿主明确报过失败；或两次调用间隔超过该会话自己的 p95 阈值且之后 60 秒无新记录；或预算耗尽且零增益 | 这是**唯一允许全量重跑**的状态 |
+| `WAITING` | 宿主 `~/.claude/sessions/*.json` 里 `status: "waiting"`：它**此刻**正在等你（子 agent 请求、对话框、审批、沙箱请求）。你一回应就消失 | 立刻看 `waitingFor`（在等什么），回它 |
+| `BLOCKED` | 宿主 `~/.claude/jobs/*/state.json` 里 `state: "blocked"`：权限确认、API 报错、沙箱拦截 | 看 `needs`（在等什么）与 `suggestedReply`（建议怎么回），回一句 |
+| `FAILED` | **只有一种来路**：宿主在 `~/.claude/jobs/*/state.json` 里写了 `state: "failed"`。不从调用间隔推断，也不从预算推断 | 这是**唯一允许全量重跑**的状态 |
 | `EXPLORING` | 其余情况：只读工具在跑、novelty 达标、样本不足、或已休眠 | **不干预**，只做预算管理；**严禁重跑** |
-| `STALLED` | 连续 3 个窗口 novelty < 0.2，且窗口内无持久化变更，且派生树没有任何节点有增益 | 先探针，再收窄，最后重新拆解，不要直接重跑 |
+| `STALLED` | 连续 3 个窗口 novelty < 0.2，**且**最近一窗内没有任何持久化变更。子 agent 的调用与主线程合并在同一条时间线上（`allCalls`），所以子 agent 有新动作会抬高 novelty；但代码里**没有**单独的「派生树有没有增益」这一判 | 先探针，再收窄，最后重新拆解，不要直接重跑 |
 | `PRODUCING` | 最近 20 次调用里出现过持久化变更：成功的 `Write`/`Edit`，或 Bash 命中写入类命令（`git commit`、`npm install`、`mvn package`、写文件重定向） | 不干预，等验收 |
+
+> **`WAITING` 为什么必须排在 `dormant` 之前**：休眠是「没在做事」，`WAITING` 是「在等你」，
+> 后者信息量更大且可行动。曾经漏读这个字段，一个 `waiting / input needed` 的会话等了 23 天，
+> 被判成「在睡觉」。见 `docs/spec/state-model.md` §2.0.3。
 
 三个容易误会的点：
 
@@ -91,11 +96,18 @@ check-structure · 仓库结构硬门
 
 ### 为什么空闲 3 天的会话是 `EXPLORING` 而不是 `FAILED`
 
-判 `FAILED` 的条件之一是「末次调用间隔超过该会话自己的 p95 阈值」。空闲 3 天的会话末次间隔当然很大，按这条会判死。但它是**做完了**，不是**失败了**。
+因为 `FAILED` **根本不从间隔推断**。2026-10-31 全语料实测后，代码里那条「末次调用间隔超过 p95 且停够 60 秒 → `FAILED`」的推断已被删除（`scripts/scan-sessions.mjs:217-233` 留着删除理由）。
 
-所以判定链里有一条休眠闸门：最后一次调用距今超过 1 小时，直接判 `EXPLORING` + `reason: dormant` + `liveness: stale`，不再往下比。它必须排在宿主报 `failed` 之后——宿主明确报过失败的会话，不该因为时间久被降级成「只是睡着了」。
+删的理由不是保守，是原判据测错了东西：6308 次超过 600 秒的大间隔里，**5977 次（94.8%）之后仍有工具调用**——大间隔只说明它歇了一会儿（等 API、跑长命令、人走开了），不说明进程死了。删除前的真实运行发了 5 条通知，5 条全是这条推断产生的误报，对应会话分别在 13 / 151 / 411 秒后继续干活。
 
-真实例子（`--days 3`，本机）：`Projects/<project-C>` 空闲 3.7 天，上一次两调用间隔 515 秒，阈值 120 秒。没有这条闸门，它会被判 `FAILED`，然后你会去「重跑」一个三天前就结束的会话。
+所以链路里现在有两道事实闸门，顺序不能换：
+
+1. **宿主报 `failed` → `FAILED`**（第 0 步，优先于一切推断）；
+2. **最后一次调用距今超过 1 小时 → `EXPLORING` + `reason: dormant`**（休眠闸门）。
+
+闸门 2 必须排在闸门 1 之后：宿主明确报过失败的会话，不该因为时间久被降级成「只是睡着了」。反过来，一个空闲 3.7 天的会话，末次间隔 515 秒、阈值 120 秒——这两个数字现在**不参与任何判断**，它只会被判成休眠。
+
+复算：`node scripts/scan-sessions.mjs --days 3 | grep -E 'dormant|FAILED'`。想知道某一行为什么是这个状态，看 `reason` 列的合法值清单（§4）。
 
 ## 4. 读懂输出
 
@@ -105,7 +117,7 @@ check-structure · 仓库结构硬门
 
 | 字段 | 含义 |
 |---|---|
-| `[PRODUCING]` | 五态之一，宽度固定，方便竖着扫 |
+| `[PRODUCING]` | 六态之一，宽度固定，方便竖着扫 |
 | 项目名 | 目录名还原（`<this-repo-slug>` → `Projects/<this-repo>`），超 24 列截断 |
 | `calls` | 扫到的工具调用总数，含子 agent。为控制耗时，每个文件只读末尾 4 MB；主 transcript 取末尾 1200 条记录，每个子 agent 取末尾 400 条 |
 | `sub` | 子 agent 数量，`100/272~` 见下 |
@@ -113,7 +125,7 @@ check-structure · 仓库结构硬门
 | `novelty` | 轨迹新颖度 0–1：最近 20 次调用里「没见过的调用」的加权占比。1.00 = 全是新动作；连续三窗低于 0.20 判 `STALLED`。不足一窗为 `null` |
 | `hb` | 末次调用间隔 / 该会话的自适应阈值（秒）。`n/a` = 间隔样本不足 20 个 |
 | `idle` | 距最后一次调用多久：`35s` / `2m` / `13.6h` / `45.7d` |
-| `reason` | 判定理由，合法值仅 `host-reported-blocked`、`host-reported-failed`、`dormant`、`hb_gap=…`、`novelty=…`、`persistent-change-in-window`、`read-only`、`cold-start` |
+| `reason` | 判定理由，合法值仅 `host-reported-blocked`、`host-reported-failed`、`host-reported-waiting`、`waiting:<waitingFor>`、`dormant`、`novelty=…`、`persistent-change-in-window`、`read-only`、`cold-start`。**`hb_gap=…` 不在其中**——产生它的那条推断已于 2026-10-31 删除，只在历史 transcript 与旧日志里还看得到 |
 | `tok=3476k` | 真实 token 用量，见下 |
 | `BAD=n` | 有 n 行 transcript 解析失败。少量不影响判定；持续增长说明记录在损坏 |
 
@@ -121,11 +133,11 @@ check-structure · 仓库结构硬门
 
 读作：**总共发现 272 个子 agent transcript，本次只展开了最近的 100 个，`~` 表示被截断。** 上限按实测定的：12 个最坏会话上，cap=30 覆盖 23.7%、耗时 11.6s；cap=100 覆盖 72.8%、19.4s；cap=200 覆盖 92.7%、24.7s。本机 69 个有子 agent 的会话里 61 个在 100 以内，所以取 100 只让少数巨无霸变慢。
 
-代价是 `depth` 与树活性建立在采样的树上——所以显式标出来，而不是假装 100 就是全部。**但判定不受影响**：四态只需要「任一节点有增益 → 整棵树 EXPLORING」，采样已足够发现增益；覆盖率低损害的是详情页画不全。没截断时只显示一个数字，如 `sub=13`。
+代价是 `depth` 与树活性建立在采样的树上——所以显式标出来，而不是假装 100 就是全部。**但判定不受影响**：只需要「任一节点有增益 → 整棵树 EXPLORING」，采样已足够发现增益；覆盖率低损害的是详情页画不全。没截断时只显示一个数字，如 `sub=13`。
 
 ### `liveness stale=17 reconstructed=2` 怎么读
 
-顶栏这一行是**当前这批会话的 liveness 分布**，不是全局状态。`stale` = 最后一次调用距今超过 1 小时、心跳不反映当前（几乎都是休眠会话）；`reconstructed` = 心跳从事后 transcript 重建、间隔样本够 20 个；`insufficient-sample` = 样本 < 20、算不出阈值，因此**永远不会**被判 `FAILED`。数字来自当前数据，不是写死的：实测同一天不同时刻跑，出现过 `stale=16 reconstructed=3` 与 `stale=15 reconstructed=4`。
+顶栏这一行是**当前这批会话的 liveness 分布**，不是全局状态。`stale` = 最后一次调用距今超过 1 小时、心跳不反映当前（几乎都是休眠会话）；`reconstructed` = 心跳从事后 transcript 重建、间隔样本够 20 个；`insufficient-sample` = 样本 < 20、算不出阈值。**这三档都不影响状态判定**：`FAILED` 只来自宿主上报（§3），间隔推断那一支已于 2026-10-31 删除——任何会话都不会因为间隔被判 `FAILED`，样本够不够都一样。数字来自当前数据，不是写死的：实测同一天不同时刻跑，出现过 `stale=16 reconstructed=3` 与 `stale=15 reconstructed=4`。
 
 ### `tok=3476k` 从哪来，为什么有的会话没有
 
@@ -142,34 +154,36 @@ node scripts/oversight-tui.mjs --days 1 --interval 15 --plain
 
 ### 详情页能看什么
 
-真实输出（某 `BLOCKED` 会话，80 列。实际还多 `目录`、`lastActivity` 两行，派生树部分有 30 行 `◇ 子 agent #n`，这里省略）：
+真实输出（本机实测，80 列，按 `i` 展开内部量之后）：
 
 ```
-  项目         <project-A>
-  sessionId    <session-H>
-  state        ? BLOCKED
-  reason       host-reported-blocked
-  liveness     reconstructed
-  hostState    blocked
-  jobDetail    3 tasks done (reports moved, 2 MINORs fixed, committed d08ef3b)
-  calls        2038
-  novelty      1.00
-  noveltyAll   0.91
-  idle         22.0d
-  心跳         末次 38s / 阈值 211s
-  tokens       3475667
+  状态        ● 在跑 · 最后动静 7s前
+  身份        24f77b3d · Projects/dsh-fcl-android-launcher
 
-派生树 · 层深 1 · 子 agent 100/128（已截断）
+  state       ● PRODUCING
+  reason      persistent-change-in-window
+  liveness    reconstructed
+  hostState   —
+  calls       4250
+  novelty     1.00
+  noveltyAll  0.74
+  lastActivity2026-11-11T17:42:26.147Z
+  心跳        末次 51s / 阈值 202s
+  派生 100/122 · 层深 1 · 节点状态 scan 未暴露
   │ ◇ 子 agent #1
   │ ◇ 子 agent #2
   │ ◇ 子 agent #3
+  │ … 另 97 个未展开（共 100）
 ```
 
-其后 #4–#30 共 27 行同样格式，再接 `│ … 另 1 个未展开 · 完整比例 30/31`，然后是「等待输入」与「建议回复」两段（内容见 §6 的 before 例子）。
+有两层：L5 首屏（`状态` / `身份` / `最近说` / `证据`）永远在；L6 内部量（`state` 到 `派生`）要按 `i` 才出现，不按 `i` 时只有一行 `派生 100/122 个    按 i 显示内部量`。
+
+**派生树只画 3 行**（`detailLines` 里的 `head = Math.min(3, shown)`）：51 行「我不知道」占 51 行，而结论是零信息。所以省略的不是「97 行没写」，是「只露 3 行 + 一句可数的披露」——`100/122` 这个比例在行内就写明，不需要自己数。
 
 - `novelty` 是最近一窗，`noveltyAll` 是全会话平均。差很多说明最近在重复。
 - `◇` 表示该节点状态未由 `scan --json` 暴露，不是警告。
 - 详情页只读：不判定、不算 novelty、不写文件，数字原样来自 `scan-sessions.mjs --json`。
+- `身份` 行的第二段是目录名（有 `cwd` 时显示缩短路径，案例里 `cwd` 缺省才退成 project 名）。
 
 ### 复制接力草稿
 
@@ -306,19 +320,63 @@ NO_COLOR=1 node scripts/oversight-tui.mjs   # 仍交互，但无色
 
 做法：`planner` 在**派发执行 Agent 之前**写 `templates/acceptance-criteria.md`，每条必须有 `criterion`（可观测事实）、`evidence`（引用形式，如 `file:line`）、`fail_if`（什么情况直接否决）。没有 `fail_if` 的标准等于没有。
 
-## 8. 常见问题
+## 8. 收工值守：让 AI 在「说做完了」时先过一道闸
+
+这是本库唯一一个**在会话结束点**动作的能力，也是最贴近产品定位的一个。
+它把 `verify-claims.mjs` 的判定挂到宿主的 `Stop` 事件上：AI 想结束回合时，宿主先把它的
+最后一段话喂进来，脚本判「这里的完成声明有没有证据」，没有就拦下、把理由喂回去让它补。
+
+**默认关闭，只记账不拦。** 不设环境变量时，它跑起来只看不拦，永远放行。
+
+### 怎么开
+
+1. 把 `templates/stop-verify-hook.settings.json` 的内容合并进 `.claude/settings.local.json`
+   （本机私有，不进仓），把 `command` 换成**你自己机器上本仓库的绝对路径**。
+   - 不要用 `${CLAUDE_PROJECT_DIR}`：hook 进程里它是**当前被 hook 的用户项目**，不是本仓库。
+   - `timeout` 给足 60 秒：hook 要回溯读 transcript，低了会被宿主静默 kill，表现为「跑了但没生效」。
+2. **先观测**：不设 `OVERWATCH_STOP_VERIFY`，用几天，看 `tasks/runs/stop-hook/<日期>.jsonl`
+   里 `outcome=allowed` 的判定对不对你的用法。
+3. 确认没误判，再在 shell 里设 `OVERWATCH_STOP_VERIFY=block`（**不写进 settings 的 env**——那样改起来太容易忘），重启会话。
+
+### 它拦什么、不拦什么
+
+| 拦 | 不拦 |
+|---|---|
+| `NO_EVIDENCE`（说了「测试通过」但整个会话没跑过测试） | `UNKNOWN` / `UNCHECKABLE`（**没读到不等于没做**） |
+| `STALE_ONLY`（跑过测试，但在最后一次改代码之前） | 后台任务在跑的回合（`background_tasks` 非空 = 在等活干完，结束是正常的） |
+| `FAILED_ONLY`（只有失败的调用） | 任何它自己出故障的情况（超时、输入是垃圾、读不到 transcript → 一律放行） |
+
+**为什么 fail-open 不可配置成 fail-closed**：这个 hook 挡的是「想结束」。它一旦故障就挡死，
+用户会看到一个**无法结束的会话**——那比放过一百个假完成更糟。脚本自己也设了 6 次上限，
+不依赖宿主的 `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`（那是实现细节，会随版本变）。
+
+### 看效果
+
+```bash
+node scripts/analyze-hook-samples.mjs        # 被放行的样本里，有多少「像完成但没跑测试」
+```
+
+这个分析命令**不参与拦截**，输出的是待人工复核的候选。理由：当前只有 6 个实验样本（3 抓 3 漏），
+拿这么点样本去拟合一条新正则，是在给未知分布配参数。先攒分布。
+细节见 `docs/research/2026-11-12-stop-hook-prototype.md`（拦得住）、
+`2026-11-12-stop-hook-e2e-validation.md`（真模型上很少有机会拦）、
+`2026-11-13-hook-sample-logging.md`（先攒样本）。
+
+## 9. 常见问题
 
 **Q：会话显示 `EXPLORING`，怎么判断它是不是活着？**
 
-按顺序看三个字段：`idle` 小于 1 小时可能在跑，大于 1 小时判休眠（`reason: dormant`）；`liveness` 为 `stale` 表示心跳不反映当前，`insufficient-sample` 表示样本 < 20 不下 `FAILED` 判定，`reconstructed` 表示有完整重建；再看扫描顶部「宿主注册的活跃会话」里的 `busy`/`idle`（`claude agents --json` 同源）。三者都不确定时，最可靠的信号是**打开那个会话看一眼**。本库事后重建，天生有延迟，不假装实时。
+按顺序看三个字段：`idle` 小于 1 小时可能在跑，大于 1 小时判休眠（`reason: dormant`）；`liveness` 为 `stale` 表示心跳不反映当前，`insufficient-sample` 表示样本 < 20 算不出阈值——但**它不再影响判定**，`FAILED` 只认宿主上报；`reconstructed` 表示有完整重建；再看扫描顶部「宿主注册的活跃会话」里的 `busy`/`idle`（`claude agents --json` 同源）。三者都不确定时，最可靠的信号是**打开那个会话看一眼**。本库事后重建，天生有延迟，不假装实时。
 
 **Q：`--days 30` 为什么这么慢？**
 
-它按**文件**扫，不按天。窗口越长，落进来的 transcript 越多：本机 2026-10-31 实测 `--days 3` 是 19 个会话、**33 秒**；`--days 30` 是 129 个会话、**87 秒**。每个会话最多读 4 MB 尾部、最多展开 30 个子 agent，所以耗时不随天数线性增长，而随「还没被裁掉的文件数」增长。日常用 `--days 3`。面板里按 `q` 会立刻杀掉扫描子进程，不会卡住等它跑完。
+它按**文件**扫，不按天。窗口越长，落进来的 transcript 越多，所以耗时**随语料增长而变，不随天数线性变**：每个会话最多读 4 MB 尾部、最多展开 **100** 个子 agent（`MAX_SUBAGENTS`，见 §4 的 `100/272~`），真正的驱动是「还没被裁掉的文件数」。日常用 `--days 3`。面板里按 `q` 会立刻杀掉扫描子进程，不会卡住等它跑完。
 
-> ⚠ 本文件的耗时数字漂移过多次（曾写 13 秒 / 48 秒，更早写「30 天约需 110 秒」，后又改成「约 40 秒」）。
-> 上面的 33 秒 / 87 秒是 2026-10-31 在本机 3,354 个 transcript 上重测的结果。
-> **这类数字会随语料增长而变，引用前请重测。**
+> **不要相信任何写死的秒数。** 想知道现在多慢，直接量：
+> `time node scripts/scan-sessions.mjs --days 3`（或看输出首行「transcript N 个」——那个数才是耗时的主因）。
+> 本文件的耗时数字漂移过多次（曾写 13 秒 / 48 秒 / 110 秒 / 40 秒 / 33 秒 / 87 秒），
+> 每次都只是记下了「当时那台机器、那份语料」的读数，没有一次能撑过语料增长。
+> 2026-11-13 本机实测 `--days 3` 约 77 秒 / 347 个 transcript，但这个值下个月就不作数。
 
 **Q：扫描会不会影响正在跑的会话？**
 
@@ -345,7 +403,7 @@ scan --days 3         → 19 条：PRODUCING=3 EXPLORING=16
 
 补充：`novelty=null` = 最近 20 次调用不够一窗，此时只可能判 `EXPLORING`，不会判 `STALLED`，调用攒够自动恢复。
 
-## 9. 出问题了怎么办
+## 10. 出问题了怎么办
 
 ### 硬门红了
 
@@ -390,7 +448,9 @@ node --test scripts/state-model.test.mjs
 
 `+ actual` 是脚本现在算出的，`- expected` 是测试认为应该的。先判断哪边对——测试也可能过期。改判定逻辑时先想清楚这个测试保护的是什么行为；行为本身要变就改测试并在提交信息里写明为什么，不要为了让测试变绿而把断言改软。
 
-四个测试文件：`state-model.test.mjs` 管五态判定、novelty、心跳阈值、Bash 归一化、权重重估；`tui-theme.test.mjs` 管字形、颜色开关、CJK 宽度；`oversight-tui.test.mjs` 管渲染、净化、草稿拼装、纯文本输出；`app-router.test.mjs` 管按键路由、页面迁移、滚动边界。全跑 `node --test scripts/`（本机 81 项全绿）。
+**21 个测试文件，973 项全绿**（2026-11-13 实测，`ls scripts/*.test.mjs | wc -l` 可核）。分管范围：`state-model.test.mjs` 管六态判定、novelty、心跳阈值、Bash 归一化、权重重估；`tui-theme.test.mjs` / `tui-layout.test.mjs` / `tui-meta.test.mjs` / `app-router.test.mjs` / `tui-redesign.test.mjs` / `tui-bugfixes.test.mjs` 管 TUI 的字形、布局、元信息、键位路由与两轮重做；`oversight-tui.test.mjs` 管渲染、净化、草稿拼装、纯文本输出；`watch.test.mjs` 管通知去重与候选派发；`verify-claims.test.mjs` / `stop-signals.test.mjs` / `asked.test.mjs` / `classify-stop.test.mjs` / `measure-interventions.test.mjs` 管各条确定性判据；`stop-verify-hook.test.mjs` / `analyze-hook-samples.test.mjs` 管 Stop hook 闸门与放行样本分析；`validate-run.test.mjs` / `install-watcher.test.mjs` / `replay-observe.test.mjs` 管运行图校验、自启动与回放；`claim-ledger.test.mjs` 管产出对账（期望 / 自述 / 磁盘 / transcript 四方交叉，含端到端 CLI 链）；`reconciliation-wiring.test.mjs` 管对账**有没有接进派发链路**（模板 / 角色定义 / SKILL.md 的 Phase E 前置门）。
+
+全跑 `node --test scripts/*.test.mjs`。**这个数字以该命令的输出为准**，`check-structure.mjs` 会把它与本文件、`README.md`、`CLAUDE.md` 里写的数字对账——写错了硬门会红。加测试后不需要手改这里，跑一次硬门就知道该改成多少。
 
 ### 扫描报错
 
@@ -400,6 +460,6 @@ node --test scripts/state-model.test.mjs
 | 输出 0 个会话，但你知道有 | `--days` 太短，或 `--project` 过滤词不匹配 | 放宽 `--days`；`--project` 做子串匹配，写目录名的一部分即可 |
 | 面板顶部 `⚠ 扫描失败…` | 扫描超时（>180 秒）、非零退出无 JSON、或输出不是合法 JSON | 手动跑 `node scripts/scan-sessions.mjs --json \| head` 看真实报错；确认 Node ≥ 18 |
 | 某会话 `calls` 很小但明显干过很多活 | 每个文件只读末尾 4 MB，主 transcript 取末尾 1200 条记录，子 agent 各取 400 条 | 正常设计，不是 bug |
-| `sub` 明显小于预期 | 子 agent 上限 30，超出被截断（显示 `30/N~`） | 正常设计；调大上限会显著拖慢扫描 |
+| `sub` 明显小于预期 | 子 agent 上限 **100**（`MAX_SUBAGENTS`），超出被截断（显示 `100/N~`） | 正常设计；调大上限会显著拖慢扫描 |
 
 排查顺序固定：先 `node --version`，再 `node scripts/scan-sessions.mjs --days 1`，再 `--json` 看结构，最后才怀疑代码。大多数「扫描坏了」是环境或路径问题。

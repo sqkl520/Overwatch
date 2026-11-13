@@ -17,29 +17,35 @@
 
 ## 规格入口
 
+**先读 [`docs/README.md`](docs/README.md)** —— 它按「你想知道什么」指路，并说清四类文档的可信度不同
+（`spec/` 是现行事实、`design/` 全部未实现、`research/` 是会过期的过程记录）。
+
 | 需要什么 | 读哪个 |
 |---|---|
+| 能做什么、每条能力对应的命令 | `docs/CAPABILITIES.md`（硬门会核那上面的命令） |
 | 状态怎么判、阈值多少 | `docs/spec/state-model.md` |
 | 怎么派发、给 Agent 什么 | `docs/spec/dispatch-contract.md` |
 | finding 怎么写、台账怎么用 | `docs/spec/evidence-discipline.md` |
 | 接力怎么触发、草稿怎么写 | `docs/spec/relay-protocol.md` |
 | 输出长什么样 | `docs/spec/output-format.md` |
 | 为什么是纯配置库 / 为什么降级 | `docs/adr/0001-config-only.md`、`docs/adr/0002-honest-degradation.md` |
+| 某条研究结论还成不成立 | `docs/research/README.md`（状态索引 + 「已被推翻的结论」表） |
 | 想看设计推演（**全部未实现**） | `docs/design/README.md` —— 先读它，再决定要不要点进去 |
 
 ## 常用命令
 
 ```bash
-node scripts/scan-sessions.mjs --days 3        # 扫描会话，判定状态（实测约 33 秒）
+node scripts/scan-sessions.mjs --days 3        # 扫描会话，判定状态（耗时随语料增长，跑一次看实际值）
 node scripts/scan-sessions.mjs --json          # 机器可读
+node scripts/verify-claims.mjs --days 3        # 「AI 说它做完了」有没有证据
 node scripts/check-structure.mjs               # 结构硬门
-node --test scripts/*.test.mjs                 # 全量回归测试（192 条）
+node --test scripts/*.test.mjs                 # 全量回归测试（973 条，硬门会对账这个数字）
 ```
 
 **任何改动后必须跑 `check-structure.mjs` 和全量测试。** 两者都绿才能提交。
 
-> 注意：实际产出有区分度的只有宿主上报的 `FAILED` / `BLOCKED`。其余状态是描述，不是判据——
-> 不要用 `EXPLORING` / `PRODUCING` / `STALLED` 去驱动重跑或重拆解。见 `README.md`「关于『四态』」。
+> 注意：实际产出有区分度的只有宿主上报的 `FAILED` / `BLOCKED` / `WAITING`。其余状态是描述，不是判据——
+> 不要用 `EXPLORING` / `PRODUCING` / `STALLED` 去驱动重跑或重拆解。见 `README.md`「六种状态」。
 
 ## 目录归属（谁能写哪里）
 

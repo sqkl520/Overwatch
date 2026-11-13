@@ -16,11 +16,13 @@ jobs:
         with:
           node-version: '20'
 
-      # 硬门：结构 + 语法 + 每个导出函数能否被调用
+      # 硬门：结构 + 语法 + 每个导出函数能否被调用 + 文档一致性
+      # （测试数对账 / 文档引用的路径与命令 / 文档常量 / 研究索引 / 能力清单）
       - name: Structure gate
         run: node scripts/check-structure.mjs
 
-      # 硬门：全部回归测试（81 条，含四态判定、TUI 视觉、键位路由）
+      # 硬门：全部回归测试（973 条，含状态判定、TUI 视觉、键位路由）。
+      # 数字由 check-structure.mjs 对账，与 README / CLAUDE / GUIDE 同源。
       - name: Tests
         run: node --test scripts/*.test.mjs
 

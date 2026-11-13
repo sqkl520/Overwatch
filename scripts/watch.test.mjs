@@ -13,6 +13,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync, statSync, utimesSync, readdirSync,
+  appendFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -27,6 +28,7 @@ import {
   traceability, readJobStates, probeWaiting, readLiveSessionStates, buildInbox, formatInbox, healthCheck, formatHealth, HEALTH_PERIODS,
   claimOwnership, readOwner, ownerPath, askedCandidates, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
   requestIdTime, lastTimelineStateTime, resolveJobEventTime, BLOCKED_MAX_AGE,
+  readLogHealth, logHealthPath, LOG_HEALTH_FILE,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -699,22 +701,29 @@ test('runTick 的 dry-run 会算出候选但不发通知', async () => {
   }
 });
 
-test('L-fast 与 L-full 报同一事件时只发一条 —— 但挡住第二条的是限额，不是键相等', async () => {
-  // ⚠ 2026-11-09 更正：这条测试原来的标题是「三层共享去重」，**它在说谎**。
-  // 实测（docs/research/2026-11-04-dedup-key-analysis.md §2.1）：两个候选的键**不相等**
-  // （jobs 用事件时刻、scan 用 lastActivity），第一个发出后第二个撞上
-  // `GLOBAL_MIN_GAP = 10min`（canNotify，watch.mjs）被抑制。把间隔调成 0 就会看到两条。
+test('jobs 与 scan 报同一事件时只发一条 —— 现在靠键相等，不再靠限额', async () => {
+  // ⚠ 2026-11-09 更正过一次，2026-11-10 又更正了一次。两次都记录在这里，
+  // 因为「标题撒谎」本身就是这类测试最容易犯的错。
   //
-  // 所以这条测的是「限额挡住了重复」，不是「去重键统一了」。真正的跨层去重测试是
-  // 下面那条 `真正测去重：同一 WAITING 事件跨两个 tick 只发一条（不靠限额）`。
-  // 本用例保留原名描述的行为（同一 tick 内不重复发），但标题必须说实话。
+  // 第一次（11-09）：标题叫「三层共享去重」，实测两个候选的键**不相等**
+  //   （jobs 用事件时刻、scan 用 lastActivity），第二条撞上 `GLOBAL_MIN_GAP = 10min`
+  //   才没发出去。于是标题改成「挡住它的是限额，不是键相等」，断言 `why==='global-10min'`。
+  //
+  // 第二次（11-10）：键真的统一了。`scan-sessions` 现在用 `job-event-time.mjs` 里
+  //   **与 `probeJobs` 同一个解析器**算事件时刻，并在行上带出
+  //   `evidenceFingerprint: 'job:<事件时刻>'`；`candidatesFromScan` 原样透传。
+  //   于是第二条在 runTick 的**轮内去重**阶段就被丢掉，根本走不到派发。
+  //   `why === 'global-10min'` 因此**按预期变红**——它不是回归，是修复生效的证据。
+  //
+  // 新断言钉住的是更强的东西：不是「限额兜住了」，而是「两条候选算出同一个键」。
   const dir = tmp();
   const claude = tmp();
   try {
     const now = Date.now();
+    const eventAt = new Date(now - 60_000).toISOString();
     mkdirSync(join(claude, 'jobs', 'j1'), { recursive: true });
     writeFileSync(join(claude, 'jobs', 'j1', 'state.json'), JSON.stringify({
-      state: 'failed', sessionId: 'dup', firstTerminalAt: new Date(now - 60_000).toISOString(), updatedAt: new Date(now).toISOString(), cwd: 'D:\\P\\demo',
+      state: 'failed', sessionId: 'dup', firstTerminalAt: eventAt, updatedAt: new Date(now).toISOString(), cwd: 'D:\\P\\demo',
     }));
     mkdirSync(join(claude, 'projects'), { recursive: true });
 
@@ -723,22 +732,110 @@ test('L-fast 与 L-full 报同一事件时只发一条 —— 但挡住第二条
       dir, claudeDir: claude, nowMs: now, forceFull: true,
       notifier: async () => { n++; },
       logger: { info: () => {}, warn: () => {}, error: () => {} },
-      // 全量扫描也报同一个会话同一个 reason —— 这正是「两层都发现」的真实情况
+      // 全量扫描也报同一个会话同一个 reason —— 这正是「两层都发现」的真实情况。
+      // 扫描行带上与 jobs 层同源的指纹（真实 `scan-sessions` 就是这么输出的）。
       scan: async () => ({
-        sessions: [{ sessionId: 'dup', state: 'FAILED', reason: 'host-reported-failed', lastActivity: new Date(now).toISOString() }],
+        sessions: [{
+          sessionId: 'dup', state: 'FAILED', reason: 'host-reported-failed',
+          lastActivity: new Date(now).toISOString(),
+          evidenceFingerprint: `job:${eventAt}`, anchorSource: 'jobs-first-terminal',
+        }],
         elapsedMs: 1, exitCode: 1,
       }),
     });
     assert.equal(n, 1, '同一事件只能发一条');
     assert.equal(r.already + r.sent.length, 1);
-    // 把真正的机制也钉住：第二条第 why 是 global-10min，不是 already-notified。
-    // 这条断言就是「测试靠限额通过」的直接证据——将来键真的统一了，它会变红并提示改名。
-    assert.equal(r.suppressed.length, 1, '第二条应被限额挡下');
-    assert.equal(r.suppressed[0].why, 'global-10min', '挡下它的是最小间隔，不是去重键');
+    // 两条候选算出同一个键 → 轮内去重直接丢掉第二条。**没有一条走到限额**。
+    assert.equal(r.suppressed.length, 0,
+      '键相等时第二条应在轮内去重阶段消失，不该再走到派发去撞限额');
+    assert.equal(dedupeKey('dup', 'FAILED', 'host-reported-failed', `job:${eventAt}`),
+      dedupeKey('dup', 'FAILED', 'host-reported-failed', `job:${eventAt}`));
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(claude, { recursive: true, force: true });
   }
+});
+
+test('跨层去重（端到端）：scan-sessions 输出与 probeJobs 对同一次失败算出同一个指纹', async () => {
+  // 上一条测的是「候选层透传」。这条测**上游真的把指纹产出来了**——
+  // 少了它，把 scan-sessions 里的 evidenceFingerprint 改成 null 也不会有人发现，
+  // 因为 candidatesFromScan 会安静地退回到 activity: 前缀。
+  //
+  // 用同一份 jobs 目录分别跑两条路径：
+  //   probeJobs  → jobs 源（watch.mjs 直读 ~/.claude/jobs）
+  //   readJobs+jobToRow → scan 源（scan-sessions 自己的读取器）
+  // 两条路径的指纹必须逐字相同。
+  const { jobToRow, mergeJobRows } = await import('./scan-sessions.mjs');
+  const claude = tmp();
+  try {
+    const now = Date.now();
+    const eventAt = new Date(now - 90 * 60_000).toISOString();
+    const jobsRoot = join(claude, 'jobs');
+    mkJob(jobsRoot, 'j-cross', {
+      state: 'failed', sessionId: 'sess-cross', cwd: 'D:' + String.fromCharCode(92) + 'P' + String.fromCharCode(92) + 'demo',
+      firstTerminalAt: eventAt, updatedAt: new Date(now).toISOString(),
+    });
+    // jobs 源
+    const fromJobs = probeJobs(jobsRoot, { nowMs: now }).found[0];
+    assert.ok(fromJobs, 'probeJobs 必须认出这条 failed');
+    // scan 源：按 scan-sessions 的真实读取路径构造（jobDir 必填，否则退化成 null）
+    const rows = [];
+    mergeJobRows(rows, [{
+      jobId: 'j-cross', jobDir: join(jobsRoot, 'j-cross'), state: 'failed',
+      sessionId: 'sess-cross', updatedAt: new Date(now).toISOString(), firstTerminalAt: eventAt,
+    }], now);
+    assert.equal(rows.length, 1, 'scan 侧必须补出这一行');
+    const fromScanRow = rows[0];
+    assert.equal(fromScanRow.evidenceFingerprint, fromJobs.evidenceFingerprint,
+      `scan 侧指纹必须与 jobs 侧相同：${fromScanRow.evidenceFingerprint} vs ${fromJobs.evidenceFingerprint}`);
+    // 再走一遍候选层：键也必须相同
+    const sc = candidatesFromScan([fromScanRow], { nowMs: now, states: ['FAILED'] })[0];
+    assert.equal(
+      dedupeKey(fromJobs.sessionId, fromJobs.state, fromJobs.reason, fromJobs.evidenceFingerprint),
+      dedupeKey(sc.sessionId, sc.state, sc.reason, sc.evidenceFingerprint),
+      '同一次失败跨层必须同键，否则隔过 10 分钟限额就会发两条',
+    );
+    void jobToRow;
+  } finally { rmSync(claude, { recursive: true, force: true }); }
+});
+
+test('跨层去重：scan 行必须带出宿主 waitingFor / statusUpdatedAt（缺了键就分叉）', async () => {
+  // 上一条测「候选层怎么用这些字段」，这条测「扫描行到底有没有把它们带出来」。
+  // 少了这条，把 `statusUpdatedAt: live?.statusUpdatedAt ?? null` 改成 null
+  // 也不会有人发现——`candidatesFromScan` 会安静地退回 activity: 前缀。
+  const { hostFieldsOf } = await import('./scan-sessions.mjs');
+  const at = 1794264896288;
+  assert.deepEqual(hostFieldsOf({ status: 'waiting', waitingFor: 'permission prompt', statusUpdatedAt: at }),
+    { waitingFor: 'permission prompt', statusUpdatedAt: at });
+  // 宿主没写时间戳时必须是 null，**不能是 0**：0 是一个"有效时间"，
+  // 会让退化指纹变成 host:1970-01-01T00:00:00.000Z，全机器共用一个键。
+  assert.equal(hostFieldsOf({ status: 'waiting' }).statusUpdatedAt, null);
+  assert.equal(hostFieldsOf(null).statusUpdatedAt, null);
+  assert.equal(hostFieldsOf({ status: 'waiting', waitingFor: 42 }).waitingFor, null, '非字符串不当成 waitingFor');
+});
+
+test('跨层去重：scan 行不带指纹时，WAITING 仍与 sessions 路径同键（退化路径统一）', () => {
+  // 上一条测「带了指纹」。这条测「没带」——不能因为主路径修好就假设退化路径也对。
+  // 两路都必须落到 `host:<statusUpdatedAt>`，因为那是同一份宿主字段。
+  const claude = tmp();
+  try {
+    const now = Date.parse('2026-11-08T21:39:00.000Z');
+    const iso = new Date(now).toISOString();
+    const row = {
+      sessionId: 'sess-both', state: 'WAITING', reason: 'waiting:input needed',
+      project: 'p-demo', lastActivity: iso, statusUpdatedAt: now,
+    };
+    const sc = candidatesFromScan([row], { nowMs: now })[0];
+    const w = { sessionId: 'sess-both', state: 'WAITING', reason: 'waiting:input needed',
+      evidenceFingerprint: `host:${iso}` };
+    assert.equal(sc.anchorSource, 'host-time', 'scan 行带 statusUpdatedAt 时应退化到 host:');
+    assert.equal(sc.evidenceFingerprint, `host:${iso}`);
+    assert.equal(
+      dedupeKey(w.sessionId, w.state, w.reason, w.evidenceFingerprint),
+      dedupeKey(sc.sessionId, sc.state, sc.reason, sc.evidenceFingerprint),
+      '两路必须同键，否则同一次等待会发两条',
+    );
+  } finally { rmSync(claude, { recursive: true, force: true }); }
 });
 
 test('真正测去重：同一 WAITING 事件跨两个 tick 只发一条（不靠限额）', async () => {
@@ -765,14 +862,96 @@ test('真正测去重：同一 WAITING 事件跨两个 tick 只发一条（不�
     const scan = async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 });
 
     await runTick({ dir, claudeDir: claude, nowMs: now, notifier, logger, scan });
-    // 清额度：否则「只发一条」可能是限额挡的
-    const st1 = loadState(dir).state;
+    // 清额度：否则「只发一条」可能是限额挡的。
+    // **必须把注入时钟传给 loadState**：它内部按 TTL 剪 state.notified，
+    // 不传就用真实挂钟。锚点只要距真实时间超过 NOTIFIED_TTL_HOURS，条目一读就被剪掉，
+    // 这条测试就会在「锚点满 24 小时」的那一刻自动翻红（实测翻红点 2026-11-10T04:10+08）。
+    const st1 = loadState(dir, { nowMs: now }).state;
     st1.budget.sentLog = [];
     st1.budget.perSession = {};
     saveState(dir, st1);
 
     await runTick({ dir, claudeDir: claude, nowMs: now + 11 * MIN, notifier, logger, scan });
     assert.equal(n, 1, `同一次等待跨 tick 只能通知一次，实际 ${n} 次`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(claude, { recursive: true, force: true });
+  }
+});
+
+// ── 防定时炸弹：时钟必须可注入 ────────────────────────────────────────
+
+test('loadState 必须用注入的 nowMs 剪枝，不得用真实挂钟', () => {
+  // 这条是缺陷 1 的最小复现，也是**反向**的那条：它不依赖「真实时间刚好走过 TTL」，
+  // 把 `Date.now()` 装回去会立刻变红。
+  // 背景：`pruneNotified(state.notified, Date.now())` 写死在 loadState 里，
+  // 而 loadState 是 runTick 的必经路径 —— 注入时钟的契约在内部有泄漏。
+  const dir = tmp();
+  try {
+    const now = Date.parse('2026-11-08T20:10:00.000Z');
+    const iso = new Date(now).toISOString();
+    writeFileSync(join(dir, 'state.json'), JSON.stringify({
+      version: 1,
+      notified: {
+        k: {
+          sessionId: 's', state: 'WAITING', reason: 'waiting:input needed',
+          firstSeenAt: iso, lastSeenAt: iso, notifyCount: 1, delivery: 'submitted',
+        },
+      },
+      budget: { day: null, sent: 0, sentLog: [], perSession: {} },
+    }));
+    assert.equal(Object.keys(loadState(dir, { nowMs: now }).state.notified).length, 1,
+      '注入的时钟必须生效；用真实 Date.now() 会在锚点满 24h 后把条目剪掉');
+    // 同一个条目，时钟推到 25 小时后 → 必须被剪掉。证明剪枝本身没被关掉。
+    assert.equal(Object.keys(loadState(dir, { nowMs: now + 25 * 3600_000 }).state.notified).length, 0,
+      'TTL 之外的条目仍然必须清掉，不能为了修时钟把剪枝关了');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('防定时炸弹：锚点在 10 年后，同一 WAITING 事件仍只通知一次', async () => {
+  // 一条会随挂钟走动而改变结论的测试，比一条从第一天就红的测试难排查得多。
+  // 实测（docs/research/2026-11-05-dedup-test-failure.md §1）：同一条测试在
+  // 「锚点 + 24h」那一刻由绿转红，没有任何代码改动。它暴露的正是未注入的时钟。
+  //
+  // 这里把锚点放到十年后 —— 真实挂钟永远到不了「锚点 + TTL」，
+  // 两个 tick 之间也不存在任何真实时间流逝造成的剪枝。
+  // 如果哪天又有人在 runTick 的调用链里写死 Date.now()，这条会在**当天**变红，
+  // 而不是等到某个深夜。
+  //
+  // **这条挡不住什么，必须说清楚**：它挡不住「把 Date.now() 装回 loadState」——
+  // 未来锚点用真实时钟剪不掉，回退了它照样绿（实测确认）。挡那件事的是上面
+  // `loadState 必须用注入的 nowMs 剪枝`（锚点在过去，真实时钟一装回去就删条目）。
+  // 两条的分工：那条测「时钟有没有被注入」，这条测「有没有别的挂钟泄漏
+  // 在 tick 之间偷偷改动去重状态」。缺一不可。
+  const dir = tmp();
+  const claude = tmp();
+  try {
+    const now = Date.parse('2036-06-01T00:00:00.000Z');
+    const projectsRoot = join(claude, 'projects');
+    mkdirSync(join(projectsRoot, 'p-future'), { recursive: true });
+    mkdirSync(join(claude, 'sessions'), { recursive: true });
+    mkdirSync(join(claude, 'jobs'), { recursive: true });
+    writeWaitingTranscript(join(projectsRoot, 'p-future', 'sess-future.jsonl'), [{ id: 'call_FUTURE' }]);
+    mkSession(join(claude, 'sessions'), 1, {
+      pid: 1, sessionId: 'sess-future', status: 'waiting', waitingFor: 'input needed',
+      statusUpdatedAt: now, cwd: 'D:\\P\\demo',
+    });
+
+    let n = 0;
+    const notifier = async () => { n++; };
+    const logger = { info: () => {}, warn: () => {}, error: () => {} };
+    const scan = async () => ({ sessions: [], elapsedMs: 1, exitCode: 0 });
+
+    await runTick({ dir, claudeDir: claude, nowMs: now, notifier, logger, scan });
+    const st1 = loadState(dir, { nowMs: now }).state;
+    st1.budget.sentLog = [];
+    st1.budget.perSession = {};
+    saveState(dir, st1);
+    await runTick({ dir, claudeDir: claude, nowMs: now + 11 * MIN, notifier, logger, scan });
+
+    assert.equal(n, 1, `十年后的锚点也必须只发一条，实际 ${n} 条`);
+    const st2 = loadState(dir, { nowMs: now + 11 * MIN }).state;
+    assert.equal(Object.keys(st2.notified).length, 1, '去重条目必须还在——它没有真的过期');
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(claude, { recursive: true, force: true });
@@ -2013,6 +2192,186 @@ test('formatHealth：不健康时明确区分「进程死了」与「进程卡�
     lastProbeAt: new Date(now - 6 * 3600e3).toISOString() }, { nowMs: now }));
   assert.ok(out.includes('没有在工作'));
   assert.ok(out.includes('不代表进程死了'), '必须说清这不是进程崩溃，而是卡住');
+});
+
+// ── 2026-11-12 日志轮转失败 ────────────────────────────────────────────
+//
+// 这组用例是**先复现、后修**的顺序写的。原始实现（`catch { /* ignore */ }` 三连）
+// 在下面每一个用例里都会静默吞掉失败：日志停止、调用方不知情、`--health` 照报「运行中」。
+//
+// 为什么用注入的 IO 而不是真的锁文件：Windows 上 rename 失败需要另一个进程持有句柄，
+// NTFS 的 chmod 不生效，杀软会改变行为。做不到稳定复现的负向测试等于没有。
+
+/** 造一个刚好在边界上的日志文件：再多写 incoming 字节就越过 maxBytes。 */
+function seedLogAtBoundary(dir, maxBytes, margin = 10) {
+  const body = 'x'.repeat(maxBytes - margin);
+  writeFileSync(join(dir, 'watch.log'), body, 'utf8');
+  return join(dir, 'watch.log');
+}
+
+test('DFS-01 rename 失败不能让日志停止：必须继续写，且降级可见', () => {
+  const dir = tmp();
+  try {
+    const maxBytes = 200;
+    seedLogAtBoundary(dir, maxBytes);
+    const faults = [];
+    const logger = createLogger(dir, {
+      maxBytes,
+      stderr: (s) => faults.push(s),
+      deps: { renameSync: () => { const e = new Error('EPERM: operation not permitted, rename'); e.code = 'EPERM'; throw e; } },
+    });
+    logger.info('这一行必须落盘');
+    const f = join(dir, 'watch.log');
+    assert.ok(existsSync(f), '日志文件必须仍然存在');
+    const text = readFileSync(f, 'utf8');
+    assert.ok(text.includes('这一行必须落盘'), 'rename 失败后仍必须写进日志——不能静默停止');
+    // 降级事实必须写进日志本身：事后看日志的人不会去看 stderr
+    assert.ok(text.includes('rotate-failed'), `日志里必须留下降级痕迹，实际：${text.slice(-200)}`);
+    assert.ok(faults.some((s) => s.includes('log-fault')), '必须写 stderr，不能只吞掉');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DFS-02 rename 与截断都失败 → 继续追加（超限可以，静默不行）', () => {
+  const dir = tmp();
+  try {
+    const maxBytes = 120;
+    const f = join(dir, 'watch.log');
+    seedLogAtBoundary(dir, maxBytes);
+    const faults = [];
+    // 模拟文件被另一进程独占：rename / copy / truncate 全部失败。
+    // 截断也必须失败，否则走的还是第 2 级降级，测不到第 3 级。
+    const eperm = () => { const e = new Error('EPERM: operation not permitted'); e.code = 'EPERM'; throw e; };
+    const logger = createLogger(dir, {
+      maxBytes,
+      stderr: (s) => faults.push(s),
+      deps: { renameSync: eperm, copyFileSync: eperm, writeFileSync: eperm },
+    });
+    logger.info('超限也要写下去');
+    const text = readFileSync(f, 'utf8');
+    assert.ok(text.includes('超限也要写下去'), '日志无限增长 > 日志静默停止');
+    assert.ok(text.includes('rotate-failed-append-only'), `必须记录第三级降级，实际：${text.slice(-160)}`);
+    assert.ok(faults.some((s) => s.includes('rotate-failed-append-only')), 'stderr 必须报出降级');
+    const health = readLogHealth(dir);
+    assert.equal(health && health.healthy, false, 'health 必须是不健康');
+    assert.equal(health.kind, 'rotate-failed-append-only');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DFS-02b 第 2 级降级：先复制再截断，旧内容不能丢', () => {
+  const dir = tmp();
+  try {
+    const maxBytes = 120;
+    // 边界文件里有可辨认的旧内容，且已顶到上限（再写一行必然触发轮转）
+    writeFileSync(join(dir, 'watch.log'), 'OLD-EVIDENCE-LINE\n' + 'x'.repeat(maxBytes - 20), 'utf8');
+    const faults = [];
+    const eperm = () => { const e = new Error('EPERM: operation not permitted'); e.code = 'EPERM'; throw e; };
+    const logger = createLogger(dir, {
+      maxBytes,
+      stderr: (s) => faults.push(s),
+      deps: { renameSync: eperm },   // 只有 rename 失败；copy 与 truncate 正常
+    });
+    logger.info('新行');
+    const copies = readdirSync(dir).filter((n) => /^watch\..+\.copy\.log$/.test(n));
+    assert.equal(copies.length, 1, `必须留下副本，实际目录：${readdirSync(dir).join(',')}`);
+    assert.ok(readFileSync(join(dir, copies[0]), 'utf8').includes('OLD-EVIDENCE-LINE'),
+      '副本必须含旧内容——旧实现直接截断会永久丢掉它');
+    assert.ok(readFileSync(join(dir, 'watch.log'), 'utf8').includes('新行'));
+    const health = readLogHealth(dir);
+    assert.equal(health.kind, 'rotate-failed-copied');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DFS-03 正常轮转仍然工作：归档带时间戳，新文件从第一行开始', () => {
+  const dir = tmp();
+  try {
+    const maxBytes = 200;
+    const logger = createLogger(dir, { maxBytes });
+    for (let i = 0; i < 6; i++) logger.info('y'.repeat(60));
+    const archives = readdirSync(dir).filter((n) => /^watch\..+\.log$/.test(n));
+    assert.ok(archives.length >= 1, `必须归档，实际目录：${readdirSync(dir).join(',')}`);
+    assert.ok(statSync(join(dir, 'watch.log')).size <= maxBytes + 200, '当前文件应已被轮转清空/重建');
+    const health = readLogHealth(dir);
+    assert.equal(health && health.healthy, true, '正常轮转必须把健康状态写成 true');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DFS-04 stat 失败（非 ENOENT）必须可见，而不是跳过轮转', () => {
+  const dir = tmp();
+  try {
+    const faults = [];
+    const logger = createLogger(dir, {
+      maxBytes: 100,
+      stderr: (s) => faults.push(s),
+      deps: { statSync: () => { const e = new Error('EACCES: permission denied, stat'); e.code = 'EACCES'; throw e; } },
+    });
+    logger.info('hello');
+    assert.ok(faults.some((s) => s.includes('stat-failed')),
+      `stat 失败必须报出来，实际 stderr：${faults.join('|')}`);
+    // 仍然要写：stat 失败只影响轮转判断，不影响能不能追加
+    assert.ok(readFileSync(join(dir, 'watch.log'), 'utf8').includes('hello'));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DFS-05 主文件写失败 → 落应急文件，内容不丢', () => {
+  const dir = tmp();
+  try {
+    const faults = [];
+    let calls = 0;
+    const logger = createLogger(dir, {
+      stderr: (s) => faults.push(s),
+      deps: {
+        // 第一次 append（主文件）失败，后续（应急文件）成功
+        appendFileSync: (p, buf) => {
+          calls++;
+          if (p.endsWith('watch.log')) { const e = new Error('ENOSPC: no space left on device'); e.code = 'ENOSPC'; throw e; }
+          appendFileSync(p, buf);
+        },
+      },
+    });
+    logger.info('磁盘满时也不能丢');
+    const em = join(dir, 'watch.log.emergency');
+    assert.ok(existsSync(em), '必须有应急文件');
+    assert.ok(readFileSync(em, 'utf8').includes('磁盘满时也不能丢'));
+    assert.ok(faults.some((s) => s.includes('write-failed')));
+    const health = readLogHealth(dir);
+    assert.equal(health && health.healthy, false, 'health 必须记下不健康');
+    assert.equal(health.kind, 'write-failed');
+    assert.ok(calls >= 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DFS-06 healthCheck 读 log-health：日志坏了必须让 --health 报不健康', () => {
+  const now = Date.now();
+  const fresh = { lastJobsScanAt: new Date(now - 10_000).toISOString(), lastProbeAt: new Date(now - 60_000).toISOString() };
+
+  const ok = healthCheck(fresh, { nowMs: now, logHealth: { healthy: true, at: new Date(now).toISOString() } });
+  assert.equal(ok.healthy, true);
+
+  const bad = healthCheck(fresh, { nowMs: now, logHealth: { healthy: false, kind: 'write-failed', detail: 'ENOSPC', streak: 3 } });
+  assert.equal(bad.healthy, false, '调度层健康 + 日志层坏了 → 整体不健康');
+  assert.ok(bad.reasons.some((r) => r.startsWith('log：')), `必须把日志故障写进 reasons，实际：${bad.reasons.join('|')}`);
+  assert.ok(bad.reasons.some((r) => r.includes('ENOSPC')));
+
+  // 未传入 = 调用方不关心日志层。此时**不加这一层**，保持旧输出形状。
+  // 早先版本加了一个 verified:false 的层，而 TUI 的 checklist 把它渲染成
+  // 「log 从未」——把「没检查」读成「从没运行」。
+  const unknown = healthCheck(fresh, { nowMs: now });
+  assert.equal(unknown.healthy, true, '未传入时不影响原有判定');
+  assert.ok(!unknown.layers.some((l) => l.name === 'log'),
+    '未传入时不得加日志层：TUI 会把它渲染成「log 从未」');
+
+  // 传 null（health 文件不存在）才加层，并明说「尚无记录」
+  const never = healthCheck(fresh, { nowMs: now, logHealth: null });
+  assert.ok(never.layers.some((l) => l.name === 'log' && l.verified === false));
+  assert.ok(formatHealth(never).includes('尚无日志健康记录'));
+});
+
+test('DFS-07 readLogHealth：没有文件返回 null（从未坏过 ≠ 健康已确认）', () => {
+  const dir = tmp();
+  try {
+    assert.equal(readLogHealth(dir), null);
+    assert.equal(readLogHealth(null), null);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('buildInbox：会话已恢复正常工作（busy）时，旧的 FAILED 记录算过时', () => {

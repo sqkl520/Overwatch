@@ -14,15 +14,20 @@
 
 ## 2. 状态行
 
-每轮携带，格式固定：
+> **⚠ 这一节描述的是约定，不是已实现的能力。** 仓库里**没有任何脚本输出这个格式**：
+> `scan-sessions.mjs` 打印的是会话表（见 `docs/GUIDE.md` §4），不是逐 Agent 状态行。
+> 状态行的字段名与语法可由主线程按下面写，但**数字必须来自 `scan-sessions.mjs --json`**，
+> 不得由模型估算。真要自动化，得先写一个渲染器——现在没有。
+
+约定格式：
 
 ```
 [阶段B · Agent#3 EXPLORING · reads=42/novelty=0.74/hb=14s · no_write=4m · budget=est:31% · liveness=reconstructed]
 ```
 
-字段定义见 `docs/spec/state-model.md` §8。**由 `scripts/scan-sessions.mjs` 渲染，不手写。**
+字段定义见 `docs/spec/state-model.md` §8。**数字只能来自 `scan-sessions.mjs --json` 的对应字段，不手写。**
 
-### 2.1 为什么必须由脚本渲染
+### 2.1 为什么数字必须来自脚本
 
 手写的状态行会随模型心情变化：数字编得越来越像真的，但没有任何计算支撑。这比没有状态行更坏——它自带格式可信度，用户无法区分真假。
 
@@ -34,7 +39,7 @@
 [阶段B · Agent#3 EXPLORING · reads=42 novelty=0.74 hb=14s · budget=est:31%]
 [阶段B · Agent#5 PRODUCING · edits=6 · last_hb=12s]
 [阶段B · Agent#7 STALLED · probe=LOOPING · 重复读 pkg.json×4 · 已L3注入(deferred)]
-[阶段B · Agent#9 FAILED · hb_gap=1240s>p95=620s · 重跑 1/2]
+[阶段B · Agent#9 BLOCKED · host-reported-blocked · 等：权限确认 · 重跑 0/0]
 ```
 
 超过 5 个 Agent 时只列异常（`STALLED` / `FAILED`），正常的合并为一行：`[其他 4 个 EXPLORING/PRODUCING 正常]`。

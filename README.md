@@ -1,6 +1,15 @@
 # Overwatch
 
-**把所有 AI 会话压成一张表，在会话等你时叫醒你，并把「AI 说它做完了」变成一句可核对的断言。**
+**在 AI 想收工时替你把关。**
+
+它会扫描本机所有 Claude Code 会话，但真正的价值只有一个动作：当某个会话说「做完了」，
+去 transcript 里找支持这句话的工具调用——找不到，就把这句话标出来。附带把会话压成一张表，
+在真的需要你时通知你。
+
+> 这一版刻意**收窄了定位**。它不做「管理你所有的会话」——官方 `claude agents` 已经把
+> 「看清有哪些会话」做完了（见下）。它做的是官方没有的那一件事：
+> **把「AI 说它做完了」变成一句可核对的断言。** 其余能力是围绕这件事的观测面。
+> 每一条能力对应的命令见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md)。
 
 零 npm 依赖（仓库里没有 `package.json`），只要 Node ≥ 18。不安装、不登录、不配置。
 
@@ -42,6 +51,8 @@ Windows 有开机自启和 Toast；macOS / Linux 给出 launchd / systemd 配置
 
 ## 核心能力
 
+下表每一行都对应 `docs/CAPABILITIES.md` 里一条**能跑的命令**——硬门会检查那些命令的脚本与参数真实存在。
+
 | 能做 | 不能做 |
 |---|---|
 | 扫全部会话，压成一张可排序的表 | 实时干预运行中的会话 |
@@ -49,9 +60,11 @@ Windows 有开机自启和 Toast；macOS / Linux 给出 launchd / systemd 配置
 | 检出持久化变更（`Write`/`Edit`/写命令），区分「在改东西」和「在读东西」 | 判断改得对不对 |
 | 会话等你时弹桌面通知（宿主 `status: waiting`） | 从「停了很久」推断失败——**实测后已删除该推断** |
 | 把完成声明与支持它的工具调用配对，判四档（见下） | 保证 AI 没在别处撒谎 |
+| 在收工点值守：AI 想结束回合时拦住没有证据的完成声明（Stop hook，默认关闭） | 替用户点「结束」或「允许」 |
 | 生成带具体下一步的接力草稿，由你复制发送 | 自动接力（见下） |
+| 产出对账：派活前登记「该产出哪些文件」，收活时对磁盘与 transcript 四方核对 | 保证子 agent 说的就是它做的（只核对文件痕迹，不核对语义） |
 
-### 关于「四态」
+### 关于「六种状态，只有两个能驱动动作」
 
 代码里有 `EXPLORING` / `PRODUCING` / `STALLED` / `FAILED` / `BLOCKED` / `WAITING`，但在真实数据里极不均衡。2026-10-31 实测 129 个会话的末态：
 
@@ -112,20 +125,29 @@ SUPPORTED / STALE_ONLY / FAILED_ONLY / NO_EVIDENCE   （另有 UNKNOWN = 读不�
 
 全量实测（228 个主 transcript、31 条断言）：`SUPPORTED 26 / STALE_ONLY 1 / FAILED_ONLY 0 / NO_EVIDENCE 1 / UNKNOWN 3`。人工抽检 13 条：11 条判对、2 条判错，**精度约 84.6%**（样本小，只能当量级看）。全量耗时 2.9–5.6 秒。
 
+2026-11-13 起多认一族 **`vague-completion`**：「修好了」「搞定了」这类**没有任何指标**的完成声明——它们恰恰最需要证据，而改造前被判为「没认出断言」直接放行。范围与已知漏报见 `docs/CAPABILITIES.md` §4。
+
 同仓库还有两个确定性判据：`stop-signals.mjs`（停机原因的结构判定：错误停机、死循环、上下文压力、原始目标提取，全部不读语义）和 `asked.mjs`（从文本判断「问了没答」，不依赖宿主）。都能直接跑，例如 `node scripts/verify-claims.mjs --days 3`、`node scripts/stop-signals.mjs`。
+
+**收工值守（可选）**：`scripts/stop-verify-hook.mjs` 把上面的判定挂到宿主的 `Stop` 事件上——
+AI 想结束回合时，宿主先问它一句「你的完成声明有证据吗」，没有就把理由喂回去让它补。
+**默认关闭，只记账不拦**；开启方式、上限与 fail-open 设计见 `docs/CAPABILITIES.md` §3。
 
 ## 目录
 
 ```
 Overwatch/
 ├─ .claude/agents/       12 个角色定义（宿主直接加载）
-├─ docs/                 GUIDE 使用手册 · spec 规格 · adr 决策 · research 实测报告
+├─ docs/                 入口 docs/README.md · CAPABILITIES 能力清单 · GUIDE 手册
+│                        spec/ 规格 · adr/ 决策 · research/ 实测报告（含状态索引）
 │                        design/ 全是未实现的设计推演，状态见 docs/design/README.md
-├─ scripts/              scan / watch / verify-claims / stop-signals / TUI / 硬门
+├─ scripts/              scan / watch / verify-claims / stop-verify-hook / TUI / 硬门
 └─ tasks/                两本台账：范围外发现、已知偏差
 ```
 
-改动后必跑 `node scripts/check-structure.mjs`（结构硬门）与 `node --test scripts/*.test.mjs`（508 条回归测试）。
+新来的人从 [`docs/README.md`](docs/README.md) 开始——它按「你想知道什么」指路，并说清四类文档的可信度不同。
+
+改动后必跑 `node scripts/check-structure.mjs`（结构硬门）与 `node --test scripts/*.test.mjs`（973 条回归测试；**这个数字由硬门与实跑对账，写错即红**，所以照抄即可、不必手工数）。
 
 ## 已知局限
 
@@ -136,7 +158,7 @@ Overwatch/
 | 在线停止分类基本失效 | 在线路径 **95.4%** 判 `UNCLASSIFIABLE` | 结构性：要判这次停止是问句还是结束得看下一句，而在线时下一句还没发生 |
 | 通知抑制准确率无法自测 | 无自动测量手段 | 需要人标注「这条该不该发」，没有基准 |
 | `needs` 覆盖稀疏 | 16 个 job 里只有 2 个带 `needs`、1 个带 `suggestedReply` | 宿主只在阻塞时写，取决于用法 |
-| `STALLED` 近乎不可达 | 全语料 0.018% | 见上文「四态」 |
+| `STALLED` 近乎不可达 | 全语料 0.018% | 见上文「六种状态」 |
 
 两条和本库无关但影响你怎么用它：
 

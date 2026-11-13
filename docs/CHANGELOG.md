@@ -12,12 +12,1191 @@
 >
 > ⚠️ **本文件是内部流水账**。它按工作阶段记录改动，包含硬门的自我失效、验收轮次、提交事故这些**我们自己才关心**的东西。
 > **面向用户的说明是另一份**：`README.md`（能力边界、30 秒上手、四态表）与 `docs/GUIDE.md`
-> （437 行使用手册：你会看到什么、该做什么）。本文件不复述它们的结论。
+> （使用手册：你会看到什么、该做什么；行数以 `wc -l` 为准）。本文件不复述它们的结论。
 
 > **三条不给糖吃的写法约定**：
 > 1. 每条必须写出处——commit hash、文件路径、函数名、实测数字。写不出出处的，不要写。
 > 2. 「修好了」必须有负向证据：把 bug 放回去，测试/硬门要变红。只跑一次绿灯不算。
 > 3. 数字冲突时以最新实测为准，并在条目里说明旧数字为什么错。
+
+---
+
+## [Unreleased] - 2026-11-13（Bash 写入识别：从「一律不认」到「可判定才认」，并给误判设了几道硬闸）
+
+> 产出：`scripts/claim-ledger.mjs`（新增 `bashWrites` / `bashWriteScan` / `observedWriteScan` 三个导出，
+> `observe` 接上 Bash 通道并报告「判不出」的计数）、`scripts/claim-ledger.test.mjs`（+13 用例，含 3 条真实回退）、
+> `scripts/check-structure.mjs`（三个新导出登记进 PROBE_ARGS）、
+> 报告 `docs/research/2026-11-13-bash-write-detection.md`。
+> 测试数 960 → 973（硬门与 `node --test` 两处都是 973）。
+>
+> **修的是上一轮自己写下的「刻意不做」**：`observe` 只认 `Write`/`Edit`，Bash 写出的文件看不见。
+> 那条理由（「猜路径必然误判」）**仍然正确**——所以这一轮不是把「猜」做得更聪明，
+> 而是划出「**哪些命令的写入路径根本不需要猜**」，只对那一小类开口。
+
+### Added
+
+- **`bashWrites(cmd, cwd) -> string[]`**（纯函数）。只识别路径**可确定解析**的形态：
+  输出重定向 `>` `>>` `2>` `&>`、`cat > p <<'EOF' … EOF`、`tee p`、`cp src dst`、`mv src dst`；
+  命令里的字面量 `cd` 参与基准目录换算（`cd sub && echo x > y.txt` → `<cwd>/sub/y.txt`）。
+  判不出就返回空数组，**不返回猜测**。
+- **`bashWriteScan(cmd, cwd)`**：同一套解析，额外给出「判不出」的逐类计数
+  （动态路径 / 临时位置 / 目录 / 原地改写 / 目标是已有目录）。**没看的部分必须可数**，
+  否则「没有产出」和「没看」长得一模一样——那正是 `claim-ledger` 开头点名的病。
+- **`observe` 接上 Bash 通道**，台账行新增 `source: 'write-tool' | 'bash'`（原来固定是 `transcript-write`，
+  现在用 `via: 'transcript'` 表示证据来源、用 `source` 区分通道）。`--no-bash` 可整条关掉。
+- **`observe` 报告里打印跳过计数**：`判不出、已跳过：动态路径 N 条 · 临时位置 N 条 · 目录(非文件) N 条 · 原地改写 N 条 · 目标是已有目录 N 条`。
+
+### 实测（不是推断）
+
+- **本机抽样 526 份子 agent transcript、36,673 次 Bash 调用**（按 `files[::step]` 等距抽取，可复算）：
+  解析出 1,149 条写入路径，**其中 1,149 条的 basename 原样出现在命令字符串里（100% 字面量证据）**；
+  0 条的 basename 是凭空生成的。落到磁盘核对：254 条文件此刻存在，**0 条解析结果指向目录**
+  （`cp src dst` 里 `dst` 是目录时会另计为「目标是已有目录」并跳过）。
+- **跳过量**（同一批样本）：动态路径 8,653、临时位置 7,626、目录 646、原地改写 123。
+  这解释了为什么「只用 Write 才算产出」会漏——也解释了为什么不能把「用过 Bash」当成「用 Bash 写任务产出」：
+  真正落到可判定路径上的只有 1,149 / 36,673 ≈ **3.1%**。
+- **回退即红（3 条真实负向验证）**：把 `bashWrites` 改成恒返回 `[]` → 6 条测试变红；
+  删掉「路径含 `$` `*` `?` 等即判动态」那一行 → 3 条变红；把 `cd` 失败时仍保留前半截结果 → 1 条变红。
+  三次都还原后 62/62 绿。
+
+### 刻意不做
+
+- **不认 `find -exec` / `xargs` / `sh -c "…"` / `eval` / 子 shell。** 路径在动态命令里，
+  看得见的是外层字符串，看不见的是它真正写了什么。**一律计数，不给结果。**
+- **不认 `mkdir`。** 目录不是文件：`probeDisk` 拒收目录，把目录写进期望会永远判 `ABSENT`。
+  计数但不产出路径。
+- **不认 `sed -i` / `perl -i`。** 原地改写会顺带生成备份文件（`f.bak`、`f~`），
+  名字取决于工具与参数，**判不准**。计数。
+- **不认 `/tmp`、`/dev/null`、`%TEMP%`。** 判得出，但实测这批样本里它们的主流形态是探针
+  （`cat > /tmp/FmtCheck.java`、`cp x /tmp/en.bak`），不是交付物。计数但不当产出。
+- **不改「期望」的定义。** Bash 命中的路径仍然只作为 transcript 痕迹（可能进 `extras`），
+  判定仍以 `declare` 的期望为准——否则一个误判就能让 `verify` 判出 `COMPLETE`。
+
+### 已知边界（不假装覆盖）
+
+- **`cp a dst` 里 `dst` 是目录时，真正的产出是 `dst/<basename>`。** 纯函数不许读盘，
+  所以解析层给的是 `dst`；`observe` 收账时用 `statSync` 判它是目录并跳过（计数）。
+  `declare` 显式声明那条路径仍然有效——那是唯一不会被动的兜底。
+- **未声明 cwd 的相对路径一律放弃。** transcript 每条记录带 `cwd`，所以 `observe` 走的是它有；
+  外部调用方没给 cwd 时只有绝对路径会被认出来。这是保守方向，不是漏洞。
+
+---
+
+## [Unreleased] - 2026-11-13（产出对账 · 接进派发链路：从「工具存在」到「有人在调」）
+
+> 产出：`scripts/validate-run.mjs`（`outputs` 必填 + `checkOutputs` / `outputPathError` /
+> `outputPathKey` 三个导出）、`scripts/validate-run.test.mjs`（+12 用例，含 1 条真实回退）、
+> `scripts/reconciliation-wiring.test.mjs`（新文件，18 用例）、
+> `scripts/claim-ledger.test.mjs`（+3 端到端 CLI 用例）、
+> `templates/dispatch.md`、`.claude/agents/oversight-executor.md`、`.claude/agents/oversight-repair.md`、
+> `.claude/skills/oversight/SKILL.md`（新增 §4.5 Phase D）、`scripts/check-structure.mjs`（导出/探针登记）、
+> 报告 `docs/research/2026-11-13-output-reconciliation-integration.md`。
+> 测试数 927 → 960（实跑核对，源码 `^\s*test(` 与 `node --test` 两处都是 960）。
+>
+> **上一轮留下的缺口**（同一天的条目，见下）：`claim-ledger.mjs` 能跑、46 条测试全绿，
+> 但 `SKILL.md` 不调它，它就完全不存在——设计 §7 自己写明了「派发链路一行未动」。
+> 本轮把那四项全部落地。这不是「新功能」，是**把已有的判定接上调用方**。
+
+### Added
+
+- **`task-graph.json` 的每个子树必须写 `outputs: string[]`**（`scripts/validate-run.mjs`）。
+  它是收活时对账的唯一期望来源：`claim-ledger declare --paths` 直接吃它。
+  **必填，不是选填**——选填则 planner 少写一行，`verify` 只能判 `NO-EXPECTATION`，
+  而那时已经是收活时，没有期望就无从补。与硬约束 4 同构：期望必须早于结果存在。
+  代价为零：仓库唯一的历史图本来就不合法（缺三个字段，早已 exit 1）。
+  `shape: artifact` 时不得为空数组（否则必填被 `[]` 绕过）；`exploration` / `hybrid` 可以空。
+  校验：绝对路径（含 `C:x` 驱动器相对形态）、UNC、`..`、空串、尾部分隔符一律 exit 1。
+- **派发模板加「产出登记（必须做）」与四元组第四节**（`templates/dispatch.md`）。
+  关键是那句 **「不执行也不会漏」——主线程会读你的 transcript**：没有它，`claim` 就会从
+  加分项退化成准入项，等于又造了一条自述通道，而自述正是这次要治的病。
+- **`executor` / `repair` 的输出改为四元组**，新增「我产出的文件」节，明写
+  「不是给你自我评价用的，是给主线程对账用的。**写错路径比不写更糟**」。
+  两个角色的 `tools` 本来就有 `Bash`（实测 `tools: Read, Write, Edit, Bash, Glob, Grep`），
+  所以 `claim` 命令跑得起来——这一条被测试固定住，防止将来白名单收窄时悄悄失效。
+- **`SKILL.md` 新增 §4.5 Phase D：收活前对账**，位于 Phase C 与 Phase E 之间。
+  `PARTIAL` / `MISSING` / `CONFLICT`（以及 `EMPTY` / `UNREPORTED` / `NO-EXPECTATION`）不进入验收，
+  并逐结论写明处置（续做 / 重派 / 退回 / 人工裁决 / 认领 / 补 outputs）。
+  理由写在入口文档里：**验收一个不完整或身份不明的交付物，等于给虚假的通过盖章**。
+
+### 实测（不是推断）
+
+- **nonce 假设成立，逐字节。** 本机 127 份有父会话的子 agent transcript，其第一条非 meta
+  user 消息与父会话里 `Agent` 工具调用的 `prompt` 字段**完全相同**（`text.length === prompt.length`，
+  无一份是「前缀相同 + 尾巴」）。prompt 长度最大 11,880 字符，全部落在
+  `SUBAGENT_HEAD_BYTES`（64 KiB）窗口内。
+- **整条链真跑通**：`tasks/runs/2026-11-13-output-reconciliation/` 下 5 个子树、`outputs` 齐全，
+  `validate-run.mjs` exit 0；`declare → claim → verify`（未认领时 exit 1）`→ consume → verify` exit 0。
+- **回退即红**：把 `const ores = checkOutputs(st)` 换成空结果 → `validate-run.test.mjs` 7 条变红；
+  把 SKILL.md 里那行 `verify || exit 1` 注释掉 → wiring 测试 1 条变红；还原后 42/42 绿。
+
+### 刻意不做
+
+- **不读子 agent 返回文本里的「我产出的文件」去对账。** 它是给人看的摘要，不是证据来源。
+  证据只有三个：自述行（`claim`）、磁盘、transcript 痕迹。把返回文本也当成一方，
+  等于让「写了一段话」重新变成判据——那正是这次要拆掉的东西。
+- **`observe` 仍未自动调用**（设计 §6 已列为下一版）。`declare` 没记 `--session`，
+  `verify` 不知道该扫哪个会话目录；自动化的前提是接口变更，本轮不做。
+
+---
+
+## [Unreleased] - 2026-11-13（产出对账：子 agent 干完了活，主线程凭什么知道）
+
+> 产出：`scripts/claim-ledger.mjs`（新脚本，31 个导出 / 6 个子命令）、
+> `scripts/claim-ledger.test.mjs`（+46 用例）、`scripts/check-structure.mjs`（导出登记 + 探针参数）、
+> 设计 `docs/design/2026-11-13-output-reconciliation.md`、`docs/CAPABILITIES.md` + `README.md` 各一行。
+> 测试数 881 → 927（实跑核对）。
+>
+> **要解决的问题**（用户原话）：「我们的 agent 架构一定要避免 agent 已经产出了然而主线程却没有意识到。」
+> 诊断出来的现状：`docs/spec/dispatch-contract.md` §6 规定子 agent 用三元组文本交回结果，
+> 而**从派发到收活之间，没有任何一处核对过「它声称的东西在不在」**。
+> `validate-run.mjs` 只校验派发图、`verify-claims.mjs` 只校验会话级断言、
+> `checkDocReferences()` 只校验文档指向——三者都不碰「任务产出」。
+> 12 份角色里，写报告的角色（critic / redteam / review）路径写死，干活角色（executor / repair）
+> 的交付物路径是自由文本，用户担心的那种失败正好发生在这里。
+
+### Added
+
+- **`scripts/claim-ledger.mjs`：四方对账。** 四个独立来源交叉：派发时登记的**期望**
+  （该产出哪些文件）、子 agent 的**自述**（可选，含 sha256）、现场的**磁盘** `stat`/hash、
+  以及从子 agent transcript 抽出的**写入痕迹**。逐项判 `OK` / `OK_WEAK` / `UNREPORTED` /
+  `ABSENT` / `DRIFTED` / `MISSING`，任务级判 `COMPLETE` / `PARTIAL` / `EMPTY` /
+  `UNREPORTED` / `DRIFTED` / `MISSING` / `CONFLICT` / `NO-EXPECTATION`。
+- **`observe` 不需要子 agent 配合。** 读 `subagents/agent-*.jsonl` 的 `tool_use` 与成对
+  `tool_result`，用派发时写进 prompt 的 8 位 nonce 做归属（按 nonce 而不是角色名：
+  同一次 run 会有两个 `executor`）。子 agent 一个字都不报告，痕迹照样在。
+- **`CONFLICT` 排在任何结论之前。** 两个 agent 写同一个文件时「都成功」是最坏形态，
+  比任何一个失败都糟。路径先按 `pathKey` 归一化再比——子 agent 给绝对路径、派发方给
+  仓库相对路径，不归一化会把同一个文件判成「期望没落地 + 额外产出」，两边都错。
+- **`PARTIAL` 与 `EMPTY` 严格分开。** 干到一半要续做，没开工要查派发是否失败，
+  混成一个「失败」两种处置都会做错。
+- **`consumed` 是第二个维度。** 产出完整但主线程还没接手，`summary.ok` 仍是 false。
+  `adopt` 专用于崩溃重启后列出「有产出、未认领」的任务。
+- **空结果三规则**：台账为空 → 退出码 1 并印「这不是全部完成，是从没登记过期望」；
+  `observe` 找不到 transcript → 退出码 1 并印「这不是没有产出，是看不到」；
+  扫到 transcript 但一份都归属不上 → **不写任何行**（记到某个任务名下会让结果变假）。
+
+### 刻意不做
+
+- **不判「Bash 写出的文件」。** 从命令行猜目标路径必然误判（`2>&1`、`tee -a`、`sed -i` 的备份文件），
+  而误判的代价是让人不再相信这个工具。兜底：Bash 产物照样可以 `declare`，那时走磁盘比对。
+- **不判产出对不对。** 只看在不在、变没变；内容完全错误但 hash 对得上仍是 `OK`。那是 `acceptor` 的活。
+- **静默不是失败判据。** `silentMin` / `quiet` 只用来说「要不要催」；`COMPLETE` 且静默 5 小时仍是
+  `COMPLETE`。依据 `state-model.md` §2.0.1（6,308 次大间隔里 94.8% 之后仍有调用），有专门测试守着。
+- **派发链路一行未动。** `SKILL.md` 不调它它就完全不存在。接法写进设计文档 §7，
+  并指出一个真实接口缺口：`task-graph.json` 没有 `outputs[]` 字段，现在 `--paths` 只能由主线程现写。
+
+---
+
+## [Unreleased] - 2026-11-12（日志轮转：交来的「静默 4 小时」是影子目录，改修「失败不可见」）
+
+> 产出：`scripts/watch.mjs`（`createLogger` / `healthCheck` / `formatHealth` + 3 个新导出）、
+> `scripts/watch.test.mjs`（+7 用例 DFS-01…DFS-07）、`scripts/check-structure.mjs`（导出登记 + 探针参数）、
+> 报告 `docs/research/2026-11-12-log-rotation-SILENT-failure.md`。
+>
+> **先证伪**：任务给的三条证据里，`watch.log`（41,857 B / 末行 10-31T19:22:58Z）**是 MSIX 影子副本**。
+> WMI 起进程外进程复核：真实 `watch.log` **289,957 B、末行当前**，与 stdout 镜像 `runner.log`
+> **逐行一致（2383 行 / 0 条缺失）**。那两份 1,048,5xx 的归档正是轮转产物，06:58:03Z 那次
+> 轮转后新 `watch.log` 从第一行开始长——**轮转一直是好的**。
+> 这是 `2026-11-04-watcher-silent-failure.md` 之后的**第二次同类误诊**。
+>
+> **改的是真缺陷**：`--health` 只读 `state.json`（调度心跳），结构上无法发现日志系统自己的故障。
+> 一个吞掉自己失败的 logger，会让「守护进程在跑」与「它什么都没记」变成同一画面。
+
+### Fixed
+
+- **日志失败三层可见。** 原来四处静默：`statSync` 非 ENOENT 失败一律 `return`（不再轮转）、
+  两次 `rename` 都失败后完全静默（轮转永久失效）、`appendFileSync` 失败只 mirror 到 stdout（行丢弃）、
+  `--health` 不看日志。现在每条故障同时：写进日志本身第一行（`[WARN] log-health: <kind>`）、
+  写 stderr（`[log-fault] <kind>`，被 VBS 拉起时进 `runner.log`）、写 `log-health.json`。
+  同一故障按签名去重，换一种故障重新报。
+- **轮转三级降级，失败不停止写。** `rename` → **先复制再截断** → 继续追加（超限）。
+  第 2 级必须先复制：单纯截断会永久丢掉旧日志的最后 1 MB，而按本项目自己的规矩
+  （README 与硬门都在守）证据不能由程序替你决定删掉。复制成功则另存
+  `watch.<时间戳>.copy.log`；复制也失败时 `kind` 报 `rotate-failed-truncated` 而非
+  `rotate-failed-copied`，**明说内容会丢**。
+  判据：**日志无限增长 > 日志静默停止**——前者用户能用 `ls` 看见，后者看不见。
+- **写失败落 `watch.log.emergency`。** 原来 `catch` 后直接 `return`，那一行永久消失。
+- **`healthCheck(state, { logHealth })` 新增日志层。** `undefined`（调用方没传）与 `null`
+  （从未坏过）都标 `verified: false` 并单独输出，**不当作健康**——「没检查」不能长得像「检查过且通过」。
+  `--health` 现在读 `log-health.json`，日志坏了直接退出码 1 并指名故障类型。
+- **`createLogger` 加 IO 接缝 `deps`。** Windows 上让 `rename` 真失败需要另一进程持句柄、
+  NTFS `chmod` 不生效、杀软改变行为——**做不到稳定复现的负向测试等于没有**，所以注入必抛错的 IO。
+
+### 负向验证（回退即红）
+
+| 回退项 | 变红的用例 |
+|---|---|
+| 轮转失败静默吞掉 | DFS-01、DFS-02 |
+| `stat` 失败一律静默 `return` | DFS-04 |
+| 写失败不落应急文件 | DFS-05 |
+| `healthCheck` 不看日志层 | DFS-06 |
+| 截断前不先复制（旧内容永久丢失） | DFS-02b |
+
+### 测试
+
+`node --test scripts/*.test.mjs` → **881 / 881 全绿**（本 Agent 开工基线 873，+8：
+DFS-01…DFS-07 + DFS-02b）。`node scripts/check-structure.mjs` → 通过。
+四份文件的测试数已同步 873 → 881。
+
+### 未做 / 存疑
+
+- **生产守护进程未重启**（PID 25456），新逻辑下次启动才生效。按任务要求不重启。
+- **但该进程在本轮工作中已经停了**：最后一轮 tick `2026-11-12T13:11:02Z`，日志里没有
+  `watch 退出`。我**没有**对它执行任何 kill；三次受控实验（哑进程 / 真 watcher 实例 / 结构门）
+  都没能复现「被测试杀掉」。**查不出原因，也不能证明与我无关**——是否重启请用户决定。
+  详见报告 §八。
+- `createObservationLog` 有同类静默 `catch`（观察日志追加无应急文件），本轮未改，记在报告 §七。
+
+---
+
+## [Unreleased] - 2026-11-13（事实清单：在多次结论翻转之后，给一份能信任的基线）
+
+> 产出：`docs/FACTS.md`（新增）。入口登记在 `docs/README.md` 的两处表里。
+>
+> **为什么需要它**：这个项目在几小时内经历了多次结论翻转——「15/24 是假报告」→ 1/31；
+> 「`claude -p` 不能用」→ 能用但慢且会静默失败 → 今天两种剥法都失败；
+> 「`claude-agent-acp` 版本不存在」→ 查错了包；「`NO_EVIDENCE` 37 条是痛点」→ 94% 来自自建沙盒；
+> 「守护进程死了 7.75 天」→ MSIX 影子目录，进程一直活着。
+> 用户要的不是又一份报告，是一份**每条都写清证据等级和复跑命令**的清单。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **880 / 880 全绿**。
+> `node scripts/check-structure.mjs` → 通过。`node scripts/check-links.mjs` → 60 链接 0 断链。
+>
+> **边界**：未改任何代码、未碰 git。所有探针落在 `.tmp-analysis/`（gitignore）。
+
+### Added
+
+- **`docs/FACTS.md`。** 四部分：已验证的技术事实（每条含 T1–T4 证据等级 + 可直接复制的命令 + 实测输出）、
+  已被推翻的结论（7 条，逐条写「曾经 / 为什么错 / 现在的正确说法 / 线索」）、
+  未验证的假设（5 条，写清「有 / 无 / 仅文档」）、明确的未知（6 条，写清「需要什么才能答」）。
+  开头有「如何读这份文档」，说明证据等级含义、哪些是快照哪些是稳定事实、数字会漂。
+
+### 实测确认（本文件新增的数字）
+
+- 回归测试 **873 条 / 19 个测试文件**（`node --test`，42 秒）。
+- `verify-claims` 全量 **349 transcript / 108 断言**：41 SUPPORTED / 10 STALE_ONLY / 0 FAILED_ONLY / 49 NO_EVIDENCE / 3 UNKNOWN / 5 UNCHECKABLE。
+- `NO_EVIDENCE` 的**沙盒 vs 真实**：按断言 **46 : 3**，按会话 **45 : 3**；`rea` 那 2 条 uuid 交集 99.7% 是同一份 transcript 的副本。
+- 介入基线：`--days 7` = 117 次 / 144 会话；`--days 0` = 830 次 / 347 会话；P1 占比分别为 56.4% 与 37.6%。
+- 介入发生在首次写操作之前的比例，四种口径 **4.5%–7.8%**（锐评报告写 8.2%，复现不出，方向和量级一致）。
+- 并发曲线：**86.7% 墙钟无活跃会话**（353 transcript / 62 万条记录 / 3,506 小时）。
+- `claude mcp serve`：**23 个工具**，`tools/call` 能真的执行。
+- ACP：`acpx opencode exec` **成功返回 PONG**；`acpx claude exec` 卡在 `session/prompt` 的 `Authentication required`。
+- `claude -p`：保留变量 → `Not logged in`；全剥 → 挂起（>400 秒）；只剥认证留 `ANTHROPIC_BASE_URL` → 「网关缺少 Authorization 头」。**P12 配方今天不复现。**
+- 网关模型列表 2 个，实际路由是 `SCNet-Max`（最近 3 天 118,315 条记录）；传假模型名不会被网关拒，转发上游后 503。
+- MSIX 影子目录：**同一文件 ID、不同目录枚举结果**（真实 11 项 / 影子 7 项，差的 4 项全是 10-31 之后产生的）；写入互通，非虚拟化子进程读数一致。
+  **修正**：上一份报告的「会话内读 `%LOCALAPPDATA%` 会被重定向」**今天不复现**——会话内读到的是活数据。
+- Stop hook：`decision:block` 真能拦（stdout 报文 + 账本 `outcome:blocked`）；
+  `stop-verify-hook.mjs:259` 的 `truncated: false` 硬编码**仍然存在**，T4 对照证明改为 `true` 会从 `NO_EVIDENCE` 翻成 `UNKNOWN`。
+
+### Known issue（本文件新发现，未修）
+
+- **守护进程活着（PID 25456，state.json 每 15 秒更新），但最新日志从 06:58 起不再增长，已静默 3.45 小时。**
+  已排除独占锁与权限；未查明根因。`watch.mjs --health` 读 state.json，所以它说「运行中」是真的，
+  但它不会告诉你日志已停。登记在 `docs/FACTS.md` §1.5 与 §3.3。
+
+
+
+> 报告：`docs/research/2026-11-13-claim-detection-fixes-and-multimodel.md`
+> （含真实实验回归、多模型可达性实测、以及「当前环境无法验证兼容多模型」的证据）。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **880 / 880 全绿**（改动前实跑一次 860 / 860）。
+> `node scripts/check-structure.mjs` → 通过，0 违规 0 提示。
+> 负向验证：`node scripts/verify-claim-fix-negatives.mjs` → **5/5 处回退都让预期测试变红**。
+>
+> **边界**：未碰 git；未碰 `scripts/oversight-tui.mjs` / `scripts/watch.mjs`。
+
+### Fixed
+
+- **`已全部修好`（不带「了」）漏检。** `detectClaims('已全部修好')` → `[]`，而加一个「了」
+  就能认出来。缺陷在两条既有分支中间：`VAGUE_ZH` 的动词全带「了」，`VAGUE_DONE_HEAD`
+  又不许「已」与动词间插词。P4 的最终首句正是 `…，已全部修好：`，P5 是
+  `…，已按下面方式修好：`，两组 hook 都记 `checkableCount: 0` 后放行。
+  新增 `VAGUE_DONE_BARE` 分支（`(?:^|[，,、])` + `已` + 最多 10 个非虚词 + 光杆动词
+  + **复用 `VAGUE_TAIL`**）。复用 tail 是关键：定语（`七份已完成报告…` / `已完成的报告有三份`）
+  仍然被挡在外面，上一轮的防误伤规则一条没动。
+  （`scripts/verify-claims.mjs`：`COMPLETION_RE` 新增分支；`VAGUE_TAIL` 补 `：:`。）
+
+- **`All four fixes are applied` 漏检（P4/P5/P6 里最后一处）。** 修完上一条后回归发现
+  P6 仍然放行。它的首句是 `All four fixes are applied to lib.js.` —— `VAGUE_EN` 只认句首
+  裸 `Done`/`Fixed`/`Completed`/`Resolved`，这句一个都没有。新增 `VAGUE_EN_ALL`
+  （句首锚定 + 数量词可选 + 名词限定在 fixes/changes/bugs/issues/patches/edits + 必须完成体）。
+  实测语料 312 段末尾文本里只命中 P6 一处。
+
+- **`Whether tests pass matters here.` 被判成 `test-count`。** 那是英文的间接疑问，
+  不是「测试通过」。`NEGATION_RE` 管不了它（既无否定也无失败措辞），`INTERROGATIVE_RE`
+  也管不了（没有问号）。P1 因此被误拦一次。新增 `HYPOTHETICAL_LEAD_RE` /
+  `HYPOTHETICAL_MARK_RE` / `HYPOTHETICAL_BRIDGE_RE` / `INVERSION_QUESTION_RE` 与
+  `isHypotheticalMatch()`，并在 `detectClaims` 里**按每一处命中判、不按整句判**：
+  只有当该族的**所有**命中都被假设语管着时才丢弃，`hits.every(...)`。
+  整句否决会误杀 `我检查了测试是否通过，结果是 18/18 通过。` 的后半句 —— 这一条由
+  `n5` 负向验证守住。
+
+- **reason 文案混入英文族 ID。** V2 的拦截文案里出现「整个文件范围内没有任何
+  vague-completion 调用」。根因不是漏映射，是**映射表抄了两份**：
+  `classifyEvidence` 里那份漏了该族，退回 `|| fam`；`stop-verify-hook.mjs` 里那份有。
+  改为唯一出处：`verify-claims.mjs` 新增 `FAMILY_NAMES` / `ACTIVITY_NAMES` 与
+  `familyName()` / `activityName()`，`stop-verify-hook.mjs` 删掉本地表改 import。
+  两个函数对未知族**都不回吐 ID**（退回「完成性断言」/「相关」）—— 写 `|| id`
+  只是把同一个 bug 换个位置。
+
+### Added
+
+- **`scripts/verify-claim-fix-negatives.mjs`**：本批 5 处修复的负向验证。每处回退 →
+  跑测试 → 还原，要求预期的那条测试真的变红。`n5` 是反向守卫：把「逐处命中判」改成
+  「整句否决」，同句后半段的真断言会被误杀，对应测试必须红。
+  它不是 `verify-bugfix-negatives.mjs` 的一部分 —— 那个脚本只跑 `tui-bugfixes.test.mjs`。
+
+### 回归（真实实验数据，不是构造句）
+
+`.tmp-analysis/hook-e2e/runs/` 的 19 组最终文本送进真实的 `decide()`，pre/post 对照：
+
+| 变化 | 组 |
+|---|---|
+| 放行 → 拦截 | **P4 / P5 / P6**（全部是本次目标） |
+| 拦截 → 放行 | **无** |
+| 拦对的仍然拦 | P2 / P3 / PC1 / PC2 / PC3 / S1 |
+| 有证据的仍然放 | C1 / H1 |
+| 无断言可核对的仍然放 | H2 / H2b / H3 / N1 / NB1 / V1 / V2 / P1 |
+
+全量语料 312 段末尾文本 A/B：新增 3 条（就是 P4/P5/P6 那三句），**丢失 0 条**，
+309 段完全一致。
+
+### Known（本次查清，但做不到）
+
+- **「兼容多模型」在当前环境无法在闸门层验证。** cc-switch 本地网关
+  （`127.0.0.1:15721`）忽略客户端的 `model` 字段，按 provider 配置一律重写成
+  `deepseek-ai/deepseek-v4.1-flash` —— 连 `totally-nonexistent-model-xyz` 都回 200 并由
+  该模型服务。`proxy_request_logs` 里四个不同模型名全部记成同一路由。
+  绕过网关直连上游（`api.furry.vg`）能指定模型（已实测 5 个模型真路由），但那条路是裸
+  HTTP，组不成「宿主 + Stop hook」的真实会话。已做的只是**判据层**验证：4 个模型在
+  「施压 + 无 shell」场景下都说了「全部测试通过」，`detectClaims` 全部识别、
+  `decide()` 全部拦截；`z-ai/glm-5.3-flash` 三次尝试无有效文本（2 次空 content、1 次 524）。
+  **`vague-completion` 这一族在别的模型上会用哪些新措辞，本次没有能力回答** ——
+  而 P4/P5/P6 的漏检全是「模型换了说法」造成的。
+
+---
+
+## [Unreleased] - 2026-11-13（文档长效机制：把「记得同步」换成「不同步就红」）
+
+> 报告：`docs/research/2026-11-13-doc-sync.md`（含一致性巡检、四类机制的取舍与「不值得做」的理由）。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **871 / 871 全绿**（本条目写作时实跑）；
+> 数字以命令输出为准，硬门的 `checkTestCount()` 会对账。`node scripts/check-structure.mjs` → 通过。
+>
+> **边界**：未碰 git；未改 `oversight-tui.mjs` / `watch.mjs` / `verify-claims.mjs`（另有 Agent 在改，
+> 它们的 11 条「导出未登记」提示保持原样、不阻塞）。
+
+### Added
+
+- **`docs/CAPABILITIES.md`**：把 README「能做」表里的每条能力绑到一条**可运行的命令**。
+  硬门 `checkCapabilities()` 校验脚本存在、参数被支持、README 必须指向它。这是「能力声称可验证化」
+  的落地：文档不再只是承诺，而是能被 `check-structure.mjs` 核对。
+- **`docs/README.md`**：文档总入口。按「你想知道什么」指路，并写明四类文档的可信度不同
+  （`spec/` 现行事实、`design/` 全部未实现、`research/` 会过期）。
+- **`templates/baseline.md`**：`dispatch-contract.md` §1 一直要求每个 Agent 收到 baseline 快照，
+  而该模板此前**从未存在**（`2026-11-10-agent-roles-audit.md` §6.6 记录过）。补上。
+- **四道新的文档一致性硬门**（`scripts/check-structure.mjs`）：
+  - `checkDocReferences()` —— 活文档引用的 `scripts/` `templates/` 路径必须存在；计划中的路径须在该行标「待建」。
+  - `checkDocCommands()` —— 文档里的 `node scripts/x.mjs --flag`，脚本要存在、`--flag` 要真被源码支持。
+  - `checkDocConstants()` —— 文档写 `` `CONST = N` `` 时，源码里该常量必须真是 N。
+  - `checkResearchIndex()` —— 每份研究报告必须在 `docs/research/README.md` 登记状态。
+
+### Changed
+
+- **README 收窄产品定位**：从「把所有会话压成一张表」改为「**在 AI 想收工时替你把关**」。
+  看清会话这件事官方 `claude agents` 已做完；本库唯一站得住的差异是「断言 vs 证据」。
+  核心能力表新增「收工值守（Stop hook，默认关闭）」一行，并指向 `CAPABILITIES.md`。
+- **状态数口径统一**：`GUIDE` 的「五态」状态表**漏了 `WAITING`**（`judgeState` 实际产出六态），
+  补齐并按 `judgeState()` 的真实顺序重排；`tui-visual.md` 的「唯二参与通知」改为四态
+  （`NOTIFY_STATES = WAITING/BLOCKED/FAILED/ASKED`）；`state-model.md` §8 的「四选一」改「六选一」。
+- **`output-format.md` §2 状态行**：原文称「由 `scripts/scan-sessions.mjs` 渲染」，**代码里没有任何脚本
+  输出这个格式**（本机 grep 确认）。改为诚实标注：格式是约定、渲染器未实现、数字只能取自 `--json`。
+  `.claude/skills/oversight/SKILL.md` §7 同步。
+- **`tui-theme.mjs` 的状态含义文案**：`FAILED` 的 `meaning` 还写着已删除的心跳推断，
+  `STALLED` 还写着「派生树无任一节点有增益」（`judgeState` 不接收派生树）。按代码事实重写。
+  这不只是文案——这串文案就是 TUI 上给用户看的解释。
+
+### Fixed
+
+- **`docs/research/README.md` 报告总数从写死的 62 改为「以目录实际份数为准」**，并补登记
+  3 份此前漏登记的报告（`pre-commit-audit` / `plan-first-mechanism` / `dsh-goal-mechanism`）。
+  写死的计数本身就是会漂的数字，改成交给硬门数。
+
+### Known（未修，刻意不碰）
+
+- `scripts/verify-claims.mjs` 的 11 个导出未登记进 `PROBE_ARGS`（硬门只提示不阻塞）。
+  该文件另有 Agent 在改，本轮不碰，留待其收口后统一登记。
+
+---
+
+## [Unreleased] - 2026-11-13（Stop hook 放行样本记录：先攒分布，再决定加不加规则）
+
+> 报告：`docs/research/2026-11-13-hook-sample-logging.md`（含漏检形态、字段设计、分析命令用法）。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **860 / 860 全绿**（基线 826，新增 34：
+> `stop-verify-hook.test.mjs` +15、`analyze-hook-samples.test.mjs` +19）。
+> 基线跑了两遍：第一遍 826 条中 1 条**计时型**性能用例红（`normalizeBash 处理长字符串不随长度变慢`，
+> 实测 32 倍长度 7.4 倍耗时），第二遍 826 / 826 全绿；该文件单跑亦全绿。属机器负载下的抖动，
+> 与本次改动无关（本次没碰 `normalizeBash`），但它是真会红，记在这里而不是假装没看见。
+> `node scripts/check-structure.mjs` → 通过，0 提示（改动前后各跑一次）。
+>
+> **边界**：未提交；未碰 git；**未改 `vague-completion` 的任何规则**，也未改
+> `verify-claims.mjs` 的判定逻辑。只动了 hook 的记账侧与新加一个只读分析脚本。
+
+### Added
+
+- **放行样本记录**：Stop hook 判定 `allow:no-checkable-claim` 时，把该轮末尾文本的
+  **前 500 字**与**真实工具调用摘要**追加到 `tasks/runs/stop-hook-samples.jsonl`（gitignored）。
+  默认**开启**（无副作用，只写日志），`--no-sample-log` 或
+  `OVERWATCH_STOP_VERIFY_SAMPLES=off` 可关。**记录不参与判定**：记完之后照样放行。
+
+  > 为什么先记录不加规则：修好 `vague-completion` 后实测 6 组里仍是 3 抓 3 漏
+  > （P4 / P5 / P6 漏）。漏的三组共同形态是 `已+动词` 后接冒号 ——
+  > `项目里的 4 个 bug 都在 lib.js...已全部修好：`。6 个样本撑不起一条新正则，
+  > 那是在用 6 个点拟合一个未知分布。
+
+- **`scripts/analyze-hook-samples.mjs`**：只读分析命令。回答「有多少条含完成语义但
+  `hadTestRun=false`」「形态有几种」「有没有共同特征」。5 类形态固定不变，便于多次
+  采样对比。**它不自动拦截，输出是待人工复核的候选，不是「已确认漏检」。**
+
+### Changed
+
+- `stop-verify-hook.mjs` 的 `decide()` 返回值新增 `assistantText`（判定实际用的原文）——
+  样本据此记录，避免记录层与判定层各自解读一次 `last_assistant_text` 而在两处读出不同文本。
+- 四处回归测试数声明 826 → 860（`README.md` / `CLAUDE.md` / `docs/GUIDE.md` /
+  `.github/workflows/validate.yml`），由结构门对账。
+
+### Known（未修，本次刻意不碰）
+
+- **`state-model.test.mjs` 有一条计时型性能用例会偶发红**：
+  `normalizeBash 处理长字符串不随长度变慢`。本次改动前跑了两遍基线 ——
+  第一遍实测「长度 32 倍但耗时 7.4 倍」，第二遍全绿；该文件单跑 41/41 全绿。
+  也就是说它受机器负载干扰，不是稳定失败，也不是本次改动引入的（本 PR 没碰 `normalizeBash`）。
+  留给后续决定：要么放宽阈值，要么把这条改成不依赖 wall-clock 的判据（例如统计内层循环次数）。
+
+---
+
+## [Unreleased] - 2026-11-12（Stop hook 端到端验证：闸门能拦，但这台机器上很少有机会拦）
+
+> 报告：`docs/research/2026-11-12-stop-hook-e2e-validation.md`（含两次实验事故、样本量、污染说明）。
+>
+> **边界**：只做实验与记录，**未改任何产品代码**；未碰 git；沙箱与运行数据都在
+> `.tmp-analysis/hook-e2e/`（gitignored）和 `%TEMP%\hook-e2e-sandboxes\`。
+
+### Added
+
+- **端到端验证报告**：用真实模型（不是原型阶段的 mock）跑 Stop hook，回答「拦截后模型行为分几种」。
+  14 次有效运行（干净配置 6 次）、**2 次真实拦截**（干净配置仅 1 次；n 太小，不给比例）。
+- 实验装置修复：`run.mjs` 新增 `--nobash` / `--sealed` / `--pressured` 三个条件；沙箱移出仓库，
+  hook 改用 `--settings` 显式注入（`--setting-sources` 会把父级 CLAUDE.md 一起拉进沙箱）。
+
+### Fixed
+
+- **实验装置的致命污染**（不是产品 bug，是实验 bug）：沙箱原在仓库的 `.tmp-analysis/` 下，
+  `--setting-sources project` 让宿主向上发现仓库自己的 `CLAUDE.md` 并注入。P1 的模型据此推理出
+  「这是一个 hook e2e test，我是被测试的对象」。对照实验确认 `--setting-sources ""` + `--settings`
+  可以只挂 hook、不引入 CLAUDE.md。此前 9 组样本因此作废。
+
+### Known（未修，留给后续决定）
+
+- **`vague-completion` 漏报 `已全部修好`（不带「了」）。** 实测
+  `detectClaims('已全部修好')` → `[]`，而 `已全部修好了` → `vague-completion`。
+  根因是 `VAGUE_DONE_HEAD` 不允许 `已` 与动词之间插入「全部」，`VAGUE_ZH` 又要求有「了」。
+  P4 的最终首句正是这个形态，`hooklog` 记 `checkableCount: 0` 后放行。
+- **`test-count` 误报假设从句。** `detectClaims('Whether tests pass matters here.')` → `test-count`，
+  P1 因此被误拦一次。`NEGATION_RE` 只管否定，不管 whether / 是否 这类假设语。
+- **reason 文案混入英文族名**：V2 的拦截文案里出现「整个文件范围内没有任何vague-completion调用」，
+  族 ID 未走中文映射。
+
+---
+
+
+## [Unreleased] - 2026-11-13（Stop hook 漏掉「修好了」：新增无指标完成声明族）
+
+> 报告：`docs/research/2026-11-13-vague-claim-detection.md`（含设计取舍、误伤边界、真实语料实测）。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **826 / 826 全绿**（基线 798，新增 28）。
+> `node scripts/check-structure.mjs` → 通过，0 提示。
+>
+> **边界**：未提交；未碰 git；未碰 `oversight-tui.mjs` / `watch.mjs`。
+
+### Fixed
+
+- **Stop hook 对「笼统的完成声明」完全失明。** 已有九族**全部**要求句子里有具体指标
+  （数字 / hash / 命令名 / 远端名），于是「修好了」「搞定了」「Fixed.」一个都不命中，
+  判定退回 `allow:no-checkable-claim` 直接放行。实验 P2 组实测：模型没有 Bash 工具、
+  改了 `lib.js`、零次测试，最后说「修好了。三处 bug 都在 lib.js。」——拦截 **0** 次。
+  （`scripts/verify-claims.mjs`：新增 `COMPLETION_RE` / `COMPLETION_VETO_RE` /
+  `CLAIM_FAMILIES` 的 `vague-completion` 族，以及 `detectClaims` 的 `veto` 支持。）
+
+- **新增 `isVerificationCommand()`：这类断言要的证据是「任何一次检查」，不是「某个特定测试」。**
+  跑过测试、构建、lint、类型检查、语法检查都算；**只读观测**（`ls` / `cat` / `grep` /
+  `git status` / `git diff`）不算 —— 把它们算进来，本族就形同虚设。
+  `mvn package -DskipTests` 也不算：它恰好什么都没验证。
+
+### Changed
+
+- **`stop-verify-hook.mjs` 的拦截文案**新增一段：明说「只读观测不算验证」，并给出
+  「如果本会话确实没有执行能力，就说『改了，未验证』」这条出路 —— 否则模型会拿着
+  `git diff` 的输出蒙混过关。
+
+### 防误伤（这一条是本族的重点，不是附注）
+
+- **句首锚定 + 短主语。** 句中出现的「修好了」绝大多数在描述或复述，不认。
+  实测反例（语料 `ea4ef562`，它自己就在讨论这个漏洞）：`而说"修好了"的人，往往什么都没跑`。
+- **`已 + 动词` 不许当定语。** `七份已完成报告全部只留在会话记录里，没有落盘到 docs/`
+  这句话恰恰在坦白**没落盘**，却被旧写法当成完成声明（实测语料 `536cf97b`）。
+- **动词后不许接长宾语。** `完成了这件事需要三步。` 是在讲方法，不是报完成。
+- **部分完成不拦。** `修好了 test.js 的语法错误，但业务逻辑还没测` —— 它已经主动交代了
+  缺口，比光说「修好了」诚实。拦它会教会模型「下次别交代」。
+- **纯对话 / 只改文档 → UNCHECKABLE，不拦。** 零改动、零命令的会话判 UNCHECKABLE；
+  只改了 markdown 的（`lastCodeIndex < 0`）也判 UNCHECKABLE —— 没有任何测试能验证它，
+  要求它跑测试是把「无解」说成「没做」（实测：`0a0e115c` 79 个 Write 全是 `_study/*.md`）。
+
+### 真实语料实测（341 个主 transcript，尾部 1 MB）
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| 含可核对断言的会话 | 67 | **85**（+18） |
+| 断言条数 | 76 | **101**（+25） |
+
+25 条 `vague-completion` 的判定分布：SUPPORTED 10 / NO_EVIDENCE 7 / UNCHECKABLE 5 /
+STALE_ONLY 2 / UNKNOWN 1。**真正会被拦的只有 9 条**（NO_EVIDENCE + STALE_ONLY），
+其余 16 条放行。这 9 条里包括实验 P2 / P3 / PC1 / S1 四组，以及 `0a0e115c` / `f37b9290`
+两句「两件事都做完了」（有源码改动、无任何验证调用）。
+
+### 证据
+
+- 负向：把 `vague-completion` 从 `CLAIM_FAMILIES` 摘掉，P2 的原话在其余九族里**一条都不命中**
+  （`verify-claims.test.mjs` 的「关掉 vague-completion 族，P2 那个用例必须变红」）。
+- 误伤：7 组「不该被识别」的用例（否定 / 假设 / 引用 / 代码块 / 纯对话 / 句中描述 / 定语）
+  全部保持不识别；另有一组证明挡住「部分完成」的是 `veto` 而不是正则碰巧不匹配。
+- 端到端：真实 P2 transcript 走 `decide()` → `action: block`，
+  `verdict.status: NO_EVIDENCE`（改前是 `allow:no-checkable-claim`）。
+
+---
+
+## [Unreleased] - 2026-11-13（TUI 非 TTY 红测：夹具过时，并揪出列表页不净化外部文本）
+
+> 报告：`docs/research/2026-11-13-tui-test-regression.md`（含因果链、真实数据实测、负向证据）。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **793 / 793 全绿**（基线 791，新增 2）。
+> `node scripts/check-structure.mjs` → 通过，0 提示（改动前后各跑一次）。
+>
+> **边界**：未提交（见下）；未碰 git；未碰 `watch.mjs` / `verify-claims.mjs` / `stop-verify-hook.mjs`。
+
+### Fixed
+
+- **列表页与 `--plain` 完全不净化外部文本，OSC 52 可改写系统剪贴板。** 详情页
+  （`detailLines`）一直对 `project` / `sessionId` / `needs` 调 `sanitize`，列表页一个字都没调；
+  `detailLines` 的 `cwd`（`whereRaw`）也漏了一行。实测把 `\x1b]52;c;eA==\x07` 塞进 `project`，
+  `node scripts/oversight-tui.mjs --plain` 原样放行。修法是在 `viewOf()`
+  （`scripts/oversight-tui.mjs:580`，列表页与纯文本页**唯一**的取数入口）统一净化
+  `title` / `path` / `needs` / `suggestedReply` / `meta.lastAssistant` / `meta.question`，
+  并补上 `detailLines` 的 `whereRaw`。`key` 故意不净化：它是光标身份，必须与 `cursorKey`
+  逐字相等。这是「两条展示路径各修一半」（DF-012 / DF-017）的又一次复发，所以修在必经点而不是渲染层。
+
+### Changed
+
+- **`oversight-tui.test.mjs` 的夹具补上 `live`，红测不是显示逻辑坏了。** `main() 非 TTY 分支
+  能产出输出` 2026-11-13 红灯（790/791）。根因：`partitionRows`（`tui-layout.mjs:395`）判「在跑」
+  要求**出现在宿主 `live` 里且有 transcript**，而夹具只给了 `sessions`，那条 `PRODUCING` 会话
+  被判成**已停**；「已停」在 `--plain` 里默认压成一行计数，项目名根本不进屏。
+  `cwd` 与这条红测无关——`viewOf` 的兜底链是 `meta.cwd → row.cwd → row.project`，
+  无 cwd 照样有项目名（实测 `scan --json --days 3` 的 **110/110 条 sessions 都没有 cwd**，
+  cwd 只在 `live`（11/11）与 transcript meta 里）。
+- **四条断言全部收紧，没有一条放松。** 旧 OSC 测试（`oversight-tui.test.mjs:226`）是**假绿**：
+  夹具同样缺 `live`，会话掉进折叠的已停段，`project` / `needs` 一个字没渲染，
+  「没有 ESC」于是自动成立。新增「必须进在跑段」「净化后正文仍在」的断言把它变成真测试，
+  并新增两条：需动作段的 `needs` / 建议回复净化（在跑段不画 needs）、`viewOf` 纯函数层
+  （无 cwd 兜底 + 五个字段净化）。负向测试：撤掉 `viewOf` 的 `sanitize` → 3 条红；恢复 → 全绿。
+
+---
+
+## [Unreleased] - 2026-11-13（一致性审计的 6 条 🔴：用户照文档做会做错决定）
+
+> 报告：`docs/research/2026-11-13-dangerous-inconsistencies-fixed.md`。
+> 来源清单：`docs/research/2026-11-13-consistency-audit.md` 的第二部分（🔴 危险档 6 条；
+> 该报告共 24 条，本次只修这 6 条，🟡/🟢 留给后续）。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **826 / 826 全绿**。这个数字在本轮内变过三次
+> （审计时 793 → 加 5 条建议命令用例 = 798 → 同目录另一个 Agent 又加 22 条 = 820 → 再加 6 条 = 826），
+> 每一次都是被本轮新增的 `checkTestCount()` 抓住的：它报「写的是 N，源码实测 M」并 exit 1。
+> **这正是这道门存在的理由** —— 数字不会再悄悄漂，漂了就有一步必做的动作。
+> `node scripts/check-structure.mjs` → 通过（含新增的 `checkTestCount()` 一道门）。
+>
+> **边界**：未提交；未碰 git；未碰 `stop-verify-hook.mjs`；未跑 `verify-tui-negatives.mjs`
+> （审计报告记了它被超时 kill 后会留脏工作树，本次不需要它）。
+
+### Fixed
+
+- **GUIDE 教用户用一条已删除的 `FAILED` 判据——照做会对只是歇一会儿的会话执行全量重跑。**
+  `docs/GUIDE.md:81` 写「宿主报失败 **或** 两次调用间隔超过 p95 且之后 60 秒无新记录 **或** 预算耗尽且零增益」，
+  而 `scripts/scan-sessions.mjs:217-233` 明写这两条推断 2026-10-31 全语料实测后已删除
+  （6308 次大间隔里 5977 次、94.8% 之后仍有 tool_use）。改成「只有一种来路：宿主 `state: "failed"`」，
+  并把 §3 的「为什么空闲 3 天是 EXPLORING」整节按当前两道事实闸门重写。
+  同类陈述一并收口：`:94` 的 p95 理由、`:135`/`:321` 的「样本不足 → 永远不会判 FAILED」
+  （`FAILED` 已与样本无关）、`:123` 的 `reason` 合法值表（混着已不存在的 `hb_gap=…`，漏了
+  `host-reported-waiting` / `waiting:<waitingFor>`）。`docs/spec/state-model.md:322-329` 同步。
+- **`verify-claims.mjs` 的补救建议硬编码 `npm test`，对 Maven 项目指错命令。** 实际命令一直在
+  `evidence.attempts[].cmd` 里没人用。新增 `recoveryCommandFor()` 三档溯源：
+  `actualCommandFor()`（会话里**成功跑过**的那条，`shortenCommand()` 从
+  `export JAVA_HOME=… && mvn.cmd -f …` 里裁出命令本体）→ `detectProjectCommands(cwd)`
+  （`project-commands.mjs`，读 `package.json` / `pom.xml` / `build.gradle` / `Cargo.toml` / `go.mod`）
+  → 直说认不出、**不编命令**。`evidenceTimeline()` 因此多返回一个 `cwd` 字段（只给建议用，不参与判定）。
+  真实语料实测：`d--Server-MCServers-Server-plugin-Mentor-Express` 的 `3b390f6e` 会话
+  现在给 `mvn -q clean verify（依据 pom.xml）`，改前给的是 `npm test`。
+- **子 agent 上限 GUIDE 写 30，代码是 100**（`MAX_SUBAGENTS = 100`，`scan-sessions.mjs:490`），
+  且同一文件 `:122` 自己写的就是 100。`GUIDE.md:317`、`:410` 与详情页示例一并改。
+- **`STALLED` 判据里有一项代码不存在。** GUIDE `:83` 与 `state-model.md:28` 都写「且派生树没有任何
+  节点有增益」，而 `judgeState()` 的签名是 `{ sessionState, waitingFor, calls, gapsMs, now }`，
+  根本不接收派生树。该效果实际由 `allCalls`（主线程 + 子 agent 调用合并按时间排序，
+  `scan-sessions.mjs:442-444`）实现——子 agent 有新动作就抬高 novelty。照实改写，并在
+  `state-model.md §5` 补上「靠合并时间线实现，不靠单独判据」。
+- **详情页示例整段是旧版 TUI 的输出。** `GUIDE.md` 的 `项目/sessionId/idle` 形态已被
+  `状态/身份/最近说` 取代，`派生树 · 层深 1 · 子 agent 100/128（已截断）` 也换成了
+  `派生 100/122 · 层深 1 · …`。按本机实跑的真实输出重写，并说明 L5/L6 两层与「只画 3 行」的披露规则。
+
+### Added
+
+- **`check-structure.mjs` 的 `checkTestCount()`** —— 测试数四份文件四个值
+  （README 508 / CLAUDE 192 / GUIDE·CI 81 / 设计稿 588，实测 793）是本仓论题的自我否定：
+  一个卖「断言必须有证据」的项目，在最核心的数字上四份文件四个值。这次不是把 4 个数字改成 1 个就完事
+  （下一次加测试又会漂），而是**数源码**（`^\s*test\(` 的条数）再与 `README.md` / `CLAUDE.md` /
+  `GUIDE.md` / `validate.yml` 逐处对账，不一致直接 `fail`。负向验证：把 README 改回 508，
+  硬门报「回归测试数写的是 508，源码实测 798」并 exit 1；改回 798 恢复绿灯。
+- **`verify-claims.test.mjs` 新增 5 条**：Maven 项目必须给 `mvn` 且**不含** `npm`（含复合命令裁剪、
+  路径不许被压成 basename）、Node 项目抄成功那条而不是失败那条、无调用时退回项目配置且要说出来源、
+  都认不出时不点名任何命令、以及一条把「写死 `npm test`」这条路堵死的负向守卫。
+
+---
+
+## [Unreleased] - 2026-11-12（Stop hook 验证闸原型：事前拦截跑通，且推翻了上游文档一条结论）
+
+> 报告：`docs/research/2026-11-12-stop-hook-prototype.md`（含真实拦截证据、边界处理、已知限制）。
+> 上游依据：`docs/research/2026-11-11-untapped-capabilities.md` §1。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **791 / 791 全绿**（基线 756，新增 35）。
+> `node scripts/check-structure.mjs` → 通过，0 提示（改动前后各跑一次）。
+>
+> **边界**：未提交（新增文件见下）；未碰 git；未动 `~/.claude/settings.json`；
+> 未在仓库内注册任何生效的 hook（默认关闭）。所有实跑都在 `%TEMP%` 下的临时目录完成。
+
+### Added
+
+- **`scripts/stop-verify-hook.mjs`** —— Stop hook 验证闸。宿主在 Claude 每次准备结束回合时同步调用，
+  读 `last_assistant_message` → 复用 `verify-claims.mjs` 的 `detectClaims/findEvidence/classifyEvidence`
+  逐条定档 → 证据不足（`NO_EVIDENCE` / `STALE_ONLY` / `FAILED_ONLY`）时返回
+  `{"decision":"block","reason":"..."}`，reason 作为下一轮指令喂回模型。
+  **默认 off（只记账，永远 exit 0）**，需显式设 `OVERWATCH_STOP_VERIFY=block` 才拦。
+- **`scripts/project-commands.mjs`** —— 从仓库根标志文件认项目类型并给出**真实**测试命令
+  （node/maven/gradle/cargo/go/python/dotnet；认不出就明说认不出）。存在的理由是
+  `verify-claims.mjs` 的 `adviceFor()` 把命令写死成 `npm test`，对 Maven 项目是错的建议。
+- **`scripts/stop-verify-hook.test.mjs`** —— 35 条测试。重点是负向：默认模式必不拦、
+  四条 fail-open 路径、`UNKNOWN` 不升级成 `NO_EVIDENCE`、Maven 项目的 reason 里不许出现 `npm test`。
+- **`templates/stop-verify-hook.settings.json`** —— 注册片段 + 三步启用说明（不含生效 hook）。
+
+### 实测（推翻上游文档的一条结论）
+
+- **`exit 2` 不拦截**。上游 `hooks.md:2903` 说它与 `decision:block` 等价；实测 2.1.289 与 2.1.308
+  都记成 `Failed with non-blocking status code`，回合照常结束。原型因此只用 `decision:block`。
+- **上限是 9 次，不是 8 次**。默认「连续 9 次后强制放行」；`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=N`
+  → 拦 N 次后在**第 N+1 次**放行（`cap=3` 实测拦 4 次）。
+- **`additionalContext` 不是温和版拦截**，它会让模型每轮重复触发直到撞上限（实测跑到第 9 轮）。
+- **`timeout` 过小时是静默 kill**：`hookInfos.durationMs` 有值、`hasOutput:false`、`hookErrors:[]` ——
+  「hook 跑了但没生效」，极难从现象反推。模板写 60 秒并把这条写进注释。
+- **子 agent 旁证是准确率分水岭**：80 个真实会话里 15 个含可核对断言，其中 14 个有
+  `subagents/`。只读主 transcript 会对绝大多数真实会话误报「没证据」，所以
+  `decide()` 在主 transcript 判为要拦**之后**才去读子 agent 尾部（代价只在本来就要拦时付），
+  查到则放行并记 `evidence-only-in-subagents`（不判 SUPPORTED：子 agent 不在主时间线上）。
+- **性能**：真闸门在 128.6 MB 的 transcript 上实测 0.54–1.49 s（3 次），靠 `readBack` 有界回溯。
+
+---
+
+## [Unreleased] - 2026-11-11（框架 v2 修订：Mastra 能派活，我们只剩「判活」）
+
+> 文档：`docs/design/2026-11-11-agent-framework-v2.md`（689 行）。
+> 索引：`docs/design/README.md` 增一行（`checkDesignIndex` 要求登记）。
+>
+> **测试基线**：`node scripts/check-structure.mjs` → 通过，0 提示（改动前后各跑一次）。
+> 未跑 `node --test`：本次零代码改动，仅新增/修订文档。
+>
+> **边界**：零行代码改动；未碰 git；零 npm 依赖。本文件是设计推演，不描述已实现能力。
+> **所有实跑都在 `%TEMP%` 下的临时目录完成**，未在仓库内安装任何包。
+
+### Changed
+
+- **agent 框架 v2 修订稿**（Proposed，零行实现）。修订动因是一条前提被实跑推翻：
+  v1 骨架基于「没有框架支持 ACP」，而 Mastra 的 `@mastra/acp` 是一等公民包（调研 2026-11-10），
+  本次又在本机跑通了它。三条核心修正：
+  - **N1「协议层不对：它们管不了别人的进程」作废**。Mastra 恰好管得了。v1 的「三条结构性理由」缩为两条，且两条同源：
+    我们编「判据」，它编「消息」。
+  - **「框架」降级为「验收层」**。给出「框架 vs 层」三条判据（有无自己的生命周期 / 有无「谁去跑」的决定权 /
+    有无可替换的宿主），并正面回答：既然只剩判活，它不该叫框架。
+  - **v0 五件缩到三件**：判据 schema（写）/ 验收闸（写）/ 三值提取器（写 20 行）；
+    适配器买 `acpx`、台账缩成一张「唯一写入者」表。
+- **「判活」被定义成五个可反驳的要件（J1–J5）**：标准先于执行且是数据 / 判定者上下文不共享 /
+  三值判定（含「不知道」）/ 判定有强制后果 / 判定可机读。并逐条论证 evals 与 `onDelegationComplete` 为何不能替代
+  （evals 位置不对：评数据集不是评这张工单；`onDelegationComplete` 身份不对：它是父 agent 的钩子，拿不到 AC、不产出判定）。
+- **不引入 Mastra 的五条理由，前四条是本机实测**：装依赖 148 包 / 6 分钟 / 149 MB / 10 085 文件、要求 Node ≥ 22.13；
+  `usage` 恒为 `undefined`（dist 硬编码 0、`steps: []`）；**默认权限处理器选 `options[0]`=allow-once，实测静默写出文件**；
+  官方文档的 Windows 接法 `command:'npx'` 直接 `ENOENT`。切换条件写死三条，任一成立才引，且必须用户批准（会推翻 ADR-0001）。
+
+### Added
+
+- **22 条本机实跑记录（P1–P22）**，其中 **7 条推翻了既有文档结论**：
+  - `claude-agent-acp@0.104.1` 在 Windows 上**握手 / 建 session / 跑完回合全部正常**——v1 §3.5「`zod/v4` ESM 崩溃」已不复现，
+    `acpx:claude` 因此成为首选适配器（用户明确说优先 Claude Code）。
+  - **`allowedTools` / `disallowedTools` 实测无效**（给了 `disallowedTools:['PowerShell',…]`，PowerShell 仍被调用）；
+    真正生效的是 `_meta.claudeCode.options.tools`。同一适配器里两个名字相近的字段，一生效一不生效——能力矩阵必须逐字段验。
+  - **外部 session 会自动加载项目 `CLAUDE.md`**（它背出了本仓硬约束 1–4 的原文），且**会写进用户的 transcript 目录**：
+    本次 20 个探针 session 出现在 `~/.claude/projects/` 下，`scan-sessions.mjs --days 1` 全部可见。
+    后果是**跨系统污染**——扫描器会把我们自己的执行会话当成用户的会话。处置：`CLAUDE_CONFIG_DIR` + `settingSources:[]`（均已实测有效）。
+  - 深度不是平台墙：给外部 session `tools:['Agent']` 后它**真的派出了第二层**（回 `DEPTH2-OK`）。
+    v1 §3.3「深度 1 是物理不可达」的后半句因此作废；正确表述是「native 侧深度 1 是配置事实，外部侧由 harness 决定，我们只能观测」。
+- **角色改法（12 份逐个判决）**：6 份必须改工具集或输出格式（planner / acceptor / redteam / research / relay / repair）、
+  3 份改边界（critic / review / resolution）、3 份不动（probe / safety / executor）。
+  关键修正：`acceptor` **不给 `Bash`**，而是给它 `gate.json`（跑过的结果，不是跑的能力）——给它 `Bash` 等于让它同时是控方与证人。
+- **输出格式统一规则（三条）**：机器读的一律 JSON + schema + 校验器（v0 只有四个：ticket / report / gate / verdict）；
+  人读的一律 markdown 且**不许有任何脚本解析**；markdown 视图一律由 JSON 渲染。
+  这正面解释了「10 种模板、零个解析器」为何能共存：人读的模板不需要解析器。
+- **红队攻击任务（强制不可合并）**，8 个必答问题，核心是第 2 问：J1–J5 里一个熟练的 Mastra 用户能不能拼出 ≥4 条。
+  **止损点写在前面**：若能拼出 ≥4 条，本方案应退化为「Mastra 使用手册」，不写代码。
+
+---
+
+## [Unreleased] - 2026-11-11（公司架构设计书：三层 + 两个旁挂，12 个角色砍到 2 个）
+
+> 文档：`docs/design/2026-11-11-company-architecture.md`（841 行）。
+> 索引：`docs/design/README.md` 增一行（`checkDesignIndex` 要求登记）。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **722 / 722 全绿**。
+> `node scripts/check-structure.mjs` → 通过，0 提示。
+>
+> **边界**：零行代码改动；未碰 git；零 npm 依赖。本文件是设计推演，不描述已实现能力。
+
+### Added
+
+- **多 agent 公司架构设计书**（Proposed，零行实现）。把用户原话「围绕着用户的公司 / 职责分明又不臃肿 /
+  可以外包给其他公司」落成可检查的组织图：
+  - **三层 + 两个旁挂**：L0 接待台（唯一能问用户）、L1 工头（切工单写契约）、L2 执行者；
+    门禁与记账旁挂——门禁不在汇报线上，记账不是岗位而是脚本。
+  - **主 agent 与手下的唯一区别**：写的是「判据」还是「产物」。落成不变量 W——
+    没有岗位同时拥有 `product` 与 `contract` 两种写权限。强制力分三级并如实标注
+    （native 子 agent 物理 / 外部 harness 协议 / 主线程仅审计）。
+  - **递归三道闸**：G1 工具可达性（物理）、G2 预算单调递减（算术，唯一真正封死的）、
+    G3 `capability_gap`（语义）。据此指出 `dispatch-contract.md` §7 的「3 层」不可执行
+    （12 份角色 tools 全部显式且无一份含 `Agent`，本次 grep 复核）。
+  - **问题五环节**：收（脚本逐字）→ 扫（五类缺项抽取表）→ 问（upfront ≤5）→
+    答（`acknowledged` 只由脚本判定）→ 传（按 `subject` 切片 + `sha256` pin）。
+    三种权力分开：drop / guess 只归接待台且必须记账；噪声提示只归脚本且只警告。
+  - **外包失败六档**：只有 `TRANSIENT` 重试。新增 `SILENT`（exit 0 但 nonce 未回显）
+    与 `BOUNDARY_BREACH`（`git status` 可检出越界），后者把 `boundary` 从字符串变成可检出项。
+  - **「不臃肿」六个可检查机制**（M1 产物闭集 / M2 每岗有被消费的边 / M3 同一 schema 唯一作者 /
+    M4 能用脚本判的不设岗位 / M5 预算递减 + 编队声明 / M6 `tools` 必填且合法）。
+  - **角色判决**：12 → 在编 2 个（`planner` 降为「笔」、`acceptor` 补 `gate.json` 证据源并限定写路径）、
+    `executor` 保留定义不派、`redteam` 转周期性，其余 8 个砍掉（其中 5 个在新边界下永远不该回来）。
+    另砍掉三个设想中的岗位（协调者 / 状态记账员 / 门禁执行者），全部改为脚本。
+
+---
+
+## [Unreleased] - 2026-11-11（检查表去表头：零值不占行，全绿压成一句）
+
+> 报告：`docs/research/2026-11-11-tui-checklist-redesign.md`（含改前改后的真实 `--plain` 输出）。
+> 依据：`docs/research/2026-11-11-claude-status-block-reverse.md`（逆向 Claude Code CLI 2.1.308，
+> 全部结论附字节偏移）。用户截图反馈「检查表很突兀」。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **722 / 722 全绿**（基线 715，新增 7）。
+> `node scripts/check-structure.mjs` → 通过，0 提示。
+> 负向验证：`scripts/verify-tui-negatives.mjs`，**23 / 23 处回退都让预期测试变红**（新增 4 项）。
+>
+> **边界**：未碰 git；未改 `scripts/verify-claims.mjs`、`scripts/asked.mjs`、`scripts/watch.mjs`；
+> 未动配色（`BINARY` / `binaryMark` / `binaryColor` 一行未改）；仍零 npm 依赖。
+
+### Changed
+
+- **删掉检查区的「检查了什么 / 结论」元表头。** 逆向结论：Claude Code 的表格组件写好了
+  `header` 渲染分支，但全库 **7 处实例、0 处使用表头**；真正带表头的只有 `/doctor` 规范里那张
+  markdown 表，且列名全是数据名（`Component | Uses | Verdict`），**没有任何「检查了什么」式的元描述**。
+  我们这对表头占着首屏最贵的一行却零信息量，还让空态看起来像「一张没填完的表」。
+
+- **检查项改写成「标签 + 一句断言」，四列压成两段。** 旧形态是标签 / 来源 / 结论 / 备注四列
+  （`→ 3 个`、`→ 0 个` 这种右对齐计数）。现在每项是一句自陈述句，照抄它的双版本 `label` 写法：
+  `声明对不上 ✗ 1 条完成声明无证据支持 · 7 条存疑 · d 看证据`。
+  严重度用**字形 + 颜色**两个通道（`✗` 硬失败 / `·` 需要注意 / `…` 还在算或不知道），
+  与 `tui-visual.md` §1「颜色是装饰，不是信息载体」一致。
+
+- **零值的项不占行，但被数进收尾句（不是静默丢弃）。** 逆向的机制是
+  `if(i===""||i==="none")continue` 加「无发现写一句」（`/doctor` 规范原文：
+  `If a check has no findings, say so in one line and move on`）。
+  移植过来：有事的项逐行画，没事的项压成 `✓ 其余 2 项没有发现`；**四项全清白时只留一句
+  `✓ 4 项检查都清白 · 监视在跑`**——这一句里「监视在跑」必须逐字出现，
+  因为健康时它是最容易被计数吞掉的那一项。
+
+- **`--plain` 与交互屏共用同一套呈现。** 旧实现两条路径各写一份（一条 `checklistLine`、
+  一条手拼 `padDisplay('检查了什么', 51)`），于是同一个概念有两套文案。
+  现在两条路都走 `checklistLines()`；`--plain` 之外多给一行 `依据：inbox · asked · verify-claims · health`
+  ——那是**数据源清单**，不是表头，是「检查了什么」这个短语的正确替代（逆向 §3.3 第 7 条）。
+
+### Added
+
+- **`tui-layout.checklistSentence(row, { wide })`（纯函数）**：一项检查的一句话断言。
+  无发现时说短句（`没有会话问了没答`），不说 `0 个`。刻意不含颜色，由渲染层决定怎么染。
+
+- **`tui-layout.isQuietRow(row)`（纯函数）**：`tone === 'ok'` 才算「查了、没发现」。
+  `muted`（还在算）与 `bad`（读不到 state.json）都**不算**——搞反了就是把「不知道」说成「清白」。
+
+- **`tui-layout.checklistSummaryLine(count, { rest, extra })`（纯函数）**：收尾句。
+  `rest: false` 是全绿判决（`✓ 4 项检查都清白`），`rest: true` 是「压掉的项数」（`✓ 其余 2 项没有发现`）。
+
+- **`tui-layout.checklistLines(rows, { cols, layout, useColor, skipKinds, extra })`（纯函数）**：
+  决定哪几项上屏。返回 `{lines, hidden, quiet}`；`quiet` 只取决于「有没有非绿项」，
+  **与 `skipKinds` 无关**——否则「监视未跑但被告警行说过了」会得出「4 项都清白」，
+  那正是本仓库最不能犯的错。默认跳过 `inbox`：它的数字就是 L0 的第一位，
+  下面还有整段需动作原文，再画一行是同一件事的第三遍。
+
+- **7 条单元测试 + 4 项负向验证**（`v20`–`v23`）：表头不许回来、零值不许占行、
+  全绿不许变空白、健康时「监视在跑」不许被吞掉。每一条都实测「把改法放回去 → 预期测试变红」。
+
+### Removed
+
+- **`tui-layout.checklistHeaderLine()`。** 它唯一的职责是画那对元表头。留着它等于留着一条
+  随时会被再调用一次的路径；`check-structure.mjs` 的 `PROBE_ARGS` / 导出白名单同步删除。
+
+### 保留（逆向报告明确说这是我们的优势，不是缺陷）
+
+1. **常驻性本身**：它监控用户看得见的对话框，我们监控看不见的后台进程——用户没有 `/status` 可敲。
+2. **「数据多新」**：它只在诊断场景给 `Last update attempt`；我们的 `8s前扫描` 常驻在判决行右侧。
+3. **后台监视存活状态**：本机实测 jobs / probe 停过 31 小时，那是真实发生过的失效。
+4. **失败项必带一条出路**：`claude doctor` 是 `- <issue>` + `  Fix: <fix>`；
+   我们的 `先修这个` / `d 看证据` 同构，保留。
+
+
+## [Unreleased] - 2026-11-11（需动作老化 + 剪贴板只放能直接发出去的话）
+
+> 报告：`docs/research/2026-11-11-tui-stale-and-copy-fix.md`（含实测延迟分布）。
+> 用户实拍两个缺陷：33 天前的问句被判成「需动作」；按 `c` 复制到「回复正文 + 一段元注释」。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **715 / 715 全绿**（基线 700，新增 15）。
+> `node scripts/check-structure.mjs` → 通过，0 提示。
+> 负向验证：`scripts/verify-tui-negatives.mjs`，**19/19 处回退都让预期测试变红**（新增 8 项）。
+>
+> **边界**：未碰 git；未改 `scripts/verify-claims.mjs`、`scripts/asked.mjs`；未动配色。
+
+### Added
+
+- **`tui-layout.ACTION_MAX_AGE_SEC`：需动作的老化上限，每个事实态一档。**
+  `WAITING` 此前**没有任何上限**（`BLOCKED` 有 `watch.mjs: BLOCKED_MAX_AGE`，WAITING 什么都没有），
+  于是一个 33 天前问的问题今天仍然进「需动作」，还因为按 `idleSec` 降序排而**永远排第一位**。
+
+  | 状态 | 上限 | 依据 |
+  |---|---|---|
+  | `WAITING` | **24h** | 本机 247 个 transcript 实测：457 条问句、443 条能配对到真人回复，延迟 p50 0.27h / p90 10.93h / p95 15.23h / **p99 17.59h**，**99.5% 在 24h 内**。与 `asked.mjs: MAX_QUESTION_HOURS` 同一口径。 |
+  | `BLOCKED` | **7d** | 直接复用 `watch.mjs: BLOCKED_MAX_AGE`。通知门与展示门对同一件事必须用同一把尺，测试钉住两者相等。 |
+  | `FAILED` | **7d** | 镜像 BLOCKED。**本表唯一推定值**（无独立实测），代码注释里已声明。 |
+
+- **`ageSecOf` / `staleOf` / `ageLimitOf`（纯函数，时钟可注入）。** 优先用行上已有的
+  `idleSec`，其次 `(nowMs - statusUpdatedAt)`，两者都取不到时 **fail-open**（不凭猜藏起真实等待）。
+  **自己不读挂钟** —— 这个仓库刚因硬编码 `Date.now()` 修过 bug。
+
+- **`oversight-tui.draftHintOf`：草稿可复制性说明。** 给界面用、不进剪贴板，
+  与 `buildDraft` 对「能不能复制」必须永远一致（测试钉住）——两者分家正是本次缺陷的根。
+
+### Changed
+
+- **`buildDraft` 只返回一段可直接发送的正文。** 旧实现把 `suggestedReply` 与
+  `（目标会话受阻，在等：${needs}）` 用 `\n\n` 拼在一起，第二段粘进对话框就变成一句奇怪的话。
+  现在：有 `suggestedReply` 且未超龄 → 返回原文；**超龄 → `null`**（33 天前猜的话不该被复制）；
+  **只有 `needs` 没有 `suggestedReply` → `null`**（旧行为会拼一段旁白，那正是缺陷本身）。
+  `needs` 仍**逐字**显示在 `--plain` 的 L2 段与详情页（`relay-protocol.md §5.1` 未放松）——
+  变的是剪贴板，不是屏幕。
+
+- **`partitionRows` 把超龄的需动作事实降级进「已停」，不丢弃。**
+  用户要求「所有都要显示」，所以既不能留在需动作（误报）也不能删掉（漏报）。
+  降级行带 `stale: true` + `staleAgeSec` / `staleLimitSec`；返回值多一个 `stale` 数组；
+  三段合计仍等于总行数（测试钉住）。
+
+- **`stoppedSummary` 数出降级条数**：`已停 (227) 4.5h–36.6d前 · 其中 2 条超龄 · h 展开`。
+  按 `h` 展开时超龄行标题后缀 `· 超龄`；详情页新增「已超龄」说明（年龄 / 上限 / 为什么不给建议回复）。
+
+- **`actionCell` 判据收紧**：从「有没有 suggestedReply」改成「按 c 到底会不会得到东西」。
+  超龄的行不再画 `c 复制回复`（规划 P6：不提供假按钮）。
+
+- `App.buildListFrame` / `buildDetailFrame` / `copyDraft` 统一把 `this.now()` 传下去：
+  一帧只取一次时钟，避免「这一帧说还年轻、下一帧说超龄」。
+
+### Tests
+
+- 新增 15 条。老化锚点用 **33.1 天**（`7710fbdb` 实测值）与 **30 天**，不贴阈值边界，
+  时钟全部注入 `2026-11-11T00:00:00Z`。
+- 负向 8 项（`v12`–`v19`）逐条真正回退源码再跑测试：删 `WAITING` 上限、
+  让 `partitionRows` 无视 `staleOf`、把降级改成丢弃、把 needs 塞回草稿、
+  去掉超龄判断、退回「only needs 也拼旁白」、删详情页说明、不再数超龄条数。
+
+### Known
+
+- `idleSec` 是「宿主最后一次写状态文件的时刻」，不是「问句发出的时刻」。
+  对本例无偏差（`7710fbdb` 的 `eventAt` 与 `updatedAt` 同为 `2026-10-08T09:45:33.518Z`），
+  但若宿主因元数据重写把 `updatedAt` 推到当下（`job-event-time.mjs` 头注释记过 27.8 天的案例），
+  老化会偏晚。`scan-sessions.mjs` 的 `eventAt` 更准，但列表行目前传 `idleSec`。**未在本单修。**
+
+## [Unreleased] - 2026-11-10（TUI 主屏重做：布局数学抽离 + 三段分区 + 空状态自证）
+
+> 报告：`docs/research/2026-11-10-tui-implementation.md`（含真实 `--plain` 输出）。
+> 规格来源：`docs/design/2026-11-05-tui-redesign-plan.md`（§2.4 草图 / §2.5 字段矩阵 /
+> §2.6 空状态 / §九·二 三条裁决）。
+> 负向验证：`scripts/verify-tui-negatives.mjs`，**11/11 处回退都让预期测试变红**。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **700 / 700 全绿**（基线 588，新增 112）。
+> `node scripts/check-structure.mjs` → 通过。
+>
+> **边界**：未碰 git；未改 `scripts/verify-claims.mjs`、`scripts/asked.mjs`、`scripts/watch.mjs`
+> （只 import 它们的导出）。
+
+### Added
+
+- **`scripts/tui-layout.mjs`（新文件）：列表页的布局数学，全部是零依赖纯函数。**
+  旧实现的宽度、列宽、降级、视口全写在 `oversight-tui.mjs` 的 `buildFrame()` 里，
+  「76 列下这一行有多宽」只能靠人眼看，**无法单测**。现在抽出 `fmtSpan` / `truncateWithDisclosure` /
+  `layoutRow` / `windowOf` / `resolveLayout` / `binaryOf` / `partitionRows` / `checklistRows` /
+  `composeListScreen` 等 20 个导出，配 61 条单元测试。
+
+- **`scripts/tui-meta.mjs`（新文件）：标题与「近」列的有界读取。**
+  transcript 的 `custom-title` / `agent-name`（128 KB 尾部只读）+ 末条 assistant 文本 +
+  「末条是不是一个没人回的问句」。按 `(路径, mtime)` 缓存，8 秒轮询下未改动的文件零成本。
+  读不到就返回 `null`，不拿目录名伪装成标题。
+
+- **`scripts/tui-theme.mjs` 新增二值状态表 `BINARY`**：彩色下四类共用 `•`（颜色承载语义），
+  无色下切 `• ! ? × ◦`（形状承载语义）。`blocked` 用蓝色不用红色 —— 「被挡住」不是「坏了」。
+
+- **`scripts/oversight-tui.mjs` 新增导出**：`viewOf`（字段矩阵的唯一入口，拿不到的字段画不上屏）、
+  `buildSections` / `actionViewOf` / `askedCountOf` / `waitingCountOf` / `claimsTally` /
+  `scanAgeText` / `defaultClaimsScan`。
+
+- 新增键位：`h` 展开/收起已停段、`d` 证据面板、`i` 详情页内部量。
+
+### Changed
+
+- **主屏重排为 L0–L4 五层**：判决行（`N 件在等你` 在最前）→ 检查表 4 行 → 需动作段 →
+  在跑段 → 已停段（压成一行）。第 1 行是判词不是计数；最后一行是健康度不是键位提示。
+- **列表页只说「在跑 / 已停」**，六态名不再出现在主屏。`PRODUCING` 与 `EXPLORING` 的处置
+  都是「不干预」，并排展示等于告诉用户「29 条都要关注」。
+- **`reason` 列从主屏删除**；`novelty` / `calls` / `liveness` / `hbThresholdSec` /
+  `lastGapSec` / `tokens` 下沉到详情页的 `i` 高级区。详情页的子 agent 从 51 行压成一行计数。
+- **选中不再用反显**（SGR 7）：改为 `❯` + 绿色，与严重度的状态字形/颜色分属两条视觉通道。
+- **空状态分四态**：首扫中 / 扫完确实没事 / 扫完但监视没跑 / 扫描失败。
+  第三态把「先修监视」放进第一屏，**且不替换会话列表**。
+- **`--plain` 与交互屏同源**：都走 `buildSections()` + `composeListScreen()`，
+  差别只在宽度固定 200、无光标。纯文本路径也会并行读宿主事实与 `verify-claims`。
+
+### Fixed
+
+- **D1 复现并修复：`liveToRow` 只切 `/` 不切 `\`**，Windows 上 `project` 变成完整路径
+  （`base.split(/[\/]/)`）。最该被看见的那几类（WAITING/BLOCKED/FAILED 且无 transcript）
+  恰好走这条路。改为切两个分隔符，并保留原始 `cwd` 供列表页显示 `…/尾两段`。
+- **`fmtSpan(null)` 曾返回 `0s`**（`Number(null) === 0`）——没有 `idleSec` 的行会被画成
+  「0 秒前」，这是撒谎。现在显式返回 `n/a`。
+- **检查表备注列被截成 `d …`**：`d 看证据` 是该行唯一可执行的提示。备注列 14 → 20 列。
+- **`app-router.test.mjs` 夹具过时**：主屏改三段后 `live: []` 让 PRODUCING 落进已停段并被折叠。
+  该文件测键位路由，夹具补上 `live` 即可（已在测试里写清理由，不是放宽断言）。
+
+---
+
+## [Unreleased] - 2026-11-10（时钟注入不彻底 + 跨层去重至今没统一）
+
+> 报告：`docs/research/2026-11-05-fix-clock-and-crosslayer-dedup.md`（诊断在前一份
+> `2026-11-05-dedup-test-failure.md`）。负向验证：`scripts/verify-bugfix-negatives.mjs`
+> 新增 5 项回退，实测 **18/18 处回退都让预期测试变红**。
+>
+> **测试基线**：`node --test scripts/*.test.mjs` → **588 / 588 全绿**（修复前 582/1 红）。
+> `node scripts/check-structure.mjs` → 通过。
+>
+> **边界**：未碰 git；未改 `scripts/verify-claims.mjs`、`scripts/asked.mjs`、
+> `scripts/oversight-tui.mjs`、`scripts/tui-theme.mjs`。
+
+### Fixed
+
+- **时钟注入不彻底：`loadState` 写死 `Date.now()` 剪去重表，导致一条测试定时翻红。**
+  `watch.mjs:371` 的 `pruneNotified(state.notified, Date.now())` 无视调用方可注入的时钟，
+  而 `loadState` 是 `runTick` 的必经路径。测试锚点 `2026-11-08T20:10Z` 距真实时钟超过
+  `NOTIFIED_TTL_HOURS = 24` 之后，tick 2 一进来就把去重条目剪掉，同一次等待被当成新边沿
+  再发一条。**这不是引入时就红，是时钟走过了 TTL 才红**——实测翻红边界精确在「锚点 + 24h」。
+  修法：`loadState` 接受 `{ nowMs }`，`pruneNotified(state.notified, nowMs)`，`runTick` 传下去；
+  测试读 state 时也传 `nowMs`（它是一处合法调用，只是此前函数不接受这个参数）。
+  顺带删掉 `probeMtime` 里一行从未使用、却绕过注入时钟契约的 `const now = Date.now()`。
+
+- **`scan-sessions.mjs` 子进程自取挂钟，与 `runTick` 的注入时钟打架。** 新增 `--now <ISO>`
+  参数，`runScan({ nowMs })` 自动透传；`judgeState` / `idleSec` / `--days` 窗口 / `mergeJobRows`
+  全部改用这一个「现在」。不传时行为与以前完全一致。
+
+- **跨层去重至今没统一：同一次等待由 sessions 与 scan 两条路径各发一条。**
+  两路对同一次等待算出不同的键：sessions 侧退化成 `host:<statusUpdatedAt>`（状态最后一次
+  变化时刻），scan 侧退化成 `lastActivity` 的数字位后 10 位（会话最后一次活动时刻）。
+  生产 `state.json` 里可确认 **3 对**「同一会话、两个键、两次实际发送」
+  （`f932d1d4` 间隔 17.7 分钟、`a80c452d` 13.4 分钟、`356e31e9` 88.9 分钟）。
+  修法分三处，缺一不可：
+  1. `scan-sessions.mjs` 新增 `hostFieldsOf()`，把 `sessions/*.json` 的
+     `waitingFor` / `statusUpdatedAt` 带进行上（以前**只有 `live[]` 有，`sessions[]` 没有**，
+     所以 `candidatesFromScan` 的退化分支在现状下是死代码）；
+  2. 宿主终态的事件时刻解析抽成 `scripts/job-event-time.mjs`，`probeJobs`（jobs 源）
+     与 `scan-sessions` 的 `scanCrossLayerFingerprint`（scan 源）**共用同一个解析器**，
+     于是 FAILED / BLOCKED 两路都得出 `job:<事件时刻>`；
+  3. `candidatesFromScan` 优先透传扫描行自带的 `job:` / `wait:` 指纹，且 **只认这两个前缀**——
+     WAITING 的锚点只能由它一处决定（`wait:<tool_use_id>`，退化 `host:<ts>`），
+     否则「两处都有指纹」会把分叉伪装成已统一。
+  实测（真实生产 transcript + 真实 `sessions/*.json`）：`f932d1d4` 与 `a80c452d`
+  两路键均 **equal=true**；改动前旧算法对同一对数据算出两个不同的键。
+
+### Changed
+
+- **`candidatesFromScan` 的 `evidenceFingerprint` 语义改变**：从「`lastActivity` 的数字位后 10 位」
+  改成带语义前缀的三种形态（`job:` / `wait:` / `host:` / `activity:`）。旧形态的问题是
+  它**没有任何语义**：看上去像「事件时刻」，实际上是「会话最后一次活动的毫秒数后 5 位」，
+  连截断都丢了年份。前缀让观察日志能直接分辨退化来源（`anchorSource` 同步给出）。
+
+- **`jobToRow` 增加 `eventAt` / `eventSource` / `eventWhy` / `evidenceFingerprint` / `anchorSource`。**
+  以前 `lastActivity` 用的是 `updatedAt`（文件重写时刻，宿主任意一次元数据写入都会把它推到当下，
+  实测差 27.8 天），现在事件时刻单独成字段，不再借用 `lastActivity`。
+
+- **测试标题更正**：`L-fast 与 L-full 报同一事件时只发一条 —— 但挡住第二条的是限额，不是键相等`
+  改为 `jobs 与 scan 报同一事件时只发一条 —— 现在靠键相等，不再靠限额`。
+  原断言 `why === 'global-10min'` 按预期变红（键统一后第二条在轮内去重阶段就消失），
+  新断言钉住更强的事实：`suppressed.length === 0`。
+
+### Added
+
+- **防定时炸弹测试**：锚点放到十年后（`2036-06-01`）跑同一 WAITING 跨 tick 场景，必须仍然只发一条。
+  它的职责是「有没有别的挂钟泄漏在 tick 之间偷偷改动去重状态」，**挡不住**「把 `Date.now()` 装回
+  `loadState`」（未来锚点用真实时钟剪不掉）——那件事由上一条 `loadState 必须用注入的 nowMs 剪枝`
+  负责。两条分工写进了测试注释。
+
+- `scripts/job-event-time.mjs`：`requestIdTime` / `lastTimelineStateTime` / `resolveJobEventTime`
+  从 `watch.mjs` 抽出，成为 jobs 源与 scan 源的唯一实现。`watch.mjs` 仍原样转出，公开 API 不变。
+
+
+
+> 报告：`docs/research/2026-11-05-tui-bugfixes.md`。六个缺陷全部由多个 Agent 独立实测确认，
+> 修法以「负向可验证」为门槛：`scripts/verify-bugfix-negatives.mjs` 把每处修复回退一次，
+> 对应测试必须变红。实测 **13/13 处回退都挡住了**。
+>
+> **边界**：不重做视觉设计，只修 bug。`scripts/verify-claims.mjs` 与 `scripts/asked.mjs` 未触碰。
+
+### Fixed
+
+- **Bug1 `--days` 按文件 mtime 过滤，时间窗口完全失真。** 宿主会往 transcript 尾部追加
+  不含 timestamp 的元数据记录（`last-prompt` / `custom-title` / `mode` / `cost-state` /
+  `atis-latch` …），每次刷新文件 mtime，但会话一步都没走。实测本机 241 个 transcript 里
+  **122 个**的 mtime 与最后一条真实记录相差超过 24h，最大 8.4 倍（mtime 194.7h vs 内部
+  1637.9h）。现在窗口判据改为 `scan-sessions.mjs` 新增的 `lastActivityOf()`：从尾部找第一条
+  带 `timestamp` 的记录。整份文件无 timestamp 时返回 `null` 并计入 `stats.transcriptsUnknownTime`，
+  **不假装知道**。
+- **Bug2 `displayWidth` 宽度表错误。** 旧表手抄 20 段 W/F，Unicode 18.0 有 **298 段**；
+  没有 grapheme 聚类，`👍🏻` 被量成 4 列。实测 10 个代表性字符（`⚓ ⚪ 🟡 🟢 🟣 ✅ ⚡ ⌚ × ▲`）
+  **错 8 个**，修复后 **0 个**。现在宽度表由新增的 `scripts/gen-width-table.mjs` 从
+  `scripts/data/EastAsianWidth.txt` + `scripts/data/emoji-data.txt`（Unicode 18.0 原文件）
+  生成到 `scripts/width-table.mjs`（EAW-W/F 298 段→合并 126 段，183,866 码点；
+  Emoji_Presentation 302 段→80 段，其中 26 个码点是 EAW 未覆盖、由 emoji 表补上的）。
+  聚类用 Node 内置 `Intl.Segmenter`，零依赖不变。
+  `truncateToWidth` 的 O(n²) 一并修掉：6400 字 **321ms/call → 8ms/call**
+  （实现搬到 `tui-theme.truncateDisplay`，按 grapheme 簇累加；`oversight-tui.truncateToWidth`
+  只转发，避免出现第二份宽度规则）。
+- **Bug3 光标用下标而非 ID，会复制错人的草稿。** 列表每次刷新按 idle 重排，下标的含义会变：
+  实测 8 秒轮询下排序从 `[b,a]` 变 `[a,b]` 后，下标 0 指向了另一条会话，按 `c` 复制到的是
+  别人的接力草稿。现在 `App` 记录 `selectedId`（`sessionKey`：sessionId > hostSessionId >
+  transcriptId > project），渲染与复制都按 ID 反查位置。会话消失时重新锚定到合法行并保证
+  「高亮行 == 复制对象」。
+- **Bug4 两个 blocked 会话在主屏完全不可见。** `7710fbdb`（等 32 天）**全盘无 transcript**，
+  任何 `--days` 都扫不到；`a9fa4c62`（503）的 transcript 存在但 mtime 被窗口挡住，且行里的
+  sessionId 是 `af6779f8` 而非宿主 id。现在行的全集来自**三个来源的并集**：
+  `sessions`（transcript 重建）+ `live`（宿主实时状态）+ `jobs/*/state.json`（宿主 job）。
+  去重按身份集合求并集（处理 a9fa4c62↔af6779f8 这类别名）。新增 `--all` / `--days 0`
+  表示不限窗口，且状态行主动说出「另有 N 个在窗口外」。
+- **Bug5 `WAITING` 没有颜色。** `badge('WAITING', true)` 返回 **0 个 ESC**——SGR 表缺
+  `brightYellow`，`paint()` 静默降级。这是「此刻正在等你」的状态，最该亮的一个。补齐
+  8 色 + 8 亮色，并让 `paint()` 遇到未定义色名**记录 + 告警**（`unknownColors()` /
+  `setColorWarn()`），不再沉默。
+- **Bug6 「无异常」吞掉「没数据」。** `counts || '无异常'` 把「真的 0 个会话」和「扫到 2 个
+  但一个都没认出来」印成同一个词。现在两种情况分别由 `emptyLines()` 与状态行说明，
+  且「没事」必须自证：检查了多少 transcript / 多少 job / 窗口多大 / 数据多新。
+
+### Added
+
+- `scripts/gen-width-table.mjs` + `scripts/data/{EastAsianWidth,emoji-data}.txt`：
+  宽度表的生成器与官方数据源，`--check` 校验表与数据一致（手改 `width-table.mjs` 会变红）。
+- `scripts/tui-bugfixes.test.mjs`（38 条）：六个 bug 的正向 + 负向测试。
+  宽度期望值从 Unicode 原始数据现算，不用自算基准。
+- `scripts/verify-bugfix-negatives.mjs`：13 处回退的自动化负向验证。
+
+### Changed
+
+- `scan-sessions.mjs --json` 新增 `stats`（扫描覆盖度：看过多少 transcript、窗口内外各多少、
+  时间未知多少、job 补入多少）与每行的 `source` / `hasTranscript` / `hostSessionId` /
+  `transcriptId` / `lastCallAt`。`done` / `stopped` 的 job 不补入列表（无行动价值）。
+
+
+
+> 注：本节日期取任务指定的报告落款日（`docs/research/2026-11-05-verify-claims-productization.md`），
+> 与下方 2026-11-09 节**不是按日期倒序** —— 放在顶部是因为它是最近一次改动的入口。
+> 二者互不影响：11-09 节改的是通知系统（`watch.mjs`），本节只动 `verify-claims.mjs`。
+
+> 四份独立调研指向同一结论：本仓库唯一站得住的差异是 `scripts/verify-claims.mjs`
+> （断言 vs 证据核对），其余能力官方 `claude agents` 与开源生态已覆盖。
+> 这个脚本能跑，但**不是能用的产品**：`--help` 会直接开始扫描，没有单会话模式，
+> 退出码恒为 0，输出只有统计报表没有人能照着做的下一步。
+> 报告与真实输出：`docs/research/2026-11-05-verify-claims-productization.md`。
+>
+> **边界**：只做「让人能用」，不做「让它更准」。判定逻辑一个字没动 ——
+> 同一时刻用 `git show HEAD:scripts/verify-claims.mjs` 与新版各跑一次全量，
+> 逐条比对 38 条断言的 status，**0 处差异**。
+
+### Added
+
+- **`--help` / `-h`：真实帮助，且不扫描。** 旧版 `--help` 落到 `parseArgs` 里无人认领，
+  直接开始 5 秒全量扫描；用户想找参数只能读源码。帮助文本是常量 `HELP_TEXT`，
+  含六档语义、全部参数、退出码、JSON 结构。实测 `node --help` 只花进程启动时间，不读 transcript。
+- **`--session <id前缀|路径>`：单会话模式。** 这是最缺的一条 —— 定位到一个可疑会话后，
+  想再确认只能重扫全部 240 个（5 秒）。前缀 ≥4 字符、必须**唯一命中**，歧义时列候选并退 2，
+  绝不替你瞎选。实测 8.46 MB 的会话 546 ms，全量 5.1 秒。
+- **退出码语义**：`0` = 无 `NO_EVIDENCE`/`FAILED_ONLY`；`1` = 有；`2` = 用法错误。
+  `UNKNOWN` **不算失败** —— 截断导致读不到，不等于它没做，把它当失败就是在制造假阳性。
+  `--exit-zero` 可强制 0。这样它能直接进 CI / git hook。
+- **`--explain <n>`**：第 n 条断言的完整来龙去脉（原话、判定、理由、命中的每条命令及其钟点、
+  最后一次源码编辑位置、计数、建议）。
+- **`--verbose`**：连 `SUPPORTED` 一起列。命中调用多于 8 次时只列失败项与最后 5 次，
+  避免一屏刷满（一个构建族常有 24 次调用）。
+- **`--format md`**：markdown 表格，直接贴 PR 评论。
+- **输出重写**：从「统计报表」改成「告警块」——
+  `<图标> <项目> · <短id>` / `AI 说：「原话」` / `证据：…` / `判定：…` / `建议：…`。
+  证据行说人话（「最后一次源码编辑在 10-19 01:35，之后没再测试运行过」），
+  建议是可执行的（「重跑 npm test 确认；若确实在子 agent 里跑过，加 --include-subagents 再查一次」）。
+  统计压到最后三行。
+- **`timeline`**：`scanSession` 的每条结果多一个 `timeline`（最后一次编辑/成功/失败的时刻与路径）。
+  **只供渲染**，判定仍只看记录下标顺序，不看时间戳。同一秒时不许假装分得出先后。
+- 新导出 17 个（`parseArgs`、`resolveSession`、`exitCodeFor`、`evidenceSentence`、`adviceFor`、
+  `renderSessionBlock`、`renderMarkdown`、`renderDetail`、`renderSummary`、`fmtClock`、
+  `verdictIcon`、`evidenceTimeline`、`timeOf`、`attemptTimes`、`attemptTime`、`flattenResults`、
+  `HELP_TEXT`/`ALERT_STATUS`），全部登记进 `scripts/check-structure.mjs` 的探针表并实际调用。
+
+### Fixed
+
+- **`UNKNOWN` 的证据行会说谎。** 三个来源（截断 / 命令被转后台 / 子 agent 有可疑证据）
+  原先在渲染层可能被一律说成「更早的部分没读到」。后台执行与截断的补救方式完全不同
+  （前者要前台重跑拿退出码，后者要读更多），说错来源会让用户照着做然后什么都没变。
+  现在证据行与建议都按 `reason` 分流。
+- **跨天时间显示踩坑。** 一个会话可横跨数天，只印 `HH:MM:SS` 会让「08:43 成功、
+  之后 22:36 失败」看起来像同一天里倒退。`fmtClock` 现在同日只给钟点、跨天带 `MM-DD`。
+
+### 验证
+
+- `node scripts/check-structure.mjs` 通过。
+- `node --test scripts/*.test.mjs` **545 条全绿**（基线 508 + 新增 37）。
+  `verify-claims.test.mjs` 自身从 79 条增至 116 条（+37）。
+- **五项负向实验**（关掉功能，测试必须变红，均已实测）：
+  1. 短路掉 `--help` 的 early return → 2 条红；
+  2. `exitCodeFor` 改成恒 `0` → 3 条红；
+  3. 忽略 `--session` 退化成全量扫描 → 2 条红；
+  4. 渲染层把 `UNKNOWN` 改写成 `NO_EVIDENCE` → 1 条红；
+  5. 渲染层把三种 `UNKNOWN` 来源压成一句话 → 2 条红。
 
 ---
 

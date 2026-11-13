@@ -12,8 +12,9 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { wrapToWidth, truncateToWidth, parseArgs, parseKeys, sanitize, buildDraft, listRow, detailLines, pendingLines } from './oversight-tui.mjs';
+import { wrapToWidth, truncateToWidth, parseArgs, parseKeys, sanitize, buildDraft, draftHintOf, listRow, detailLines, pendingLines, viewOf } from './oversight-tui.mjs';
 import { displayWidth } from './tui-theme.mjs';
+import { titleOf } from './tui-layout.mjs';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -173,15 +174,27 @@ test('扫描未返回时按 q 能立即退出，并调用 cancel', async () => {
 // 非 TTY 分支，也没有一条端到端断言渲染输出不含 OSC。纯函数全绿掩盖了
 // 契约变更（defaultScan 从 Promise 变成 { promise, cancel }）造成的回归。
 
-/** 造一个符合 scan 契约的假 job */
-function fakeJob(session) {
+/** 造一个符合 scan 契约的假 job。
+ *
+ *  **`live` 不是可选装饰，是新契约的一半。** `partitionRows` 的判据是
+ *  「在跑 = 出现在宿主 live 里且有 transcript」，于是只给 `sessions` 的夹具会让
+ *  一条 PRODUCING 会话掉进「已停」段——而「已停」默认压成一行计数，项目名根本不进屏。
+ *  这正是 2026-11-13 那条红测的真因：不是显示逻辑坏了，是夹具还停在旧契约上。
+ *  真实 `scan --json` 的 `live` 一定存在（实测 11 条），所以夹具必须给。
+ */
+function fakeJob(session, live = []) {
   return {
-    promise: Promise.resolve({ data: { sessions: [session] }, warning: null }),
+    promise: Promise.resolve({ data: { sessions: [session], live }, warning: null }),
     cancel: () => {},
   };
 }
 
+/** 宿主「此刻活着」的最小事实。缺了它，PRODUCING 会话只会进「已停」段。 */
+const LIVE_BUSY = [{ sessionId: 's', status: 'busy' }];
+
 const baseSession = {
+  // **没有 cwd**：这是真实 scan 行的形状（实测 110/110 条 sessions 都没有 cwd，
+  // cwd 只出现在 live 与 transcript meta 里）。项目名必须能从 project 兜底显示。
   project: 'p', sessionId: 's', state: 'PRODUCING',
   reason: 'r', needs: null, suggestedReply: null, jobDetail: null, hostState: null,
   calls: 10, novelty: 0.5, idleSec: 5, liveness: 'reconstructed',
@@ -189,14 +202,14 @@ const baseSession = {
   hbThresholdSec: 120, lastGapSec: 5,
 };
 
-async function renderPlain(session) {
+async function renderPlain(session, live = LIVE_BUSY) {
   const { PassThrough } = await import('node:stream');
   const out = new PassThrough();
   out.isTTY = false;
   let buf = '';
   out.write = (c) => { buf += String(c); return true; };
   const { main } = await import('./oversight-tui.mjs');
-  await main({ argv: [], stdout: out, stdin: new PassThrough(), env: {}, scan: () => fakeJob(session) });
+  await main({ argv: [], stdout: out, stdin: new PassThrough(), env: {}, scan: () => fakeJob(session, live) });
   return buf;
 }
 
@@ -206,7 +219,9 @@ test('main() 非 TTY 分支能产出输出（曾因契约变更整段失效）',
   const buf = await renderPlain({ ...baseSession });
   assert.ok(buf.length > 0, '非 TTY 分支没有任何输出');
   assert.ok(!buf.includes('扫描失败'), `非 TTY 分支报错：${buf.slice(0, 120)}`);
-  assert.ok(buf.includes('p'), '输出里没有项目名');
+  // 项目名必须**真的进屏**。这条断言 2026-11-13 红过：夹具缺 live 条目，
+  // 会话掉进「已停」段，而「已停」默认只画一行计数 —— 界面上确实没有项目名。
+  assert.ok(buf.includes(' p '), `输出里没有项目名 p：\n${buf.slice(0, 400)}`);
 });
 
 test('main() 非 TTY 输出不含任何 ANSI 序列（含 OSC 52）', async () => {
@@ -223,9 +238,32 @@ test('main() 非 TTY 输出不含任何 ANSI 序列（含 OSC 52）', async () =
     jobDetail: 'j' + evil,
     hostState: 'h' + evil,
   };
-  const buf = await renderPlain(session);
+  const buf = await renderPlain(session, [{ sessionId: session.sessionId, status: 'busy' }]);
   assert.ok(!buf.includes(E), '输出里含 ESC');
   assert.ok(!buf.includes('52;c'), 'OSC 52 的正文残留（ESC 被剥但内容还在）');
+  // **假绿的防线**：上面两条断言在「会话掉进折叠的已停段」时会自动成立——
+  // 那一行根本不渲染 project / needs。必须证明它确实渲染了这些字段，
+  // 否则这条测试只能说「没画的东西里没有 ESC」。
+  // 注意用 `在跑 (`（段标题）而不是 `在跑`：判决行里也有「N 个会话在跑」。
+  assert.ok(buf.includes('在跑 ('), `会话没进「在跑」段，OSC 断言是假绿：\n${buf.slice(0, 400)}`);
+  assert.ok(buf.includes('px'), '项目名没进屏（净化可以删序列，但不能把正文一起删掉）');
+});
+
+test('main() 非 TTY：需动作段的 needs / 建议回复也必须净化', async () => {
+  // 在跑段只画标题，needs 不出现；只测那一段就漏掉了「逐字 needs 上屏」这条路
+  // （relay-protocol §5.1 要求逐字展示，也就在终端上原样执行）。
+  const E = String.fromCharCode(0x1b);
+  const B = String.fromCharCode(0x07);
+  const evil = E + ']52;c;eA==' + B;
+  const buf = await renderPlain(
+    { ...baseSession, state: 'BLOCKED', needs: 'n' + evil + 'x', suggestedReply: 'g' + evil + 'x' },
+    [{ sessionId: 's', status: 'blocked' }],
+  );
+  assert.ok(!buf.includes(E), '需动作段输出含 ESC');
+  assert.ok(!buf.includes('52;c'), '需动作段输出残留 OSC 正文');
+  assert.ok(buf.includes('需动作'), `会话没进需动作段，断言是假绿：\n${buf.slice(0, 400)}`);
+  assert.ok(buf.includes('nx'), 'needs 没进屏');
+  assert.ok(buf.includes('gx'), '建议回复没进屏');
 });
 
 test('buildDraft 净化 needs 与 suggestedReply', async () => {
@@ -334,6 +372,73 @@ test('liveToRow：路径里的控制字符被替换，不破坏终端渲染', ()
   assert.ok(!/[\u0001-\u001f]/.test(row.project), `project 仍含控制字符：${JSON.stringify(row.project)}`);
 });
 
+test('viewOf：没有 cwd 时项目名照样显示，且五种外部文本全部净化', () => {
+  // 这条守两件事，都是 2026-11-13 那条红测暴露出来的：
+  //
+  // 1. **没有 cwd 必须有兜底。** 实测 `scan --json --days 3` 的 110 条 sessions
+  //    里 **110 条都没有 cwd**（cwd 只在 live 与 transcript meta 里）。若项目名
+  //    依赖 cwd，真实数据里几乎每一行都会是空白。`viewOf` 的兜底链是
+  //    meta.cwd → row.cwd → row.project，project 永远在。
+  // 2. **列表页也要净化。** 详情页此前净化了 project / sessionId，列表页没有；
+  //    两条展示路径又一次各修一半，实测 `--plain` 能把 OSC 52 放行到终端。
+  const E = String.fromCharCode(0x1b);
+  const B = String.fromCharCode(0x07);
+  const evil = E + ']52;c;eA==' + B;
+
+  const bare = viewOf({ project: 'proj-x', sessionId: 's', state: 'PRODUCING', idleSec: 5 }, null);
+  assert.equal(bare.title, 'proj-x', '没有 cwd 时标题应回退到 project，而不是空');
+  assert.equal(bare.path, '', 'project 是目录编码不是路径，不能当路径用');
+
+  const dirty = viewOf({
+    project: 'pr' + evil + 'oj', sessionId: 'si' + evil + 'd', state: 'BLOCKED', idleSec: 5,
+    needs: 'ne' + evil + 'eds', suggestedReply: 're' + evil + 'ply',
+    cwd: '/x/fo' + evil + 'o',
+  }, { title: 'ti' + evil + 'tle', cwd: '/y/ba' + evil + 'r', lastAssistant: 'la' + evil + 'st', question: 'q' + evil });
+  // 只断言**上屏字段**。`key` 是光标身份，必须保持原样以便与 `cursorKey` 逐字比较
+  // （`sessionKey()` 两侧同源），它不进任何渲染路径 —— 见下面那条单独的断言。
+  const shown = { ...dirty, key: undefined, row: undefined };
+  for (const [k, v] of Object.entries(shown)) {
+    if (typeof v !== 'string') continue;
+    assert.ok(!v.includes(E), `viewOf().${k} 残留 ESC：${JSON.stringify(v)}`);
+    assert.ok(!v.includes(B), `viewOf().${k} 残留 BEL：${JSON.stringify(v)}`);
+  }
+  for (const [k, v] of Object.entries(dirty.meta || {})) {
+    assert.ok(!String(v).includes(E), `viewOf().meta.${k} 残留 ESC：${JSON.stringify(v)}`);
+  }
+  assert.ok(dirty.needs.includes('needs'), '净化不得把 needs 正文一起删掉');
+  assert.ok(dirty.suggestedReply.includes('reply'), '净化不得把建议回复正文一起删掉');
+  assert.ok(dirty.title.includes('title'), '净化不得把标题正文一起删掉');
+  // title 永不为空，于是 `titleOf` 的 key 兜底分支在真实数据上不会触发。
+  assert.ok(dirty.title.length > 0, 'title 不能为空，否则渲染层会退到 key');
+
+  // 标题**整段**都是转义序列 → 净化后是空串 → 渲染层的 `titleOf` 会退到 `key` 兜底，
+  // 而 key 是光标身份、故意不净化。这条钉住「净化后仍给非空标题」。
+  const onlyEsc = viewOf({ project: evil, sessionId: 'si' + evil + 'd', state: 'PRODUCING', idleSec: 5 }, null);
+  assert.ok(onlyEsc.title.length > 0, '标题被整段净化成空串，渲染层会退到未净化的 key');
+  assert.ok(!onlyEsc.title.includes(E), `兜底标题残留 ESC：${JSON.stringify(onlyEsc.title)}`);
+  const rendered = titleOf({ title: onlyEsc.title, path: onlyEsc.path, key: onlyEsc.key });
+  assert.ok(!rendered.text.includes(E), `titleOf 渲染出的标题残留 ESC：${JSON.stringify(rendered.text)}`);
+});
+
+test('D1：Windows 路径必须按 `\\` 切分，项目名不能变成整条路径', () => {
+  // 规划 §1.4 D1：旧实现 `base.split(/[\/]/)` 只切 `/`，于是 Windows 上的
+  // `project` 变成完整路径。而最该被看见的那几类（WAITING/BLOCKED/FAILED 且无
+  // transcript）恰好走这条路——它们从 live 补进来。
+  const BS = String.fromCharCode(92);
+  const win = `D:${BS}Server${BS}MCServers${BS}testharness`;
+  const row = liveToRow({ sessionId: 's', status: 'waiting', cwd: win, statusUpdatedAt: Date.now() });
+  assert.equal(row.project, 'testharness', `项目名应只是尾段，实际 ${JSON.stringify(row.project)}`);
+  assert.equal(row.cwd, win, '原始 cwd 必须保留，否则同名目录无法去歧义');
+  // POSIX 路径仍须正确
+  assert.equal(liveToRow({ sessionId: 's', status: 'waiting', cwd: '/a/b/overwatch' }).project, 'overwatch');
+});
+
+test('D1 回归：live 行带原始 cwd，列表页才能显示 `…/尾两段` 而不是空', () => {
+  const row = liveToRow({ sessionId: 's', status: 'blocked', cwd: 'C:/Users/me/src/app-x' });
+  const v = viewOf(row, null);
+  assert.ok(v.path.includes('app-x'), `路径列是空的：${JSON.stringify(v)}`);
+});
+
 test('mergeLiveSessions 与 App.sessions 必须同源——两条展示路径不能各写一份', () => {
   // 2026-11-01：先只改了 App.sessions()，纯文本路径仍读 data.sessions，
   // 于是同一个 waiting 会话在交互界面出现了、在 | head 输出里还是看不见。
@@ -359,24 +464,116 @@ test('列表行：calls 未知时显示破折号，不是 0', () => {
 });
 
 test('详情页：liveness 与 hostState 有值时不得显示破折号', () => {
+  // 2026-11-10：这两个字段按规划 §2.5 下沉到「高级区」（L6），首屏只放能改变动作的
+  // 四块（状态 / 身份 / 最近说 / 证据）。按 i 展开后它们必须仍然**有值**，
+  // 而不是退化成破折号 —— 下沉不等于丢失。
   const out = detailLines({
     sessionId: 's', state: 'WAITING', reason: 'waiting:input needed', project: 'p',
     liveness: 'live', hostState: 'waiting', calls: null, novelty: null, idleSec: 60,
-  }, 100, false);
+  }, 100, false, { internals: true });
   const joined = out.join('\n');
   assert.ok(/liveness\s+live/.test(joined), `liveness 应有值：\n${joined}`);
   assert.ok(/hostState\s+waiting/.test(joined), `hostState 应有值：\n${joined}`);
 });
 
-test('草稿措辞跟着状态走：FAILED 不能说「正在等待」', () => {
-  // 复制出去的话写错这句，用户会以为对方在提问，而它其实是失败了。
+test('详情页：超龄的会话必须说清「已超龄」与为什么没有建议回复', () => {
+  // 不解释的话，用户会以为界面上少了东西——而这个缺陷的另一半正是「显示错了」。
+  const now = Date.parse('2026-11-11T00:00:00Z');
+  const s = {
+    sessionId: 'hilltop', state: 'BLOCKED', project: 'Hilltop', idleSec: 33.1 * 86400,
+    needs: '要我现在就把用户实测单交给你，还是你先看这四份测试报告？',
+    suggestedReply: '把实测单发给我',
+  };
+  const out = detailLines(s, 100, false, { nowMs: now }).join('\n');
+  assert.ok(out.includes('已超龄'), `详情页应说明超龄：\n${out}`);
+  assert.ok(/33\.\d d|33\.1d/.test(out), `要说出超了多久：\n${out}`);
+  assert.ok(/老化上限/.test(out), `要说出上限：\n${out}`);
+  // 未超龄时不出现这段噪声
+  const fresh = detailLines({ ...s, idleSec: 60 }, 100, false, { nowMs: now }).join('\n');
+  assert.ok(!fresh.includes('已超龄'), `未超龄的不该有这段：\n${fresh}`);
+});
+
+test('详情页首屏不下沉字段：novelty / calls / liveness 只在按 i 之后出现', () => {
+  // 规划 §2.5：L5 首屏只留能改变动作的四块。这三个字段没有一个能。
+  const session = {
+    sessionId: 's', state: 'PRODUCING', project: 'p', liveness: 'reconstructed',
+    calls: 748, novelty: 0.92, noveltyAll: 0.94, idleSec: 60, hbThresholdSec: 900, lastGapSec: 12,
+  };
+  const first = detailLines(session, 100, false).join('\n');
+  assert.ok(!/novelty/.test(first), `首屏不该出现 novelty：\n${first}`);
+  assert.ok(!/calls/.test(first), `首屏不该出现 calls：\n${first}`);
+  assert.ok(!/liveness/.test(first), `首屏不该出现 liveness：\n${first}`);
+  const internals = detailLines(session, 100, false, { internals: true }).join('\n');
+  assert.ok(/novelty/.test(internals) && /calls/.test(internals) && /liveness/.test(internals),
+    `按 i 之后必须能看到内部量：\n${internals}`);
+});
+
+test('草稿只含可直接发送的正文，不含 needs 这类元注释', () => {
+  // 2026-11-11 用户实测：按 c 复制到的是「把实测单发给我」+ 一段
+  // 「（目标会话受阻，在等：…）」。第二段是**给人看的上下文**，粘进对话框
+  // 就变成了一句奇怪的话。剪贴板里只能有能直接发出去的文字。
+  //
+  // 这条测试守的是新契约（旧契约是「needs 作为上下文附在后面」，那一版被用户否掉）。
   const w = buildDraft({ state: 'WAITING', needs: '选 A 还是 B', suggestedReply: 'A' });
-  const f = buildDraft({ state: 'FAILED', needs: '构建报错', suggestedReply: null });
-  const b = buildDraft({ state: 'BLOCKED', needs: '等授权', suggestedReply: null });
-  assert.ok(w.includes('正在等待'));
-  assert.ok(f.includes('已失败'), `FAILED 草稿措辞应说明失败：${f}`);
-  assert.ok(!f.includes('正在等待'), 'FAILED 不得被说成在等待');
-  assert.ok(b.includes('受阻'));
+  assert.equal(w, 'A', `草稿必须只有可发送的正文：${JSON.stringify(w)}`);
+  // 没有 suggestedReply 时**不给草稿**：以前会把「（目标会话正在等待：…）」
+  // 塞进剪贴板，那正是缺陷本身。
+  assert.equal(buildDraft({ state: 'FAILED', needs: '构建报错', suggestedReply: null }), null);
+  assert.equal(buildDraft({ state: 'BLOCKED', needs: '等授权', suggestedReply: null }), null);
+  // needs 单独存在（连 suggestedReply 都没有）时也不给
+  assert.equal(buildDraft({ needs: '选 A 还是 B' }), null);
+  assert.equal(buildDraft({}), null);
+  assert.equal(buildDraft(null), null);
+});
+
+test('草稿里绝不能出现「目标会话」这类旁白，也绝不能出现 needs 原文', () => {
+  const needs = '要我现在就把用户实测单交给你，还是你先看这四份测试报告？';
+  const d = buildDraft({ state: 'BLOCKED', needs, suggestedReply: '把实测单发给我' });
+  assert.equal(d, '把实测单发给我');
+  for (const bad of ['目标会话', '（', '）', '它在等', '受阻']) {
+    assert.ok(!d.includes(bad), `草稿里出现了旁白片段 ${bad}：${JSON.stringify(d)}`);
+  }
+  assert.ok(!d.includes(needs), 'needs 原文进了剪贴板');
+  // 草稿必须是单段：多段会被当成分两次发送
+  assert.ok(!/\n/.test(d), `草稿不该有换行：${JSON.stringify(d)}`);
+});
+
+test('超龄的等待不给建议回复（陈年问句的 suggestedReply 是 33 天前猜的）', () => {
+  const now = Date.parse('2026-11-11T00:00:00Z');
+  const session = {
+    state: 'BLOCKED',
+    // 实测：7710fbdb 的 blocked 发生在 2026-10-08，距今 33.1 天
+    idleSec: 33.1 * 86400,
+    needs: '要我现在就把用户实测单交给你，还是你先看这四份测试报告？',
+    suggestedReply: '把实测单发给我',
+  };
+  assert.equal(buildDraft(session, { nowMs: now }), null, '超龄的 suggestedReply 不该被复制出去');
+  const hint = draftHintOf(session, { nowMs: now });
+  assert.equal(hint.copyable, false);
+  assert.ok(/没动|老化/.test(hint.reason), `必须说清为什么没有草稿：${hint.reason}`);
+  // 同龄但未超龄的仍应正常给草稿（不能一刀切关掉）
+  const fresh = { ...session, idleSec: 3600 };
+  assert.equal(buildDraft(fresh, { nowMs: now }), '把实测单发给我');
+  assert.equal(draftHintOf(fresh, { nowMs: now }).copyable, true);
+});
+
+test('draftHintOf 与 buildDraft 对「能不能复制」必须永远一致', () => {
+  // 两者分家正是这次缺陷的根：界面说「c 复制回复」，按下去却复制到别的东西。
+  const now = Date.parse('2026-11-11T00:00:00Z');
+  const cases = [
+    { state: 'BLOCKED', idleSec: 60, suggestedReply: 'A' },
+    { state: 'BLOCKED', idleSec: 33 * 86400, suggestedReply: 'A' },
+    { state: 'WAITING', idleSec: 2 * 86400, suggestedReply: 'B' },
+    { state: 'FAILED', idleSec: 60, suggestedReply: null },
+    { state: 'BLOCKED', idleSec: 60, needs: '只有 needs' },
+  ];
+  for (const c of cases) {
+    const draft = buildDraft(c, { nowMs: now });
+    const hint = draftHintOf(c, { nowMs: now });
+    assert.equal(hint.copyable, draft !== null,
+      `不一致：${JSON.stringify(c)} → draft=${JSON.stringify(draft)} hint=${JSON.stringify(hint)}`);
+    if (draft !== null) assert.equal(hint.text, draft);
+  }
 });
 
 test('帮助文本不得声称「本界面不计算任何状态」——它会从 live 补会话', () => {

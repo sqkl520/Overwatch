@@ -25,7 +25,7 @@
 | 0.5 | `BLOCKED` | **仅**宿主 `state === 'blocked'` | 读它的 `needs` / `suggestedReply`，由人决定 |
 | 0.6 | `WAITING` | **仅**宿主 `~/.claude/sessions/*.json` 的 `status === 'waiting'` | **回它**。带 `waitingFor` 说明在等什么 |
 | 1 | `EXPLORING`（休眠） | 最后一次调用距今超过 **1 小时**（`DORMANT_MS`） | 不干预。标注 `reason: dormant`、`liveness: stale` |
-| 2 | `STALLED` | 连续 3 个窗口 novelty < 0.2，**且**该窗口内无持久化变更，**且**派生树无任一节点有增益 | L2 探针 → L3 收窄 → L4 重新拆解 |
+| 2 | `STALLED` | 连续 3 个窗口 novelty < 0.2，**且**最近一窗内无持久化变更 | L2 探针 → L3 收窄 → L4 重新拆解 |
 | 3 | `PRODUCING` | 窗口内存在**持久化变更**：成功的 `Write` / `Edit`，或 Bash 命令命中写入类动词表（§3.4） | 不干预，等验收 |
 | 4 | `EXPLORING` | 其余全部情况（只读工具、novelty 达标、或冷启动样本不足） | **不干预**，只做预算管理与状态行标注 |
 
@@ -243,6 +243,13 @@ threshold = clamp(p95(该会话自身全部间隔), 120s, 900s)
 
 父 Agent 卡在只读工具上，可能是在等子 Agent。只要派生树**任一节点**有增益，整棵树判 `EXPLORING`，不判 `STALLED`。
 
+**实现方式（2026-11-13 核对）**：`judgeState` 不接收派生树参数，它的签名是
+`{ sessionState, waitingFor, calls, gapsMs, now }`。这条效果靠**合并时间线**实现，不靠单独判据：
+`scan-sessions.mjs` 传给 `judgeState` 的 `calls` 是 `allCalls` —— 主 transcript 的调用与
+**每个子 agent 的调用合在一起按时间排序**（`scan-sessions.mjs:442-444`）。子 agent 有新动作会
+直接抬高窗口 novelty，于是父线程卡住也不会被判 `STALLED`。截断（超过 `MAX_SUBAGENTS = 100`
+的子 agent 不被展开）因此只损害覆盖率，不改变这条判定的方向：能看到的那部分有增益就够。
+
 ### 5.1 树的重建方式（已实测可行）
 
 1. 主 transcript 中每个 `Agent` tool_use 的 `id`；
@@ -301,7 +308,7 @@ tree_state = (tree_gain ≥ 0.2) ? EXPLORING : 按 §2 依次判定
 |---|---|---|
 | `阶段` | `state.json` 的 `phase` | A–F |
 | `Agent#N` | `state.json` 的 `agents[].id` | 整数 |
-| 状态 | §2 计算 | 四选一 |
+| 状态 | §2 计算 | 六选一 |
 | `reads` | transcript 计数 | 整数 |
 | `novelty` | §3 计算 | 两位小数；冷启动为 `null` |
 | `hb` | 距最后一次 tool_use | 秒或分钟 |
@@ -314,10 +321,12 @@ tree_state = (tree_gain ≥ 0.2) ? EXPLORING : 按 §2 依次判定
 | 值 | 含义 |
 |---|---|
 | `reconstructed` | 已从事后 transcript 重建出心跳序列 |
-| `insufficient-sample` | 间隔样本 < 20，无法算自适应阈值，不下 FAILED 判定 |
+| `insufficient-sample` | 间隔样本 < 20，算不出自适应阈值。**它不决定能不能判 `FAILED`** —— 那条推断已删除，`FAILED` 只认宿主 `state === 'failed'` |
 | `stale` | 会话已休眠（最后一次调用 > 1h），心跳数据不反映当前状态 |
 
-`reason` 的合法取值：`host-reported-failed`、`host-reported-blocked`、`dormant`、`novelty=…`、`persistent-change-in-window`、`read-only`、`cold-start`。
+`reason` 的合法取值：`host-reported-failed`、`host-reported-blocked`、`host-reported-waiting`、
+`waiting:<waitingFor>`、`dormant`、`novelty=…`、`persistent-change-in-window`、`read-only`、`cold-start`。
+（以 `scripts/scan-sessions.mjs` 的 `judgeState()` 为准；GUIDE §4 与本表逐字一致。）
 
 **`hb_gap=…` 已从合法取值中移除**（§2.0.1）。历史 transcript 与旧日志里仍可能出现，但当前代码不会产生它。
 

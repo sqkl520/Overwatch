@@ -29,7 +29,7 @@
 
 import {
   existsSync, readdirSync, statSync, readFileSync, writeFileSync,
-  mkdirSync, renameSync, rmSync, appendFileSync, openSync, readSync, closeSync,
+  mkdirSync, renameSync, rmSync, copyFileSync, appendFileSync, openSync, readSync, closeSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -39,6 +39,7 @@ import { fileURLToPath } from 'node:url';
 
 import { classifyStop, openWaitingToolUseIds } from './classify-stop.mjs';
 import { sessionIdOf } from './asked.mjs';
+import { resolveJobEventTime } from './job-event-time.mjs';
 
 // ── 常量 ──────────────────────────────────────────────────────────────
 
@@ -83,9 +84,8 @@ const ACTIVE_WINDOW = 24 * HOUR;
  *  仍然值得人看一眼；一个 27 天前的 503 不值得。7 天是用户划的线，不是拍的。 */
 export const BLOCKED_MAX_AGE = 7 * DAY;
 
-/** `timeline.jsonl` 只读尾部这么多字节。实测本机最长 141 KB（e461a939），256 KB 覆盖全文件。
- *  被截断且尾部找不到同状态记录时按「事件时间无法确定」处理（fail-closed）。 */
-const TIMELINE_TAIL_BYTES = 256 * 1024;
+/** `timeline.jsonl` 的尾部预算现在住在 job-event-time.mjs（`TIMELINE_TAIL_BYTES`），
+ *  因为它和「事件时刻」是同一件事，两个源必须共用同一份定义。 */
 
 /** 需要通知的终态。
  *
@@ -259,11 +259,52 @@ function claudeRoot(env, override) {
 
 // ── 日志 ──────────────────────────────────────────────────────────────
 
+/** 日志健康状态旁挂文件的文件名。
+ *
+ *  为什么不是一个 state.json 字段：logger 拿不到 state（createLogger 在 runTick 的
+ *  默认参数里就构造好了，早于 loadState），而 saveState 是每轮最后一次写——两者
+ *  会互相覆盖。旁挂文件让「日志坏了」这件事自己独立留痕，`--health` 直接读它。
+ *
+ *  2026-11-12 实测的故障形态：`--health` 只读 state.json，而 state.json 由
+ *  **另一条**路径写入，于是「日志静默停止、tick 照常推进」表现为「一切正常」。
+ *  健康检查必须能看见日志系统自己的故障，否则它检查的不是系统，只是调度器的心跳。 */
+export const LOG_HEALTH_FILE = 'log-health.json';
+export const logHealthPath = (dir) => join(String(dir), LOG_HEALTH_FILE);
+
+/** 读日志健康状态。返回 { healthy, ... } 或 null（从未记录 = 没有坏过）。 */
+export function readLogHealth(dir) {
+  const target = asPath(dir);
+  if (!target) return null;
+  try {
+    const j = JSON.parse(readFileSync(logHealthPath(target), 'utf8'));
+    return j && typeof j === 'object' ? j : null;
+  } catch { return null; }
+}
+
 /**
- * 单文件 1MB 上限，超出轮转到 watch.log.1（覆盖旧的 .1，只留一份）。
+ * 单文件 1MB 上限，超出轮转到带时间戳的归档文件（从不覆盖）。
  * 行格式：2026-10-30T21:00:00Z [INFO] probe=48ms changed=0 skipped=1
+ *
+ * **日志系统坏掉时不能静默。** 这是本项目最该守住的一条：一个把自己失败吞掉的
+ * logger，会让「守护进程看起来在跑」和「它什么都没记」变成同一个画面。
+ * 2026-11-12 排查时就有过这个形态（`state.json` 每 15 秒更新，日志却停在 4 小时前），
+ * 最后查明是读路径的问题，但**代码当时确实无法证明自己没坏**——这本身就是缺陷。
+ *
+ * 失败时的三层可见性（从内到外）：
+ *   1. 行本身落进 `watch.log.emergency`，内容不丢
+ *   2. 写 stderr（守护进程被 VBS 拉起时进 runner.log）与 mirror（stdout）
+ *   3. 写 `log-health.json` 旁挂文件，`--health` 读它
+ *
+ * 失败时的行为（**绝不停止写**）：
+ *   轮转失败 → 继续往原文件追加（哪怕超限）。日志无限增长 > 日志静默停止：
+ *   前者用户能看见，后者看不见。
+ *
+ * `deps` 是给测试用的 IO 接缝：注入一个必抛错的 renameSync，才能在没有真实占用的
+ * 情况下稳定复现「轮转失败」。生产路径不传它。
  */
-export function createLogger(dir, { maxBytes = LOG_MAX_BYTES, mirror = null } = {}) {
+export function createLogger(dir, {
+  maxBytes = LOG_MAX_BYTES, mirror = null, stderr = null, deps = {},
+} = {}) {
   const target = asPath(dir);
   if (!target) {
     // 没有目录只能走 mirror（stdout）。不静默丢日志，也不在 cwd 里建目录。
@@ -276,22 +317,151 @@ export function createLogger(dir, { maxBytes = LOG_MAX_BYTES, mirror = null } = 
   }
   mkdirSync(target, { recursive: true });
   const file = logPath(target);
-  const rotated = file + '.1';
+  const emergency = `${file}.emergency`;
+  // IO 接缝：默认就是真实现。测试注入整组失败来复现「轮转失败」的形态，
+  // 因为 Windows 上文件被占用时 renameSync 抛 EPERM 这件事**无法在单测里稳定造出来**
+  // （chmod 在 NTFS 上不生效；打开文件句柄要靠另一个进程，且行为随杀软变化）。
+  const io = {
+    stat: deps.statSync || statSync,
+    rename: deps.renameSync || renameSync,
+    copy: deps.copyFileSync || copyFileSync,
+    // 截断与「写空文件」是同一件事。放进接缝，测试才能造出「rename 和截断都失败」。
+    truncate: deps.writeFileSync || writeFileSync,
+    append: deps.appendFileSync || appendFileSync,
+  };
+  const emitStderr = stderr || ((s) => { try { process.stderr.write(s); } catch { /* 没有 stderr */ } });
 
+  /** 上一次报告过的故障签名。同一故障每行都喊一遍会把 runner.log 冲掉；
+   *  但**换一种故障必须重新喊**，否则「日志又坏了一次」被去重成「已知」。 */
+  let lastFault = null;
+  /** 连续失败计数。它让「一直在坏」这件事在 health 文件里是可见的，
+   *  而不是每行都被覆盖成一个布尔值。 */
+  let faultStreak = 0;
+  /** 是否已经写过一次 health 记录。第一次正常轮转也要落一个 healthy:true——
+   *  否则「日志一直正常」和「还没检查过」在 --health 眼里是同一种（都是 null）。 */
+  let hasHealthRecord = false;
+  /** 上次写健康记录的时刻。健康的路径按分钟节流：日志约 8,500 行/天，
+   *  每行都重写一个几百字节的 JSON 是白费。故障路径**不节流**——那是罕见的。 */
+  let healthWrittenAt = 0;
+  const HEALTH_EVERY_MS = 60_000;
+
+  const reportFault = (kind, detail) => {
+    const sig = `${kind}|${detail}`;
+    faultStreak = sig === lastFault ? faultStreak + 1 : 1;
+    lastFault = sig;
+    hasHealthRecord = true;
+    const msg = `[log-fault] ${kind}: ${detail}`;
+    // 1) stderr + mirror：进程外能立刻看到
+    try { emitStderr(msg + '\n'); } catch { /* stderr 也写不了就算了 */ }
+    if (mirror) { try { mirror(msg); } catch { /* 同上 */ } }
+    // 3) 旁挂 health 文件：`--health` 的输入
+    try {
+      writeFileSync(logHealthPath(target), JSON.stringify({
+        healthy: false,
+        kind,
+        detail,
+        streak: faultStreak,
+        at: new Date().toISOString(),
+        logFile: file,
+        sizeBytes: (() => { try { return io.stat(file).size; } catch { return null; } })(),
+        maxBytes,
+      }, null, 2) + '\n', 'utf8');
+    } catch { /* health 文件也写不了：至少 stderr 已经说了 */ }
+  };
+
+  /** 写一条健康的 health 记录。
+   *
+   *  `sizeBytes` 必须由调用方在**轮转之后**显式给（刚轮转完就是 0）——
+   *  让它自己去 stat 会拿到一个不存在的新文件（rename 已经把旧的挪走了），
+   *  于是 `--health` 打印「大小未知」，而那看起来像另一个故障。
+   *  实测踩过：正常轮转后输出 `✓ log 大小未知`，把「一切正常」显示成「有点不对劲」。
+   *
+   *  **在自己内部做「值没变就跳过」是不行的。** 试过：轮转后 size 记成 0，
+   *  之后因为「值没变」（其实是我们不再更新）永远是 0，读数就成了一句假话。
+   *  所以这里**无条件写**；节流只由调用方按时间做（见 write 里的 HEALTH_EVERY_MS），
+   *  并且 `at` 字段会让人看出这个数字是几点量的。
+   *
+   *  另一个踩过的点：如果在 append **之前**调它，记下的 size 会少最后一行
+   *  （实测 138 vs 实际 172）。所以健康记录必须在 append 成功后写。 */
+  const reportHealthy = ({ sizeBytes = undefined } = {}) => {
+    lastFault = null;
+    faultStreak = 0;
+    hasHealthRecord = true;
+    healthWrittenAt = Date.now();
+    const size = sizeBytes !== undefined
+      ? sizeBytes
+      : (() => { try { return io.stat(file).size; } catch { return null; } })();
+    try {
+      writeFileSync(logHealthPath(target), JSON.stringify({
+        healthy: true,
+        at: new Date().toISOString(),
+        logFile: file,
+        sizeBytes: size,
+        maxBytes,
+      }, null, 2) + '\n', 'utf8');
+    } catch { /* ignore */ }
+  };
+
+  /** 轮转。返回 { rotated, warn }。
+   *
+   *  **任何失败都不阻止后续写入。** 三种降级按顺序尝试：
+   *    1. 归档到带时间戳的新文件（正常路径）
+   *    2. 截断原文件（rename 被占用时的等价效果：内容仍可追回的部分在归档里没有，
+   *       但至少不会无限增长）
+   *    3. 什么都不做，继续追加（超限但内容完整）
+   *
+   *  返回的 warn 由调用方写进**新**文件的第一行——否则「轮转失败」这个事实
+   *  只存在于 stderr，而事后复盘看的正是那个日志文件。 */
   const rotateIfNeeded = (incoming) => {
-    let size = 0;
-    try { size = statSync(file).size; } catch { return; }
-    if (size + incoming > maxBytes) {
-      // 归档而不是覆盖 watch.log.1。实测日志约 511 KB/天、上限 1 MiB，
-      // 所以「只留一份」意味着**每两天永久丢掉更早的全部日志**。
-      // 那是排查「昨晚到底发生了什么」时唯一的东西。
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const archived = join(target, `watch.${stamp}.log`);
-      try { renameSync(file, archived); } catch {
-        // 归档失败时退回旧行为，至少不让日志无限增长
-        try { rmSync(rotated, { force: true }); } catch { /* ignore */ }
-        try { renameSync(file, rotated); } catch { /* ignore */ }
+    let size;
+    try {
+      size = io.stat(file).size;
+    } catch (e) {
+      // ENOENT 是正常的（第一次写），其余（EACCES/EBUSY/EPERM）是真故障。
+      // 旧实现一律 `return`，于是目录权限变了之后**再也不轮转**，
+      // 而没有任何地方记下这件事。
+      if (e && e.code !== 'ENOENT') {
+        reportFault('stat-failed', `${e.code || ''} ${e.message}`);
+        return { rotated: false };
       }
+      return { rotated: false };
+    }
+    if (size + incoming <= maxBytes) { return { rotated: false }; }
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const archived = join(target, `watch.${stamp}.log`);
+    let renameErr = null;
+    try {
+      io.rename(file, archived);
+      // 这里不写 healthy：新文件还没建，size 只能是 0，而 0 会在 --health 上
+      // 停到下一次 append（最多 15 秒）——那段时间读数是假的。让 write() 在
+      // append 成功后写，那时 size 是真的。故障等级已由 rot.warn 决定。
+      return { rotated: true };
+    } catch (e) {
+      renameErr = e;
+    }
+
+    // 降级 2：**先复制**再截断。
+    // 单纯 `writeFileSync(file, '')` 会永久丢掉旧日志的最后 1 MB——而那正是排查
+    // 「昨晚发生了什么」时唯一的东西。复制若成功，内容另存一份，截断才安全。
+    const fallback = join(target, `watch.${stamp}.copy.log`);
+    let copied = false;
+    try {
+      io.copy(file, fallback);
+      copied = true;
+    } catch { /* 复制不了：下面只截断，并明确说出内容会丢 */ }
+    try {
+      io.truncate(file, '', 'utf8');
+      reportFault(copied ? 'rotate-failed-copied' : 'rotate-failed-truncated',
+        copied
+          ? `rename→${archived} 失败（${renameErr.code || ''} ${renameErr.message}），已复制到 ${fallback} 并截断原文件`
+          : `rename→${archived} 失败（${renameErr.code || ''} ${renameErr.message}）且复制失败：已截断原文件，旧内容丢失`);
+      return { rotated: true, warn: copied ? 'rotate-failed-copied' : 'rotate-failed-truncated' };
+    } catch (truncErr) {
+      // 降级 3：全都失败 → **继续追加**（超限，但内容完整）。
+      reportFault('rotate-failed-append-only',
+        `rename 失败（${renameErr.code || ''}）且截断失败（${truncErr.code || ''}）：继续追加，日志将超过 ${maxBytes} 字节`);
+      return { rotated: false, warn: 'rotate-failed-append-only' };
     }
   };
 
@@ -299,19 +469,41 @@ export function createLogger(dir, { maxBytes = LOG_MAX_BYTES, mirror = null } = 
     const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     const line = `${stamp} [${level}] ${message}`;
     const buf = Buffer.from(line + '\n', 'utf8');
-    rotateIfNeeded(buf.length);
+    const rot = rotateIfNeeded(buf.length);
+    // 轮转降级必须写进**日志本身的第一行**，不能只进 stderr：
+    // 事后看日志的人不会去看 stderr，而 runner.log 会滚掉。
+    const prefix = rot.warn
+      ? Buffer.from(`${stamp} [WARN] log-health: ${rot.warn}（见 log-health.json）\n`, 'utf8')
+      : null;
     try {
-      appendFileSync(file, buf);
+      io.append(file, prefix ? Buffer.concat([prefix, buf]) : buf);
     } catch (e) {
-      // 日志写不了不能让守护进程死掉；但必须让调用方看见
-      if (mirror) mirror(`${line}  [log-write-failed: ${e.message}]`);
+      // 主文件写不了 → 应急文件。**不是 return**：旧实现直接放弃这一行，
+      // 于是「日志静默」和「日志系统死了」在文件层面完全同形。
+      reportFault('write-failed', `${e.code || ''} ${e.message}`);
+      try {
+        io.append(emergency, buf);
+      } catch (e2) {
+        // 应急文件也不行 → 只剩 stderr。这已经是最后一道，必须说清楚。
+        try { emitStderr(`${line}  [log-emergency-failed: ${e2.message}]\n`); } catch { /* 无 */ }
+      }
+      if (mirror) { try { mirror(`${line}  [log-write-failed: ${e.message}]`); } catch { /* 无 */ } }
       return;
     }
-    if (mirror) mirror(line);
+    if (mirror) { try { mirror(line); } catch { /* 无 */ } }
+    // 健康记录在这里写：**append 之后**、轮转之后。放在 append 之前会少记最后一行
+    // （实测 138 vs 实际 172）。正常路径按分钟节流；刚从故障恢复时不节流（hasHealthRecord 为 true 也写）。
+    if (!rot.warn) {
+      const due = Date.now() - healthWrittenAt >= HEALTH_EVERY_MS;
+      if (due || !hasHealthRecord || faultStreak > 0 || lastFault !== null) reportHealthy();
+    }
   };
 
   return {
     path: file,
+    /** 应急文件路径与健康读取，供 --health / 测试使用。 */
+    emergencyPath: emergency,
+    healthPath: logHealthPath(target),
     info: (m) => write('INFO', m),
     warn: (m) => write('WARN', m),
     error: (m) => write('ERROR', m),
@@ -332,8 +524,17 @@ export function emptyState() {
   };
 }
 
-/** 校验并补齐缺字段。返回 { state, corrupt }。坏文件不静默吞——改名留证后从空状态起步。 */
-export function loadState(dir, { logger = null } = {}) {
+/** 校验并补齐缺字段。返回 { state, corrupt }。坏文件不静默吞——改名留证后从空状态起步。
+ *
+ *  `nowMs` 是**可注入的时钟**，和 `runTick` 的契约一致。
+ *  ⚠ 2026-11-10 修：以前这里写死 `pruneNotified(state.notified, Date.now())`，
+ *  而 `loadState` 又是 `runTick` 的必经路径（`watch.mjs` 的 runTick 内部调用）。
+ *  后果不是立刻可见的：注入时钟停在 T 时，条目 `lastSeenAt` 也停在 T；
+ *  只要真实时钟走过 `T + NOTIFIED_TTL_HOURS`，**同一份 state 一读进来条目就被剪掉**，
+ *  于是同一次等待被重新当成新边沿又发一条。测试从绿变红的时间点实测就是锚点 + 24h
+ *  （`docs/research/2026-11-05-dedup-test-failure.md` §1）。
+ *  一条会随挂钟走动而改变结论的测试，暴露的是被它测的代码里有个没注入的时钟。 */
+export function loadState(dir, { logger = null, nowMs = Date.now() } = {}) {
   const target = asPath(dir);
   if (!target) throw new TypeError('loadState: dir 必须是字符串路径');
   const p = statePath(target);
@@ -368,7 +569,7 @@ export function loadState(dir, { logger = null } = {}) {
   // 条目就再也不会被匹配到，只会让 state.json 一路膨胀。
   // 实测：跑了一晚攒下 10 条，其中一半指向已经不存在的会话。
   // 按 firstSeenAt 的年龄清理，只保留还在 24h 去重窗口内的。
-  const pruned = pruneNotified(state.notified, Date.now());
+  const pruned = pruneNotified(state.notified, nowMs);
   if (pruned.removed && logger) {
     logger.info(`state 清理：移除 ${pruned.removed} 条超过 ${NOTIFIED_TTL_HOURS}h 的已通知条目`);
   }
@@ -684,112 +885,10 @@ export function probeWaiting(sessionsRoot, { nowMs = Date.now(), projectsRoot = 
   };
 }
 
-/** 从 `detail` 文本里解析分布式请求 id 里的时间戳，形如 `20261005155700`（UTC）。
- *
- *  这是**唯一由错误本身携带**的时间：宿主写 503 的正文时把 id 一起写下了，
- *  之后无论记录被重写多少次，这个串都不变。返回 ms；解析不出返回 null。 */
-export function requestIdTime(text) {
-  const m = String(text || '').match(/request id:\s*(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
-  if (!m) return null;
-  const [, y, mo, d, h, mi, s] = m;
-  // Date.UTC 的月份从 0 起；逐段验回读，挡住 20261332259900 这种看起来合法的乱码
-  const ms = Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
-  if (!Number.isFinite(ms)) return null;
-  const back = new Date(ms);
-  if (back.getUTCFullYear() !== +y || back.getUTCMonth() !== +mo - 1 || back.getUTCDate() !== +d) return null;
-  return ms;
-}
-
-/** 读 `timeline.jsonl` 尾部，返回**最后一条** `state === terminal` 记录的 `at`（ms）。
- *
- *  为什么只认同状态的记录：一个 job 可能先 failed 后 blocked。最后一条 blocked
- *  才是「这次阻塞何时发生」，取任意最后一条会让先失败后阻塞的记录时刻被失败时刻顶替。
- *
- *  被截断（文件大于尾部预算）且尾部找不到同状态记录时返回 null —— 此时**不能**断言
- *  「没有这条事件」，只能说「尾部没有」。调用方按 fail-closed 处理。 */
-export function lastTimelineStateTime(jobsDir, terminal, maxBytes = TIMELINE_TAIL_BYTES) {
-  const p = join(String(jobsDir), 'timeline.jsonl');
-  let raw;
-  let truncated = false;
-  try {
-    const size = statSync(p).size;
-    const n = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : TIMELINE_TAIL_BYTES;
-    if (size > n) {
-      const buf = Buffer.allocUnsafe(n);
-      const fd = openSync(p, 'r');
-      try { readSync(fd, buf, 0, n, size - n); } finally { closeSync(fd); }
-      raw = buf.toString('utf8');
-      const firstNl = raw.indexOf('\n');
-      if (firstNl >= 0) raw = raw.slice(firstNl + 1);
-      truncated = true;
-    } else {
-      raw = readFileSync(p, 'utf8');
-    }
-  } catch {
-    return { atMs: null, truncated: false, found: false };
-  }
-  const lines = raw.split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    let rec;
-    try { rec = JSON.parse(line); } catch { continue; } // 坏行不影响其余记录
-    if (!rec || rec.state !== terminal) continue;
-    const at = Date.parse(rec.at || '');
-    return { atMs: Number.isFinite(at) ? at : null, truncated, found: true };
-  }
-  return { atMs: null, truncated, found: false };
-}
-
-/** 判定一条宿主终态记录的**事件时刻**，返回 `{ atMs, source, why }`。
- *
- *  ⚠ 绝不能拿 `job.updatedAt` 当事件时刻。它是**文件元数据时间**：宿主在启动、
- *  补写 `respawnFlags` / `name` / `providerEnv` 时都会重写这个 json，把它刷新到当下。
- *  2026-11-02 实测的假阳性正是这么来的（`a9fa4c62`）：
- *
- *      state: "blocked"，detail 里的 request id 是 2026-10-05T15:57:00Z
- *      timeline.jsonl 末条  {"at":"2026-10-05T15:57:02.483Z","state":"blocked"}
- *      updatedAt:            "2026-11-01T18:41:21.066Z"   ← 重写记录的时刻
- *
- *  **差 27.8 天。** 判定器把 27 天前的 503 当成新鲜阻塞，还据此算出 idle=916m
- *  写进通知正文——那个数字是编造的。
- *
- *  取数优先级（越靠前越接近「事件发生」）：
- *    1. `timeline.jsonl` 末条同状态记录的 `at` —— 宿主自己的事件流水，最强的证据
- *    2. `detail` 里 request id 的时间戳      —— 由那次错误本身携带，不会被重写
- *    3. `firstTerminalAt`                    —— 宿主写的「首次进入终态」，只在下两条都没有时兜底
- *  三者都拿不到 → `atMs: null`，调用方 **fail-closed 不通知**。
- *  不退回 `updatedAt`：宁可漏报一条无法定时的旧记录，也不把重写时刻当事件时刻。
- *
- *  两条都用时取**更旧**的那条。理由：两者都是真实事件时刻，更旧的那条离「现在」更远，
- *  按它判过期只会少发不会多发。取新的会把一条其实早就死掉的记录续命。 */
-export function resolveJobEventTime(job, jobsDir) {
-  const terminal = job && job.state === 'failed' ? 'failed' : 'blocked';
-  const candidates = [];
-
-  const tl = lastTimelineStateTime(jobsDir, terminal);
-  if (Number.isFinite(tl.atMs)) candidates.push({ atMs: tl.atMs, source: 'timeline' });
-
-  const rid = requestIdTime(job && (job.detail || job.needs));
-  if (Number.isFinite(rid)) candidates.push({ atMs: rid, source: 'request-id' });
-
-  if (!candidates.length) {
-    const ft = Date.parse(job && job.firstTerminalAt || '');
-    // firstTerminalAt 是「首次进入终态」——它可能早于这次终态（先 failed 后 blocked），
-    // 所以只在没有更强证据时用，且它偏旧，只会让判过期更保守。
-    if (Number.isFinite(ft)) candidates.push({ atMs: ft, source: 'first-terminal' });
-  }
-
-  if (!candidates.length) {
-    return {
-      atMs: null,
-      source: null,
-      why: tl.truncated ? 'timeline-truncated-no-match' : 'no-event-time',
-    };
-  }
-  candidates.sort((a, b) => a.atMs - b.atMs);
-  return { atMs: candidates[0].atMs, source: candidates[0].source, why: null };
-}
+// 宿主终态的事件时刻解析已抽到 job-event-time.mjs：
+// `probeJobs`（jobs 源）与 `candidatesFromScan`（scan 源）必须算出同一个事件时刻，
+// 否则同一次失败跨层得到两个去重键。这里只做转出，保持公开 API 不变。
+export { requestIdTime, lastTimelineStateTime, resolveJobEventTime } from './job-event-time.mjs';
 
 export function probeJobs(jobsRoot, { nowMs = Date.now(), blockedMaxAge = BLOCKED_MAX_AGE } = {}) {
   const started = process.hrtime.bigint();
@@ -889,10 +988,13 @@ export function probeJobs(jobsRoot, { nowMs = Date.now(), blockedMaxAge = BLOCKE
 /**
  * 顶层 ＊.jsonl 的 mtime，**不递归子目录**（实测递归会从 50ms 涨到约 1s）。
  * 只用来回答「哪个项目有新活动」，然后只对那个项目跑增量扫描。
+ *
+ * 这个函数**不需要时钟**：它只比较 mtime 的大小关系，不判断「多久以前」。
+ * 以前留了一行 `const now = Date.now()` 却从未使用——一个未被使用、又绕过
+ * 注入时钟契约的挂钟读取，是下一次「测试定时翻红」的种子。删掉。
  */
 export function probeMtime(projectsRoot) {
   const started = process.hrtime.bigint();
-  const now = Date.now();
   const result = { projects: [], changed: [], elapsedMs: 0, skipped: 0 };
   const target = asPath(projectsRoot);
   if (!target || !existsSync(target)) return { ...result, elapsedMs: 0 };
@@ -952,11 +1054,17 @@ export function foldProbe(previous, current) {
 /**
  * 跑一次扫描。`project` 为 null 时是全量（约 20s），否则单项目（约 1.5–2s）。
  * scan-sessions 在有 FAILED 时 exit 1 —— 那是正常输出，不是失败。
+ *
+ * `nowMs` 会作为 `--now` 传给子进程。不传时子进程自己取挂钟（与以前一致），
+ * 但**只要调用方有注入时钟就必须传**：否则同一轮里 `idleSec` 用的是另一个「现在」，
+ * 而 `candidatesFromScan` 的活跃窗口用的是注入时钟——两段时间基准打架，
+ * 症状是同一份数据在不同 tick 里被判成不同状态。
  */
-export function runScan({ project = null, days = 3, timeoutMs = 180_000, nodePath = process.execPath } = {}) {
+export function runScan({ project = null, days = 3, timeoutMs = 180_000, nodePath = process.execPath, nowMs = null } = {}) {
   const started = process.hrtime.bigint();
   const args = [SCAN_SCRIPT, '--days', String(days || 3), '--json'];
   if (typeof project === 'string' && project) args.push('--project', project);
+  if (Number.isFinite(nowMs)) args.push('--now', new Date(nowMs).toISOString());
 
   return new Promise((resolve, reject) => {
     const child = spawn(nodePath, args, {
@@ -997,31 +1105,69 @@ export function runScan({ project = null, days = 3, timeoutMs = 180_000, nodePat
 
 /** 把扫描结果转成通知候选。只看「最近还有活动」的会话，见 ACTIVE_WINDOW。
  *
- *  `projectsRoot` 给了的时候，WAITING 候选的指纹改成**与 `probeWaiting` 同一个锚点**
- *  （transcript 里未闭合的等待型 `tool_use_id`）。不给时退回旧行为（lastActivity 数字位）。
- *  为什么要统一：两条路径对同一次等待算出不同键，同一次等待就会发两条 ——
- *  实测 `<session-U>` 的 sessions 键 `3679ed23e2930d88` 与 scan 键 `4181354ebb8ac70c` 不相等，
- *  相隔 18 分钟弹了两次。见 `docs/research/2026-11-04-dedup-key-analysis.md` §2.1。 */
+ *  **`evidenceFingerprint` 必须与产出它的那个源算出同一个值**——两条路径描述的是
+ *  同一个事件，键不同就意味着同一件事发两条。取值优先级：
+ *
+ *    0. 扫描行**自己带了** `job:` 或 `wait:` 指纹
+ *       → 原样透传。`job:<事件时刻>` 是 `scan-sessions` 用 `job-event-time.mjs`
+ *         算出来的，与 `probeJobs` 同源同算法。`host:` / `activity:` **不放行**：
+ *         WAITING 的锚点只能由本函数一处决定，否则「两处都有指纹」会把分叉
+ *         伪装成已统一（见下方实现处的注释）。
+ *    1. WAITING 且能读到 transcript 里未闭合的等待型 `tool_use_id`
+ *       → `wait:<tool_use_id>`（两路共用 `waitingAnchor`）
+ *    2. WAITING 且宿主写了 `statusUpdatedAt`
+ *       → `host:<statusUpdatedAt>`
+ *    3. 其余状态（以及拿不到上面两者的 WAITING）
+ *       → `activity:<lastActivity 的 ISO>`（**会话完全静止时稳定**）
+ *
+ *  ⚠ 2026-11-10 统一：以前第 0 档不存在，第 2 档也不可能命中（scan 行没有
+ *  `statusUpdatedAt`），第 3 档用的是 `lastActivity` 的数字位后 10 位——
+ *  于是同一次等待在 sessions 侧算成「状态最后一次变化时刻」、
+ *  在 scan 侧算成「最后一次活动时刻」，**键必然不等**。
+ *  生产 `state.json` 实测 2 对（f932d1d4 / a80c452d），每次都是 sessions 先发、
+ *  十几分钟后 scan 换一个键再发一次。
+ *  见 `docs/research/2026-11-05-dedup-test-failure.md` §5 与 §7。
+ *
+ *  `activity:` 前缀保留：它和 `job:` / `wait:` / `host:` 是**不同的语义**
+ *  （「隔多久没人动」vs「哪一次事件」），前缀让观察日志能分辨退化来源。
+ *  这也是为什么旧实现不能简单加个前缀了事——它**没有**区分语义，只是数字位。 */
 export function candidatesFromScan(sessions, { nowMs = Date.now(), states = NOTIFY_STATES, projectsRoot = null } = {}) {
   const out = [];
   for (const s of sessions || []) {
     if (!states.includes(s.state)) continue;
     const activity = Date.parse(s.lastActivity || '');
     if (Number.isFinite(activity) && nowMs - activity > ACTIVE_WINDOW) continue;
-    // 证据指纹：WAITING 用「这次等待」的锚点（与 probeWaiting 一致）；
-    // 其余状态沿用 lastActivity —— 会话静止时它稳定，真的「卡在别处」时它会变。
-    // 不用 idleSec：那是每轮都在走的，会让去重失效。
-    let fingerprint = String(s.lastActivity || '').replace(/\D/g, '').slice(-10);
+    // 证据指纹：见函数头。
+    const activityIso = Number.isFinite(activity) ? new Date(activity).toISOString() : null;
+    let fingerprint = activityIso ? `activity:${activityIso}` : '';
     let anchorSource = 'last-activity';
-    if (s.state === 'WAITING' && projectsRoot) {
-      const anchor = waitingAnchor(projectsRoot, s.sessionId, s.project, nowMs);
-      if (anchor) { fingerprint = anchor; anchorSource = 'transcript'; }
-      // scan 行没有 `statusUpdatedAt`（只有 `live[]` 有，而 `runScan` 只取 `parsed.sessions`），
-      // 所以这条退化分支在现状下基本不触发，退化后仍然用 lastActivity 的指纹。
-      // 这是一个**已知残留**：取不到 transcript 时两路键仍可能不等。要彻底统一需要
-      // 先改 `scan-sessions` 的输出契约（把 `live[]` 按 sessionId join 进 `sessions[]`），
-      // 属于跨文件契约变更，不在本次修复的边界内。见研究报告 §7 第 1 条。
-      else if (s.statusUpdatedAt) { fingerprint = `host:${new Date(Number(s.statusUpdatedAt)).toISOString()}`; anchorSource = 'host-time'; }
+    // 第 0 档：扫描行自带的 `job:` 指纹优先。它是**跨层统一**的入口——
+    // scan-sessions 用共享的 job-event-time 解析器算它，probeJobs 用同一个。
+    //
+    // **只认 `job:` 前缀**，不认别的。理由是这里有一条必须守住的边界：
+    // WAITING 的锚点只能由**这一处**决定（transcript 的 `wait:<id>`，退化 `host:<ts>`）。
+    // 如果放行上游随便给的 `host:` / `activity:`，那么 sessions 侧（走 probeWaiting、
+    // 算得出 `wait:call_X`）与 scan 侧（抄了个 `host:<ts>`）就会分叉——
+    // 而两边「都有指纹」会让分叉看起来像已统一，比没有指纹更难发现。
+    const given = typeof s.evidenceFingerprint === 'string' ? s.evidenceFingerprint : '';
+    if (given.startsWith('job:') || given.startsWith('wait:')) {
+      fingerprint = given;
+      anchorSource = s.anchorSource || 'scan-row';
+    } else if (s.state === 'WAITING') {
+      const anchor = projectsRoot
+        ? waitingAnchor(projectsRoot, s.sessionId, s.project, nowMs)
+        : null;
+      const hostAt = Number(s.statusUpdatedAt);
+      if (anchor) {
+        fingerprint = anchor;
+        anchorSource = 'transcript';
+      } else if (Number.isFinite(hostAt) && hostAt > 0) {
+        fingerprint = `host:${new Date(hostAt).toISOString()}`;
+        anchorSource = 'host-time';
+      }
+      // 两者都拿不到：沿用 lastActivity（`activity:`），并让 anchorSource 说出这一点。
+      // 这是**已知残留**：会话确实在等，但没有任何「这一次等待」的标识。
+      // fail-open 到 lastActivity 而不是产空串——空串会让同一会话的多次等待并成一个键。
     }
     out.push({
       sessionId: s.sessionId,
@@ -1029,6 +1175,9 @@ export function candidatesFromScan(sessions, { nowMs = Date.now(), states = NOTI
       reason: s.reason || 'unknown',
       project: s.project,
       needs: s.needs || null,
+      // `waitingFor` 与 sessions 源对齐：噪声桶门（permission prompt）读它。
+      // scan-sessions 现在会从 live 记录里带出这个字段（见 scan 行的 statusUpdatedAt）。
+      waitingFor: typeof s.waitingFor === 'string' ? s.waitingFor : null,
       // scan 一般会直接给 idleSec；缺了就从 lastActivity 反推，别让时间门槛因为
       // 上游少一个字段而静默失效。
       idleSec: Number.isFinite(s.idleSec)
@@ -1956,7 +2105,7 @@ export async function runTick({
     : classify;
   const obsLog = observations === null ? createObservationLog(stateDir) : observations;
 
-  const { state, corrupt } = loadState(stateDir, { logger: log });
+  const { state, corrupt } = loadState(stateDir, { logger: log, nowMs });
   const summary = { ran: [], sent: [], suppressed: [], failed: [], already: 0, corrupt, timings: {} };
 
   const notify = notifier || (async () => { throw new Error('未注入 notifier'); });
@@ -2031,7 +2180,7 @@ export async function runTick({
       // 只对变化的项目跑增量：约 1.5–2s，不是 20s
       for (const project of changed.slice(0, 5)) {
         try {
-          const r = await scan({ project, days: 3 });
+          const r = await scan({ project, days: 3, nowMs });
           candidates = candidates.concat(candidatesFromScan(r.sessions, { nowMs, projectsRoot }));
           summary.timings.incrementalMs = Math.round(r.elapsedMs);
           summary.ran.push(`scan:${project}`);
@@ -2089,7 +2238,7 @@ export async function runTick({
   // `--full` 仍然可用：手动排查问题时要看到全量输出，那是调试工具，不是常驻开销。
   if (forceFull) {
     try {
-      const r = await scan({ project: null, days: 3 });
+      const r = await scan({ project: null, days: 3, nowMs });
       candidates = candidates.concat(candidatesFromScan(r.sessions, { nowMs, projectsRoot }));
       summary.timings.fullMs = Math.round(r.elapsedMs);
       summary.ran.push('full');
@@ -2416,13 +2565,22 @@ export function formatInbox(items) {
  *  取 3 个周期而不是 1 个：单次 tick 可能因为扫描慢而推后，1 个周期会误报。
  *  超过 3 个周期还没动静，就不是「慢」，是「停了」。
  *
- *  返回 { healthy, reasons[], layers[] }。reasons 为空才算健康。 */
+ *  返回 { healthy, reasons[], layers[] }。reasons 为空才算健康。
+ *
+ *  ⚠ **2026-11-12 修：它当时检查的不是系统，只是调度器的心跳。**
+ *  实测形态：`state.json` 每 15 秒更新、`--health` 报「运行中」，而日志看起来
+ *  停在 4 小时前。那次查明是读到了旧文件（见 docs/research/2026-11-12-...），
+ *  但检查器**无法区分**「日志正常」与「日志系统坏了」这件事本身就是缺陷：
+ *  state.json 由一条路径写，日志由另一条路径写，前者活不能证明后者活。
+ *
+ *  现在把 logger 自报的 `log-health.json` 并进判定。`logHealth` 不传时**不**当作健康
+ *  （那会把「没检查」伪装成「检查过且通过」），而是记一条 unverified 层说明。 */
 export const HEALTH_PERIODS = Object.freeze({
   jobs: JOBS_INTERVAL,
   probe: PROBE_INTERVAL,
 });
 
-export function healthCheck(state, { nowMs = Date.now(), periods = HEALTH_PERIODS } = {}) {
+export function healthCheck(state, { nowMs = Date.now(), periods = HEALTH_PERIODS, logHealth = undefined } = {}) {
   const layers = [];
   const reasons = [];
 
@@ -2443,6 +2601,33 @@ export function healthCheck(state, { nowMs = Date.now(), periods = HEALTH_PERIOD
       reasons.push(`${name}：已 ${fmtAge(ageMs)} 未运行（上限 ${fmtAge(limit)}）`);
     }
   }
+
+  // 日志层。三种状态必须可分：
+  //   未传入（调用方不关心日志）→ **不加这一层**，保持旧输出形状
+  //   null（从未坏过）          → verified: false，明确说「尚无记录」
+  //   healthy: true / false     → ✓ / ✗（后者进 reasons）
+  //
+  // 为什么 `undefined` 不加层：TUI 的 checklist 会把每一层渲染成 `<name> <age>`，
+  // 而日志层没有 ageMs，会显示成「log 从未」——把「没检查」读成「从没运行」。
+  // 与其为了统一而在别的调用方那里制造一句假话，不如让它们保持原样。
+  if (logHealth === null) {
+    layers.push({ name: 'log', verified: false, stale: null, reason: '尚无日志健康记录（从未出现过故障）' });
+  } else if (logHealth && typeof logHealth === 'object') {
+    const ok = logHealth.healthy === true;
+    layers.push({
+      name: 'log',
+      verified: true,
+      stale: !ok,
+      kind: logHealth.kind || null,
+      detail: logHealth.detail || null,
+      at: logHealth.at || null,
+      sizeBytes: logHealth.sizeBytes ?? null,
+    });
+    if (!ok) {
+      reasons.push(`log：日志系统故障（${logHealth.kind || 'unknown'}）${logHealth.detail ? `：${logHealth.detail}` : ''}` +
+        `${logHealth.streak > 1 ? `（连续 ${logHealth.streak} 次）` : ''}`);
+    }
+  }
   return { healthy: reasons.length === 0, reasons, layers };
 }
 
@@ -2458,6 +2643,21 @@ export function formatHealth(result) {
   if (!result) return '无法判定：没有状态文件。';
   const lines = [];
   for (const l of result.layers) {
+    if (l.verified === false) {
+      // 「没检查」必须与「检查过、没问题」长得不一样。
+      lines.push(`  ？ ${l.name.padEnd(6)} ${l.reason}`);
+      continue;
+    }
+    if (l.name === 'log') {
+      const mark = l.stale ? '✗' : '✓';
+      // **不印大小。** 试过印，但它是「上次写 health 那一刻」的量（正常路径按分钟节流），
+      // 实测会与真实值差一截（69 vs 172）。给一个精确到字节、却已经过期的数字，
+      // 正是 output-format.md §2.1 禁止的那种「看起来精确的估算」。
+      // 日志层要回答的是「日志系统有没有坏」，不是「现在几百字节」。
+      const what = l.stale ? `${l.kind || '故障'}${l.detail ? `（${l.detail}）` : ''}` : '正常';
+      lines.push(`  ${mark} ${l.name.padEnd(6)} ${what}`);
+      continue;
+    }
     const age = l.ageMs == null ? '从未' : fmtAge(l.ageMs);
     const mark = l.stale ? '✗' : '✓';
     lines.push(`  ${mark} ${l.name.padEnd(6)} 上次 ${age}前   周期 ${fmtAge(l.interval)}（上限 ${fmtAge(l.interval * 3)}）`);
@@ -2547,7 +2747,7 @@ async function main(argv) {
       console.log('无法读取状态文件——守护进程可能从未运行过。');
       process.exit(1);
     }
-    const r = healthCheck(state, { nowMs: Date.now() });
+    const r = healthCheck(state, { nowMs: Date.now(), logHealth: readLogHealth(dir) });
     if (flags.has('--json')) {
       console.log(JSON.stringify({ generatedAt: new Date().toISOString(), ...r }, null, 2));
     } else {

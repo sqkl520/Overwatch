@@ -31,6 +31,8 @@ maxTurns: 40
 5. **不得替执行 Agent 做实质分析**。你可以说「需要审计 X 的线程安全」，不能说「X 的线程问题是 Y」。
 6. **每层派发写明「为什么需要这一层，而不是由父级自己完成」**。写不出就不派。
 7. 递归深度上限 3 层。
+8. **每个子树必须声明 `outputs`（磁盘上会多出哪些文件）**。写不出来说明这个子树还没有可交付的东西，
+   那就不该派。`shape: artifact` 不得配空数组。
 
 ## 输出
 
@@ -54,11 +56,19 @@ maxTurns: 40
       "acceptance": [
         { "id": "AC1", "criterion": "", "evidence": "file:line", "fail_if": "" }
       ],
+      "outputs": ["docs/a.md", "scripts/b.mjs"],
       "why_this_layer": ""
     }
   ]
 }
 ```
+
+`outputs` 是**必填**：这个子树干完之后，磁盘上应当**多出哪些文件**（仓库相对路径）。
+它是收活时对账的唯一期望来源（`scripts/claim-ledger.mjs` 的 `declare --paths` 直接吃它）。
+`acceptance` 说「怎么算过」，`outputs` 说「过的时候磁盘上多了什么」——两者不可互推：
+一条 AC 可能不需要新文件（「不加依赖」），一个 output 可能不对应任何 AC（「顺手写的日志」）。
+`shape` 为 `artifact` 时不得为空数组；`exploration` 可以空（它按定义不承诺文件）。
+不得写绝对路径，不得含 `..`。
 
 ## 禁止
 

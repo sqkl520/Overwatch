@@ -18,6 +18,12 @@
 | [`frontend-and-shape.md`](frontend-and-shape.md) | **Proposed** | — | 前端三层形态、策略文件 schema、自动接力的分级与用户规则。**技术前提已实测**（命名管道可达），但「接收方会不会执行 AI 发的指令」尚未验证 |
 | [`continuation-engine.md`](continuation-engine.md) | **Proposed** | — | 读 transcript 还原需求与进度、按证据分级判断达没达到、产出「继续」而非「重来」的指令草稿。**未实现**。结论：前两件可做且廉价（有效上下文 p50≈315 token），第三件受 ADR-0001 约束，只能产草稿 |
 | [`2026-11-04-next-phase-plan.md`](2026-11-04-next-phase-plan.md) | **Proposed** | — | 下一阶段的优先级判定与任务拆解（五件事、为什么是这五件）。**零行实现**，是规划产物，不是能力说明 |
+| [`2026-11-05-tui-redesign-plan.md`](2026-11-05-tui-redesign-plan.md) | **Proposed** | — | TUI 重做的现状诊断、信息架构（判决行 / 检查表 / 三段分区 / 空状态自证）、从 dsh-TUI 的可抄与不抄、七个可派发任务。**零行实现**，未获裁决前不得开工实现 |
+| [`2026-11-10-agent-framework-skeleton.md`](2026-11-10-agent-framework-skeleton.md) | **Proposed** | — | agent 框架 v0 骨架：为什么不用现成框架（N1/N2/N3 三条结构性理由，各附证伪条件）、v0 做五件不做十件、角色 ≠ harness 的分层、三事件汇报协议、一条最小链路、七个可派发任务。**零行实现**；§三.3 与 §七 记录了本文件推翻/降级的两条既有前提 |
+| [`2026-11-11-question-protocol-thesis.md`](2026-11-11-question-protocol-thesis.md) | **方向性声明** | — | 用户原话与由此推出的产品定位：把人工干预集中到开工之前（「问问题」是项目主题）。**不是设计方案，零行实现**；记录四个已确认约束与代价前移的理由 |
+| [`2026-11-11-agent-framework-v2.md`](2026-11-11-agent-framework-v2.md) | **Proposed** | — | agent 框架 v2（修订 v1 骨架）：承认 Mastra 覆盖「派活」、我们只剩「判活」（J1–J5 五个要件），据此把「框架」降级为「验收层」；v0 五件缩到三件；给出不引 Mastra 的五条实测理由与三条切换条件；12 个角色的逐个判决；统一「机器读 JSON / 人读 markdown」的输出规则。**零行实现**；含 P1–P22 共 22 条本机实跑记录，其中 7 条推翻了既有文档结论 |
+| [`2026-11-11-company-architecture.md`](2026-11-11-company-architecture.md) | **Proposed** | — | 多 agent 公司架构：三层（接待台 / 工头 / 执行者）+ 两个旁挂（门禁 / 记账）、主 agent 与手下的唯一区别（写判据 vs 写产物）、递归的三道闸（工具可达性 / 预算递减 / capability_gap）、问题五环节流转与三种权力归属、外包的交接契约与失败六档、「不臃肿」的六个可检查机制、v0 只留 2 / 12 个角色。**零行实现**；§九 给出 12 个角色的逐个判决，砍掉 8 个 |
+| [`2026-11-13-output-reconciliation.md`](2026-11-13-output-reconciliation.md) | **已接入派发链路** | `scripts/claim-ledger.mjs` 四方对账 + 端到端 CLI 测试；§7 四项已落地（`task-graph` 的 `outputs` 必填、模板带 nonce、executor/repair 四元组、`SKILL.md` §4.5 验收前置门），见 `docs/research/2026-11-13-output-reconciliation-integration.md`。§3.6 的 Bash 盲区已收窄为「只认可确定解析的字面量路径」，见 `docs/research/2026-11-13-bash-write-detection.md` | 仍未做：`observe` 需手动跑第二步（`declare` 未记 `--session`）、变量 / 通配 / `find -exec` / 子 shell / `/tmp` 探针这类 Bash 写入仍不在痕迹范围、纯文本结论无从对账。**用户原话：「避免 agent 已经产出了而主线程没意识到」** |
 
 ## `hosted-mode.md` 的已实现 / 未实现对照
 
