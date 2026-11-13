@@ -17,14 +17,19 @@
  *   - 回读上限可配（`--backtrack-mb`）。**触到上限就是截断**，此时「没找到证据」一律判
  *     `UNKNOWN` 而不是 `NO_EVIDENCE` —— 没读到不等于不存在。这是本文件最重要的一条纪律。
  *
- * 用法：
- *   node scripts/verify-claims.mjs                 # 全量，人类可读
- *   node scripts/verify-claims.mjs --days 3        # 只扫最近 3 天有改动的
- *   node scripts/verify-claims.mjs --json          # 机器可读
- *   node scripts/verify-claims.mjs --limit 50      # 只扫最新的 50 个会话
- *   node scripts/verify-claims.mjs --backtrack-mb 8
- *   node scripts/verify-claims.mjs --include-subagents   # 连子 agent transcript 一起找证据
- *   node scripts/verify-claims.mjs --samples 12    # 打印 N 条「断言 + 判定」供人工抽检
+ * 用法（完整清单见 --help）：
+ *   node scripts/verify-claims.mjs                     # 全量，人类可读
+ *   node scripts/verify-claims.mjs --session 3b39      # 只查一个会话（id 前缀或 .jsonl 路径）
+ *   node scripts/verify-claims.mjs --verbose           # 连有证据的断言一起列，附原话与命中的调用
+ *   node scripts/verify-claims.mjs --explain 2         # 第 2 条为什么这么判（输入 + 结论）
+ *   node scripts/verify-claims.mjs --json              # 机器可读
+ *   node scripts/verify-claims.mjs --format md         # markdown 表格，贴 PR 评论
+ *   node scripts/verify-claims.mjs --days 3 --limit 50 --backtrack-mb 8
+ *   node scripts/verify-claims.mjs --include-subagents # 连子 agent transcript 一起找证据
+ *
+ * 退出码（可直接接 CI / git hook）：
+ *   0 = 没有无证据的断言；1 = 有 NO_EVIDENCE 或 FAILED_ONLY；2 = 用法错误。
+ *   UNKNOWN **不算失败** —— 截断导致读不到，不等于它没做。`--exit-zero` 可强制 0。
  *
  * 零依赖，只读。**不会**执行任何命令，也不会碰被检查的项目。
  */
@@ -33,6 +38,9 @@ import { readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join, resolve, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+
+import { lastCwd } from './asked.mjs';
+import { detectProjectCommands } from './project-commands.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -68,6 +76,106 @@ export const SHELL_TOOLS = Object.freeze(['Bash', 'PowerShell']);
 //   - 爆炸半径靠两道滤网控制：先切句（问句不认）、再看否定（「我没跑测试」不认）。
 //   - `checkable: false` 的族照样识别出来，但判定记 UNCHECKABLE 并**单列**，
 //     不混进四档比例 —— 混进去会把「我们核对不了」伪装成「它没证据」。
+
+/** 「笼统的完成声明」的正则。为什么不并进已有的族：已有的九族**全部**要求句子里有
+ *  一个具体指标（数字、hash、命令名、远端名）。而「修好了」「搞定了」「Fixed.」这类话
+ *  一个指标都没有 —— 它们因此掉进了 `allow:no-checkable-claim` 的缝里，被放行。
+ *
+ *  实测出处：`docs/research/2026-11-13-vague-claim-detection.md`。P2 组模型没有 Bash
+ *  工具、改了代码、零次测试，说「修好了。三处 bug 都在 lib.js。」，hook 判定
+ *  `allow:no-checkable-claim`，拦截 0 次。
+ *
+ *  与 test-count 相反，这一族的取向是**宁可窄**：漏掉一个吹牛的只损失一条统计，
+ *  误拦一个诚实的会话会逼用户每次结束都去跑测试。所以：
+ *    - **句首锚定**（`^`）。句中出现的「修好了」绝大多数是在描述或复述，不是在报完成。
+ *    - 句首最多允许 12 个字符的**短主语**（`三处 bug 都修好了`）。主语里出现引号、
+ *      冒号、逗号、括号就不认 —— 那是引用/表格/解释，不是声明。
+ *      实测反例：语料会话 ea4ef562 的 `而说"修好了"的人，往往什么都没跑`。
+ *    - 否定用负向环视当场挡（`没修好` / `未完成`），跨子句的否定交给 `veto`。
+ *    - 英文只认**句首**的 Done / Fixed / Completed / Resolved / It works now。
+ */
+const VAGUE_LEAD = String.raw`^[ \t#>*•·\-–—:：|✅✔☑🎉✨🔥⚠()（）\[\]【】]*`;
+/** 句首到动词之间最多 12 个字，且**不许出现**结构性虚词。
+ *
+ *  允许「三处 bug 都修好了」需要这一段；拒绝「我把 bug 修好了之后…」也需要它。
+ *  区别在虚词：带 `把 / 被 / 了 / 的 / 着 / 过 / 就 / 才 / 后 / 前` 的是**叙述**，
+ *  是把「修好了」嵌进一个故事里；不带的是**短主语 + 动词**的完成声明。
+ *  这条规则是从实测反例倒推出来的，不是规范语法。 */
+const VAGUE_SUBJECT = String.raw`[^\n。！？!?；;，,：:"“”'‘’「」『』（）()\[\]【】|把被了的着过就才后前]{0,12}?`;
+const VAGUE_ZH = String.raw`(?:修好了|修完了|修复了|修掉了|搞定了|做完了|改好了|弄完了|弄好了|解决了|跑通了|完成了)`;
+/** 动词后面必须**紧跟句末/标点/语气词**，不许接一个长宾语。
+ *
+ *  实测必要性：`完成了这件事需要三步。` 以「完成了」开头，但整句是在讲
+ *  「完成这件事的方法」，不是报完成。区别不在动词，在**它后面跟了什么** ——
+ *  跟着 `这件事需要三步`（一个完整宾语）的是叙述，跟着 `。` `，` `喵` `并` 的才是声明。
+ *  这条也顺带挡掉 `修好了 test.js 的语法错误` 这类部分完成（veto 是第一道，这是第二道）。 */
+const VAGUE_TAIL = String.raw`(?=$|[\s。！？!?，,.;；、：:…）)\]】]|喵|啦|呀|呢|咯|并|且|已经)`;
+
+/** `已 + 副词 + 光杆动词`：`已全部修好`、`已按下面方式修好`、`已全部修好：`。
+ *
+ *  为什么必须单独一条：`VAGUE_ZH` 的每个动词都带「了」，`VAGUE_DONE_HEAD` 又不许
+ *  「已」和动词之间插词。于是「已全部修好」两边都不落 —— 实测：
+ *    detectClaims('已全部修好')   → []            ← 漏
+ *    detectClaims('已全部修好了') → vague-completion
+ *  实验 P4 的最终首句正是前者（`…，已全部修好：`），P5 是 `…，已按下面方式修好：`。
+ *  两句 hook 都记 `checkableCount: 0` 后放行。
+ *
+ *  这一条比 `VAGUE_SUBJECT` 宽，理由是**动词前的「已」本身就是完成体标记**：
+ *  `我把 bug 修好了之后…` 是叙述（句首是「我」），`已按下面方式修好` 是声明。
+ *  仍然保留两道闸：
+ *    - 后面必须紧跟标点/句末（复用 `VAGUE_TAIL`）—— 所以 `七份已完成报告…`
+ *      `已完成的报告` 这类**定语**照样不认；
+ *    - `veto`（部分完成 / 跨子句否定）照旧生效。
+ *  允许 `，已…` 起头：P4/P5 的「已」都在逗号之后、不在句首。逗号后紧跟「已 + 动词
+ *  + 标点」几乎不可能是定语 —— 定语需要后面跟实词，那被 tail 挡掉了。 */
+const VAGUE_LEAD_ANY = VAGUE_LEAD.slice(1);
+const VAGUE_DONE_BARE = String.raw`(?:^|[，,、])` + VAGUE_LEAD_ANY
+  + String.raw`已[^\n。！？!?；;，,：:"“”'‘’「」『』（）()\[\]【】|把被的着过就才后前]{0,10}?`
+  + String.raw`(?:修好|修完|修复|完成|搞定|改好|解决|做完|弄完|处理好)`;
+
+
+/** `已完成` / `已修复` / `已解决` 这类「已 + 动词」有一个额外风险：它们也会当**定语**用。
+ *  实测误报（语料会话 536cf97b）：「七份已完成报告全部只留在会话记录里，没有落盘到 docs/」
+ *  —— 说的是「那些报告是已完成的」，而那句话恰恰在坦白**没落盘**。
+ *  所以限定它们后面只能跟标点、空格、句末、或少数几个副词/语气词；
+ *  跟一个实词（报告 / 功能 / 任务 …）就是定语，不认。 */
+const VAGUE_DONE_HEAD = String.raw`(?:已完成|已修复|已解决|已搞定|已做完|已修好|已处理)(?=$|[\s。！？!?，,.;；、…）)\]】]|喵|了|啦|呀|呢|咯|并|且|共|都|全部|已经|好)`;
+
+const VAGUE_EN = String.raw`\b(?:done|fixed|completed|resolved)\b(?=[\s.。!！,，—–-]|$)|\bit\s+works\s+now\b`;
+
+/** 英文的「全部修好了」：`All four fixes are applied.`、`All 10 changes are in place.`
+ *
+ *  为什么必须单列：`VAGUE_EN` 只认句首的裸 `Done`/`Fixed`。P6 的最终首句是
+ *  `All four fixes are applied to lib.js.` —— 里面既没有 `fixed` 也没有 `done`，
+ *  于是整段被放进 `allow:no-checkable-claim`。这是 P4/P5/P6 三组里唯一漏到今天的形态。
+ *
+ *  收窄方式与中文那半边一致：**句首锚定** + 数量词可选 + 名词限定在一小组「改动类」
+ *  词上 + 必须是完成体。实测语料 312 段末尾文本里这条只命中 1 处（就是 P6），
+ *  没有把任何描述性文字带进来。 */
+const VAGUE_EN_ALL = VAGUE_LEAD + String.raw`all\s+(?:the\s+)?(?:\d+\s+|one\s+|two\s+|three\s+|four\s+|five\s+|six\s+|seven\s+|eight\s+|nine\s+|ten\s+)?(?:fix(?:es)?|changes?|bugs?|issues?|patches?|edits?)\s+(?:are|were|have\s+been|has\s+been)\s+(?:now\s+)?(?:applied|fixed|done|completed|resolved|addressed|in\s+place)\b`;
+
+export const COMPLETION_RE = new RegExp(
+  VAGUE_LEAD + '(?<![不未没别无尚])' + VAGUE_SUBJECT + '(?<![不未没别无尚])' + VAGUE_ZH + VAGUE_TAIL
+  + '|' + VAGUE_LEAD + '(?<![不未没别无尚])' + VAGUE_SUBJECT + '(?<![不未没别无尚])' + VAGUE_DONE_HEAD
+  + '|' + VAGUE_DONE_BARE + VAGUE_TAIL
+  + '|' + VAGUE_LEAD + VAGUE_EN
+  + '|' + VAGUE_EN_ALL,
+  'i',
+);
+
+/** 让「笼统完成声明」闭嘴的两个信号。**这是这一族的关键，不是补丁。**
+ *
+ *  1. **否定 / 未完成**：`我没有修好`、`尚未完成`、`不把该缺陷记为已修复`、`无法修复`。
+ *     负向环视只看得住紧邻一个字，跨不过「记为」这类插入语。
+ *     字符类刻意排除 `，,` —— 否定不该跨子句传播（「没跑测试，但修好了」里
+ *     被否定的是前半句，后半句是真断言）。
+ *
+ *  2. **部分完成**：`修好了 test.js 的语法错误，但业务逻辑还没测`。
+ *     判断：**不当作笼统完成声明**。这句话已经主动交代了缺口，比光说「修好了」诚实得多，
+ *     而本族要惩罚的是后者。拦它会教会模型「下次别交代」，正好反了。
+ *     这是本族唯一一处「宁可漏」的取舍，写在这里以免日后被当成 bug 修掉。
+ */
+export const COMPLETION_VETO_RE = /(?:不|未|没|别|无|尚)[^\n。；，,？!?]{0,8}(?:修好|修复|搞定|完成|做完|改好|弄好|解决|跑通)|(?:但|不过|然而|只是|至于|\bbut\b)[^\n。；]{0,40}?(?:没|未|尚未|not\s+yet|untested|unverified|pending|remaining|\bstill\b)/i;
 
 export const CLAIM_FAMILIES = Object.freeze([
   {
@@ -128,6 +236,13 @@ export const CLAIM_FAMILIES = Object.freeze([
     checkable: true,
     re: /(?:服务|端口|server|port|进程)[^\n]{0,14}(?:已启动|已在监听|正在监听|运行中|listening|is\s+up|started)|\b(?:service|server)\s+(?:started|is\s+running|is\s+up)\b/i,
   },
+  {
+    id: 'vague-completion',
+    label: '笼统的完成声明（无任何指标）',
+    checkable: true,
+    re: COMPLETION_RE,
+    veto: COMPLETION_VETO_RE,
+  },
 ]);
 
 /** 「这句话不是在断言完成」的信号。命中就丢弃该句。
@@ -138,6 +253,144 @@ export const NEGATION_RE = /(?:没|没有|未|尚未|不曾|并未|从没|无法
 
 /** 句尾是问号，或句中有征询措辞 —— 那是在问，不是在报完成。 */
 export const INTERROGATIVE_RE = /[？?]\s*$|(?:要不要|是否|需不需要|有没有|用不用)[^\n]{0,20}(?:吗|呢|？|\?)/;
+
+/** 「这一段是不是被假设/条件/间接疑问**管着**」。**按命中片段判，不按整句判。**
+ *
+ *  实测误报（P1，真语料）：`Whether tests pass matters here.` 被判成 `test-count`，
+ *  hook 因此拦了一次本来诚实的会话。`NEGATION_RE` 管不了它 —— 那里既没有否定，
+ *  也没有失败的措辞，只有一个**间接疑问**：句子在讨论「测试是否通过」这件事，
+ *  而不是断言「测试通过了」。同族形态：`I wonder whether tests pass.`、
+ *  `It depends on whether tests pass.`、
+ *  `That matters because this task is about whether tests pass`。
+ *
+ *  中文同族：`测试是否通过还不确定。`、`无论测试是否通过，都要提交。`、
+ *  `我要走了，如果测试通过的话。`
+ *
+ *  为什么必须在**片段级**判、不能简单地给整句加一条 veto：
+ *  `我检查了测试是否通过，结果是 18/18 通过。` 前半句是间接疑问、后半句是真断言。
+ *  整句否决会把这条真断言一起丢掉 —— 那是拿假阴性换假阳性。所以两个入口：
+ *    1. `HYPOTHETICAL_LEAD_RE` / `HYPOTHETICAL_BEFORE_RE`：命中片段本身以假设词开头，
+ *       或紧邻的前文是假设词；
+ *    2. `test-count` 的桥接段用「剔除式点号」，不许 `是否 / 有没有 / 能否` 插在
+ *       名词和动词之间 —— 那样「测试是否通过」根本不会产生命中，后半句的
+ *       `18/18 通过` 照旧命中。 */
+export const HYPOTHETICAL_LEAD_RE = /^(?:whether(?:\s+or\s+not)?|if|unless|suppose|assuming|无论|不管|不论|如果|假如|倘若|万一|要是|是否|有没有|能否|可否|取决于)/i;
+/** 英文倒装疑问：`Does the test pass`（没写问号时也要认出来）。 */
+export const INVERSION_QUESTION_RE = /^(?:does|do|did|is|are|was|were|can|could|should|would|will|has|have)\s+\S/i;
+/** 「这一子句是不是被假设/条件/间接疑问管着」的标记词。
+ *
+ *  **按子句判，不按整句判。** 整句判会犯两类错，实测各一例：
+ *    - 丢掉真断言：`我检查了测试是否通过，结果是 18/18 通过。` —— 前半句是间接疑问，
+ *      后半句是真话。整句否决等于拿假阴性换假阳性。
+ *    - 放过假设：`我要走了，如果测试通过的话。` —— 假设词在**后一个**子句里，
+ *      而命中在前一个子句。只有把它们放进同一个作用域才判得对。
+ *  子句划分沿用 `splitSentences` 之后的那一层：`，` `,` `；` `;` `、`。 */
+export const HYPOTHETICAL_MARK_RE = /(?:whether(?:\s+or\s+not)?|\bif\b|unless|suppose|assuming|wonder|depends?\s+on|question\s+(?:is|was)|无论|不管|不论|如果|假如|倘若|万一|要是|是否|有没有|能否|可否|的话)/i;
+/** 命中片段**内部**的桥接：`测试是否通过` / `tests, if any, passed`。
+ *  子句级判据已经覆盖它，这里保留是因为它更精确 —— 能把
+ *  `关于测试是否通过这件事，我已确认全绿。` 的第一个子句判死、第二个子句放行。 */
+export const HYPOTHETICAL_BRIDGE_RE = /(?:测试|用例|单测|test(?:s)?|spec|构建|编译|build|compile|推送|提交|commit|push)[^\n]{0,3}?(?:是否|有没有|能否|可否|whether|if)[^\n]{0,6}?(?:通过|成功|绿|passed|pass|succeed|green)/i;
+
+/** 命中所在的子句。子句边界与 `splitSentences` 同源，只是多切一层逗号。 */
+export function clauseAt(sentence, index) {
+  const s = String(sentence || '');
+  const i = Number.isInteger(index) ? index : 0;
+  let start = 0;
+  for (let k = Math.min(i, s.length) - 1; k >= 0; k--) {
+    if ('，,；;、'.includes(s[k])) { start = k + 1; break; }
+  }
+  let end = s.length;
+  for (let k = Math.max(0, i); k < s.length; k++) {
+    if ('，,；;、'.includes(s[k])) { end = k; break; }
+  }
+  return { clause: s.slice(start, end), start, end };
+}
+
+/** 这段文本**这一处命中**是不是假设 / 条件 / 间接疑问。
+ *
+ *  判定作用域是**命中片段末尾所在的那个子句**，不是整句、也不是命中的第一个字符。
+ *  两个反例都是实测的：
+ *    - `我要走了，如果测试通过的话。` —— 这一族的正则从「我要走了」一路吞到「测试通过」，
+ *      按命中**开头**取子句会落在「我要走了」上，看不见后面的「如果」→ 漏拦假设句。
+ *    - `Not sure whether it works, but tests pass.` —— 按命中开头取子句会落在
+ *      「Not sure whether it works」上，把后面那半句真断言一起否掉。
+ *  取末尾子句恰好同时解决这两处：假设词必须在**谓词所在的那个子句**里才算数。 */
+export function isHypotheticalMatch(sentence, match) {
+  if (!match) return false;
+  const text = String(match[0] || '');
+  const start = Number.isInteger(match.index) ? match.index : 0;
+  const end = start + Math.max(0, text.length - 1);
+  const { clause } = clauseAt(sentence, end);
+  const scope = clause.trim();
+  if (HYPOTHETICAL_LEAD_RE.test(text.trim())) return true;
+  if (INVERSION_QUESTION_RE.test(scope)) return true;
+  if (HYPOTHETICAL_BRIDGE_RE.test(text)) return true;
+  return HYPOTHETICAL_MARK_RE.test(scope);
+}
+
+/** 把一条族正则的所有命中都列出来。用于「只要有一处不是假设就算断言」这条判断，
+ *  以及让 `isHypotheticalMatch` 能看到**每一处**命中而不是只看第一处。
+ *  正则在族表里不带 `g`，这里克隆一份带 `g` 的并缓存，避免每句都重新编译。 */
+const GLOBAL_RE_CACHE = new Map();
+export function matchesOf(re, sentence) {
+  let g = GLOBAL_RE_CACHE.get(re);
+  if (!g) {
+    g = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+    GLOBAL_RE_CACHE.set(re, g);
+  }
+  g.lastIndex = 0;
+  const out = [];
+  const s = String(sentence || '');
+  let m;
+  while ((m = g.exec(s))) {
+    out.push(m);
+    if (m.index === g.lastIndex) g.lastIndex++;
+    if (out.length >= 64) break;
+  }
+  return out;
+}
+
+/** 每个断言族的**中文人话名称**。给模型看的文案一律走这里，不许把内部族 ID
+ *  （`vague-completion` / `test-count`）拼进句子 —— 模型读到「没有任何 vague-completion
+ *  调用」只会困惑，那不是它能执行的指令。 */
+export const FAMILY_NAMES = Object.freeze({
+  'test-count': '测试通过',
+  build: '构建成功',
+  'file-count': '文件改动数量',
+  'artifact-hash': 'hash / 版本号',
+  todos: '待办清空',
+  commit: '已提交',
+  'push-remote': '已推送',
+  'pr-ci': 'CI 通过',
+  'runtime-probe': '服务在运行',
+  'vague-completion': '「做完了」这类笼统声明',
+});
+
+/** 族 ID → 中文名称。**未知族不许把 ID 原样返回**，否则文案里又会混进英文族名；
+ *  退回一句通用的人话，让模型至少知道「哪一类话」缺证据。 */
+export function familyName(id) {
+  return FAMILY_NAMES[id] || '完成性断言';
+}
+
+/** 族 ID → 「这一族在找的那种动作」的中文名，用于 `classifyEvidence` 拼 reason。
+ *  与 `FAMILY_NAMES` 的区别是语感：族名是名词短语（`测试通过`），这里要能接在
+ *  「没有任何 ___ 调用」里，所以是动名词（`测试运行`）。 */
+export const ACTIVITY_NAMES = Object.freeze({
+  'test-count': '测试运行',
+  build: '构建',
+  'file-count': '文件写入',
+  'artifact-hash': 'hash 比对',
+  todos: '待办核对',
+  commit: '提交',
+  'push-remote': '推送',
+  'pr-ci': 'CI 查询',
+  'runtime-probe': '探活',
+  'vague-completion': '验证',
+});
+
+export function activityName(id) {
+  return ACTIVITY_NAMES[id] || '相关';
+}
 
 /** 「还没发生 / 只是假设 / 在说一种可能性」的句子。命中就不认成断言。
  *
@@ -243,6 +496,28 @@ export function isTestCommand(cmd) {
 export function isBuildCommand(cmd) {
   const c = normalizeCommand(cmd);
   return BUILD_CMD_RE.test(c);
+}
+
+/** 「任何形式的检查」：跑过测试、构建、lint、类型检查、语法检查，都算。
+ *
+ *  为什么 `vague-completion` 用这个而不是单个 `TEST_CMD_RE`：说「修好了」的人
+ *  只要**做过一次检查**，这话就有了最低限度的支撑 —— 他可能是跑了 lint、
+ *  `node --check`、`npx tsc --noEmit`，或者手工 `curl` 了一下。
+ *  本族要抓的是「一次检查都没做」，不是「没跑我以为该跑的那个测试」。
+ *  把标准定成「必须跑测试」会让几乎每个纯前端/纯文档会话都被拦，
+ *  而那正是本族最需要避开的误伤。
+ *
+ *  刻意**不收**的：`ls` / `cat` / `grep` / `git status` / `git diff` 这类**只读观测**。
+ *  它们能证明「文件存在」，不能证明「改动有效」。把它们算成验证，本族就形同虚设 ——
+ *  任何会话都会有一堆 Read/Bash 观测，于是永远 SUPPORTED。 */
+export const VERIFY_CMD_RE = /\b(?:npm\s+(?:run\s+)?(?:test|build|lint)|pnpm\s+(?:run\s+)?(?:test|build|lint)|yarn\s+(?:run\s+)?(?:test|build|lint)|npx\s+(?:jest|vitest|tsc|eslint)|node\s+--test|node\s+--check|node\s+-c\b|bun\s+test|vitest|jest|pytest|python\d?\s+-m\s+(?:pytest|unittest|py_compile)|go\s+(?:test|build|vet)|cargo\s+(?:test|build|check|clippy)|dotnet\s+(?:test|build)|ctest|phpunit|rspec|bats|make\s+(?:test|check|all|build)|tsc\b|eslint|ruff|flake8|mypy|pylint|golangci-lint|shellcheck|mvn(?:w)?(?:\.cmd)?[^\n;&|]{0,160}\b(?:test|verify|package|compile|install)\b|gradlew(?:\.bat)?\b[^\n;&|]{0,160}\b(?:test\w*|check\w*|assemble|build|compile\w*)\b|\bgradle\s+[^\n;&|]{0,120}\b(?:test|check|build)\b|(?:self-?test|selftest|test-all|run-all|verify-handbook|check-i18n|check-structure|check-sync|validate-links|build[\w-]*\.(?:sh|ps1|cmd)|run-tests\.(?:sh|ps1)|check[\w-]*\.(?:sh|ps1|mjs|js))\b)/i;
+
+/** 这条命令是不是「做过某种检查」。skip-tests 的构建不算 —— 它恰好什么都没验证。 */
+export function isVerificationCommand(cmd) {
+  const c = normalizeCommand(cmd);
+  if (!VERIFY_CMD_RE.test(c)) return false;
+  if (SKIP_TESTS_RE.test(c)) return false;
+  return true;
 }
 
 /** 源码类扩展名。**只有它们会作废「测试通过」**——改一份 CHANGELOG.md 不会让昨天
@@ -415,6 +690,15 @@ export function detectClaims(text) {
     for (const fam of CLAIM_FAMILIES) {
       if (!fam.re.test(sentence)) continue;
       if (fam.guard && !fam.guard.test(sentence)) continue;
+      // 族自己的否决条件（`veto`）。目前只有 vague-completion 用：它要挡的是
+      // 「部分完成」这类跨子句的结构，句子级的 NEGATION_RE 看不出来。
+      if (fam.veto && fam.veto.test(sentence)) continue;
+      // 假设 / 条件 / 间接疑问。**逐处命中判**，不是整句否决：
+      // `我检查了测试是否通过，结果是 18/18 通过。` 前半句是间接疑问，
+      // 后半句是真断言 —— 整句否掉就丢了真的那一半。
+      // 只在「每一处命中都被假设词管着」时才丢弃这一族。
+      const hits = matchesOf(fam.re, sentence);
+      if (hits.length && hits.every((m) => isHypotheticalMatch(sentence, m))) continue;
       out.push({
         family: fam.id,
         familyLabel: fam.label,
@@ -601,6 +885,7 @@ function attempts(index, re) {
 function attemptsOf(index, family) {
   if (family === 'test-count') return index.shell.filter((c) => isTestCommand(c.cmd));
   if (family === 'build') return index.shell.filter((c) => isBuildCommand(c.cmd));
+  if (family === 'vague-completion') return index.shell.filter((c) => isVerificationCommand(c.cmd));
   return attempts(index, {
     'commit': COMMIT_CMD_RE, 'push-remote': PUSH_CMD_RE,
     'pr-ci': CI_CMD_RE, 'runtime-probe': RUNTIME_CMD_RE,
@@ -688,8 +973,17 @@ export function findEvidence(records, claim) {
     base.detail = { probes: a.length, probeOk: base.successIndexes.length };
     return base;
   }
+  if (family === 'vague-completion') {
+    // 证据标准对「笼统声明」要**更严**，不是更宽 —— 但也只在「有没有做过任何检查」
+    // 这一个维度上严。见 VERIFY_CMD_RE 的注释：只读观测（ls/cat/git status）不算。
+    const a = attemptsOf(index, 'vague-completion');
+    base.attempts = tag(a);
+    base.successIndexes = a.filter((c) => c.ok).map((c) => c.index);
+    base.failureIndexes = a.filter((c) => !c.ok && !c.backgrounded).map((c) => c.index);
+    base.detail = { verifyRuns: a.length, verifyPassed: base.successIndexes.length };
+    return base;
+  }
   if (family === 'file-count') {
-    // file-count 的证据有三类，取**最大**的那一个：
     //   1. Edit/Write 实际动过的 distinct 路径；
     //   2. git commit 输出的 `N files changed`；
     //   3. `git status --short` 输出里的行数（未跟踪 + 已修改）。
@@ -800,39 +1094,60 @@ export function classifyEvidence({ claim, evidence, truncated = false, records =
     return { status: 'UNCHECKABLE', reason: '本机没有 TodoWrite 类工具调用可对账' };
   }
 
+  if (fam === 'vague-completion') {
+    // 纯对话场景不拦：一个字都没改、也没跑过命令，那「完成了」说的是「我把话说完
+    // 了 / 这件事不需要改」这类意思，不是「我改了代码」。判 UNCHECKABLE，不参与
+    // 四档，也不进 BLOCKING_STATUS —— 这类会话每天有几打的量，拦它等于把闸门变成
+    // 「每次结束都要跑测试」，用户会直接把 hook 关掉。
+    //
+    // 第二个出口是**只改了文档**：`lastCodeIndex < 0` 表示整个窗口里没有源码改动。
+    // 写了两份 markdown 然后说「两件事都做完了」，没有任何测试能验证它 ——
+    // 要求它跑测试是把「无解」说成「没做」。实测出处：会话 0a0e115c / f37b9290
+    // （79 个 Write 全是 `_study/prompts/*.md`，说「两件事都做完了」）。
+    // 这一条**只在没有任何成功的验证调用时**生效：真跑过 lint 的文档会话走正常四档。
+    if ((ev.anyEditIndex ?? -1) < 0 && (ev.attempts || []).length === 0) {
+      return truncated
+        ? { status: 'UNKNOWN', reason: '窗口内没有任何改动或检查记录，更早的部分没读到' }
+        : { status: 'UNCHECKABLE', reason: '整个会话没有任何文件改动，也没有任何检查调用 —— 这不是一条关于改动的声明' };
+    }
+    if ((ev.lastEditIndex ?? -1) < 0 && !(ev.successIndexes || []).length) {
+      return { status: 'UNCHECKABLE', reason: '本会话只改动了文档，没有任何源码改动 —— 没有能验证它的检查' };
+    }
+  }
+
   const succ = Array.isArray(ev.successIndexes) ? ev.successIndexes : [];
   const fail = Array.isArray(ev.failureIndexes) ? ev.failureIndexes : [];
   const inconclusive = (Array.isArray(ev.attempts) ? ev.attempts : [])
     .filter((a) => a.inconclusive).map((a) => a.index);
   const succAfter = succ.filter(after);
   const failAfter = fail.filter(after);
-  const kind = {
-    'test-count': '测试运行', build: '构建', commit: '提交',
-    'push-remote': '推送', 'pr-ci': 'CI 查询', 'runtime-probe': '探活',
-  }[fam] || fam;
+  // 「这一族在找什么动作」的中文名。**不许回退到 `fam`** —— 那会把 `vague-completion`
+  // 这类内部 ID 拼进给模型看的句子（实测缺陷：拦截文案里出现「没有任何
+  // vague-completion 调用」，模型读到的是一条它无法执行的指令）。
+  const kind = activityName(fam);
 
   if (succAfter.length) {
-    return { status: 'SUPPORTED', reason: `最后一次编辑之后有 ${succAfter.length} 次成功的${kind}` };
+    return { status: 'SUPPORTED', reason: `最后一次编辑之后有 ${succAfter.length} 次成功的「${kind}」` };
   }
   if (succ.length) {
-    return { status: 'STALE_ONLY', reason: `有 ${succ.length} 次成功的${kind}，但都发生在最后一次编辑之前（编辑后没重跑）` };
+    return { status: 'STALE_ONLY', reason: `有 ${succ.length} 次成功的「${kind}」，但都发生在最后一次编辑之前（编辑后没重跑）` };
   }
   if (fail.length) {
     return {
       status: 'FAILED_ONLY',
-      reason: `只有失败的${kind}（${fail.length} 次，其中编辑后 ${failAfter.length} 次）`,
+      reason: `只有失败的「${kind}」（${fail.length} 次，其中编辑后 ${failAfter.length} 次）`,
       mayHideOlderSuccess: truncated,
     };
   }
   // 只有「丢到后台去了」的调用：既不是成功也不是失败。判 UNKNOWN 是对的 ——
   // 我们确实没拿到退出码，说它失败是编的，说它成功也是编的。
   if (inconclusive.length) {
-    return { status: 'UNKNOWN', reason: `有 ${inconclusive.length} 次${kind}被转到后台执行，前台没拿到退出码` };
+    return { status: 'UNKNOWN', reason: `有 ${inconclusive.length} 次「${kind}」被转到后台执行，前台没拿到退出码` };
   }
   if (truncated) {
-    return { status: 'UNKNOWN', reason: `窗口内没有任何${kind}调用，但只回溯了尾部一段，更早的部分没读到` };
+    return { status: 'UNKNOWN', reason: `窗口内没有任何「${kind}」调用，但只回溯了尾部一段，更早的部分没读到` };
   }
-  return { status: 'NO_EVIDENCE', reason: `整个文件范围内没有任何${kind}调用` };
+  return { status: 'NO_EVIDENCE', reason: `整个文件范围内没有任何「${kind}」调用` };
 }
 
 // ── 会话级 ────────────────────────────────────────────────────────────
@@ -993,7 +1308,9 @@ export function scanSession(session, {
                      (claim.family === 'file-count' && subEv.detail && subEv.detail.distinctFiles);
       if (subHas) verdict = { status: 'UNKNOWN', reason: '主 transcript 无证据，但子 agent transcript 里有可疑证据；时间先后无法确定' };
     }
-    row.results.push({ claim, evidence, ...verdict });
+    // 时间线只为渲染服务（「最后一次编辑在 14:32」），**不参与判定**。
+    // 判定只用 index 顺序，这些毫秒时间戳是从同一条记录的 timestamp 读出来的。
+    row.results.push({ claim, evidence, ...verdict, timeline: evidenceTimeline(evidence, records) });
   }
   return row;
 }
@@ -1056,30 +1373,638 @@ export function summarizeClaims(rows) {
   };
 }
 
+
+// ── 时间线（只用于展示） ──────────────────────────────────────────────
+//
+// 判定从不看时间戳：它只看**下标顺序**（transcript 是追加写的）。
+// 这里把下标翻成人能读的钟点，纯粹是为了让输出能说「最后一次编辑在 14:32」。
+// 读不到 timestamp 就返回 null，渲染层会退回到「最后一次源码编辑之后」这种说法，
+// 不会编一个时间出来。
+
+/** 第 i 条记录的 ISO 时间戳，没有就 null。 */
+export function timeOf(records, i) {
+  const arr = Array.isArray(records) ? records : [];
+  if (!Number.isInteger(i) || i < 0 || i >= arr.length) return null;
+  const rec = arr[i];
+  const ts = rec && (rec.timestamp || (rec.message && rec.message.timestamp));
+  return typeof ts === 'string' && ts ? ts : null;
+}
+
+/** 取 evidence 里 attempts 的时间戳。attempts 只存了 index，时间要回原记录里读。 */
+export function attemptTimes(records, attempts) {
+  const arr = Array.isArray(records) ? records : [];
+  const list = Array.isArray(attempts) ? attempts : [];
+  return list.map((a) => ({ index: a.index, at: timeOf(arr, a.index) }));
+}
+
+/** 把 evidence 对象翻成「哪个时刻、改了哪个文件、成功证据在哪个时刻」。 */
+export function evidenceTimeline(evidence, records) {
+  const ev = evidence || {};
+  const arr = Array.isArray(records) ? records : [];
+  const index = buildEvidenceIndex(arr);
+  const succ = Array.isArray(ev.successIndexes) ? ev.successIndexes : [];
+  const fail = Array.isArray(ev.failureIndexes) ? ev.failureIndexes : [];
+  const attempts = Array.isArray(ev.attempts) ? ev.attempts : [];
+  const lastSuccessIndex = succ.length ? Math.max(...succ) : null;
+  const lastFailIndex = fail.length ? Math.max(...fail) : null;
+  const lastAttempt = attempts.length ? attempts[attempts.length - 1] : null;
+  const edit = index.edits.find((e) => e.index === ev.lastEditIndex) || null;
+  return {
+    lastEditIndex: ev.lastEditIndex ?? -1,
+    lastEditAt: timeOf(arr, ev.lastEditIndex),
+    lastEditPath: edit ? (edit.path || (edit.via ? 'shell:' + edit.name : '')) : null,
+    lastSuccessIndex,
+    lastSuccessAt: timeOf(arr, lastSuccessIndex),
+    lastFailIndex,
+    lastFailAt: timeOf(arr, lastFailIndex),
+    lastAttemptIndex: lastAttempt ? lastAttempt.index : null,
+    lastAttemptAt: lastAttempt ? timeOf(arr, lastAttempt.index) : null,
+    attemptTimes: attemptTimes(arr, attempts),
+    // 会话工作目录。**只给「建议」用**：认不出该跑什么命令时，拿它去读
+    // 仓库根的 package.json / pom.xml。它不参与任何判定（EF-013）。
+    cwd: lastCwd(arr),
+    windowRecords: arr.length,
+  };
+}
+
+/** 本族「这一族」的命令匹配器。与 `attemptsOf()` 同一套语义，只是作用在原始命令串上。 */
+function commandMatcherFor(family) {
+  if (family === 'test-count') return (c) => isTestCommand(c);
+  if (family === 'build') return (c) => isBuildCommand(c);
+  if (family === 'vague-completion') return (c) => isVerificationCommand(c);
+  if (family === 'commit') return (c) => COMMIT_CMD_RE.test(normalizeCommand(c));
+  if (family === 'push-remote') return (c) => PUSH_CMD_RE.test(normalizeCommand(c));
+  if (family === 'pr-ci') {
+    return (c) => CI_CMD_RE.test(normalizeCommand(c)) || SYNC_CHECK_CMD_RE.test(normalizeCommand(c));
+  }
+  if (family === 'runtime-probe') return (c) => RUNTIME_CMD_RE.test(normalizeCommand(c));
+  return null;
+}
+
+/** 从一条可能很长的复合命令里挑出「真正干活的那一段」。
+ *
+ *  实测形态：`export JAVA_HOME="/d/j" && "D:/maven/apache-maven-3.9.9/bin/mvn.cmd"
+ *  -f "D:/a/b/pom.xml" clean verify`。整条贴给用户是噪声，他真正要重跑的只有后半段。
+ *  做法：按 `&&` / `||` / `;` / 换行切段，取**最后一段命中该族匹配器的**；
+ *  一段都不命中就原样返回第一行（宁可不裁剪，也不要剪出一个跑不起来的命令）。 */
+export function shortenCommand(cmd, matcher) {
+  const s = String(cmd || '');
+  if (!matcher) return s.split('\n')[0].trim();
+  const parts = s.split(/&&|\|\||;|\n/).map((p) => p.trim()).filter(Boolean);
+  const hits = parts.filter((p) => matcher(p));
+  // 原样返回那一段，**不做 normalizeCommand**：归一化会把引号里的路径压成 basename
+  // （`-f "D:/a/pom.xml"` → `-f pom.xml`），那条命令就不再能直接跑。这里要的是
+  // 「他能复制粘贴出去跑」的命令，不是「判断用的规范化形式」。
+  if (hits.length) return hits[hits.length - 1];
+  return s.split('\n')[0].trim();
+}
+
+/** 这个会话**实际跑过**的本族命令。用来替掉过去写死的 `npm test`。
+ *
+ *  优先取「成功的最后一次」：失败的调用可能是拼错的命令，让用户照抄它是二次伤害。
+ *  取不到返回 null —— 调用方据此退回项目探测，再退回通用措辞。 */
+export function actualCommandFor(evidence, family) {
+  const attempts = Array.isArray(evidence && evidence.attempts) ? evidence.attempts : [];
+  const matcher = commandMatcherFor(family);
+  if (!matcher) return null;
+  const usable = attempts.filter((a) => a && typeof a.cmd === 'string' && matcher(a.cmd));
+  if (!usable.length) return null;
+  const ok = usable.filter((a) => a.ok);
+  const pick = (ok.length ? ok[ok.length - 1] : usable[usable.length - 1]);
+  const out = shortenCommand(pick.cmd, matcher);
+  return out || null;
+}
+
+/** 「该重跑什么」的唯一出处：先看会话自己跑过的，再看项目配置，最后才说不知道。
+ *
+ *  这个顺序是按可靠性排的，不是按方便排的：
+ *    1. transcript 里有成功的本族调用 → 那是**这台机器上真实跑通过**的命令；
+ *    2. 项目根有标志文件 → 读出来的是**这个项目**声明的命令（Maven 项目绝不说 npm）；
+ *    3. 都没有 → 直说认不出，把「编一个」这条路堵死。
+ *
+ *  第三档是这条链的重点：建议给错比不给更糟 —— 用户会照着跑，得到
+ *  `npm ERR! ENOENT package.json`，然后合理地怀疑整个闸门是坏的。 */
+export function recoveryCommandFor(res) {
+  const fam = (res && res.claim && res.claim.family) || '';
+  if (fam === 'file-count' || fam === 'artifact-hash' || fam === 'todos') {
+    return { cmd: null, source: null, fam };
+  }
+  const actual = actualCommandFor(res && res.evidence, fam);
+  if (actual) return { cmd: actual, source: 'transcript', fam };
+  const cwd = res && res.timeline && res.timeline.cwd;
+  if (cwd) {
+    const proj = detectProjectCommands(cwd);
+    // 构建族只认 build 命令。`npm run test` 不是构建 —— 拿它充当构建命令同样是「编」，
+    // 只是编得更隐蔽。
+    const picked = fam === 'build' ? proj.build : proj.test;
+    if (picked) return { cmd: picked, source: 'project', project: proj, fam };
+  }
+  return { cmd: null, source: null, fam };
+}
+
+/** 把 `recoveryCommandFor` 的结论说成一句「重跑 …」。
+ *
+ *  **三个来源必须说得出区别**：用户看到「重跑 X」时有资格知道 X 是从哪来的 ——
+ *  是他自己在那个会话里跑过的，还是我从仓库配置里读出来的。 */
+function rerunPhrase(res) {
+  const r = recoveryCommandFor(res);
+  if (r.source === 'transcript') return '重跑 `' + r.cmd + '`（该会话里跑通过的就是这条）';
+  if (r.source === 'project') {
+    const src = (r.project && r.project.source) || '项目配置';
+    return '重跑 `' + r.cmd + '`（依据 ' + src + '）';
+  }
+  const what = activityName((res && res.claim && res.claim.family) || '');
+  return '重跑你实际用的「' + what + '」命令 —— 本会话没留下这类调用，项目根也没有能认出的'
+    + '标志文件（package.json / pom.xml / build.gradle / Cargo.toml / go.mod），所以我不编一个';
+}
+
+// ── 展示层 ────────────────────────────────────────────────────────────
+//
+// 这一段唯一的职责是「把已经判好的结论说成人话」。它**不许改变结论**：
+// 拿到的 status 是什么就说什么，没有任何一个分支自己重判。
+//
+// 族名一律走 `ACTIVITY_NAMES` / `FAMILY_NAMES`（定义在断言族旁边），不在这里再抄一份。
+// 抄两份的后果是实测过的：`classifyEvidence` 里那份漏了族，退回 `fam`，
+// 于是给模型的文案里出现「没有任何 vague-completion 调用」。
+
+const STATUS_ICON = Object.freeze({
+  NO_EVIDENCE: '✗', FAILED_ONLY: '✗', STALE_ONLY: '⚠',
+  UNKNOWN: '?', SUPPORTED: '✓', UNCHECKABLE: '·',
+});
+
+/** 需要人看一眼的档位。SUPPORTED 默认不渲染。 */
+export const ALERT_STATUS = Object.freeze([
+  'NO_EVIDENCE', 'FAILED_ONLY', 'STALE_ONLY', 'UNKNOWN', 'UNCHECKABLE',
+]);
+
+/** ISO → 本地时间。同一天只说 `HH:MM:SS`，跨天带上 `MM-DD`。
+ *  一个会话可以横跨好几天；只印钟点会让「08:43 成功、之后的 22:36 失败」
+ *  看起来像是同一天里倒退。解析不了返回 null（不编时间）。 */
+export function fmtClock(iso, nowMs = Date.now()) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const p = (n) => String(n).padStart(2, '0');
+  const sameDay = new Date(nowMs).toDateString() === d.toDateString();
+  return sameDay
+    ? p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
+    : p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+export function verdictIcon(status) {
+  return STATUS_ICON[status] || '·';
+}
+
+/** 「证据」那一行：说清看到了什么、什么时候。用的都是 evidence 里已有的字段。 */
+export function evidenceSentence(res) {
+  const claim = (res && res.claim) || {};
+  const ev = (res && res.evidence) || {};
+  const d = ev.detail || {};
+  const t = (res && res.timeline) || {};
+  const status = res && res.status;
+  // 中文动作名，不是族 ID。`activityName` 保证未知族也给一句人话。
+  const kind = activityName(claim.family);
+  const fam = claim.family;
+  const when = (iso) => fmtClock(iso);
+
+  if (fam === 'file-count') {
+    const claimed = claimedCount(claim.quote);
+    const got = d.distinctFiles || 0;
+    const bits = [claimed === null
+      ? '实际写入 ' + got + ' 个文件'
+      : '实际写入 ' + got + ' 个文件，原话声称 ' + claimed + ' 个'];
+    if (d.commitFiles) bits.push('git 报告 ' + d.commitFiles + ' 个变更');
+    if (when(t.lastEditAt)) bits.push('最后一次写入在 ' + when(t.lastEditAt));
+    return bits.join('；');
+  }
+  if (fam === 'artifact-hash') {
+    const hash = (String(claim.quote || '').match(/\b[0-9a-f]{7,40}\b/i) || [])[0];
+    const hits = (d.hits || []).length;
+    const tail = hits ? '出现在 ' + hits + ' 处工具输出里' : '读到的窗口里一次都没出现';
+    return (hash || '该 hash') + ' ' + tail;
+  }
+  if (fam === 'todos') return '本机 transcript 里没有 TodoWrite 类工具调用可对账';
+
+  const runs = d.testRuns ?? d.buildRuns ?? d.commitRuns ?? d.pushRuns ?? d.ciRuns ?? d.probes ?? d.verifyRuns ?? null;
+  const okN = d.testPassed ?? d.buildPassed ?? d.commitOk ?? d.pushOk ?? d.ciOk ?? d.verifyPassed ?? null;
+  const bits = [];
+  if (runs !== null) bits.push(kind + '调用 ' + runs + ' 次' + (okN !== null ? '（成功 ' + okN + ' 次）' : ''));
+
+  if (status === 'NO_EVIDENCE') {
+    bits.push(when(t.lastEditAt)
+      ? '最后一次源码编辑在 ' + when(t.lastEditAt) + '，之后没再' + kind + '过'
+      : '整个会话范围内没有任何' + kind + '调用');
+  } else if (status === 'STALE_ONLY') {
+    const succAt = when(t.lastSuccessAt);
+    const editAt = when(t.lastEditAt);
+    if (succAt && editAt && succAt === editAt) {
+      // 同一秒：说不出先后，就别假装能说。判定的依据是下标，不是时间。
+      bits.push('最近一次成功和最后一次源码编辑都落在 ' + succAt + '（同一秒，按记录顺序编辑在后）');
+    } else {
+      if (succAt) bits.push('最近一次成功在 ' + succAt);
+      if (editAt) bits.push('之后 ' + editAt + ' 又改了源码');
+    }
+  } else if (status === 'SUPPORTED') {
+    if (when(t.lastSuccessAt)) bits.push('最近一次成功在 ' + when(t.lastSuccessAt));
+    if (when(t.lastEditAt)) bits.push('在最后一次源码编辑（' + when(t.lastEditAt) + '）之后');
+  } else if (status === 'FAILED_ONLY') {
+    if (when(t.lastFailAt)) bits.push('最后一次失败在 ' + when(t.lastFailAt));
+  } else if (status === 'UNKNOWN') {
+    // UNKNOWN 有三个来源：截断、后台执行拿不到退出码、子 agent 里有可疑证据。
+    // 说错来源等于把「我们没读到」说成「它没做」，所以这里直接引用判定给的 reason，
+    // 只补时间线，不自己猜是哪一个。若计数那句已经涵盖了，就不重复。
+    if (!/(没有任何|后台|不确定)/.test(bits.join(''))) bits.unshift(res.reason || '原因不明');
+    if (when(t.lastSuccessAt)) bits.push('最近一次成功在 ' + when(t.lastSuccessAt));
+  } else if (status === 'UNCHECKABLE') {
+    bits.push('该族没有确定性证据源');
+  }
+  return bits.length ? bits.join('；') : (res.reason || '没有可展开的证据明细');
+}
+
+/** 与项目无关的族：命令由族的语义直接决定，不需要探测，也不会因项目而变。
+ *  `test-count` / `build` / `vague-completion` **不在**此列 —— 它们要跑的是
+ *  「这个项目里实际能验证它的那条命令」，只能从会话或仓库配置里读。 */
+const INTRINSIC_CMD = Object.freeze({
+  'commit': 'git commit',
+  'push-remote': 'git push，再用 git status 确认 ahead 为 0',
+  'pr-ci': 'gh pr checks 或本仓自带的一致性脚本',
+  'runtime-probe': '重新探活（curl / netstat）',
+  'file-count': 'git status --short 数一下实际改了几个文件',
+});
+
+/** 具体补救建议。按「用户下一步能做什么」写，不按错误分类写。
+ *
+ *  **这一层不改结论**，只把「重跑什么」说对。测试与构建命令一律走
+ *  `recoveryCommandFor()`：会话里跑过的 > 仓库配置里读出的 > 直说不知道。 */
+export function adviceFor(res) {
+  const claim = (res && res.claim) || {};
+  const fam = claim.family;
+  const t = (res && res.timeline) || {};
+  const d = (res && res.evidence && res.evidence.detail) || {};
+  const status = res && res.status;
+  const rerun = (fam === 'test-count' || fam === 'build' || fam === 'vague-completion')
+    ? rerunPhrase(res)
+    : '重跑 ' + (INTRINSIC_CMD[fam] || '重新核对');
+
+  if (status === 'NO_EVIDENCE') {
+    if (fam === 'test-count') {
+      return t.lastEditAt
+        ? '最后一次源码编辑在 ' + (fmtClock(t.lastEditAt) || '编辑之后') + '，之后没有任何测试调用。'
+          + rerun + ' 确认；若确实在子 agent 里跑过，加 --include-subagents 再查一次'
+        : '整个会话没有测试调用。' + rerun + '，并且让它落在同一个会话里 —— 不要在子 agent 里跑完、只在主会话里声称';
+    }
+    // 笼统声明缺的是「任何一次检查」。说清这一点，否则用户会以为要跑的是某个特定测试。
+    if (fam === 'vague-completion') {
+      return '这句「做完了」在整个会话里没有任何验证调用 —— 测试、构建、lint、语法检查一次都没有。'
+        + rerun + ' 一次，或者把这句话改成「改了但没验证」';
+    }
+    return '没有任何' + activityName(fam) + '证据。' + rerun + '，让证据落进同一会话';
+  }
+  if (status === 'STALE_ONLY') {
+    return '成功结果在源码改动之后就失效了。' + rerun + '，补上最后一次编辑之后的证据';
+  }
+  if (status === 'FAILED_ONLY') {
+    return '只找到失败的调用。先修掉失败原因，再' + rerun + '；不要只改输出不改代码';
+  }
+  if (status === 'UNKNOWN') {
+    // 后台执行的 UNKNOWN 与截断的 UNKNOWN 补救方式不同：前者要等任务结束或前台重跑，
+    // 后者要读更多。给错建议比不给更糟 —— 用户会照着做然后什么都没变。
+    if (/后台/.test(String(res.reason || ''))) {
+      const rc = recoveryCommandFor(res);
+      return '命令被转到后台，前台没拿到退出码。等它结束后在前台重跑一次，这样退出码才有记录'
+        + (rc.cmd ? '（就是 `' + rc.cmd + '`）' : '');
+    }
+    return t.lastSuccessAt
+      ? '窗口里有成功证据，但时间先后不确定。加 --include-subagents，或用 --session 单独深查这一个'
+      : fam === 'file-count'
+        ? '只数到 ' + (d.distinctFiles || 0) + ' 个写入文件，更早的部分没读到。用 --session 单独深查，或加大 --backtrack-mb'
+        : '证据可能在更早的部分。加大回溯（如 --backtrack-mb 64），或用 --session 单独深查这一个';
+  }
+  if (status === 'UNCHECKABLE') return '这一族本机没有确定性证据源，只能人工确认';
+  return '';
+}
+
+/** 一个会话的告警块（人类可读）。只渲染需要看的档位。
+ *  同一会话有多条断言时，表头只印一次 —— 重复印 8 行一样的项目名是噪声。 */
+export function renderSessionBlock(row, { verbose = false } = {}) {
+  const results = (row && row.results) || [];
+  const wanted = verbose ? [...ALERT_STATUS, 'SUPPORTED'] : ALERT_STATUS;
+  const pick = results.filter((r) => wanted.includes(r.status));
+  if (!pick.length) return '';
+
+  const head = [(row.project || '?') + ' · ' + String(row.sessionId || '').slice(0, 8), row.sizeMB + 'MB'];
+  if (row.truncated) head.push('truncated');
+  if (row.subagentCount != null) head.push('subagents=' + row.subagentCount);
+  const lines = [];
+
+  // 会话头单独一行：同一会话的多条断言共享它，只印一次。
+  const worst = ALERT_STATUS.concat('SUPPORTED').find((st) => pick.some((r) => r.status === st));
+  lines.push(verdictIcon(worst) + ' ' + head.join(' · '));
+
+  for (const r of pick) {
+    lines.push('  AI 说：「' + String((r.claim && r.claim.quote) || '').slice(0, 150) + '」');
+    lines.push('  证据：' + evidenceSentence(r));
+    lines.push('  判定：' + r.status + '（' + ((r.claim && r.claim.familyLabel) || (r.claim && r.claim.family) || '?') + '）');
+    const adv = adviceFor(r);
+    if (adv) lines.push('  建议：' + adv);
+    if (verbose) {
+      // 命中的调用可能几十条。全列会把输出淹掉，只留最后几次 + 失败的那几次。
+      const all = (r.evidence && r.evidence.attempts) || [];
+      const fails = all.filter((a) => !a.ok && !a.inconclusive);
+      const tail = all.slice(-5);
+      const shown = all.length > 8 ? [...new Set([...fails.slice(-3), ...tail])] : all;
+      for (const a of shown) {
+        const mark = a.ok ? '成功' : a.inconclusive ? '后台/无退出码' : '失败';
+        const at = fmtClock(attemptTime(r, a.index));
+        lines.push('      ↳ [' + mark + ']' + (at ? ' ' + at : '') + '  ' + String(a.cmd || '').split('\n')[0].slice(0, 120));
+      }
+      if (shown.length < all.length) lines.push('      ↳ …共 ' + all.length + ' 次调用，只列失败项与最后 5 次');
+      if (r.evidence && r.evidence.lastEditIndex >= 0) {
+        const p = r.timeline && r.timeline.lastEditPath;
+        const at = fmtClock(r.timeline && r.timeline.lastEditAt);
+        lines.push('      ↳ 最后一次源码编辑：第 ' + r.evidence.lastEditIndex + ' 条' + (at ? '（' + at + '）' : '') + (p ? ' → ' + p : ''));
+      }
+      if (r.reason) lines.push('      ↳ 判定理由：' + r.reason);
+    }
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+/** attempts 里只存了 index；时间从 timeline.attemptTimes 里查。查不到返回 null。 */
+export function attemptTime(res, index) {
+  const t = (res && res.timeline) || {};
+  for (const a of t.attemptTimes || []) if (a.index === index) return a.at;
+  if (t.lastAttemptIndex === index) return t.lastAttemptAt;
+  return null;
+}
+
+/** markdown 表格：一行一条断言，方便贴 PR 评论。 */
+export function renderMarkdown(rows, { verbose = false } = {}) {
+  const flat = [];
+  for (const row of rows || []) {
+    for (const r of (row.results || [])) {
+      if (!verbose && r.status === 'SUPPORTED') continue;
+      flat.push({ row, r });
+    }
+  }
+  const esc = (s) => String(s == null ? '' : s).replace(/\|/g, '\\|').replace(/\n/g, ' ');
+  const out = ['| 状态 | 会话 | 断言族 | AI 说 | 证据 |', '|---|---|---|---|---|'];
+  if (!flat.length) out.push('| ✓ | — | — | 没有需要核对的断言 | — |');
+  for (const { row, r } of flat) {
+    const sess = esc(row.project) + ' `' + String(row.sessionId || '').slice(0, 8) + '`';
+    out.push('| ' + r.status + ' | ' + sess + ' | ' + esc(r.claim && r.claim.family) + ' | '
+      + esc(String((r.claim && r.claim.quote) || '').slice(0, 120)) + ' | ' + esc(evidenceSentence(r)) + ' |');
+  }
+  return out.join('\n') + '\n';
+}
+
+/** 退出码：发现问题才非零。UNKNOWN **不算失败** —— 读不到不等于没做。 */
+export function exitCodeFor(summary) {
+  const by = (summary && summary.byStatus) || {};
+  return (by.NO_EVIDENCE || 0) + (by.FAILED_ONLY || 0) > 0 ? 1 : 0;
+}
+
+/** 汇总统计（排版用）。它不重算判定。 */
+export function renderSummary(summary, opts = {}) {
+  const totalChecked = (summary.claims || 0) - ((summary.byStatus && summary.byStatus.UNCHECKABLE) || 0);
+  const lines = [];
+  const dist = EVIDENCE_STATUS
+    .filter((st) => summary.byStatus && summary.byStatus[st] > 0)
+    .map((st) => summary.byStatus[st] + ' ' + st)
+    .join(' / ');
+  lines.push('合计 ' + (summary.claims || 0) + ' 条可核对断言：' + (dist || '无'));
+  lines.push('覆盖 ' + (summary.sessions || 0) + ' 个 transcript，其中 ' + (summary.sessionsWithClaims || 0)
+    + ' 个含可核对断言；读盘 ' + (((summary.bytesRead || 0) / 1e9).toFixed(2)) + ' GB · 截断 '
+    + (summary.truncatedSessions || 0) + ' 个' + (opts.elapsedMs != null ? ' · ' + opts.elapsedMs + ' ms' : ''));
+  if (totalChecked > 0) {
+    lines.push('（四档比例按 ' + totalChecked + ' 条计：SUPPORTED ' + pct(summary.byStatus.SUPPORTED || 0, totalChecked) + '）');
+  }
+  return lines.join('\n');
+}
+
+/** 单条断言的完整明细（--explain 与 --samples 共用）。 */
+export function renderDetail(row, res, n = null) {
+  const lines = [];
+  lines.push((n != null ? '#' + n + ' ' : '') + row.project + ' · ' + String(row.sessionId || '').slice(0, 8) + ' · ' + res.claim.family);
+  lines.push('  原话：' + res.claim.quote);
+  lines.push('  判定：' + res.status);
+  lines.push('  理由：' + res.reason);
+  lines.push('  证据：' + evidenceSentence(res));
+  const t = res.timeline || {};
+  if (t.lastEditIndex >= 0) {
+    const clock = fmtClock(t.lastEditAt);
+    lines.push('  最后一次源码编辑：第 ' + t.lastEditIndex + ' 条' + (clock ? '（' + clock + '）' : '')
+      + (t.lastEditPath ? ' → ' + t.lastEditPath : ''));
+  }
+  // 命中的调用可能几十条，命令本身也可能带换行（heredoc）。这里只取第一行：
+  // 一屏能扫完比「完整还原命令」重要，完整命令用 --json 取。
+  const attempts = (res.evidence && res.evidence.attempts) || [];
+  for (const a of attempts) {
+    const mark = a.ok ? '成功' : a.inconclusive ? '后台/无退出码' : '失败';
+    const clock = fmtClock(attemptTime(res, a.index));
+    const cmd = String(a.cmd || '').split('\n')[0].slice(0, 140);
+    lines.push('  · [' + mark + '] 第 ' + a.index + ' 条' + (clock ? ' ' + clock : '') + '  ' + cmd);
+  }
+  if (res.evidence && res.evidence.detail && typeof res.evidence.detail === 'object') {
+    const d = Object.entries(res.evidence.detail)
+      .filter(([, v]) => typeof v === 'number' || typeof v === 'boolean')
+      .map(([k, v]) => k + '=' + v).join(' ');
+    if (d) lines.push('  计数：' + d);
+  }
+  const adv = adviceFor(res);
+  if (adv) lines.push('  建议：' + adv);
+  return lines.join('\n');
+}
+
 // ── CLI ───────────────────────────────────────────────────────────────
 
-function parseArgs(argv) {
-  const out = { days: 0, json: false, limit: 0, backtrackMB: DEFAULT_BACKTRACK_BYTES / 1024 / 1024, includeSubagents: false, samples: 0 };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === '--json') out.json = true;
+export const HELP_TEXT = [
+  'verify-claims — 「AI 说它做完了」到底有没有证据',
+  '',
+  '它读 Claude Code 的会话 transcript，从最后一条 assistant 文本里认出可核对的完成性',
+  '断言（测试通过 / 构建成功 / 已提交 / 已推送 / 文件数 / hash / CI / 探活 / 笼统的',
+  '「修好了」），再去 tool_use / tool_result 里找能支持它的调用。判四档：',
+  '',
+  '  SUPPORTED    最后一次源码编辑之后，有成功的相关调用',
+  '  STALE_ONLY   有成功的调用，但都发生在最后一次源码编辑之前（改完没重跑）',
+  '  FAILED_ONLY  只有失败的调用',
+  '  NO_EVIDENCE  整个会话范围内没有任何相关调用',
+  '  UNKNOWN      只读到会话尾部（截断），更早的部分没读到 —— 不等于「没有」',
+  '  UNCHECKABLE  该族没有确定性证据源，不参与四档比例',
+  '',
+  '用法：',
+  '  node scripts/verify-claims.mjs                    全量扫描，人类可读',
+  '  node scripts/verify-claims.mjs --session 3b39     只查一个会话（id 前缀 / 会话路径）',
+  '  node scripts/verify-claims.mjs --verbose          连 SUPPORTED 一起列，附原话与命中的调用',
+  '  node scripts/verify-claims.mjs --explain 3        解释第 3 条为什么这么判',
+  '  node scripts/verify-claims.mjs --json             机器可读',
+  '  node scripts/verify-claims.mjs --format md        输出 markdown 表格，贴 PR 评论',
+  '',
+  '参数：',
+  '  --session <id|path>     只查一个会话。会话 id 前缀（≥4 字符）或 .jsonl 路径',
+  '  --days <n>              只看最近 n 天有改动的会话（默认全部）',
+  '  --limit <n>             只看最新的 n 个会话',
+  '  --backtrack-mb <n>      回溯上限，单位 MB（默认 ' + (DEFAULT_BACKTRACK_BYTES / 1024 / 1024)
+    + '）。触到上限判 UNKNOWN，不判 NO_EVIDENCE',
+  '  --include-subagents     连子 agent transcript 一起找证据（只会把 NO_EVIDENCE 降级成 UNKNOWN）',
+  '  --verbose, -v           显示有证据的断言和命中的命令',
+  '  --explain <n>           解释第 n 条断言（按输出顺序，从 1 开始）',
+  '  --json                  JSON 输出',
+  '  --format <text|md>      输出格式（默认 text）',
+  '  --samples <n>           额外打印 n 条抽样（旧参数，保留兼容）',
+  '  --exit-zero             无论结果如何都退出 0（默认发现问题退回 1）',
+  '  --help, -h              显示这份帮助（不会扫描任何文件）',
+  '',
+  '退出码：',
+  '  0  没有 NO_EVIDENCE / FAILED_ONLY',
+  '  1  存在 NO_EVIDENCE 或 FAILED_ONLY —— 可直接接 CI 或 git hook',
+  '  2  用法错误（未知参数、--session 找不到或前缀有歧义、--explain 越界）',
+  '',
+  'JSON 结构：',
+  '  { generatedAt, projectsRoot, days, session, elapsedMs, backtrackMB,',
+  '    includeSubagents, exitCode, summary, rows }',
+  '  summary = { sessions, sessionsWithClaims, claims, byStatus, byFamily,',
+  '              sessionsByStatus, truncatedSessions, bytesRead, noEvidence, unknown }',
+  '  rows[]  = { sessionId, project, sizeMB, mtimeMs, claims, results,',
+  '              truncated, bytesRead, windowBytes, subagentCount }',
+  '  results[] = { claim, evidence, status, reason, timeline }',
+  '',
+  '零依赖，只读。不执行任何命令，不碰被检查的项目。',
+  '',
+].join('\n');
+
+export function parseArgs(argv) {
+  const out = {
+    days: 0, json: false, limit: 0, backtrackMB: DEFAULT_BACKTRACK_BYTES / 1024 / 1024,
+    includeSubagents: false, samples: 0, verbose: false, explain: 0,
+    session: null, format: 'text', exitZero: false, help: false, unknown: null, badFormat: null,
+  };
+  const list = Array.isArray(argv) ? argv : [];
+  const num = (v) => {
+    if (v === undefined || v === null || String(v).trim() === '') return NaN;
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : NaN;
+  };
+  for (let i = 0; i < list.length; i++) {
+    const a = list[i];
+    if (a === '--help' || a === '-h') out.help = true;
+    else if (a === '--json') out.json = true;
+    else if (a === '--verbose' || a === '-v') out.verbose = true;
     else if (a === '--include-subagents') out.includeSubagents = true;
-    else if (a === '--days') out.days = Number(argv[++i]) || 0;
-    else if (a === '--limit') out.limit = Number(argv[++i]) || 0;
-    else if (a === '--backtrack-mb') out.backtrackMB = Number(argv[++i]) || out.backtrackMB;
-    else if (a === '--samples') out.samples = Number(argv[++i]) || 0;
+    else if (a === '--exit-zero') out.exitZero = true;
+    else if (a === '--days') out.days = num(list[++i]);
+    else if (a === '--limit') out.limit = num(list[++i]);
+    else if (a === '--backtrack-mb') {
+      const n = num(list[++i]);
+      if (Number.isFinite(n) && n > 0) out.backtrackMB = n;
+    } else if (a === '--samples') out.samples = num(list[++i]);
+    else if (a === '--explain') out.explain = num(list[++i]);
+    else if (a === '--session') out.session = String(list[++i] ?? '').trim() || null;
+    else if (a === '--format') {
+      const f = String(list[++i] ?? '').toLowerCase();
+      if (f === 'md' || f === 'markdown') out.format = 'md';
+      else if (f === 'text' || f === 'plain') out.format = 'text';
+      else out.badFormat = f || '(空)';
+    } else {
+      out.unknown = a;
+    }
+  }
+  for (const k of ['days', 'limit', 'samples', 'explain']) {
+    if (!Number.isFinite(out[k])) out[k] = 0;
   }
   return out;
 }
 
-const pct = (n, d) => (d ? `${((n / d) * 100).toFixed(1)}%` : 'n/a');
+/** `--session` 的解析：.jsonl 路径优先，其次 id 前缀。
+ *  返回 `{ session }`，或 `{ error, candidates, ambiguous }`。 */
+export function resolveSession(projectsRoot, spec) {
+  const want = String(spec || '').trim();
+  if (!want) return { error: '没有给 --session 的值' };
+
+  if (/\.jsonl$/i.test(want)) {
+    const p = resolve(want);
+    let st;
+    try { st = statSync(p); } catch { return { error: '找不到这个 transcript：' + want }; }
+    if (!st.isFile()) return { error: '不是文件：' + want };
+    return {
+      session: {
+        path: p,
+        project: basename(dirname(p)),
+        sessionId: basename(p, '.jsonl'),
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+      },
+    };
+  }
+
+  // id 前缀：全量列举，不按 --days 过滤 —— 点名要看一个会话，就不该被时间窗吃掉。
+  const all = listSessions(projectsRoot, { days: 0 });
+  const lower = want.toLowerCase();
+  const hits = all.filter((s) => s.sessionId.toLowerCase().startsWith(lower));
+  if (!hits.length) {
+    const near = all.filter((s) => s.sessionId.toLowerCase().includes(lower)).slice(0, 5);
+    return {
+      error: near.length
+        ? '没有以「' + want + '」开头的会话；可能是这几个：'
+        : '没有匹配「' + want + '」的会话（共 ' + all.length + ' 个 transcript）',
+      candidates: near,
+    };
+  }
+  if (hits.length > 1) {
+    return {
+      error: '前缀「' + want + '」匹配到 ' + hits.length + ' 个会话，请写长一点：',
+      ambiguous: true,
+      candidates: hits.slice(0, 10),
+    };
+  }
+  return { session: hits[0] };
+}
+
+const pct = (n, d) => (d ? ((n / d) * 100).toFixed(1) + '%' : 'n/a');
+
+/** flatten：所有会话的 (row, result)，顺序就是 --explain 的编号顺序。 */
+export function flattenResults(rows) {
+  const out = [];
+  for (const row of rows || []) for (const r of (row.results || [])) out.push({ row, r });
+  return out;
+}
 
 function main(argv) {
   const opts = parseArgs(argv);
+  if (opts.help) {
+    process.stdout.write(HELP_TEXT);
+    return 0;
+  }
+  if (opts.unknown) {
+    process.stderr.write('未知参数：' + opts.unknown + '\n试试 --help\n');
+    return 2;
+  }
+  if (opts.badFormat) {
+    process.stderr.write('不认识的输出格式：' + opts.badFormat + '（可用 text / md）\n');
+    return 2;
+  }
+
   const projectsRoot = join(homedir(), '.claude', 'projects');
   const t0 = Date.now();
-  let sessions = listSessions(projectsRoot, { days: opts.days });
-  if (opts.limit > 0) sessions = sessions.slice(0, opts.limit);
+  let sessions;
+  let target = null;
+
+  if (opts.session) {
+    const found = resolveSession(projectsRoot, opts.session);
+    if (!found.session) {
+      process.stderr.write(found.error + '\n');
+      for (const c of found.candidates || []) {
+        process.stderr.write('  ' + c.sessionId + '  [' + c.project + ']  ' + (c.size / 1e6).toFixed(2) + 'MB\n');
+      }
+      return 2;
+    }
+    target = found.session;
+    sessions = [target];
+  } else {
+    sessions = listSessions(projectsRoot, { days: opts.days });
+    if (opts.limit > 0) sessions = sessions.slice(0, opts.limit);
+  }
 
   const rows = [];
   const backtrack = Math.max(1, opts.backtrackMB) * 1024 * 1024;
@@ -1088,72 +2013,95 @@ function main(argv) {
     try {
       row = scanSession(s, { backtrack, includeSubagents: opts.includeSubagents });
     } catch (e) {
-      row = { sessionId: s.sessionId, project: s.project, sizeMB: Number((s.size / 1e6).toFixed(2)), mtimeMs: s.mtimeMs, claims: [], results: [], truncated: false, bytesRead: 0, error: String(e && e.message || e) };
+      row = {
+        sessionId: s.sessionId, project: s.project, sizeMB: Number((s.size / 1e6).toFixed(2)),
+        mtimeMs: s.mtimeMs, claims: [], results: [], truncated: false, bytesRead: 0,
+        error: String((e && e.message) || e),
+      };
     }
     rows.push(row);
   }
   const elapsed = Date.now() - t0;
   const summary = summarizeClaims(rows);
+  let code = exitCodeFor(summary);
+  if (opts.exitZero) code = 0;
+
+  if (opts.explain > 0) {
+    const flat = flattenResults(rows);
+    if (opts.explain > flat.length) {
+      process.stderr.write('--explain ' + opts.explain + ' 越界：本次只有 ' + flat.length + ' 条断言\n');
+      return 2;
+    }
+    const hit = flat[opts.explain - 1];
+    process.stdout.write(renderDetail(hit.row, hit.r, opts.explain) + '\n');
+    return code;
+  }
 
   if (opts.json) {
     process.stdout.write(JSON.stringify({
       generatedAt: new Date().toISOString(),
       projectsRoot,
       days: opts.days,
+      session: target ? { sessionId: target.sessionId, project: target.project, path: target.path } : null,
       elapsedMs: elapsed,
       backtrackMB: opts.backtrackMB,
       includeSubagents: opts.includeSubagents,
+      exitCode: code,
       summary,
       rows,
     }, null, 2) + '\n');
-    return 0;
+    return code;
   }
 
-  console.log(`verify-claims · ${summary.sessions} 个主 transcript，${summary.sessionsWithClaims} 个含可核对断言（${elapsed} ms）`);
-  console.log(`回溯上限 ${opts.backtrackMB} MB · 累计读盘 ${(summary.bytesRead / 1e9).toFixed(2)} GB · 截断 ${summary.truncatedSessions} 个会话`);
-  console.log('');
-  console.log(`可核对断言 ${summary.claims - (summary.byStatus.UNCHECKABLE || 0)} 条，另有 UNCHECKABLE ${summary.byStatus.UNCHECKABLE || 0} 条（不参与四档比例）`);
-  console.log('');
-  console.log('断言级分布：');
-  const totalChecked = summary.claims - (summary.byStatus.UNCHECKABLE || 0);
-  for (const st of EVIDENCE_STATUS) {
-    const n = summary.byStatus[st] || 0;
-    if (!n) continue;
-    console.log(`  ${st.padEnd(14)} ${String(n).padStart(5)}  ${pct(n, totalChecked).padStart(7)}`);
+  if (opts.format === 'md') {
+    process.stdout.write(renderMarkdown(rows, { verbose: opts.verbose }));
+    return code;
   }
-  console.log('');
-  console.log('断言族分布：');
-  for (const [k, v] of Object.entries(summary.byFamily).sort((a, b) => b[1] - a[1])) {
-    console.log(`  ${k.padEnd(14)} ${String(v).padStart(5)}`);
-  }
-  console.log('');
-  console.log(`NO_EVIDENCE（整个文件范围内没有任何相关调用）：${summary.noEvidence.length} 个会话`);
-  for (const s of summary.noEvidence) {
-    console.log(`  [${s.project}] ${s.sessionId}  ${s.sizeMB}MB  subagents=${s.subagentCount ?? 'n/a'}`);
-    for (const c of s.claims) console.log(`      · ${c.slice(0, 140)}`);
-  }
-  if (summary.unknown.length) {
+
+  if (opts.session) {
+    const row = rows[0];
+    const flags = (row.truncated ? ' truncated' : '')
+      + (row.subagentCount != null ? ' subagents=' + row.subagentCount : '');
+    console.log('verify-claims · ' + row.project + ' · ' + row.sessionId + '  ' + row.sizeMB + 'MB' + flags + '（' + elapsed + ' ms）');
     console.log('');
-    console.log(`UNKNOWN（证据可能在被截断的部分，不能当「没有」）：${summary.unknown.length} 个会话`);
-    for (const s of summary.unknown.slice(0, 12)) {
-      console.log(`  [${s.project}] ${s.sessionId}  ${s.sizeMB}MB  truncated=${s.truncated}  subagents=${s.subagentCount ?? 'n/a'}`);
+    if (!row.results || !row.results.length) {
+      console.log('这个会话没有可核对的完成性断言 —— 最后一条 assistant 文本里没认出「测试通过 / 构建成功 / 已提交」这类话。');
+      return code;
     }
+    const block = renderSessionBlock(row, { verbose: opts.verbose });
+    console.log(block ? block.trimEnd() : '(全部 SUPPORTED，加 --verbose 可看细节)');
+    console.log('');
+    console.log(renderSummary(summary, { elapsedMs: elapsed }));
+    return code;
   }
+
+  const blocks = [];
+  for (const row of rows) {
+    const b = renderSessionBlock(row, { verbose: opts.verbose });
+    if (b) blocks.push(b.trimEnd());
+  }
+  if (blocks.length) {
+    console.log(blocks.join('\n\n'));
+    console.log('');
+  } else {
+    console.log('没有需要看的断言（全部 SUPPORTED 或没有可核对断言）。加 --verbose 可看全部。');
+    console.log('');
+  }
+  console.log(renderSummary(summary, { elapsedMs: elapsed }));
   if (opts.samples > 0) {
-    console.log('');
-    console.log(`── 抽样 ${opts.samples} 条（断言 + 判定 + 原因）──`);
-    let n = 0;
-    for (const r of rows) {
-      for (const res of r.results || []) {
-        if (n++ >= opts.samples) break;
-        console.log(`  [${r.project}/${r.sessionId.slice(0, 8)}] ${res.status}  ${res.claim.family}`);
-        console.log(`      原话：${res.claim.quote.slice(0, 120)}`);
-        console.log(`      理由：${res.reason}`);
+    const flat = flattenResults(rows);
+    const n = Math.min(opts.samples, flat.length);
+    // 没有可抽的就不印「抽样 0 条」—— 那只是噪声。
+    if (n > 0) {
+      console.log('');
+      console.log('── 抽样 ' + n + ' 条（断言 + 判定 + 原因）──');
+      for (let i = 0; i < n; i++) {
+        console.log(renderDetail(flat[i].row, flat[i].r, i + 1));
+        console.log('');
       }
-      if (n >= opts.samples) break;
     }
   }
-  return 0;
+  return code;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {

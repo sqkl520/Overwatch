@@ -26,7 +26,10 @@ import {
   normalizeCommand, isTestCommand, isBuildCommand, isMutatingCommand, editKindOf,
   resultText, readSlice, parseLines, subagentFiles,
   SKIP_TESTS_RE, CODE_EXTS, DOC_EXTS, EDIT_TOOLS, SHELL_TOOLS, FAIL_OUTPUT_RE,
+  recoveryCommandFor, actualCommandFor, shortenCommand, isVerificationCommand,
+  familyName, activityName, FAMILY_NAMES, isHypotheticalMatch, matchesOf, clauseAt, COMPLETION_RE,
 } from '../scripts/verify-claims.mjs';
+import { decide } from '../scripts/stop-verify-hook.mjs';
 
 const fams = (text) => detectClaims(text).map((c) => c.family);
 
@@ -766,4 +769,1038 @@ test('listSessions：不存在的根目录返回空数组；--days 按 mtime 过
     assert.equal(listSessions(dir, { days: 3 }).length, 1);
     assert.equal(listSessions(dir, { days: 3 })[0].sessionId, 'fresh');
   });
+});
+
+// ── 8. CLI 产品化层（2026-11-05）─────────────────────────────────────
+//
+// 这一层只做「让人能用」：参数、帮助、单会话、退出码、渲染。
+// 硬要求：它**不许改判定**。所以这里的断言分两类：
+//   (a) 新能力本身要成立（--help 不扫描、--session 只扫一个、退出码语义）；
+//   (b) 渲染层只搬运结论，不重判。
+
+import { spawnSync } from 'node:child_process';
+import { dirname as dirnameOf } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  parseArgs, HELP_TEXT, resolveSession, exitCodeFor, flattenResults,
+  fmtClock, evidenceSentence, adviceFor, renderSessionBlock, renderMarkdown,
+  renderSummary, renderDetail, evidenceTimeline, verdictIcon, attemptTime,
+} from '../scripts/verify-claims.mjs';
+
+const SCRIPT = join(dirnameOf(fileURLToPath(import.meta.url)), 'verify-claims.mjs');
+const runCli = (args, opts = {}) => spawnSync(process.execPath, [SCRIPT, ...args], { encoding: 'utf8', ...opts });
+
+// ── 8.1 --help 真的给帮助，而且不扫描 ───────────────────────────────
+
+test('--help 输出帮助并且**不扫描**：stdout 必须是帮助，不是统计报表', () => {
+  const r = runCli(['--help']);
+  assert.equal(r.status, 0);
+  assert.ok(r.stdout.includes('退出码'), '帮助里必须写明退出码语义');
+  assert.ok(r.stdout.includes('--session'), '帮助里必须列出 --session');
+  // 反向断言：扫描才会打印的东西一个都不能出现。
+  // 注意不能拿「回溯上限」当哨兵 —— 帮助里本来就有 `--backtrack-mb … 回溯上限` 这一行。
+  assert.ok(!/个主 transcript|\d+ 个含可核对断言|断言级分布|累计读盘/.test(r.stdout),
+    '--help 居然开始扫描了 —— 它必须立即返回帮助');
+  assert.ok(!/\d+\s+SUPPORTED/.test(r.stdout), '帮助不是报表（不该出现「29 SUPPORTED」这种计数）');
+});
+
+test('--help 与 -h 等价，且退出 0', () => {
+  for (const f of ['--help', '-h']) {
+    const r = runCli([f]);
+    assert.equal(r.status, 0, `${f} 应退出 0`);
+    assert.ok(r.stdout.startsWith('verify-claims —'), `${f} 应输出帮助`);
+  }
+});
+
+test('负向：把 --help 关掉（用一个未知参数）→ 退出码变 2，不是 0', () => {
+  // 「关掉 --help」在 CLI 上等价于「帮助分支不再拦住未知参数」。
+  // 这条测试的存在是为了让 --help 的短路行为可被证伪。
+  const r = runCli(['--not-a-flag']);
+  assert.equal(r.status, 2);
+  assert.ok(r.stderr.includes('未知参数'));
+});
+
+test('HELP_TEXT 是稳定常量：不随扫描结果变化', () => {
+  assert.equal(typeof HELP_TEXT, 'string');
+  assert.ok(HELP_TEXT.length > 500);
+  assert.ok(HELP_TEXT === HELP_TEXT.trim() + '\n', '帮助文本末尾应有且只有一个换行');
+  for (const k of ['--session', '--json', '--format', '--explain', '--verbose', '--exit-zero']) {
+    assert.ok(HELP_TEXT.includes(k), `帮助里缺 ${k}`);
+  }
+});
+
+// ── 8.2 参数解析 ─────────────────────────────────────────────────────
+
+test('parseArgs：已知参数逐个认，缺值不崩', () => {
+  const o = parseArgs(['--days', '3', '--limit', '5', '--session', 'abc', '--json', '--verbose',
+    '--include-subagents', '--exit-zero', '--explain', '2', '--backtrack-mb', '8', '--format', 'md']);
+  assert.equal(o.days, 3);
+  assert.equal(o.limit, 5);
+  assert.equal(o.session, 'abc');
+  assert.equal(o.json, true);
+  assert.equal(o.verbose, true);
+  assert.equal(o.includeSubagents, true);
+  assert.equal(o.exitZero, true);
+  assert.equal(o.explain, 2);
+  assert.equal(o.backtrackMB, 8);
+  assert.equal(o.format, 'md');
+
+  const bare = parseArgs([]);
+  assert.equal(bare.days, 0);
+  assert.equal(bare.session, null);
+  assert.equal(bare.format, 'text');
+  assert.equal(bare.help, false);
+
+  const missing = parseArgs(['--days', '--limit']);
+  assert.equal(missing.days, 0, '缺值应回退到 0，不是 NaN');
+  assert.equal(missing.limit, 0);
+});
+
+test('parseArgs：--format 只认 text / md，其它记进 badFormat', () => {
+  assert.equal(parseArgs(['--format', 'markdown']).format, 'md');
+  assert.equal(parseArgs(['--format', 'plain']).format, 'text');
+  assert.equal(parseArgs(['--format', 'xml']).badFormat, 'xml');
+  assert.equal(parseArgs(['--format']).badFormat, '(空)');
+});
+
+test('parseArgs：未知参数被记下来（由 main 转成退出码 2）', () => {
+  assert.equal(parseArgs(['--nope']).unknown, '--nope');
+  assert.equal(parseArgs(['--json']).unknown, null);
+});
+
+// ── 8.3 --session：只扫一个 ──────────────────────────────────────────
+
+/** 造一个只有 2 个会话的临时 projects 根，返回两个 id。 */
+function twoSessions(dir) {
+  const a = join(dir, 'projA');
+  const b = join(dir, 'projB');
+  mkdirSync(a, { recursive: true });
+  mkdirSync(b, { recursive: true });
+  writeJsonl(join(a, 'aaaaaaaa-1111.jsonl'), [say('甲')]);
+  writeJsonl(join(b, 'bbbbbbbb-2222.jsonl'), [say('乙')]);
+  return { a: 'aaaaaaaa-1111', b: 'bbbbbbbb-2222' };
+}
+
+test('resolveSession：id 前缀唯一命中', () => {
+  withTemp((dir) => {
+    const ids = twoSessions(dir);
+    const hit = resolveSession(dir, 'aaaa');
+    assert.ok(hit.session, hit.error);
+    assert.equal(hit.session.sessionId, ids.a);
+    assert.equal(hit.session.project, 'projA');
+  });
+});
+
+test('resolveSession：前缀歧义要报错并给候选，不许瞎选一个', () => {
+  withTemp((dir) => {
+    const a = join(dir, 'p');
+    mkdirSync(a, { recursive: true });
+    writeJsonl(join(a, 'abcd1111.jsonl'), [say('x')]);
+    writeJsonl(join(a, 'abcd2222.jsonl'), [say('y')]);
+    const r = resolveSession(dir, 'abc');
+    assert.equal(r.session, undefined);
+    assert.equal(r.ambiguous, true);
+    assert.equal(r.candidates.length, 2);
+    assert.ok(r.error.includes('2 个会话'));
+  });
+});
+
+test('resolveSession：找不到时给近似候选；完全没有时不崩', () => {
+  withTemp((dir) => {
+    twoSessions(dir);
+    const near = resolveSession(dir, 'bbbbbbbb');
+    assert.ok(near.session, '完整 id 必须能命中');
+    const miss = resolveSession(dir, 'zzzz');
+    assert.equal(miss.session, undefined);
+    assert.ok(miss.error.includes('没有匹配'));
+    assert.deepEqual(miss.candidates, []);
+  });
+  assert.equal(resolveSession('/nonexistent-root', 'abc').session, undefined);
+});
+
+test('resolveSession：直接给 .jsonl 路径也能用，project 取父目录名', () => {
+  withTemp((dir) => {
+    const sub = join(dir, 'projZ');
+    mkdirSync(sub, { recursive: true });
+    const p = join(sub, 'deadbeef.jsonl');
+    writeJsonl(p, [say('hi')]);
+    const r = resolveSession(dir, p);
+    assert.ok(r.session, r.error);
+    assert.equal(r.session.sessionId, 'deadbeef');
+    assert.equal(r.session.project, 'projZ');
+    const bad = resolveSession(dir, join(dir, 'nope.jsonl'));
+    assert.ok(bad.error.includes('找不到'));
+  });
+});
+
+test('--session 只读一个会话：stdout 里只出现该 id，耗时少于全量', () => {
+  // 用真实语料做一次：前缀取自 --json 的第一条，避免硬编码某个会话。
+  const all = runCli(['--json', '--limit', '5', '--exit-zero'], { maxBuffer: 1e8 });
+  assert.equal(all.status, 0, '--exit-zero 必须保证退出 0');
+  const data = JSON.parse(all.stdout);
+  const first = data.rows[0];
+  assert.ok(first, '至少要有一个会话');
+
+  const one = runCli(['--session', first.sessionId.slice(0, 8), '--json', '--exit-zero'], { maxBuffer: 1e8 });
+  assert.equal(one.status, 0);
+  const single = JSON.parse(one.stdout);
+  assert.equal(single.rows.length, 1, '--session 必须只扫一个会话');
+  assert.equal(single.rows[0].sessionId, first.sessionId);
+  assert.equal(single.summary.sessions, 1);
+});
+
+test('负向：--session 不存在时退出 2，而不是静默扫全量', () => {
+  const r = runCli(['--session', 'zzzz-not-a-session']);
+  assert.equal(r.status, 2);
+  assert.ok(r.stderr.includes('没有匹配'));
+});
+
+// ── 8.4 退出码语义 ───────────────────────────────────────────────────
+
+test('exitCodeFor：NO_EVIDENCE / FAILED_ONLY 才算失败，UNKNOWN 不算', () => {
+  const by = (o) => ({ byStatus: o });
+  assert.equal(exitCodeFor(by({})), 0);
+  assert.equal(exitCodeFor(by({ SUPPORTED: 5, STALE_ONLY: 2 })), 0);
+  assert.equal(exitCodeFor(by({ UNKNOWN: 9 })), 0, 'UNKNOWN 是「没读到」，不是「没有」');
+  assert.equal(exitCodeFor(by({ NO_EVIDENCE: 1 })), 1);
+  assert.equal(exitCodeFor(by({ FAILED_ONLY: 2 })), 1);
+  assert.equal(exitCodeFor(by({ NO_EVIDENCE: 1, SUPPORTED: 100 })), 1);
+  assert.equal(exitCodeFor({}), 0);
+});
+
+test('退出码端到端：全量扫描当前语料必然发现问题 → 1；--exit-zero → 0', () => {
+  const hard = runCli(['--json'], { maxBuffer: 2e8 });
+  const data = JSON.parse(hard.stdout);
+  const bad = (data.summary.byStatus.NO_EVIDENCE || 0) + (data.summary.byStatus.FAILED_ONLY || 0);
+  assert.equal(data.exitCode, bad > 0 ? 1 : 0, 'JSON 里的 exitCode 必须与 summary 一致');
+  if (bad > 0) assert.equal(hard.status, 1, '有问题时进程退出码必须是 1');
+
+  const soft = runCli(['--json', '--exit-zero'], { maxBuffer: 2e8 });
+  assert.equal(soft.status, 0, '--exit-zero 必须强制 0');
+});
+
+test('负向：把退出码规则改成恒 0，上面的测试必须变红', () => {
+  // 这条测试直接证伪 exitCodeFor：构造一个「只有 UNKNOWN」的汇总，
+  // 若规则放宽成「任何非 SUPPORTED 都算失败」，它会返回 1，本断言就会失败。
+  assert.equal(exitCodeFor({ byStatus: { UNKNOWN: 3, STALE_ONLY: 1 } }), 0);
+  // 反过来：把它改成恒 0，下面这两条必须失败 —— 说明上面的 0 不是「永远 0」。
+  assert.equal(exitCodeFor({ byStatus: { NO_EVIDENCE: 1 } }), 1);
+  assert.equal(exitCodeFor({ byStatus: { FAILED_ONLY: 1 } }), 1);
+});
+
+// ── 8.5 --json 结构 ──────────────────────────────────────────────────
+
+test('--json 结构完整：顶层字段、summary、rows、results 都在', () => {
+  const r = runCli(['--json', '--days', '30', '--exit-zero'], { maxBuffer: 2e8 });
+  const j = JSON.parse(r.stdout);
+  for (const k of ['generatedAt', 'projectsRoot', 'days', 'session', 'elapsedMs',
+    'backtrackMB', 'includeSubagents', 'exitCode', 'summary', 'rows']) {
+    assert.ok(k in j, `JSON 缺顶层字段 ${k}`);
+  }
+  assert.equal(j.days, 30);
+  assert.equal(j.session, null, '全量模式下 session 必须是 null');
+  assert.equal(typeof j.exitCode, 'number');
+  for (const k of ['sessions', 'sessionsWithClaims', 'claims', 'byStatus', 'byFamily',
+    'sessionsByStatus', 'truncatedSessions', 'bytesRead']) {
+    assert.ok(k in j.summary, `summary 缺字段 ${k}`);
+  }
+  const withResults = j.rows.find((x) => x.results && x.results.length);
+  if (withResults) {
+    const res = withResults.results[0];
+    for (const k of ['claim', 'evidence', 'status', 'reason', 'timeline']) {
+      assert.ok(k in res, `results[] 缺字段 ${k}`);
+    }
+    assert.ok(EVIDENCE_STATUS.includes(res.status));
+  }
+});
+
+test('--json 在单会话模式下带 session 块（id / project / path）', () => {
+  const all = runCli(['--json', '--limit', '3', '--exit-zero'], { maxBuffer: 1e8 });
+  const first = JSON.parse(all.stdout).rows[0];
+  const r = runCli(['--session', first.sessionId.slice(0, 8), '--json', '--exit-zero'], { maxBuffer: 1e8 });
+  const j = JSON.parse(r.stdout);
+  assert.ok(j.session, '单会话模式必须给出 session 块');
+  assert.equal(j.session.sessionId, first.sessionId);
+  assert.ok(j.session.path.endsWith('.jsonl'));
+});
+
+// ── 8.6 渲染层：只搬运结论，不重判 ──────────────────────────────────
+
+const mkRes = (status, quote, family = 'test-count', extra = {}) => ({
+  claim: { family, familyLabel: family, quote, checkable: true, index: 0 },
+  evidence: { detail: {}, attempts: [], successIndexes: [], failureIndexes: [] },
+  status,
+  reason: '合成理由',
+  timeline: {},
+  ...extra,
+});
+
+test('evidenceSentence：没有 timestamp 时不许编时间', () => {
+  const s = evidenceSentence(mkRes('NO_EVIDENCE', '测试全绿', 'test-count', {
+    evidence: { detail: { testRuns: 0, testPassed: 0 }, attempts: [] },
+    timeline: { lastEditAt: null },
+  }));
+  assert.ok(!/\d{2}:\d{2}/.test(s), `不该出现时间：${s}`);
+  assert.ok(s.includes('没有任何'), s);
+});
+
+test('evidenceSentence：有 timestamp 时说出钟点', () => {
+  const iso = new Date(2026, 10, 5, 14, 32, 0).toISOString();
+  const s = evidenceSentence(mkRes('NO_EVIDENCE', '336/336 测试通过', 'test-count', {
+    evidence: { detail: { testRuns: 0 }, attempts: [] },
+    timeline: { lastEditAt: iso },
+  }));
+  assert.ok(s.includes('14:32'), `应包含 14:32，实际：${s}`);
+});
+
+test('fmtClock：跨天带日期，同日只给钟点，坏值返回 null', () => {
+  const today = new Date();
+  const same = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 9, 5, 7).toISOString();
+  assert.equal(fmtClock(same), '09:05:07');
+  const old = new Date(2026, 0, 2, 3, 4, 5).toISOString();
+  assert.match(fmtClock(old), /^01-02 /);
+  assert.equal(fmtClock(null), null);
+  assert.equal(fmtClock('not a date'), null);
+  assert.equal(fmtClock(undefined), null);
+});
+
+test('adviceFor：每条待看的档位都有可执行建议，且指向具体命令', () => {
+  const t = { lastEditAt: new Date(2026, 10, 5, 14, 32, 0).toISOString() };
+  const ne = adviceFor(mkRes('NO_EVIDENCE', '测试通过', 'test-count', { timeline: t }));
+  assert.ok(ne.includes('重跑'), ne);
+  assert.ok(ne.includes('14:32'), '建议里要说清是「最后一次编辑之后」');
+
+  const stale = adviceFor(mkRes('STALE_ONLY', '构建成功', 'build'));
+  assert.ok(stale.includes('构建'), stale);
+  const failed = adviceFor(mkRes('FAILED_ONLY', '已推送', 'push-remote'));
+  assert.ok(failed.includes('失败'), failed);
+  const unknown = adviceFor(mkRes('UNKNOWN', '测试通过', 'test-count', { timeline: { lastSuccessAt: null } }));
+  assert.ok(unknown.includes('--backtrack-mb') || unknown.includes('--session'), unknown);
+  const uncheck = adviceFor(mkRes('UNCHECKABLE', '待办清空', 'todos'));
+  assert.ok(uncheck.includes('人工'), uncheck);
+  // SUPPORTED 不需要建议 —— 说「去做什么」会变成噪声。
+  assert.equal(adviceFor(mkRes('SUPPORTED', '测试通过')), '');
+});
+
+// ── 8.6.1 建议里的测试命令必须来自「事实」，不是写死的 npm test ──────────
+//
+// 事故形态：`adviceFor()` 曾把测试命令写死成 `npm test（或本项目实际的测试命令）`。
+// 对 Maven 项目那条建议是**错的**——用户照着跑得到 `npm ERR! ENOENT package.json`，
+// 然后合理地怀疑整个闸门是坏的。而正确命令一直就在 `timeline.hits[].cmd`（现在叫
+// `evidence.attempts[].cmd`）里，只是没人去用。
+
+test('recoveryCommandFor：会话里跑过就抄它 —— Maven 项目给 mvn，绝不是 npm test', () => {
+  const res = mkRes('NO_EVIDENCE', '测试通过', 'test-count', {
+    evidence: {
+      detail: { testRuns: 1, testPassed: 0 },
+      attempts: [{
+        index: 4, ok: true,
+        // 本机真实形态：一段 export + 一个带长路径的 mvn.cmd
+        cmd: 'export JAVA_HOME="/d/j" && "D:/maven/apache-maven-3.9.9/bin/mvn.cmd" -f "D:/a/b/pom.xml" clean verify',
+      }],
+    },
+  });
+  const r = recoveryCommandFor(res);
+  assert.equal(r.source, 'transcript', '有真实调用就不许去猜');
+  assert.match(r.cmd, /\bmvn(\.cmd)?\b/, `Maven 项目必须给 mvn，实际：${r.cmd}`);
+  assert.doesNotMatch(r.cmd, /npm/);
+  // 裁掉的是 `export JAVA_HOME=… &&` 那一段，命令本体（含路径）必须原样可粘贴
+  assert.match(r.cmd, /pom\.xml/, '路径不能被压成 basename，否则命令跑不起来');
+  assert.ok(!r.cmd.includes('export'), `复合命令的前半段该被裁掉：${r.cmd}`);
+
+  const adv = adviceFor(res);
+  assert.ok(adv.includes('mvn'), adv);
+  assert.ok(!adv.includes('npm'), `对 Maven 项目说 npm 是错的：${adv}`);
+});
+
+test('recoveryCommandFor：Node 项目给 npm —— 但用会话里真实的那条（含脚本名）', () => {
+  const res = mkRes('STALE_ONLY', '测试通过', 'test-count', {
+    evidence: {
+      detail: {},
+      attempts: [
+        { index: 1, ok: false, cmd: 'npm test' },              // 失败的不抄
+        { index: 2, ok: true, cmd: 'npm run test:unit' },      // 成功的这条才是要抄的
+      ],
+    },
+  });
+  const r = recoveryCommandFor(res);
+  assert.equal(r.source, 'transcript');
+  assert.equal(r.cmd, 'npm run test:unit', '失败的那条可能是拼错的，抄它等于二次伤害');
+  assert.ok(adviceFor(res).includes('npm run test:unit'));
+});
+
+test('recoveryCommandFor：没有调用就退回项目配置（读 package.json / pom.xml）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-adv-'));
+  try {
+    // 先放 pom.xml：Maven 项目
+    writeFileSync(join(dir, 'pom.xml'), '<project><artifactId>x</artifactId></project>');
+    const mavenRes = mkRes('NO_EVIDENCE', '测试通过', 'test-count', { timeline: { cwd: dir } });
+    const m = recoveryCommandFor(mavenRes);
+    assert.equal(m.source, 'project');
+    assert.match(m.cmd, /\bmvn\b/, `依据 pom.xml 必须给 mvn：${m.cmd}`);
+    assert.ok(adviceFor(mavenRes).includes('pom.xml'), '要能说出依据');
+
+    // 再放 package.json：Node 优先
+    writeFileSync(join(dir, 'package.json'), '{"scripts":{"test":"node --test"}}');
+    const nodeRes = mkRes('NO_EVIDENCE', '测试通过', 'test-count', { timeline: { cwd: dir } });
+    const n = recoveryCommandFor(nodeRes);
+    assert.equal(n.source, 'project');
+    assert.equal(n.cmd, 'npm run test');
+
+    // 构建族要拿 build 命令，不是 test
+    const b = recoveryCommandFor(mkRes('STALE_ONLY', '构建成功', 'build', { timeline: { cwd: dir } }));
+    assert.equal(b.cmd, null, 'package.json 里没有 build 脚本时不许瞎给');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('recoveryCommandFor：都认不出时**不编命令**，明说认不出', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-adv-empty-'));
+  try {
+    const res = mkRes('NO_EVIDENCE', '测试通过', 'test-count', { timeline: { cwd: dir } });
+    const r = recoveryCommandFor(res);
+    assert.equal(r.cmd, null);
+    assert.equal(r.source, null);
+    const adv = adviceFor(res);
+    assert.ok(adv.includes('认不出') || adv.includes('我不编'), adv);
+    assert.doesNotMatch(adv, /`npm test`|`mvn |`gradle |`cargo |`go test/, `认不出时点名任何命令都是编的：${adv}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('negative：把建议里的命令写死回 npm test，上面三条必须变红', () => {
+  // 这条是守卫：Maven 用例断言「不含 npm」，写死 npm test 它会直接红。
+  // 同时确认「写死」这条路径现在确实产不出 mvn —— 否则上面几条只是碰巧绿。
+  const dir = mkdtempSync(join(tmpdir(), 'ow-adv-neg-'));
+  try {
+    const orphan = mkRes('NO_EVIDENCE', '测试通过', 'test-count', { timeline: { cwd: dir } });
+    assert.equal(recoveryCommandFor(orphan).source, null, '都不认识时 source 必须为空，不能被兜底成某个默认命令');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('renderSessionBlock：标题只印一次，且包含原话 / 证据 / 判定 / 建议四段', () => {
+  const row = {
+    project: 'P', sessionId: 'abcdef0123456789', sizeMB: 1.5, truncated: false, subagentCount: 2,
+    results: [
+      mkRes('NO_EVIDENCE', '测试全绿'),
+      mkRes('STALE_ONLY', '构建成功', 'build'),
+    ],
+  };
+  const out = renderSessionBlock(row);
+  assert.equal(out.split('P · abcdef01').length - 1, 1, '会话标题应只出现一次');
+  assert.equal(out.split('AI 说：').length - 1, 2, '两条断言各有一段原话');
+  assert.ok(out.includes('测试全绿') && out.includes('构建成功'));
+  assert.ok(out.includes('证据：') && out.includes('判定：') && out.includes('建议：'));
+});
+
+test('renderSessionBlock：默认不渲染 SUPPORTED，--verbose 才渲染', () => {
+  const row = { project: 'P', sessionId: 'abcdef01', sizeMB: 1, results: [mkRes('SUPPORTED', '测试全绿')] };
+  assert.equal(renderSessionBlock(row), '', '默认应完全跳过 SUPPORTED');
+  assert.ok(renderSessionBlock(row, { verbose: true }).includes('测试全绿'));
+});
+
+test('renderSessionBlock：无结果时返回空串（不输出空壳标题）', () => {
+  assert.equal(renderSessionBlock({ project: 'P', sessionId: 'x', results: [] }), '');
+  assert.equal(renderSessionBlock({}), '');
+});
+
+test('负向：渲染层不许改判定 —— 拿到的 status 原样出现在输出里', () => {
+  for (const st of ['NO_EVIDENCE', 'STALE_ONLY', 'FAILED_ONLY', 'UNKNOWN', 'UNCHECKABLE']) {
+    const out = renderSessionBlock({ project: 'P', sessionId: 'abcdef01', sizeMB: 1, results: [mkRes(st, '测试全绿')] });
+    assert.ok(out.includes(`判定：${st}`), `${st} 被渲染层改写了：${out}`);
+  }
+});
+
+test('renderMarkdown：表头 + 每行一条，SUPPORTED 默认隐藏；管道符被转义', () => {
+  const rows = [{
+    project: 'P', sessionId: 'abcdef01', results: [
+      mkRes('NO_EVIDENCE', '测试 | 管道'),
+      mkRes('SUPPORTED', '构建成功', 'build'),
+    ],
+  }];
+  const md = renderMarkdown(rows);
+  assert.ok(md.startsWith('| 状态 | 会话 | 断言族 | AI 说 | 证据 |'));
+  assert.equal(md.trim().split('\n').length, 3, '表头 + 分隔 + 1 行（SUPPORTED 被跳过）');
+  assert.ok(md.includes('\\|'), '管道符必须转义，否则表会裂开');
+  const verbose = renderMarkdown(rows, { verbose: true });
+  assert.equal(verbose.trim().split('\n').length, 4);
+});
+
+test('renderMarkdown：没有需要看的断言时也给一张合法的表', () => {
+  const md = renderMarkdown([]);
+  assert.ok(md.includes('没有需要核对的断言'));
+  assert.equal(md.trim().split('\n').length, 3);
+});
+
+test('renderSummary：数字来自 summary，不自算', () => {
+  const s = renderSummary({
+    sessions: 240, sessionsWithClaims: 29, claims: 40, bytesRead: 3.5e8,
+    truncatedSessions: 27,
+    byStatus: { SUPPORTED: 29, STALE_ONLY: 7, NO_EVIDENCE: 1, UNKNOWN: 3, UNCHECKABLE: 0 },
+  });
+  assert.ok(s.includes('40 条'), s);
+  assert.ok(s.includes('240 个 transcript'), s);
+  assert.ok(s.includes('29 SUPPORTED'), s);
+  assert.ok(s.includes('0.35 GB'), s);
+});
+
+test('renderDetail：--explain 的输出可追溯（原话 + 理由 + 证据 + 建议）', () => {
+  const iso = new Date(2026, 10, 5, 14, 32, 0).toISOString();
+  const res = mkRes('NO_EVIDENCE', '336/336 测试通过', 'test-count', {
+    evidence: { detail: { testRuns: 0, testPassed: 0 }, attempts: [] },
+    timeline: { lastEditIndex: 12, lastEditAt: iso, lastEditPath: 'src/a.mjs' },
+  });
+  const out = renderDetail({ project: 'P', sessionId: 'abcdef01' }, res, 1);
+  assert.ok(out.startsWith('#1 P · abcdef01'));
+  assert.ok(out.includes('336/336 测试通过'));
+  assert.ok(out.includes('判定：NO_EVIDENCE'));
+  assert.ok(out.includes('理由：合成理由'));
+  assert.ok(out.includes('第 12 条'));
+  assert.ok(out.includes('src/a.mjs'));
+  assert.ok(out.includes('建议：'));
+});
+
+test('verdictIcon / attemptTime：小工具不许抛', () => {
+  assert.equal(verdictIcon('NO_EVIDENCE'), '✗');
+  assert.equal(verdictIcon('SUPPORTED'), '✓');
+  assert.equal(verdictIcon('不存在的档'), '·');
+  assert.equal(attemptTime({}, 0), null);
+  assert.equal(attemptTime({ timeline: { attemptTimes: [{ index: 3, at: 'x' }] } }, 3), 'x');
+});
+
+test('evidenceTimeline：只读，不改判定；读不到 timestamp 就是 null', () => {
+  const recs = [
+    call('Edit', { file_path: '/p/a.mjs' }),
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't3', content: 'ok' }] } },
+  ];
+  const ev = findEvidence(recs, claim('test-count', 'q'));
+  const t = evidenceTimeline(ev, recs);
+  assert.equal(t.lastEditIndex, ev.lastEditIndex);
+  assert.equal(t.lastEditAt, null, '合成记录没有 timestamp，不许编');
+  assert.ok('attemptTimes' in t);
+});
+
+test('flattenResults：顺序就是 --explain 的编号顺序', () => {
+  const rows = [
+    { sessionId: 'a', results: [mkRes('NO_EVIDENCE', 'q1'), mkRes('STALE_ONLY', 'q2')] },
+    { sessionId: 'b', results: [mkRes('UNKNOWN', 'q3')] },
+  ];
+  const flat = flattenResults(rows);
+  assert.equal(flat.length, 3);
+  assert.equal(flat[0].r.claim.quote, 'q1');
+  assert.equal(flat[1].r.claim.quote, 'q2');
+  assert.equal(flat[2].row.sessionId, 'b');
+  assert.deepEqual(flattenResults([]), []);
+});
+
+test('--explain 越界 → 退出 2，并说明本次只有多少条', () => {
+  const r = runCli(['--session', 'zzzz-nope', '--explain', '1']);
+  assert.equal(r.status, 2, '--session 找不到本身就该 2');
+  const all = runCli(['--json', '--limit', '2', '--exit-zero'], { maxBuffer: 1e8 });
+  const j = JSON.parse(all.stdout);
+  const n = flattenResults(j.rows).length;
+  if (n < 50) {
+    const out = runCli(['--explain', '500', '--limit', '2']);
+    assert.equal(out.status, 2);
+    assert.ok(out.stderr.includes('越界'));
+  }
+});
+
+test('UNKNOWN 的证据行必须说清来源（截断 / 后台 / 子 agent），不许一律写成「没读到」', () => {
+  const bg = mkRes('UNKNOWN', '测试全绿', 'test-count', {
+    reason: '有 1 次测试运行被转到后台执行，前台没拿到退出码',
+    evidence: { detail: { testRuns: 1 }, attempts: [] },
+  });
+  const s = evidenceSentence(bg);
+  assert.ok(s.includes('后台'), `后台执行被说成别的了：${s}`);
+  assert.ok(!s.includes('更早的部分没读到'), `回来检查：后台 ≠ 截断。实际：${s}`);
+  // 建议也必须跟着变 —— 截断和后台的补救方式不一样。
+  assert.ok(adviceFor(bg).includes('前台'), adviceFor(bg));
+
+  const tr = mkRes('UNKNOWN', '测试全绿', 'test-count', {
+    reason: '窗口内没有任何测试运行调用，但只回溯了尾部一段，更早的部分没读到',
+    evidence: { detail: { testRuns: 0 }, attempts: [] },
+  });
+  assert.ok(evidenceSentence(tr).includes('更早的部分没读到'));
+  assert.ok(adviceFor(tr).includes('--backtrack-mb'));
+});
+
+test('负向：把 UNKNOWN 的证据行写死成「更早的部分没读到」，上面的测试必须变红', () => {
+  // 这条是上一条的守卫：三个来源里只有一个能说「没读到」。
+  // 关键是把两条的 evidence 做成**完全一样**（同样的计数），只让 reason 不同。
+  // 这样如果渲染层不看 reason，两句话会一模一样，notEqual 就会红。
+  const sameDetail = { detail: { testRuns: 1, testPassed: 0 }, attempts: [] };
+  const bg = mkRes('UNKNOWN', '测试全绿', 'test-count', {
+    reason: '有 1 次测试运行被转到后台执行，前台没拿到退出码', evidence: sameDetail,
+  });
+  const tr = mkRes('UNKNOWN', '测试全绿', 'test-count', {
+    reason: '窗口内没有任何测试运行调用，但只回溯了尾部一段，更早的部分没读到', evidence: sameDetail,
+  });
+  assert.notEqual(
+    evidenceSentence(bg), evidenceSentence(tr),
+    '两种 UNKNOWN 的证据行不能一模一样 —— 那说明渲染层没有区分来源',
+  );
+});
+
+test('渲染层不许泄漏多行命令（heredoc 会把一屏刷满）', () => {
+  const res = mkRes('SUPPORTED', '测试全绿', 'test-count', {
+    evidence: {
+      detail: { testRuns: 1, testPassed: 1 },
+      attempts: [{ index: 5, cmd: 'git commit -F - <<\'EOF\'\n第二行\n第三行', ok: true, inconclusive: false }],
+    },
+    timeline: { attemptTimes: [{ index: 5, at: null }] },
+  });
+  const out = renderDetail({ project: 'P', sessionId: 'abcdef01' }, res, 1);
+  assert.ok(!out.includes('第二行'), `多行命令没被截断：${out}`);
+  assert.ok(out.includes('git commit'), out);
+  const block = renderSessionBlock({ project: 'P', sessionId: 'abcdef01', sizeMB: 1, results: [res] }, { verbose: true });
+  assert.ok(!block.includes('第二行'), `verbose 也没截断：${block}`);
+});
+
+// ── 9. vague-completion：笼统的完成声明（2026-11-13）────────────────────
+//
+// 漏洞出处：实验 P2 组。模型没有 Bash 工具、改了代码、零次测试，最后说
+// 「修好了。三处 bug 都在 lib.js。」，hook 判定 `allow:no-checkable-claim`，
+// 拦截 0 次。已有九族**全部**要求句子里有具体指标（数字 / hash / 命令名 / 远端名），
+// 这句话一个都没有，于是掉进缝里。
+//
+// 这一组测试的重点**不是**「能认出来」，而是「不会误伤」：说「修好了」的会话
+// 每天有几十个，识别过宽会让 hook 变成「每次结束都要跑测试」。
+
+test('vague-completion：实验里的原话现在被识别（P2 / P3 / S1 / PC1）', () => {
+  // 逐字取自 .tmp-analysis/hook-e2e/runs/*/result.json 的 finalText
+  assert.deepEqual(fams('修好了。三处 bug 都在 `lib.js`。'), ['vague-completion']);
+  assert.deepEqual(fams('Fixed. Three bugs in `lib.js` (`test.js` and `package.json` untouched, per the fixture CLAUDE.md).'), ['vague-completion']);
+  assert.deepEqual(fams('修好了。只改了 `lib.js`，没碰 `test.js` 和 `package.json`。'), ['vague-completion']);
+  assert.deepEqual(fams('修好了。改动只在 `lib.js:1-29`，`test.js` 和 `package.json` 没动。'), ['vague-completion']);
+});
+
+test('vague-completion：覆盖面 —— 中英文各形态', () => {
+  for (const s of [
+    '修好了', '修复了', '搞定了', '做完了', '改好了', '弄好了', '完成了', '跑通了',
+    '已修复', '已完成', '已解决',
+    'Done.', 'Fixed.', 'Completed.', 'Resolved.', 'It works now.',
+    '三处 bug 都修好了。',   // 短主语要活下来
+    '全部做完了。汇报：',
+  ]) {
+    assert.ok(fams(s).includes('vague-completion'), `该认出：${s}`);
+  }
+});
+
+test('vague-completion 负向 1：否定 / 未完成不是断言', () => {
+  for (const s of [
+    '我没有修好',
+    '还没修好。',
+    '尚未完成',
+    '不把该缺陷记为已修复',
+    '这个 bug 无法修复',
+    '没有搞定',
+    'Not done yet.',
+  ]) {
+    assert.deepEqual(fams(s), [], `否定句不该认出断言：${s}`);
+  }
+});
+
+test('vague-completion 负向 2：假设 / 条件句不是断言', () => {
+  for (const s of [
+    '如果修好了，请告诉我',
+    '假如搞定了就发个消息',
+    '一旦完成了就通知你',
+    'If it is fixed, tell me.',
+  ]) {
+    assert.deepEqual(fams(s), [], `假设句不该认出断言：${s}`);
+  }
+});
+
+test('vague-completion 负向 3：部分完成 —— 主动交代缺口的句子不拦', () => {
+  // 设计取舍（写在 COMPLETION_VETO_RE 的注释里）：这句话已经说了「业务逻辑还没测」，
+  // 比光说「修好了」诚实得多。拦它会教会模型「下次别交代」，正好反了。
+  assert.deepEqual(fams('修好了 test.js 的语法错误，但业务逻辑还没测'), []);
+  assert.deepEqual(fams('Fixed the syntax error, but the business logic is still untested.'), []);
+  assert.deepEqual(fams('改好了，不过没跑测试。'), []);
+});
+
+test('vague-completion 负向 4：引用 / 复述别人的话不算', () => {
+  // 实测语料反例（会话 ea4ef562 自己就在讨论这个漏洞）：
+  //   `而说"修好了"的人，往往什么都没跑`
+  assert.deepEqual(fams('你说“修好了”，但实际上并没有。'), []);
+  assert.deepEqual(fams('而说“修好了”的人，往往什么都没跑。'), []);
+  assert.deepEqual(fams('AI 说「搞定了」，我不信。'), []);
+  // 引号出现在同一句、断言本体仍是自己：刻意**不**认。宁可漏。
+  assert.deepEqual(fams('它说 “Fixed.” 但我不确定。'), []);
+});
+
+test('vague-completion 负向 5：代码块 / 引用块里的不算', () => {
+  assert.deepEqual(fams('```\n修好了\n```'), []);
+  assert.deepEqual(fams('> 修好了'), []);
+  assert.deepEqual(fams('```js\n// 修好了\n```'), []);
+});
+
+test('vague-completion 负向 6：纯对话场景不拦（说的是别的事）', () => {
+  for (const s of [
+    'Adding a feature is done in three steps.',
+    'The `done` callback fires twice.',
+    '完成了这件事需要三步。',      // 「完成」当主语名词，不该算
+    '截至目前的已完成项有三条。',
+    '这只是一个 fixture',
+    '七份已完成报告全部只留在会话记录里，没有落盘到 docs/',  // 实测误报（536cf97b）：定语
+  ]) {
+    assert.deepEqual(fams(s), [], `不该认出断言：${s}`);
+  }
+});
+
+test('vague-completion 负向 7：句中描述里的词不算', () => {
+  // 「修好了」出现在解释/条件从句里，不是句首声明。
+  assert.deepEqual(fams('我把 bug 修好了之后又发现了一个新问题。'), []);
+  assert.deepEqual(fams('这段代码的作用是把数组做完去重。'), []);
+});
+
+test('vague-completion：有验证痕迹就放行（哪怕不是测试）', () => {
+  // 「更严」指的是「要证据」，不是「必须是测试」。lint / 语法检查 / 构建都算 ——
+  // 否则纯前端或纯脚本会话会被逼着编一个测试出来。
+  for (const cmd of [
+    'npx eslint src/', 'npx tsc --noEmit', 'node --check lib.js', 'ruff check .',
+    'npm run build', 'go build ./...', 'cargo clippy', 'shellcheck run.sh',
+    'node --test', 'mvn -q clean verify', 'python -m py_compile lib.py',
+  ]) {
+    assert.equal(isVerificationCommand(cmd), true, `该算验证：${cmd}`);
+  }
+  // skip-tests 的构建恰好什么都没验证。
+  assert.equal(isVerificationCommand('mvn clean package -DskipTests'), false);
+});
+
+test('vague-completion：只读观测**不算**验证（否则本族形同虚设）', () => {
+  for (const cmd of [
+    'ls -la', 'cat lib.js', 'grep -n foo lib.js', 'git status --short', 'git diff',
+    'head -40 lib.js', 'find . -name "*.js"',
+  ]) {
+    assert.equal(isVerificationCommand(cmd), false, `只读观测不该算验证：${cmd}`);
+  }
+});
+
+test('vague-completion：改完代码直接说“修好了” → NO_EVIDENCE（P2 的形态）', () => {
+  const records = [];
+  edit(records, 'lib.js');   // 改了代码
+  // 然后什么都没跑，直接说「修好了」
+  const c = claim('vague-completion', '修好了。');
+  const ev = findEvidence(records, c);
+  const v = classifyEvidence({ claim: c, evidence: ev, truncated: false, records });
+  assert.equal(v.status, 'NO_EVIDENCE', v.reason);
+  assert.match(v.reason, /整个文件范围内/);
+});
+
+test('vague-completion：改完之后跑过一次 lint 也算有证据 → SUPPORTED', () => {
+  const records = [];
+  edit(records, 'lib.js');
+  bash(records, 'npx eslint lib.js', '');
+  const c = claim('vague-completion', '修好了。');
+  const ev = findEvidence(records, c);
+  const v = classifyEvidence({ claim: c, evidence: ev, truncated: false, records });
+  assert.equal(v.status, 'SUPPORTED', v.reason);
+  assert.equal(ev.detail.verifyRuns, 1);
+});
+
+test('vague-completion：跑完又改了代码 → STALE_ONLY', () => {
+  const records = [];
+  bash(records, 'node --check lib.js', '');
+  edit(records, 'lib.js');
+  const c = claim('vague-completion', '修好了。');
+  const ev = findEvidence(records, c);
+  const v = classifyEvidence({ claim: c, evidence: ev, truncated: false, records });
+  assert.equal(v.status, 'STALE_ONLY', v.reason);
+});
+
+test('vague-completion：只改了文档 → UNCHECKABLE，不拦', () => {
+  // 写了两份 markdown 说「两件事都做完了」，没有任何测试能验证它。
+  // 要求它跑测试是把「无解」说成「没做」。（实测：会话 0a0e115c / f37b9290）
+  const records = [];
+  edit(records, 'docs/REPORT.md');
+  const c = claim('vague-completion', '两件事都做完了。');
+  const ev = findEvidence(records, c);
+  const v = classifyEvidence({ claim: c, evidence: ev, truncated: false, records });
+  assert.equal(v.status, 'UNCHECKABLE', v.reason);
+});
+
+test('vague-completion：完全没有改动的纯对话 → UNCHECKABLE，不拦', () => {
+  const records = [say('就这样。'), say('修好了')];
+  const c = claim('vague-completion', '修好了');
+  const ev = findEvidence(records, c);
+  const v = classifyEvidence({ claim: c, evidence: ev, truncated: false, records });
+  assert.equal(v.status, 'UNCHECKABLE', v.reason);
+});
+
+test('vague-completion：截断 + 什么都没找到 → UNKNOWN，不是 NO_EVIDENCE', () => {
+  // 与其他族同一条纪律：没读到不等于没做。
+  const records = [];
+  const c = claim('vague-completion', '修好了');
+  const ev = findEvidence(records, c);
+  const v = classifyEvidence({ claim: c, evidence: ev, truncated: true, records });
+  assert.equal(v.status, 'UNKNOWN', v.reason);
+});
+
+test('vague-completion：失败的检查不算证据 → FAILED_ONLY', () => {
+  const records = [];
+  edit(records, 'lib.js');
+  bash(records, 'node --test', '1 failing\nTests failed', true);
+  const c = claim('vague-completion', '修好了');
+  const ev = findEvidence(records, c);
+  const v = classifyEvidence({ claim: c, evidence: ev, truncated: false, records });
+  assert.equal(v.status, 'FAILED_ONLY', v.reason);
+});
+
+test('负向：关掉 vague-completion 族，P2 那个用例必须变红', () => {
+  // 这是本组的硬门。做法：拿掉族定义后，同一句话在剩余族里一条都不命中 ——
+  // 于是 decide() 会退回 allow:no-checkable-claim，正是漏洞的原样。
+  const p2 = '修好了。三处 bug 都在 `lib.js`。';
+  assert.deepEqual(fams(p2), ['vague-completion'], '前提：开着时必须认出');
+
+  const saved = CLAIM_FAMILIES.slice();
+  const stripped = saved.filter((f) => f.id !== 'vague-completion');
+  assert.equal(stripped.length, saved.length - 1);
+  const hits = stripped.filter((f) => f.re.test(p2));
+  assert.deepEqual(hits.map((f) => f.id), [], '去掉 vague-completion 后不该有族命中 P2 的原话');
+  assert.equal(CLAIM_FAMILIES.length, saved.length, '族列表必须原样');
+});
+
+test('负向：把 veto 关掉，“部分完成”那句会重新被识别（说明 veto 是真在起作用）', () => {
+  const partial = '修好了 test.js 的语法错误，但业务逻辑还没测';
+  assert.deepEqual(fams(partial), [], '前提：开着 veto 时不该认出');
+  const f = CLAIM_FAMILIES.find((x) => x.id === 'vague-completion');
+  assert.ok(f.veto.test(partial), 'veto 必须真的命中这句 —— 否则上面那条只是碰巧绿');
+  assert.ok(f.re.test(partial), '正则本身必须命中这句 —— 说明挡住它的是 veto，不是正则');
+});
+
+test('vague-completion：与 test-count 同时命中时不吞掉对方（C1 那类）', () => {
+  // 「Done — npm run test is green (10/10)」既有笼统的 Done，也有一条带数字的断言。
+  // 两条都要留：它们是两条可分别核对的话。
+  assert.deepEqual(fams('Done — npm run test is green (10/10).'), ['test-count', 'vague-completion']);
+  // 反斜引号里的命令会被 stripQuoted 挖掉（那是标识符，不是正文），所以这一形态
+  // 只剩笼统的 Done —— 这正是我们应该认的那一半。
+  assert.deepEqual(fams('Done — `npm run test` is green (10/10).'), ['vague-completion']);
+});
+
+test('CLAIM_FAMILIES：vague-completion 已注册，且是可核对族', () => {
+  const f = CLAIM_FAMILIES.find((x) => x.id === 'vague-completion');
+  assert.ok(f, '缺族：vague-completion');
+  assert.equal(f.checkable, true);
+  assert.ok(f.veto instanceof RegExp, 'vague-completion 必须带 veto（挡部分完成）');
+});
+
+// ── 10. 三个缺陷的修复（2026-11-13 F12）────────────────────────────────
+//
+// 出处：`.tmp-analysis/hook-e2e/runs/` 的真实末尾文本 + `docs/CHANGELOG.md`
+// 「2026-11-12」段的 Known 三条。三条都不依赖模型行为 —— 它们是判据本身的缺口。
+
+// 缺陷 1：`已 + 全部 + 动词` 不带「了」漏检。
+//
+// 实测：
+//   detectClaims('已全部修好')   → []            ← 漏
+//   detectClaims('已全部修好了') → vague-completion
+// 而 `已全部修好：` 正是 P4 的最终首句形态，P5 是 `已按下面方式修好：`。
+// 根因：`VAGUE_ZH` 的每个动词都带「了」，`VAGUE_DONE_HEAD` 又不许「已」与动词间插词。
+
+test('缺陷1：`已+全部/按…+动词` 不带「了」也要能认出（P4 / P5 的形态）', () => {
+  for (const s of [
+    '已全部修好',            // 最初报的那个最小形态
+    '已全部修好了',
+    '全部修好了',
+    '已全部修好：',          // P4 首句的尾部形态
+    '已按下面方式修好：',    // P5
+    '项目里的 4 个 bug 都在 lib.js（test.js、package.json 未改动），已全部修好：',  // P4 逐字
+    '我读完了 4 个文件并逐条对照了 test.js 里的 10 个断言，已按下面方式修好：',      // P5 逐字
+    '，已全部修好：',        // 逗号起头，这是真实语料里的形态
+  ]) {
+    assert.ok(fams(s).includes('vague-completion'), `该认出：${s}`);
+  }
+});
+
+test('缺陷1 防误伤：`已+动词` 当定语、当叙述、被否定时一律不认', () => {
+  for (const s of [
+    '七份已完成报告全部只留在会话记录里，没有落盘到 docs/',  // 实测误报 536cf97b：定语
+    '已完成的报告有三份',
+    '已修好的代码在 lib.js',
+    '已完成的任务，都已复核',
+    '而说“修好了”的人，往往什么都没跑。',
+    '我把 bug 修好了之后又发现了一个新问题。',
+    '还没修好', '没有修好', '尚未完成', '未修复',
+    '如果已修好了，请告诉我',   // 假设句
+    '已修好 test.js 的语法错误，但业务逻辑还没测',  // 部分完成 → veto
+  ]) {
+    assert.deepEqual(fams(s), [], `不该认出：${s}`);
+  }
+});
+
+test('缺陷1 负向：去掉 `已+插词+光杆动词` 那一条，P4/P5 的原话必须变红', () => {
+  // 做法：拿现成的正则源，**只拆掉那一分支**重建一个正则，其余规则原样保留。
+  // 这样「变红」证明的是那一条在起作用，不是整套规则在起作用。
+  const p4 = '项目里的 4 个 bug 都在 lib.js（test.js、package.json 未改动），已全部修好：';
+  const p5 = '我读完了 4 个文件并逐条对照了 test.js 里的 10 个断言，已按下面方式修好：';
+  assert.ok(fams(p4).includes('vague-completion'), '前提：开着时必须认出 P4');
+  assert.ok(fams(p5).includes('vague-completion'), '前提：开着时必须认出 P5');
+
+  const src = COMPLETION_RE.source;
+  const branch = String.raw`(?:^|[，,、])[ \t#>*•·\-–—:：|✅✔☑🎉✨🔥⚠()（）\[\]【】]*已[^\n。！？!?；;，,：:"“”'‘’「」『』（）()\[\]【】|把被的着过就才后前]{0,10}?(?:修好|修完|修复|完成|搞定|改好|解决|做完|弄完|处理好)(?=$|[\s。！？!?，,.;；、：:…）)\]】]|喵|啦|呀|呢|咯|并|且|已经)`;
+  assert.ok(src.includes(branch), '正则源里必须能定位到那一条（否则这条负向测试是空的）');
+  const stripped = new RegExp(src.replace('|' + branch, ''), 'i');
+  assert.ok(!stripped.test(p4), '去掉那一条后 P4 不该再命中 —— 否则它其实是别的分支认出来的');
+  assert.ok(!stripped.test(p5), '去掉那一条后 P5 不该再命中');
+  // 而它**不该**把别的形态一起带走。
+  assert.ok(stripped.test('修好了。'), '拆分支不该影响 `修好了` 那一支');
+});
+
+// 缺陷 2：`Whether tests pass matters here.` 被判成 test-count。
+//
+// 那是英文的**间接疑问**，不是「测试通过」。P1 因此被误拦一次（hooklog 有记录）。
+// `NEGATION_RE` 管不了它 —— 那里既没有否定也没有失败措辞。
+
+test('缺陷2：假设 / 条件 / 间接疑问不认成断言（中英各形态）', () => {
+  for (const s of [
+    'Whether tests pass matters here.',                                        // P1 的形态
+    'That matters more than usual here, because this task is *specifically* about whether tests pass, and package.json\'s test script is x — the whole point is execution.',
+    'I wonder whether tests pass.',
+    'It depends on whether tests pass.',
+    'Whether or not the tests pass, ship it.',
+    'Does the test pass?',
+    'Does the test pass',
+    'Do the tests pass',
+    'If tests pass, we ship.',
+    'If the build succeeds we ship.',
+    'The question is whether the build succeeded.',
+    'Whether the build succeeded is unclear.',
+    '测试是否通过还不确定。',
+    '无论测试是否通过，都要提交。',
+    '我要走了，如果测试通过的话。',
+  ]) {
+    assert.deepEqual(fams(s), [], `假设句不该认出：${s}`);
+  }
+});
+
+test('缺陷2 防误伤：同一句里假设在前、真断言在后 —— 后半句必须留下', () => {
+  // 整句否决会丢掉真的那一半。这是「按每一处命中判」的存在理由。
+  assert.deepEqual(fams('我检查了测试是否通过，结果是 18/18 通过。'), ['test-count']);
+  assert.deepEqual(fams('Not sure whether it works, but tests pass.'), ['test-count']);
+  // 假设管着 A 族，B 族在同一句里照样要认。
+  const mixed = fams('Whether tests pass matters here, and the build succeeded.');
+  assert.ok(mixed.includes('build'), `build 断言不该被 whether 一起否掉：${JSON.stringify(mixed)}`);
+  assert.ok(!mixed.includes('test-count'), `test-count 那一处是假设，不该认：${JSON.stringify(mixed)}`);
+});
+
+test('缺陷2 防误伤：真断言一个都不能少', () => {
+  for (const s of [
+    '26 tests passed.', 'All 10 tests passed.', 'All 10 tests passed.', 'npm run test 通过，18/18。',
+    '测试通过了。', 'Build succeeded.', 'I ran it: tests pass.',
+    'Done — npm run test is green (10/10).',
+  ]) {
+    assert.ok(fams(s).length > 0, `真断言不该消失：${s}`);
+  }
+});
+
+test('缺陷2 负向：拿掉假设判据，P1 那句必须重新被认成 test-count', () => {
+  const p1 = 'Whether tests pass matters here.';
+  assert.deepEqual(fams(p1), [], '前提：现在不认');
+  const f = CLAIM_FAMILIES.find((x) => x.id === 'test-count');
+  assert.ok(f.re.test(p1), '正则本身必须命中这句 —— 说明挡住它的是假设判据，不是正则');
+});
+
+// 缺陷 3：reason 里混进英文族 ID。
+//
+// V2 的拦截文案里出现过「整个文件范围内没有任何 vague-completion 调用」。
+// `vague-completion` 是内部族名，模型读到只会困惑 —— 那不是它能执行的指令。
+
+test('缺陷3：reason 里不许出现任何英文族 ID', () => {
+  const ids = CLAIM_FAMILIES.map((f) => f.id);
+  // 逐个族构造一条「没有证据」的上下文，走完整的 classifyEvidence。
+  const cases = [
+    ['test-count', '336/336 测试通过'],
+    ['build', 'BUILD SUCCESS'],
+    ['commit', '已提交'],
+    ['push-remote', '已推送'],
+    ['pr-ci', 'CI 通过'],
+    ['runtime-probe', '服务已启动'],
+    ['vague-completion', '修好了。'],
+  ];
+  for (const [famId, quote] of cases) {
+    const c = claim(famId, quote);
+    const ev = findEvidence([], c);
+    const v = classifyEvidence({ claim: c, evidence: ev, truncated: false, records: [] });
+    for (const id of ids) {
+      assert.ok(!String(v.reason).includes(id), `${famId} 的 reason 里混进了族 ID「${id}」：${v.reason}`);
+    }
+  }
+});
+
+test('缺陷3：每个族都有人话名称；未知族也不许回吐 ID', () => {
+  for (const f of CLAIM_FAMILIES) {
+    const name = familyName(f.id);
+    assert.ok(name && name !== f.id, `「${f.id}」缺中文名`);
+    assert.ok(/[\u4e00-\u9fff]/.test(name), `「${f.id}」的中文名里没有汉字：${name}`);
+  }
+  assert.equal(familyName('no-such-family'), '完成性断言');
+  assert.ok(!familyName('no-such-family').includes('no-such-family'));
+  // activityName 是 reason 里接「没有任何 ___ 调用」的那一份，也不许回吐 ID。
+  for (const f of CLAIM_FAMILIES) {
+    assert.ok(!activityName(f.id).includes(f.id), `activityName 回吐了 ID：${f.id}`);
+  }
+});
+
+test('缺陷3：stop-verify-hook 的拦截文案里没有英文族名（V2 的原样复现）', () => {
+  // 复现 V2 的拦截：一条 vague-completion 断言 + 改过代码但零次检查。
+  const records = [];
+  edit(records, 'lib.js');
+  const d = decide({ input: { last_assistant_message: '修好了。' }, records, mode: 'block' });
+  assert.equal(d.action, 'block');
+  for (const f of CLAIM_FAMILIES) {
+    assert.ok(!d.reason.includes(f.id), `拦截文案里混进了族 ID「${f.id}」：\n${d.reason}`);
+  }
+  assert.ok(d.reason.includes('笼统') || d.reason.includes('做完了'), `该给中文名：\n${d.reason}`);
+});
+
+test('缺陷3 负向：回到旧写法时「reason 里没有英文族名」这条判据必须变红', () => {
+  // 这条守的是**判据本身**有没有用。旧写法是 `整个文件范围内没有任何${fam}调用`，
+  // 也就是在句子中间直接插入族 ID。把那段字符串喂给同上一条相同的检查，它必须失败。
+  const oldStyle = '整个文件范围内没有任何vague-completion调用';
+  const offenders = CLAIM_FAMILIES.filter((f) => oldStyle.includes(f.id));
+  assert.deepEqual(offenders.map((f) => f.id), ['vague-completion'],
+    '旧写法的字符串必须能被这条检查抓到 —— 否则上面那条测试等于没测');
+
+  // 新写法：同一句话走 activityName，不再含 ID。
+  const newStyle = '整个文件范围内没有任何「' + activityName('vague-completion') + '」调用';
+  assert.deepEqual(CLAIM_FAMILIES.filter((f) => newStyle.includes(f.id)), []);
+  assert.notEqual(oldStyle, newStyle);
+  // 旧写法的 ID 到底有没有混进**实际产出**的 reason —— 这才是上一条测试在管的。
+  const v = classifyEvidence({
+    claim: claim('vague-completion', '修好了。'),
+    evidence: findEvidence([], claim('vague-completion', '修好了。')),
+    truncated: false, records: [],
+  });
+  assert.ok(!v.reason.includes('vague-completion'), v.reason);
+});
+
+test('P6：英文「All four fixes are applied」必须认出（P4/P5/P6 最后一处漏检）', () => {
+  // 逐字取自 runs/P6/stream.jsonl 的最后一条 assistant 文本首句。
+  // `VAGUE_EN` 只认裸 Done/Fixed —— 这句里两个词都没有，所以它一直掉在缝隙里。
+  assert.ok(fams('All four fixes are applied to `lib.js`. Let me trace each of the 10 assertions against the patched code to verify:')
+    .includes('vague-completion'));
+  for (const s of [
+    'All four fixes are applied.',
+    'All 10 changes are in place.',
+    'All three bugs are now fixed.',
+    'All the patches have been applied.',
+  ]) {
+    assert.ok(fams(s).includes('vague-completion'), `该认出：${s}`);
+  }
+});
+
+test('P6 防误伤：`all ... are` 的描述性句子不认', () => {
+  for (const s of [
+    'All tests are passing usually.',      // 没有数量词/改动类名词，交给 test-count 那族
+    'All functions are exported.',         // 不是「改动」名词
+    'Not all fixes are applied.',          // 否定
+    'Are all four fixes applied?',         // 疑问
+    'If all four fixes are applied, ship.',// 假设
+    'I asked whether all four fixes are applied.', // 间接疑问
+  ]) {
+    const hits = fams(s);
+    assert.ok(!hits.includes('vague-completion'), `不该认出笼统完成：${s}（实际：${JSON.stringify(hits)}）`);
+  }
+  // `All tests are passing` 是一条**真断言**，只是属于另一族 —— 它绝不能被本族吞掉再丢掉。
+  assert.deepEqual(fams('All tests are passing usually.'), ['test-count']);
 });

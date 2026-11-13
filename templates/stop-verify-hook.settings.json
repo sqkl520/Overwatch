@@ -1,0 +1,33 @@
+{
+  "_how_to_enable": [
+    "这是给 **overwatch 仓库自己** 用的注册片段。把它合并进 .claude/settings.local.json（本机私有）",
+    "或 .claude/settings.json（可提交、本仓库所有会话生效）。不要动 ~/.claude/settings.json。",
+    "",
+    "默认是**观测模式**：不设 OVERWATCH_STOP_VERIFY=block 时，hook 只往",
+    "tasks/runs/stop-hook/<日期>.jsonl 记账，永远 exit 0，不会拦住任何会话。",
+    "要真的拦，同时在 shell 环境里设 OVERWATCH_STOP_VERIFY=block（不是写在 settings 的 env 里 ——",
+    "那样改起来太容易忘，见报告「如何启用」一节）。",
+    "",
+    "command 用**绝对路径**，不要用 ${CLAUDE_PROJECT_DIR}：hook 进程里的 CLAUDE_PROJECT_DIR",
+    "是**用户当前项目**（实测：在被 hook 的那个项目根），不是 overwatch 仓库根。",
+    "换成你自己机器上 overwatch 的路径。check-structure.mjs 会拦可发布区里的本机绝对路径，",
+    "所以这份模板只作为示例放在 templates/ 下，实际使用时请放进 .claude/settings.local.json（gitignored）。",
+    "",
+    "timeout 建议 ≥ 60 秒。实测在不含 success 证据的会话上，hook 要回溯读 transcript",
+    "并扫子 agent，最坏情况见报告「性能」一节。低于这条线会被宿主静默 kill，",
+    "表现为「hook 跑了但没生效」—— 这个坑我们踩过。"
+  ],
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<OVERWATCH_ROOT>/scripts/stop-verify-hook.mjs\"",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
