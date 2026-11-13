@@ -39,7 +39,7 @@ node scripts/scan-sessions.mjs --days 3        # 扫描会话，判定状态（�
 node scripts/scan-sessions.mjs --json          # 机器可读
 node scripts/verify-claims.mjs --days 3        # 「AI 说它做完了」有没有证据
 node scripts/check-structure.mjs               # 结构硬门
-node --test scripts/*.test.mjs                 # 全量回归测试（973 条，硬门会对账这个数字）
+node --test scripts/*.test.mjs                 # 全量回归测试（1261 条，硬门会对账这个数字）
 ```
 
 **任何改动后必须跑 `check-structure.mjs` 和全量测试。** 两者都绿才能提交。

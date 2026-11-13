@@ -1,0 +1,70 @@
+{
+  "_how_to_enable": [
+    "写前闸：第一次写文件之前，先证明你读过这个项目。",
+    "把下面 hooks 段整段合并进 .claude/settings.json（可提交，本仓库所有会话生效）",
+    "或 .claude/settings.local.json（本机私有）。不要动 ~/.claude/settings.json。",
+    "",
+    "── 默认是观测模式，装上也不会拦任何东西 ──",
+    "不设 OW_PRE_WRITE_GATE 时等于 observe：只往 tasks/runs/pre-write-gate/<日期>.jsonl 记账，",
+    "stdout 不输出任何东西（= 放行）。先跑几天，看日志里 would-deny 有多少、都是哪些工具，",
+    "再决定要不要开。",
+    "",
+    "三档，用 shell 环境变量切（不要写进 settings 的 env —— 那样改起来太容易忘）：",
+    "  OW_PRE_WRITE_GATE=observe  只记账（默认）",
+    "  OW_PRE_WRITE_GATE=warn     放行 + additionalContext 提醒（实测只注入一次，不引发循环）",
+    "  OW_PRE_WRITE_GATE=deny     真的拦",
+    "",
+    "── 刹车 ──",
+    "PreToolUse 的拒绝循环宿主没有上限（实测连拒 69 次仍在跑），本闸每次 deny 都自带刹车。",
+    "  OW_PRE_WRITE_GATE_BRAKE=halt    默认。deny 同时返回顶层 continue:false，一轮即停。",
+    "                                  代价：整个回合结束，模型没机会「先去读文件」。",
+    "  OW_PRE_WRITE_GATE_BRAKE=budget  前 N 次 deny 不刹车，让模型先去读；到 N 次才停。",
+    "                                  配合 OW_PRE_WRITE_GATE_DENY_BUDGET=<N>（默认 2）。",
+    "",
+    "── 其它 ──",
+    "  OW_PRE_WRITE_GATE_MIN_READS=<n>            算「读过项目」的最少**不同**文件数（默认 3）",
+    "  OW_PRE_WRITE_GATE_TRANSCRIPT_BYTES=<n>     读 transcript 尾部的字节数（默认 1048576）",
+    "  OW_PRE_WRITE_GATE_CROSS_SESSION=1          承认别的会话留下的标记（默认否）",
+    "  OW_PRE_WRITE_GATE_LOG=<path>               覆盖记账文件路径",
+    "",
+    "── matcher 为什么是这五个 ──",
+    "只写 Write|Edit 会被 shell 绕过：实测 PowerShell 的 Set-Content 照常落盘（G6）。",
+    "所以 Bash 与 PowerShell 必须同时注册，由 hook 自己解析命令里有没有写操作。",
+    "NotebookEdit 一起收进来，否则 notebook 是另一个洞。",
+    "",
+    "── command 用绝对路径，不要用 ${CLAUDE_PROJECT_DIR} ──",
+    "hook 进程里的 CLAUDE_PROJECT_DIR 是**用户当前项目**，不是本仓库根。",
+    "换成你自己机器上 overwatch 的路径。check-structure.mjs 会拦可发布区里的本机绝对路径，",
+    "所以这份模板只作为示例放在 templates/ 下，实际使用时请放进 .claude/settings.local.json（gitignored）。",
+    "",
+    "── shell 字段别省 ──",
+    "Windows 上不写 \"shell\": \"powershell\"，宿主找不到 Git Bash 时会走 fallback，",
+    "把任何非零退出都转成 ask（headless 下即拒绝）—— 这会伪造出「拦住了」的假象（实测 B4/D1）。",
+    "写上它，退出码语义才是真的。",
+    "",
+    "── timeout ──",
+    "5 秒足够：本 hook 只读 transcript 尾部（默认 1MB）+ 一次 stat。",
+    "脚本内部还有 5 秒预算闸，超时自己放行 —— 不依赖宿主的 kill。",
+    "",
+    "── 标记文件 ──",
+    "<项目根>/.claude/.ow-read-done。内容是 JSON，satisfied_by 字段区分：",
+    "  auto  = hook 从 transcript 里数出来「确实读过 N 个文件」（主路）",
+    "  claim = AI 被拒后自己跑的 mark 子命令（自述，事后可审计）",
+    "想把这个文件加进 .gitignore 就加 —— 它是本机会话状态，不是项目内容。"
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit|Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"<OVERWATCH_ROOT>/scripts/pre-write-gate.mjs\"",
+            "shell": "powershell",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

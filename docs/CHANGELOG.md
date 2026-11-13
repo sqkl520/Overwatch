@@ -21,6 +21,463 @@
 
 ---
 
+## [Unreleased] - 2026-11-14（写前闸：按首写工具拆判据 + 堵掉伪造标记）
+
+> 两件事都是**已实测确认**的缺陷，不是设计推演。依据：
+> `docs/research/2026-11-14-gate-widening-resolution.md`（P1 的裁决）与
+> `docs/research/2026-11-14-gate-widening-redteam.md` §1.5 / §5-B（伪造路径）。
+> 复算：`node scripts/resolution-gate-audit.mjs --only R8`。
+
+### Changed
+
+- **`pre-write-gate.mjs`：`Edit` / `MultiEdit` / `NotebookEdit` 换成「读过这个文件本身」这条判据**
+  （新增 `EDIT_SIDE_TOOLS`，新增 `allowReason:"target-read"`）。`Write` 与 shell 写入**一行未改**，
+  仍是「读过 ≥`minReads` 个不同文件」。
+  **依据**：R8 实测被拦 27 个会话 = Edit/MultiEdit 4 · Write 23；被拦里「首写前读过同一文件」4 个
+  （即这 4 个**全都**读过自己的目标）。本机复算（`observe-reality-check` 的 `analyzeOne`，435 份
+  transcript → fork 去重后 410，有写 202）：真实 Edit-first 18 个里 targetRead **18**、
+  「reads≥3 且**没**读目标」**0** 个；沙箱 Edit-first 8 个里 targetRead 7、同类 0 个。
+  逐会话对照旧判据：**只有 4 个会话改变判定**（正是那 4 个误伤），其余 198 个逐条相同。
+  **这一条比原来更严**，不是更松：它同时拦下「读了 3 个无关文件就改一个没读过的文件」——
+  与宿主自己的 Edit 门一致。安全兜底是标记语义：任何通过的 `Write` 都会落标记，
+  所以「先写新文件再 Edit 它」走 `marker-present`，不会掉进这一支。
+  `target-read` **不写标记**：它只证明这一个文件读过，不证明读过这个项目。
+- **`pre-write-gate.mjs`：`satisfied_by:"auto"` 改为必须带 HMAC-SHA256 签名**（`node:crypto`，零依赖）。
+  签名覆盖 `session_id + at + reads + verified_at + reads_sample + prompt_id`，密钥是
+  `.claude/.ow-gate-secret`（**首次写 `auto` 标记时随机生成**，32 字节 hex，不硬编码）。
+  `markerValidity()` 重算比对（`timingSafeEqual`），不合法即判 `auto-unsigned` /
+  `auto-bad-signature` / `auto-no-secret`，并退回 transcript 判定。
+  **依据**：红队 §1.5 + §5-B 实测一条 `echo '{"satisfied_by":"auto","reads":99}' > .claude/.ow-read-done`
+  就能让闸门记 `allow / marker-present / by=auto`，事后审计完全失效；且 `session_id` 从
+  `$CLAUDE_CODE_SESSION_ID` 就能读到，不需要猜。
+  **新增 `allowReason:"secret-tamper"`**：命中密钥文件的写单独拦，**不**跟 `gate-own-file` 一起放行
+  —— 否则改密钥再签一次，等于没签。
+  **为什么选签名而不是「加字段降级」**：任务书给的备选（`verified_at` + `reads_sample` 缺了就降级
+  untrusted）**不构成防护** —— 那两个字段同样是写标记的人随手能填的，伪造成本没变。签名是唯一能把
+  「闸门写的」和「别的进程写的」分开的机制。
+  `reasonFor()` 里 `gateCommand` 那段保留（合法的逃生口），文案加强一句：手写的 `"auto"` 标记会被拒。
+  `claim` **不签** —— 它本来就是自述，签了反而会被误读成「验出来的」。
+- **`status` 子命令**多打两行（`secret` 在不在、marker 签名 valid/INVALID），否则「标记看起来在、
+  其实不算数」这件事在盘上不可见。
+
+### 未做（诚实边界，写在这里免得下次再猜）
+
+- **`decide()` 仍是纯函数**：签名密钥由调用方经 `state.secret` 传入，`runHook` 负责读盘。
+- **`state.getReads` 在生产 hook 路径下拿到的是「读过哪些不同文件」的完整路径列表**
+  （`readTranscriptReads` → `readPathsInTranscriptText` → `readPathsOfToolUse`），不是只有计数 ——
+  所以 `target-read` 在真实 hook 里可用。**但 `transcript_path` 指的是主 transcript**，
+  子 agent 的读不在其中（`subagents/*.jsonl` 是兄弟目录，闸门不扫）；那类会话走 `claim` 逃生口。
+- 只读 transcript 尾部（默认 1 MB），读取发生在窗口之前的会话仍拿不到证据 —— 既有边界，未变。
+- `Edit` 侧不再接受「读过几个」作为证据；若某个模型真会「不读就 Edit」，日志里会出现
+  `observe-mode`/deny 且 `reads` 很高 —— 那是可观测的，不是静默的。
+
+### 测试
+
+- **测试数 1242 → 1261**（`pre-write-gate.test.mjs` 66 → 85，+19）。四份声明文件已同步。
+- 覆盖：`Edit` 目标读过 → `target-read`；`Edit` 读过 5 个**别的**文件 → **仍拦**（关键负向，
+  证明不是把 Edit 侧整体放宽）；`Write` 侧逐条不变；伪造 `auto`（无签名 / 假签名 / 改了 `reads`
+  不重签 / 换密钥）→ 全部不放行；闸门自己写的 → 放行；密钥被删 → 旧 `auto` 失效；
+  `pathKeyOf` 归一化（大小写与分隔符折叠，但**不做**绝对化）。
+- **负向验证（真跑过）**：去掉 `!editSide` 守卫 → 「读过 5 个别文件仍拦」变红（fail 1）；
+  绕过 `verifyMarkerSig` → 5 条伪造用例同时变红（fail 5）。两处已还原。
+
+---
+
+
+
+> 修的是**一个已经确认、会让测量失去意义的缺陷**：`observe-reality-check.mjs` 的重放器
+> 自己写了一份「与闸门同构」的路径抽取。同构是**声称**，不是保证 —— 闸门把读动词表改宽
+> （例如加 `ls`）之后，重放不会跟着变，于是「改宽后降到 4%」这种数无法用重放复算。
+> 更糟的是 `observe-reality-check.test.mjs` 里那条名叫「与闸门一致」的测试只比较重放器
+> **内部的两个函数**，是个假守门人。
+> **没有修改闸门的判定行为**：66 条 `pre-write-gate.test.mjs` 一条未改、全绿。
+
+### Added
+
+- **`scripts/probe-parser-divergence.mjs`**：先量化再修。两种口径（同文本 / 同文件+同窗口）
+  逐会话比对，另加 5 组合成用例覆盖已知差异点。**给数字，不给判断。**
+  实测结论：真实语料 155 个会话两种口径**都是 0 分叉**，但**合成用例 3/5 分叉** ——
+  所以「真实语料 0 分叉」不等于「等价」，只是这批语料没踩到那三种形状。
+- **`scripts/probe-parser-divergence.test.mjs`**（8 条）：守「探针真的比了两侧」，
+  含「小语料必须报 0 分叉」——「等价」必须由跑出来支撑，不能靠注释声称。
+
+### Changed
+
+- **`pre-write-gate.mjs`**：抽出并导出纯函数 `readPathsOfToolUse()` /
+  `readPathsInTranscriptText()`，`readTranscriptReads()` 改为调用它们。
+  另导出只读常量 `GATE_SHELL_READ_VERBS`。**行为逐字节等价**：用 33 组合成输入
+  （含空路径 / 纯空白 / 首尾空格 / `null` / `0` / `false` / 重复项 / 大小写 / 反斜杠）
+  对提取前后的解析器逐条对账，0 差异。
+- **`observe-reality-check.mjs`**：`gateReadsOf()` / `gateReadPathsInText()` 改为委托闸门
+  的同一个实现；`GATE_READ_VERBS` 改为从 `GATE_SHELL_READ_VERBS` **派生**（不再是第二份字面量）。
+  `readVerbs` 参数只为让测试证明「动词表是判据的唯一来源」，生产调用从不传。
+- **修好一处被复制了两遍的窗口 bug**：`tailGateReads()` 与 `measure-gate-ceiling.readWindowText()`
+  曾经**无条件丢首行**，而闸门只在「读满窗口」时丢。文件比 1MB 小时会少算一条完整记录。
+  两处已同步到闸门的真实条件。
+- **测试数 1231 → 1242**（+11：探针 8 条 + 重放器真守门人 3 条）。四份声明文件已同步。
+
+### Changed（测试口径）
+
+- `observe-reality-check.test.mjs` 里那条假测试改成真测试：喂**同一段文本**给闸门的实现与
+  重放器，断言路径数组逐条相同；另加一条负向验证 —— 在测试内给动词表注入 `ls`，
+  断言重放器跟着变。**已实测**：把重放器改回「自己一份动词表」，这两条**都变红**（fail 2）。
+- 已知解析缺陷（`head -n 20 a.mjs` 取到 `20`）**本轮不修**，但钉在测试里：
+  重放器必须**带着同一个缺陷**才算同构，将来修它会红。
+
+### 未改变的数字（必须说明，不许假设）
+
+- 重跑 `node scripts/observe-reality-check.mjs` 仍是 **19.9%（27/136）**，
+  p50 6 / p90 14.5 / mean 7.5、读 0 个 13（9.6%）、cumulative 26、broad 15、
+  归因五类 5/5/8/6/3 —— 全部逐位相同。原因是那三处分叉在本次语料里一次都没触发。
+  这不是「所以分叉不要紧」，只是「这批语料没踩到」。
+
+---
+
+## [Unreleased] - 2026-11-14（主线程写的提示词：分层 + 派发前的机器检查）
+
+> 产出：`scripts/compose-agent-prompt.mjs` + `scripts/compose-agent-prompt.test.mjs`（50 条）+
+> 报告 `docs/design/2026-11-14-main-thread-authored-prompts.md`（索引已登记）。
+> 起因是用户原话「多 agent 的提示词应该由主线程 agent 编写」，以及今晚那条实测矛盾：
+> `acceptor` 的 tools 是 `Read, Grep, Glob, Write`，而验收标准写「判定前必须逐条跑
+> `check-structure.mjs` / `node --test`」—— 它跑不了任何一条，唯一能给的诚实结论是「不通过」。
+> **没有修改** 12 份角色定义，没有碰 git、`tasks/runs/`。新增 50 条测试，硬门全绿。
+
+### Added
+
+- **`scripts/compose-agent-prompt.mjs`**：把「主线程照模板填空」换成四层拼装。
+  **L0 身份**（人写的，冻结，提示词里只放指针）/ **L1 协议**（`templates/dispatch.md` 逐字内联，
+  具名占位符必须填掉）/ **L2 现写**（任务、验收标准、约束、停机条件）/ **L3 注入**
+  （构建/测试命令、硬门输出、`outputs`、nonce、上次失败模式，全部从仓库状态派生）。
+- **`checkPromptSpec()`**：九条必填元素的机械检查（`REQUIRED_ELEMENTS`）。
+  不过就 **exit 1，且不落文件、不记台账** —— 否则就是「提示词发出去但主线程不知道」。
+- **工具相容性判据**（`classifyRequirement` + `requiredTools`）：把每条验收标准分类成
+  `command` / `file` / `decision`，再和角色 `tools` 比对。
+  验收要跑命令而角色没有 `Bash` ⇒ 拒绝，并给出两条出路（换角色 / 主线程跑完把输出注入）。
+  **这是今晚那条矛盾唯一能在派发前算出来的形态。**
+- **`prompts.jsonl` + `verify`**：compose 时记成品 hash，收活时从子 agent transcript 的
+  **第一条 user 消息**取正文重算。`match: null`（找不到 transcript）与 `match: false`
+  （找到了但不是这一份）**分开报**。
+
+### Findings
+
+1. **acceptor 那条矛盾是硬门强制的，不是文档疏忽。** `scripts/check-structure.mjs:37` 的
+   `READONLY_ROLES` 与 `:203` 的「只读角色不得拥有 Edit/Bash」会挡住「给它加 `Bash`」这条修法。
+   所以正解不是加工具，而是**主线程在派发前把命令跑掉、把输出作为事实注入**——
+   验收从「跑命令」变成「读一份已落盘的输出并核对」，`acceptor` 保持只读。
+2. **三段式拼装从来没有脚本读过。** `grep -rn "templates/dispatch" scripts/*.mjs` 本轮复核仍零命中
+   （`docs/research/2026-11-10-agent-roles-audit.md:295` 记的同一事实）。
+   后果里最贵的是 `<nonce>` 没填：`claim-ledger observe` 归属失败**不报错**，只打印「扫了 N 份没有一份能归属」。
+3. **「主线程写的提示词」不是「让模型自由发挥」。** 结论相反：主线程该写的范围比现在小得多，
+   只写 L2；可派生的（命令、outputs、nonce、失败模式）必须从人手里拿走。
+   判据是 `docs/spec/output-format.md:32` 已经立过的那条——手写的数字会随模型心情漂，
+   而它「自带格式可信度，用户无法区分真假」。
+4. **前提已复核：40/40。** 同一会话 40 份子 agent transcript 的首条 user 消息与父会话
+   `Agent` 工具调用的 `prompt` 参数**逐字节相同**（另有 77 条父级 `Agent` 调用带 `prompt` 字段可对上）。
+   这是「提示词可对账」的地基；没有它，hash 台账证不了任何事。
+5. **本仓自身认不出构建系统。** 没有 `package.json` / `pom.xml` / `build.gradle` / `Cargo.toml` /
+   `go.mod` / `pyproject.toml`，`detectProjectCommands()` 返回 `unknown`。
+   原型因此注入「未识别出测试命令（不是『没有测试』，是『我没认出来』）」。**已知缺口，未修**：
+   它会改变一个已有 43 条测试钉住的模块的行为，属于另一件事。
+6. **12 份角色定义里 4 份「职责与工具互斥」**（`acceptor` / `redteam` / `research` / `relay`）。
+   本轮只做**派发前拦截**，**没有改定义**——改法是决定（加 `Bash` 还是改掉那句职责），不是一次编辑。
+
+### Changed
+
+- 回归测试 1145 → **1195**（+50）。四份声明文件（README / CLAUDE.md / GUIDE / CI）已同步，
+  `checkTestCount()` 硬门核对通过。
+- `scripts/check-structure.mjs`：PROBE_ARGS 新增 13 条（compose 的纯函数），
+  REGISTERED 新增 `COMPOSE_PROMPT_FNS`（26 条）。
+
+
+
+> 产出：`scripts/observe-reality-check.mjs` + `scripts/observe-reality-check.test.mjs`（26 条）+
+> 报告 `docs/research/2026-11-14-observe-mode-reality-check.md`（索引已登记）。
+> 装置是**历史语料重放**：432 份主 transcript / 2.0 GB / 约 90 秒全量。
+> 没有动仓库 `.claude/settings.json`，没有碰 git、`tasks/runs/`。新增 26 条测试，硬门全绿。
+
+### Added
+
+- **`scripts/observe-reality-check.mjs`**：在真实语料上重放 `pre-write-gate.mjs` 的判定。
+  三个口径同时给：**gate**（闸门真实实现，1 MB 尾窗）、**cumulative**（同判据不看窗口）、
+  **broad**（+`ls`/`find`/`grep`/`Glob`/`git log`）。判定走**真 `decide()`**，不重写一份。
+- **五类互斥归因**（`attribute()`）：`A-continuation` / `B-subagent` /
+  `B2-subagent-unattributed` / `C-broad-explore` / `D-no-evidence`。判据全部可复核。
+
+### Findings
+
+1. **真实模型行为仍然没有证据，且这一轮确认它做不了。** `claude -p` 不是「静默失败」，
+   是**认证闸**：`ANTHROPIC_BASE_URL` 指向宿主网关，`ANTHROPIC_AUTH_TOKEN` 只注入给宿主管理的进程。
+   实测 `Not logged in · Please run /login`（exit 0）与剥掉宿主变量后的 `401 认证失败`（exit 0），
+   网关 `/v1/models` 无授权头 `http=401`。**`observe` 模式本身也测不到** —— 它不拦，模型就没有障碍可反应。
+2. **阈值 3 在真实项目上会拦 19.9%（27/136 个有写会话）。** 首次写前 gate 口径可见的不同文件数
+   **p50=6 / p90=14.5 / mean=7.5**，真「读 0 个就写」只有 **9.6%（13/136）**。
+   阈值扫描：0→0%、1→9.6%、2→16.2%、3→19.9%、5→38.2%、8→58.8%。
+3. **27 次「会拦」里 88.9%（24/27）拦的时候项目其实被读过。** A 续接 5（读在上一段会话）、
+   B 子 agent 5（严格 `toolUseId` 配对）、B2 旧格式配不上 8、C 结构性探索 6。
+   落进 `D-no-evidence` 的只有 3 次，其中 2 次是「只读了目标文件本身」（`Read pom.xml` → `Edit pom.xml`）的真误伤。
+   **没有任何一个是「一句话改拼写」那种简单任务** —— 题目预设的「读 0 个＝简单任务」在语料上不成立。
+4. **阴性对照：66 个测试沙箱会话被拦 49 次，归因 100% 是 `D-no-evidence`。** 闸门对它们完全正确。
+   没有这一桶，前面的比例无法区分「闸门太严」和「语料本来如此」。
+5. **语料卫生两处必查，不查会得到 38.1% 这种错数（第一版就是）：**
+   ① 本仓自己的实验沙箱（`Temp\*`、`.tmp-analysis/*`）混在里面，必须分桶；
+   ② **224/224 个有写会话都存在时间戳倒退**（148 个 >60s、116 个 >1h，最大 293h），
+   成因是 `queue-operation` 等元数据写当前时间而对话记录是 resume 回放的旧历史。
+   故子 agent 的先后判定改用**主 transcript 字节偏移**，不用时间戳。
+   `--order file` 与 `--order time` 实测给出**同一组被拦会话**（差集 0），两种口径在本语料上等价。
+6. **顺带发现闸门自身一个解析缺陷（未修，不在本任务范围）：** `head -n 20 a.mjs` 会把 `20`
+   当成读过的文件（`tail -c 512` 同理），因为 `-n` 被跳过而其值没有。方向是**多算 → 更宽松 → 更少拦截**，
+   影响 1/136 个会话（19.9% → 20.6%）。测试把现状钉住了，将来修它会红。
+
+### Changed
+
+- 回归测试 1119 → **1145**（+26）。四份声明文件（README / CLAUDE.md / GUIDE / CI）已同步，
+  `checkTestCount()` 硬门核对通过。
+
+
+
+> 产出：报告 `docs/research/2026-11-14-prompt-based-multiagent-limits.md`（索引已登记）。
+> **零行代码改动**——纯 exploration，读外部只读目录 `many-agents_multi-prompt-files_token-heavy/`
+> 后写的根因分析。没有修改那个目录的任何文件，没有碰 git、`tasks/runs/`。
+> 未新增脚本，因此测试数不变。
+
+### Added
+
+- **`docs/research/2026-11-14-prompt-based-multiagent-limits.md`**：回答「提示词式多 agent
+  为什么不够原生」。核心结论是**谁持有计划**（`Claude, turn by turn` vs `The script`），
+  并给出 11 个维度的逐条对比（提示词方案 / 原生方案 / 差距后果 / 是否必须原生）、
+  9 条来自外部框架实跑记录的失败案例、以及「用现有 Claude Code 原语能补多少」的覆盖表。
+- **提示词够用的 7 类**（不该重做的清单）：审什么 / 什么算证据 / 什么结论不成立 /
+  报告形状 / 角色可见性 / 停机条件 / 裁量留痕。判据一句话：
+  **运行时能判定真假的交给原生，需要读懂内容才能决定的留在提示词。**
+
+### Findings
+
+1. **那个框架自己已经算出了这个结论**：6,113 行里 **2,809 行（47%）**在做并发/状态/重试/契约，
+   原话是「**这不是简化版，是更差的版本**」（`harness-first-pivot.md:111`、`:126`）。
+   47% 就是「不够原生」的可量化定义。
+2. **最贵的一条不是功能缺失，是状态只能靠代理指标。** 三条代理指标各错过一次：
+   8 分钟阈值（真实常态 47 分钟，12 个里 9 个会被误杀）、转录大小（35 分钟误判）、
+   `in_flight` 数组（自己忘了更新就一直错）。而唯一的 A 级活性证据 `TaskStop` **是破坏性的**。
+3. **契约退化成散文是可量化的**：15 个真实产物 **0 个**含 JSON 信封；40 份产物只有 **9 份**
+   可被 grep 解析；契约里写「一律视为违规」的 19 条判据，校验器实测有 **3 条从未执行**。
+4. **递归在机制上是 0**：7 个 wrapper 的 `tools` 全部不含 `Agent`，子 Agent 结构上无法再派；
+   而 `triage.md:124` 写着 9×5×5×5=1125 并称「这不是上限，是目标」。**提示词在许诺运行时不提供的能力。**
+5. **多 agent 的增益是并集不是视角**：4 个同提示词 agent 并集只比最好的单个多 1 条，
+   Jaccard 相对随机仅 1.25×（`AGENT-CONSISTENCY.md:152-170`）。所以「多派几个」不需要原生，
+   **「调度多派」才需要**。
+6. **覆盖评估：11 个维度里 7 个能被现有原语覆盖，加权后约 6.5/11。**
+   硬缺口 4 条：跨会话持久状态（`Workflow` resume「Same session only」）、运行中注入
+   （`No mid-run user input`）、子→父投递语义（返回值是「已启动」不是「已完成」）、
+   深度与预算的强制（宿主到限只拒绝，不按你的意图降级）。
+
+### 诚实边界
+
+- **所有外部数字均未重跑**。本文核对的是「原文确实在哪个文件哪一行这么写」，不是「原文真对」。
+  标 `[未复核]` 的条目需主线程或验收 Agent 复算。
+- **未在 `Workflow` 上做任何实测**，覆盖表是按能力映射推的。三个可证伪的下一步实验写在报告 §5.4。
+
+---
+
+## [Unreleased] - 2026-11-14（中断的**代价**：按返工需求率重算，并发现「中断=返工」不成立）
+
+> 产出：`scripts/measure-intervention-cost.mjs` + `scripts/measure-intervention-cost.test.mjs`（43 条）+
+> 报告 `docs/research/2026-11-14-intervention-cost.md`（索引已登记）。
+> **没有改任何既有脚本的逻辑**——分组 / 执行起点 / 人类发言判据全部从
+> `measure-execution-phase.mjs` import，官方的 `run()` 直接调用，只追加代价指标。
+> 没有碰 git、`tasks/runs/`。新增 43 条测试，硬门全绿。
+
+### Added
+
+- **`scripts/measure-intervention-cost.mjs`**：执行期中断的代价测量器。
+  主指标 **返工需求率** = 执行期含否定/撤销/重做语义的人类发言 ÷ 执行期中断。
+  判据复用 `classifyHumanMessage()` 的 `correction` 档，不另写正则。
+- **第二层去重：恢复分支快照**（`dedupeResumeForks`）。第一层「整份内容哈希 + 记录条数」
+  抓不到一类簇：同一段对话写成多个 sessionId，**前缀逐条相同（连时间戳都相同）、长度不同**，
+  短的那份是恢复出来的早期快照。判据 = 同 `firstTs` 同首条人类消息 + 归一化记录序列
+  公共前缀 ≥ 较短者的 98% 且 ≥ 30 条。实测合并 66 份 / 25 簇。
+
+### Findings
+
+1. **第二层去重把 A 组从 14 改成 7，改变了上一轮报告的可引用性。**
+   三份 `2b8b5fc6` / `69a23385` / `b7deae45` 全被判进 A 组，前缀 99.9% / 99.6% 相同，
+   是同一段对话的副本；而那份对话恰好是 A 组 undo 最多的一个。
+   **上一轮 A=14 的具体数字不能再直接引用**，方向性结论（体量解释一切）不受影响。
+2. **控制体量后「开工前提问」的代价不更低。** 返工需求率 A 1.20%（n=7）/
+   B 0.99%（n=34），置换检验 p=0.69，Cliff's delta +0.109。
+   分层（286–1024 层 A 2.44% vs B 1.55%；>1024 层 0.88% vs 0.61%）与 1:1 体量匹配
+   （0 胜 2 负 3 平）方向一致。**但只有 15 个返工事件（0.87%），证伪不了，只能说无数据支持。**
+3. **「中断 = 返工」这个前提本身不成立**（本次最硬的观察）：1727 次执行期中断里
+   只有 **15 次（0.87%）是纠正**，最大的一块是新增需求 / 补充前提（1379 次）。
+   用户举的「你完全理解错了，重做」在真实语料里是万分之一量级的事件。
+   这解释了为什么「按次数」和「按代价」都测不出提问的优势。
+4. **文件重叠度这个候选被实测否决**：中断后 10 个写操作落在中断前已写过文件上的比例
+   32.4%，同长度随机窗口 42.0%——**中断点更低**。它测的是工作连续性，不是返工。
+   否定结论已固化进脚本（`redoShareAfterInterruptions` + `redoShareRandomWindows`），可复算。
+5. **自撤销事件只能当辅助**：中断后 2.69% vs 中断前 2.23%（仅高 20%），
+   且与任务体量相关 0.75——大任务自然改得多。
+6. **主指标与体量的相关只有 0.31**（中断数与体量是 0.90）。返工需求不是体量的另一种说法，
+   这是它比「中断次数」更适合做对比口径的直接理由。
+
+### 一句话
+
+```
+主指标不是次数，是代价；代价的实测结果：A 不低于 B，但样本只有 15 个事件。
+真正的发现在于 —— 中断绝大多数根本不是返工，所以这个问题的前提需要重写。
+```
+
+---
+
+## [Unreleased] - 2026-11-14（写前闸原型：`PreToolUse` 上「第一次写之前先读项目」跑通闭环）
+
+> 产出：`scripts/pre-write-gate.mjs` + `scripts/pre-write-gate.test.mjs`（66 条）+
+> `templates/pre-write-gate.settings.json`。报告 `docs/research/2026-11-14-pre-write-gate-prototype.md`
+> （`docs/research/README.md` 已登记）。试跑装置与原始日志在 `.tmp-analysis/pretooluse-proto/`（gitignored，**不发布**）。
+> **没有动 `.claude/settings.json`**（仓库级），没有碰 git。本文件新增 66 条测试，硬门全绿。
+
+### Added
+
+- **`scripts/pre-write-gate.mjs`** —— 首次写文件之前要求「已读过项目」的 PreToolUse 闸门。
+  `decide()` 是**纯函数**（判据全在参数里），`runHook()` 收全部副作用，所以判定逻辑可被单测穷举。
+  三档 `OW_PRE_WRITE_GATE=observe|warn|deny`，**默认 observe**（只记账，stdout 不输出 = 放行）。
+- **`scripts/pre-write-gate.test.mjs`**（66 条）—— 含端到端 spawn 与四条负向回退。
+- **`templates/pre-write-gate.settings.json`** —— 可直接合并进 `.claude/settings.json`，matcher 覆盖
+  `Write|Edit|NotebookEdit|Bash|PowerShell`，带 `"shell": "powershell"`。
+- `scripts/check-structure.mjs`：登记本模块的 17 个导出探针参数（纯函数实调一次）与 7 个常量，
+  否则结构门会把它们列成「未登记」。
+
+### 设计选择（两条，都写在文件头与报告里）
+
+1. **标记文件默认由 hook 创建，不由 AI 举手。** hook 从 transcript 尾部数本会话 `Read` 过的
+   **不同文件路径**，够了就自己写 `.claude/.ow-read-done` 并放行（`satisfied_by:"auto"`）。
+   AI 被拒后跑 `mark` 子命令是逃生口（`satisfied_by:"claim"`，自述，事后可审计）。
+   理由：(a) 只看 AI 听话会把闸门退化成提示；(b) 是「本来就会先读项目的 agent 感觉不到闸门」。
+2. **标记绑定 session，没有 `session_id` 的标记判无效。** 早期写法是「没写 session 就当通配」，
+   那会在盘上留一个永久有效的标记：本会话建过一次，之后每个新会话都被静默放行，而日志里一切正常。
+
+### 实测（真 `claude.exe 2.1.308` + stub 模型，与 `2026-11-14-pretooluse-desktop-verification.md` 同装置）
+
+- **t1** 不做准备就写 → deny + `continue:false`，`num_turns=2`，文件**不落盘**，`permission_denials` 有完整记录。
+- **t4** 用 `PowerShell` 的 `Set-Content` 绕 → **同样被拦**。堵上验证报告 §3 G6 那个洞。
+- **t2** 先读三个文件再写 → **一次都没被拦**，闸门从 transcript 数出 3 个路径，自己写标记（`satisfied_by:"auto"`）。
+- **t3** 被拒 → 模型跑 reason 里那条命令 → 重试 → 落盘（`satisfied_by:"claim"`）。完整闭环。
+- **t5** 连续发 5 次同一个写 → 前 3 次全拒、第 4 次刹车结束回合。**重试绕不过去**（对照 E1 计数器第 2 次就过）。
+- **阴性对照**：`OW_PRE_WRITE_GATE=observe` 下同一个 t1，`out.txt` **落盘了**、`denials: []`、记账 `would-deny`。
+
+### Findings（三条）
+
+1. **`claude -p` 在本机仍然不可用**，两次复现：剥掉宿主变量 + 指向本地网关 → 120 秒零输出、`exit=0`、
+   stdout 完全为空；网关 `/v1/messages` 25 秒无响应（`http=000`），但 `/v1/models` 正常。
+   与 `docs/FACTS.md:516` 一致。**所以模型行为类推论一律标「未实测」。**
+2. **本机宿主没有 `Bash` 工具**：stub 发 `Bash` 收到 `Error: No such tool available: Bash`，只有 `PowerShell`。
+   不推翻已有 Bash 语料结论（那是别的会话），但它意味着本机的闸必须以 `PowerShell` 为主路径。
+3. **一个真实 bug 由实测暴露**：`Number('')` 是 `0`，所以只设 `OW_PRE_WRITE_GATE=deny` 时 `minReads`
+   被读成 0，**(b) 自动放行那条主路被静默关掉**，闸门退化成纯荣誉制 —— 而日志里看起来一切正常。
+   跑 t2 时发现（模型读了 3 个文件却仍被拒）。已修，并有一条负向测试守着（放回 bug → 1 条变红）。
+
+---
+
+## [Unreleased] - 2026-11-14（PreToolUse 契约：`exit 2` 与 Stop hook 一样不拦，拒绝循环没有宿主兜底）
+
+> 产出：报告 `docs/research/2026-11-14-pretooluse-desktop-verification.md`（`docs/research/README.md` 已登记）。
+> 实验脚本与原始日志在 `.tmp-analysis/pretooluse-lab/`（gitignored，**不发布**）。
+> **零生产代码改动**：没有新增 `scripts/` 模块，没有动 `.claude/settings.json`（仓库级），没有碰 git。
+> 测试数不变（1010），硬门全绿。
+
+### Added（只在报告里，不在代码里）
+
+- **`PreToolUse` 的完整输入契约**：`session_id` / `transcript_path` / `cwd` / `prompt_id` /
+  `permission_mode` / `effort` / `hook_event_name` / `tool_name` / `tool_input` / `tool_use_id`。
+  `tool_input` 是**完整参数**（`Write` 拿得到全文 `content`，`Edit` 拿得到 `old_string`/`new_string`/`replace_all`）。
+  **没有「第几次调用」这类字段**；`prompt_id` 是可用的「本回合」锚点。
+
+### Findings（其中两条会改变已有文档的可信度）
+
+1. **`exit 2` 在 `PreToolUse` 上同样不拦截** —— 与 `2026-11-12-stop-hook-prototype.md` §2.2 在 Stop 上的实测一致。
+   本仓 `2026-11-13` 那组 B4 看着「exit 2 拦住了」，**是假象**：那次被「Git Bash 未找到」的 fallback 污染，
+   宿主把 hook 进程失败转成 `ask`，headless 下 `ask` 即拒绝。决定性对照：`exit 1` 得到**逐字相同**的 fallback 文案
+   并同样拦住；给 hook 显式加 `"shell": "powershell"` 后，同一个 `exit 2` 触发 1 次、**文件照常落盘**。
+   同装置下 `deny` 仍拦住 —— 这一对才是干净的。
+2. **`PreToolUse` 的拒绝循环没有宿主上限** —— 实测连续拒绝 **69 次仍在继续**（等 180 秒后我主动 SIGTERM 才停）。
+   对比 Stop hook 有 9 次上限。**任何闸门必须自带刹车**：拒绝时同时返回顶层 `continue:false`（实测一轮即停）。
+   代价写清：`continue:false` 会终止整个回合，与「让模型被拒后先去读文件」互斥。
+
+### 实测（20 组，宿主 `2.1.308`，transcript 均记 `entrypoint=claude-desktop-3p`；原有 7 组 + 本次补做 13 组）
+
+- `deny` → 文件不落盘、reason 原文回模型、`permission_denials` 有记录。
+- `ask` → 非交互 `-p` 下退化成拒绝（**桌面交互态弹不弹卡片，未实测**）。
+- `updatedInput` → **真的改写**：路径 `gated.txt`→`gated-REWRITTEN.txt`、`content` 整段替换，
+  盘上出现改写后的文件，模型收到的是新路径。**改写对模型透明，对用户界面也透明**——
+  这正是 `2026-11-11-untapped-capabilities.md` §563 警告的用法，现有一条实测。
+- `additionalContext` → 以 `PreToolUse:Write hook additional context: …` 的系统块注入，**只注入一次、不引发循环**
+  （与 Stop hook 上它会无限循环形成对比）。
+- **旁路**：只 matcher `Write|Edit` 的闸门，被 `PowerShell` 的 `Set-Content` 直接绕过（实测落盘）。
+  与已有「首次改动走 Bash 占 31.3%」互相印证。
+
+### 仍需说明的边界
+
+模型端是 stub（hooks / 权限 / 工具循环 / transcript 全是真的）。所以「模型被拒后会不会照 reason 去先读项目/提问」
+**没有真实模型证据**，报告里标了「未实测」。**`PreToolUse` 能做的是「写前强制某个前置动作」，
+做不到「写前强制提问」**——`ask` 只能问「允许这次工具调用吗」。
+
+---
+
+## [Unreleased] - 2026-11-14（执行期中断：按用户口径重算，并把「提问算成本」那条推导拆开）
+
+> 产出：`scripts/measure-execution-phase.mjs`（新增，纯函数导出 + CLI + `--json`）、
+> `scripts/measure-execution-phase.test.mjs`（37 条）、
+> 报告 `docs/research/2026-11-14-execution-phase-measurement.md`。
+> `scripts/check-structure.mjs` 登记 22 个纯函数（PROBE_ARGS + REGISTERED）与 8 个有副作用的导出。
+> 测试数 973 → 1010（硬门与 `node --test` 两处对账）。
+>
+> **为什么不改 `measure-interventions.mjs`**：那个脚本的口径是「人工介入总数」，把
+> `AskUserQuestion` 的作答算作一类介入（Q）。按用户 2026-11-14 的模型，提问是开工前的投资、
+> 不是执行期的成本。**两套口径必须同时存在、能互相换算**，所以新开一个器，旧数字原样保留。
+
+### Added
+
+- **`measure-execution-phase.mjs`**：测「执行起点之后的人类发言数」。
+  三个边界可复算：执行起点 = 第一次 `Write`/`Edit`/`NotebookEdit`，或第一次被
+  `verify-claims.mjs` 的 `isMutatingCommand` 判为改写工作区文件的 Bash 命令；
+  执行期 = 墙钟；执行期中断 = 其中除会话首条外的人类发言（`AskUserQuestion` 的作答与
+  `[Request interrupted by user]` 标记单独计数，不进主指标）。
+  分组 A（第一次提问在执行起点前）/ B（之后）/ C（从不提问）/ none（无写操作）。
+  输出 mean/median/p90、零中断率、执行期时长、纠正/催促构成、体量分层、最小工具数门槛、
+  体量 1:1 匹配对照、偏 Spearman 相关、两条敏感性检验（边界挪到首次工具调用 / 严格口径）。
+  置换检验 5000 次固定种子，同一输入必得同一 p 值。
+- **`matchedPairs()`**：按执行期工具数做 1:1 匹配（容差 log 比 ≤ 0.7），返回胜负计数与逐对明细。
+  存在的理由：A/B 的体量分布严重不重叠（p50 154 vs 1060），四分位分层粒度不够。
+
+### Changed
+
+- `README.md` / `CLAUDE.md` / `docs/GUIDE.md` / `.github/workflows/validate.yml`：
+  回归测试数 973 → 1010（新增 37 条）。硬门 `checkTestCount()` 对账。
+- `docs/research/README.md`：登记本轮报告。
+- `docs/design/README.md`：登记另一个 Agent 新增的 `2026-11-14-agent-roster-policy.md`
+  （硬门 `checkDesignIndex()` 要求的配套索引行，不是对那份文档内容的裁决）。
+
+### Findings（写进报告，这里只列会被后续工作依赖的三条）
+
+1. **A 组的执行期中断原始值确实低于 B（mean 14.4 vs 30.5，p = 0.011），但 A 的活小 6.6 倍**
+   （执行期工具 p50 154 vs 1060，时长 p50 19 h vs 171 h）。控制体量后效应消失甚至反向：
+   每 100 次工具 A 3.29 / B 1.94（A 更差）、1:1 匹配 3 胜 3 负、门槛 ≥400 时 A 反超 38.5 vs 31.4。
+   **「提前问减少执行期中断」在本机语料上没有数据支持。**
+2. **28 个执行期零中断的会话全部在 C 组，执行期工具全部 ≤ 11。**
+   门槛 ≥ 20 工具的 136 个会话里零中断 0 个——「一口气做完」目前是小任务的产物。
+3. **同语料两套口径的差额**：旧口径 2530（非首条人类发言 2346 + 作答 184）、
+   新口径 2253（只数执行期人类发言），差 277（−10.9%）。
+   `2026-11-13-critique-question-layer-product.md` §4.4 的「828 → 859」把开工前提问的作答
+   算进了分子（本语料 15 次），新口径下这部分对执行期成本贡献为 0。
+   **但必须同时记住**：184 次作答里 169 次（91.8%）落在执行期，且被新口径排除在主指标之外。
+
+### 顺带修掉的一个测量污染
+
+语料里有 **19 簇 / 51 份 fork 重放**（内容逐条相同、sessionId 不同、时间戳被整体平移几分钟）。
+最刺眼的一簇 3 份全被判进 A 组，而 A 组总共只有 14 个。按 sessionId 去重抓不到；
+按「执行起点之前的内容哈希」会过度合并（同项目同初始化流程会撞前缀）；
+最后用「整份文件归一化内容哈希 + 记录条数」，归一化连时间戳都丢掉。去重 80 份。
+
+---
+
 ## [Unreleased] - 2026-11-13（Bash 写入识别：从「一律不认」到「可判定才认」，并给误判设了几道硬闸）
 
 > 产出：`scripts/claim-ledger.mjs`（新增 `bashWrites` / `bashWriteScan` / `observedWriteScan` 三个导出，

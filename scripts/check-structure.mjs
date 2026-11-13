@@ -463,9 +463,46 @@ const PROBE_ARGS = {
   // 「笼统完成声明」的验证判据（2026-11-13）。和 isTestCommand / isBuildCommand 同一层：
   // 给一条命令，答「它算不算做过一次检查」。冒烟输入取一条只读命令，必须返回 false。
   isVerificationCommand: '"ls -la"',
+  // compose-agent-prompt.mjs（2026-11-14 提示词分层拼装）：判定层全部纯函数，
+  // 参数取最小可构造输入。读盘的几个用不存在的路径 / 空数组——「什么都没有」
+  // 是它们的正常分支，正好顺带验一遍空而不炸。main 以外的副作用只有 appendFileSync，
+  // 而它只在 CLI 的 compose 分支里被调用，结构门不会走到。
+  parseFrontmatter: '""', roleTools: '""',
+  extractCommands: '""', classifyRequirement: '""', requiredTools: '[[]]',
+  stopConditionProblem: '""',
+  checkPromptSpec: '[{}]',
+  fillDispatchTemplate: '["", {}]', composePrompt: '[{}]',
+  deriveInjected: '[{ root: "/nonexistent-ow-probe" }]',
+  normalizeForHash: '""', promptHash: '""', makePromptRow: '[{ run: "r", task: "t", hash: "h", bytes: 0 }]',
+  firstUserText: '[[]]',
+  verifyPrompts: '[{ rows: [], sessionPath: "/nonexistent-ow-probe" }]',
   renderSessionBlock: '[{}]', attemptTime: '[{}, 0]', renderMarkdown: '[[]]',
   exitCodeFor: '[{}]', renderSummary: '[{}]', renderDetail: '[{}, { claim: {} }]',
   parseArgs: '[[]]', resolveSession: '["/nonexistent", "abc"]', flattenResults: '[[]]',
+  // measure-execution-phase.mjs（2026-11-14 执行期中断测量）：全部纯函数。
+  // 参数一律取最小可构造输入（空对象 / 空串 / 空数组），让「导出但调用即炸」
+  // 在结构门暴露。analyzeFile 用不存在的路径——它会抛，由 checkImportable 吞掉
+  // （它只关心 ReferenceError）。run / formatReport 的完整正确性由
+  // measure-execution-phase.test.mjs 的小目录用例覆盖。
+  normToolName: '""', isWriteCall: '["Bash", { command: "ls" }]', isReadCall: '["Bash", { command: "ls" }]',
+  optionLabels: '[[]]', questionsOf: '[{}]', classifyAnswer: '[{ options: [] }, ""]',
+  createAccumulator: '[]', absorbRecord: '[{}, {}]',
+  finalizeSession: '[{}, { path: "/x", bytes: 0, mtimeMs: 0 }]',
+  groupSessions: '[[]]', groupStats: '[[]]', oneShotRate: '[[]]',
+  ranks: '[[]]', spearman: '[[], []]', cliffsDelta: '[[], []]',
+  spearmanPartial: '[[], [], []]', matchedPairs: '[[], []]',
+  mulberry32: '[1]', permutationTest: '[[], []]',
+  fnv1a: '[1, "x"]', recordSignature: '[{}]', analyzeFile: '["/nonexistent-ow-probe"]',
+  // measure-intervention-cost.mjs（2026-11-14 中断代价测量）：全部纯函数。
+  // 参数一律取最小可构造输入（空串 / 空数组 / 空对象），让「导出但调用即炸」
+  // 在结构门暴露。readSessionDetail 用不存在的路径——它会抛，由 checkImportable
+  // 吞掉（它只关心 ReferenceError）。run / formatReport 的完整正确性由
+  // measure-intervention-cost.test.mjs 的小目录用例覆盖。
+  normPath: '"x"', isReworkDemand: '""', undoEvents: '[[]]',
+  commonPrefixLen: '[[], []]', dedupeResumeForks: '[[]]',
+  readSessionDetail: '["/nonexistent-ow-probe"]', sessionCost: '[{ writes: [], humans: [], asks: [], seq: [], path: "/x", bytes: 0 }]',
+  undoAroundInterruptions: '[{ writes: [], humans: [] }]', density: '[[], "x"]',
+  groupRow: '[[]]', stratified: '[[]]',
   // tui-theme.mjs 的宽度算法（2026-11-05 宽度表修复）：Unicode 官方数据 + grapheme 聚类。
   // 参数取最小可构造输入，让「导出了但调用即炸」在结构门就暴露。
   codePointWidth: '"a"', truncateDisplay: '["x", 5]', hasColor: '"red"',
@@ -541,6 +578,75 @@ const PROBE_ARGS = {
   subagentTranscriptsOf: '["/nonexistent-ow-probe"]',
   collectSubagentTranscripts: '["/nonexistent-ow-probe"]',
   readHeadText: '["/nonexistent-ow-probe", 8]', nonceOwners: '[[]]',
+  // pre-write-gate.mjs（2026-11-14 写前闸）。判定层是纯函数，参数一律取最小可构造输入：
+  // 空对象 / 空串 / 不存在的路径。带副作用的三个（writeMarker / appendLog /
+  // bumpDenials）的 env 与路径都指向临时区 —— 探针不会写进任何真实项目。
+  // 目的是让「导出了但调用即炸」在结构门暴露，而不是等到 hook 在真实会话里崩掉。
+  //
+  // 与 stop-verify-hook.mjs **重名**的六个导出（decide / runHook / parseHookInput /
+  // readStdin / logPathFor / appendLog）不在这里重复登记：`PROBE_ARGS` 是一张扁平表，
+  // 按名字命中所有模块，所以上面那份停在那里的探针参数同样会把本文件的同名导出调一次。
+  // 本文件的签名对那几个探针都兼容（空对象 → passthrough，不写盘）。
+  configOf: '[{}]', defaultConfig: '[]', markerPathFor: '["/nonexistent-ow-probe"]',
+  denialPathFor: '["/nonexistent-ow-probe"]', pathKeyOf: '""',
+  isGateOwnedPath: '["/nonexistent-ow-probe/.claude/.ow-read-done", "/nonexistent-ow-probe"]',
+  powershellWriteScan: '"Get-Content a.txt"',
+  writeIntentOf: '["Read", {}, "/nonexistent-ow-probe"]',
+  readTranscriptReads: '["/nonexistent-ow-probe"]',
+  // 2026-11-14 从 readTranscriptReads 抽出的纯解析层，重放器与闸门共用：
+  // 提取纯函数让「同构」从声称变成保证，见 probe-parser-divergence.mjs。
+  readPathsOfToolUse: '["Read", { file_path: "/nonexistent-ow-probe" }]',
+  readPathsInTranscriptText: '""',
+  readMarker: '["/nonexistent-ow-probe"]',
+  writeMarker: '["/nonexistent-ow-probe/.claude/.ow-read-done", { sessionId: "probe" }]',
+  markerValidity: '[{ marker: { exists: false }, secret: null }, { session_id: "probe" }]',
+  // 2026-11-14 改动二：auto 标记的 HMAC 签名。密钥路径指向不存在的目录 —— 那是
+  // 「还没有密钥」的正常分支，正好把 readGateSecret 返回 null 那条路也验一遍。
+  markerSigOf: '[{ version: 1, session_id: "probe", at: "x", reads: 3 }, "k"]',
+  verifyMarkerSig: '[{ version: 1, session_id: "probe", at: "x", reads: 3 }, null]',
+  secretPathFor: '["/nonexistent-ow-probe"]',
+  readGateSecret: '["/nonexistent-ow-probe/.claude/.ow-gate-secret"]',
+  reasonFor: '[{ cwd: "/x", markerPath: "/x/m", gateCommand: "g", minReads: 3, halt: false }]',
+  bumpDenials: '["/nonexistent-dir-ow/pwg.json", "probe", { readOnly: true }]',
+  cli: '[["status", "--cwd", "/nonexistent-ow-probe"], {}]',
+
+  // observe-reality-check.mjs（2026-11-14 写前闸的真实语料重放）：
+  // 判定函数全是纯的，探针取最小可构造输入。读盘的几个用不存在的路径 ——
+  // 那正是「什么都没有」的正常路径，顺带把空分支也验一遍。
+  // `defaultRoot` / `listTranscripts` / `fnv1a` / `recordSignature` / `distOf` 这些
+  // 名字在别的模块已有同形探针（探针按名字命中**所有**模块），不重复登记。
+  // 全量扫描（buildReport / main）要读 2GB 语料，登记在 INTENTIONALLY_PROBED_FREE。
+  isSandbox: '[{}]', eachLineOffset: '["/nonexistent-ow-probe", () => {}]',
+  verbsOf: '""',
+  gateReadsOf: '["Read", {}]', broadReadsOf: '["Read", {}]',
+  gateReadPathsInText: '""', tailGateReads: '["/nonexistent-ow-probe", 0]',
+  structuralKind: '[{}]',
+  verdict: '[{ firstWrite: { name: "Write", input: {} }, cwd: "/x" }]',
+  GATE_READ_VERBS: '[]', STRUCT_VERBS: '[]', CONTENT_VERBS: '[]', STRUCT_TOOLS: '[]',
+
+  // measure-gate-ceiling.mjs（2026-11-14 写前闸改宽上限）：判定层纯函数全部可调，
+  // 探针取最小可构造输入；读盘的几个用不存在的路径（那是「什么都没有」的正常分支）。
+  // 与 observe-reality-check.mjs 重名的导出（isSandbox / eachLineOffset / gateReadsOf
+  // / tailGateReads / gateReadPathsInText / defaultRoot / listTranscripts / dedupeForks
+  // / analyzeOne / agentToolIdsBefore / subagentReadsByToolId / looseSubagentReads
+  // / isContinuation / CONTINUATION_RE / ATTRIBUTION_CLASSES / attribute）不重复登记 ——
+  // PROBE_ARGS 按名字命中所有模块，上面那份探针会同样调用它们。
+  gateReadsFixedOf: '["Bash", { command: "head -n 20 a.mjs" }]',
+  readWindowText: '["/nonexistent-ow-probe", 0]',
+  windowReadPaths: '["/nonexistent-ow-probe", 0]',
+  subagentPathSet: '[{ path: "/nonexistent-ow-probe/x.jsonl" }, []]',
+  looseSubagentPathSet: '[{ path: "/nonexistent-ow-probe/x.jsonl" }]',
+  upstreamOf: '[{}, []]',
+  toolCallCount: '["/nonexistent-ow-probe"]',
+  evidenceOf: '[{ path: "/nonexistent-ow-probe/x.jsonl", firstWrite: null }, [], { denied: false }]',
+  variantSets: '[{ gateWin: new Set(), fixWin: new Set(), struct: new Set(), subStrict: new Set(), subLoose: new Set(), up: { set: new Set(), unique: false } }]',
+  contentReads: '[{ gateWin: new Set(), fixWin: new Set(), subStrict: new Set(), subLoose: new Set(), up: { set: new Set() } }]',
+  alignWithBaseline: '[{ threshold: 3, real: { withWrite: 0, zeroRead: 0, variants: {}, attribution: {} }, sandbox: { withWrite: 0, variants: {} }, rows: { real: [] } }]',
+  parserEquivalence: '[[]]',
+  byToolCalls: '[{ threshold: 3, rows: { real: [] } }]',
+  byDate: '[{ threshold: 3, rows: { real: [] } }]',
+  dropLargestProject: '[{ threshold: 3, rows: { real: [] } }]',
+  BASE_THRESHOLD: '[]',
 };
 
 /** 需要临时目录的导出，参数由探针注入 `_sandbox` */
@@ -551,6 +657,9 @@ const SANDBOX_ARGS = {
   readLogHealth: '[_sandbox]', logHealthPath: '["/nonexistent"]',
   createObservationLog: '[_sandbox]', observationStats: '[_sandbox]',
   classifyCandidate: '[{}]', readTranscriptTail: '["/nonexistent"]',
+  // pre-write-gate.mjs 的签名密钥生成（2026-11-14）。它会 real 写盘，所以只能进
+  // SANDBOX_ARGS —— 探针把它指到结构门自己的临时目录，不碰任何真实项目。
+  ensureGateSecret: '[_join(_sandbox, "pwg-secret")]',
 };
 /** `node --check` 只查语法，查不到「调用了一个不存在的函数」。
  *  曾把 wrapToWidth 的循环变量改了一半，语法全绿、结构门全绿，
@@ -830,6 +939,23 @@ function checkUnregisteredExports() {
     // 常量与枚举：都是数据，不是函数。
     'LEDGER_VERSION', 'LEDGER_FILE', 'HASH_MAX_BYTES', 'SUBAGENT_HEAD_BYTES',
     'OBSERVE_TAIL_BYTES', 'WRITE_TOOLS', 'ITEM_STATUS', 'TASK_VERDICT', 'FAILING_VERDICTS',
+    // compose-agent-prompt.mjs（2026-11-14）：提示词分层拼装。
+    // 判定层全是纯函数，逐个进 PROBE_ARGS 实际调用；读盘的四个用不存在的路径
+    // （那正是它们「什么都没有」的正常路径，顺带把空分支验一遍）。
+    'promptHash', 'readPromptLedger', 'subagentFiles', 'readHeadRecords',
+    // 数据：四层声明、义务三分类、必填元素清单 —— 不是函数，无需探针。
+    'LAYERS', 'OBLIGATION_KINDS', 'REQUIRED_ELEMENTS', 'REQUIRED_PLACEHOLDERS',
+    'FORBIDDEN_CONTEXT',
+    // probe-evidence-sources.mjs（2026-11-14 扩宽判据的取证探针）：全部导出都是
+    // 「读语料并汇总」，没有一个是能拿空参数安全调用的纯判据 —— sectionA/B/C/D
+    // 都要遍历 400+ 份 transcript（其中 sectionD 还要读子 agent 正文，全量 6 GB）。
+    // 让它进 checkImportable 会让结构门本身跑上几分钟，所以整体登记为免探针；
+    // 正确性由报告 §7 的复算命令与 `--section X` 的单项运行保证。
+    'SANDBOX_RE', 'SANDBOX_SLUG_RE', 'GATE_READ_VERBS', 'STRUCT_VERBS', 'CONTINUATION_RE',
+    'defaultRoot', 'isSandbox', 'cwdOf', 'listMainTranscripts', 'subagentDirOf',
+    'readTail', 'eachRecord', 'toolUsesOf', 'gateReadPaths', 'gateReadsFromToolUse',
+    'pathKey', 'idNamespace', 'agentToolUseIds', 'agentIdsFromResults',
+    'sectionA', 'sectionB', 'sectionC', 'sectionD', 'format', 'main',
   ]);
   const INTENTIONALLY_PROBED_FREE = new Set([
     'main', 'printPlain', 'copyToClipboard', 'startWatch', 'runTick',
@@ -847,7 +973,98 @@ function checkUnregisteredExports() {
     // 同样不能塞进结构门；判据本身已逐条登记在 PROBE_ARGS 里。
     'TAIL_BYTES', 'HEAD_BYTES', 'LOOP_WINDOW', 'LOOP_REPEAT', 'CONTEXT_NEAR_FULL_RATIO',
     'scanAll', 'KINDS',
+    // measure-execution-phase.mjs：run 会全量扫 1.8GB transcript（实测 37s），
+    // 不能进结构门；它的正确性由 measure-execution-phase.test.mjs 的小目录端到端用例覆盖。
+    // 三个常量是数据（工具白名单 / 文本截断长度 / 空闲切分参数），不是函数。
+    'run', 'summarize', 'formatReport', 'WRITE_TOOLS', 'READ_TOOLS', 'SHELL_TOOLS',
+    'TEXT_CAP', 'IDLE_GAP_MS',
   ]);
+  // measure-execution-phase.mjs 的纯函数：全部已进 PROBE_ARGS 实际调用，
+  // 这里显式登记，免得被上面的「未登记导出」提示刷屏。
+  const EXEC_PHASE_FNS = [
+    'normToolName', 'isWriteCall', 'isReadCall', 'optionLabels', 'questionsOf',
+    'classifyAnswer', 'createAccumulator', 'absorbRecord', 'finalizeSession',
+    'groupSessions', 'groupStats', 'oneShotRate', 'ranks', 'spearman', 'cliffsDelta',
+    'mulberry32', 'permutationTest', 'fnv1a', 'recordSignature', 'analyzeFile',
+    'spearmanPartial', 'matchedPairs',
+  ];
+  for (const k of EXEC_PHASE_FNS) REGISTERED.add(k);
+
+  // measure-intervention-cost.mjs（2026-11-14 中断代价测量）：全部纯函数。
+  // 探针参数取最小可构造输入（空串 / 空数组 / 空对象），要求「不抛」。
+  // run / summarize / formatReport 要全量扫 1.9 GB，登记在 INTENTIONALLY_PROBED_FREE。
+  const COST_FNS = [
+    'normPath', 'isReworkDemand', 'undoEvents', 'commonPrefixLen', 'dedupeResumeForks',
+    'readSessionDetail', 'sessionCost', 'undoAroundInterruptions', 'density',
+    'groupRow', 'stratified', 'summarize', 'PRIMARY_TIER', 'REWORK_EXT_RE',
+    'MIN_FRAGMENT_LEN', 'RESUME_PREFIX_RATIO', 'RESUME_MIN_COMMON',
+  ];
+  for (const k of COST_FNS) REGISTERED.add(k);
+
+  // pre-write-gate.mjs（2026-11-14 写前闸）：函数全部已进 PROBE_ARGS 实际调用，
+  // 这里显式登记，免得被「未登记导出」提示刷屏。同名的六个导出
+  // （decide / runHook / parseHookInput / readStdin / logPathFor / appendLog）
+  // 也一并登记 —— 它们与 stop-verify-hook.mjs 重名，但探针是按名字命中所有模块的，
+  // 所以上面那份停在那里的参数同样会把本文件的同名导出调一次。
+  const PRE_WRITE_GATE_FNS = [
+    'configOf', 'defaultConfig', 'markerPathFor', 'denialPathFor', 'pathKeyOf',
+    'isGateOwnedPath', 'powershellWriteScan', 'writeIntentOf', 'readTranscriptReads',
+    'readPathsOfToolUse', 'readPathsInTranscriptText', 'GATE_SHELL_READ_VERBS',
+    'readMarker', 'writeMarker', 'markerValidity', 'reasonFor', 'bumpDenials', 'cli',
+    // 2026-11-14 改动二：签名与密钥。ensureGateSecret 有写副作用，登记在 SANDBOX_ARGS。
+    'markerSigOf', 'verifyMarkerSig', 'readGateSecret', 'ensureGateSecret', 'secretPathFor',
+    'SECRET_REL', 'EDIT_SIDE_TOOLS',
+    'decide', 'runHook', 'parseHookInput', 'readStdin', 'logPathFor', 'appendLog',
+    'MARKER_REL', 'DENIAL_REL', 'MODES', 'BRAKES', 'DEFAULT_BUDGET_MS',
+    'WRITE_TOOLS', 'SHELL_TOOLS', 'READ_TOOLS',
+  ];
+  for (const k of PRE_WRITE_GATE_FNS) REGISTERED.add(k);
+
+  // observe-reality-check.mjs（2026-11-14 写前闸的真实语料重放）：纯函数已进 PROBE_ARGS，
+  // 这里显式登记免得被「未登记导出」提示刷屏。buildReport / main 要扫 2GB 语料，
+  // 与 measure-* 系列同处置 —— 由测试里的小目录端到端用例覆盖。
+  const OBSERVE_REALITY_FNS = [
+    'listTranscripts', 'isSandbox', 'eachLineOffset', 'recordSignature', 'verbsOf',
+    'analyzeOne', 'gateReadsOf', 'broadReadsOf', 'tailGateReads', 'gateReadPathsInText',
+    'dedupeForks', 'distOf', 'structuralKind', 'verdict', 'main', 'buildReport',
+    'GATE_READ_VERBS', 'STRUCT_VERBS', 'CONTENT_VERBS', 'STRUCT_TOOLS', 'HERE',
+    'CONTINUATION_RE', 'ATTRIBUTION_CLASSES',
+    'isContinuation', 'agentToolIdsBefore', 'subagentReadsByToolId', 'looseSubagentReads', 'attribute',
+  ];
+  for (const k of OBSERVE_REALITY_FNS) REGISTERED.add(k);
+
+  // compose-agent-prompt.mjs（2026-11-14 提示词分层拼装）：判定层纯函数已进 PROBE_ARGS
+  // 实际调用，这里显式登记免得被「未登记导出」刷屏。main 是 CLI 入口，
+  // 由 compose-agent-prompt.test.mjs 的端到端用例覆盖。
+  const COMPOSE_PROMPT_FNS = [
+    'PROMPT_LEDGER_VERSION', 'PROMPT_LEDGER_FILE',
+    'parseFrontmatter', 'roleTools', 'extractCommands', 'classifyRequirement', 'requiredTools',
+    'stopConditionProblem', 'checkPromptSpec', 'deriveInjected', 'fillDispatchTemplate',
+    'composePrompt', 'normalizeForHash', 'promptHash', 'makePromptRow', 'readPromptLedger',
+    'firstUserText', 'readHeadRecords', 'subagentFiles', 'verifyPrompts', 'main',
+    'LAYERS', 'OBLIGATION_KINDS', 'REQUIRED_ELEMENTS', 'REQUIRED_PLACEHOLDERS', 'FORBIDDEN_CONTEXT',
+  ];
+  for (const k of COMPOSE_PROMPT_FNS) REGISTERED.add(k);
+
+  // measure-gate-ceiling.mjs：纯函数已进 PROBE_ARGS 实际调用，这里显式登记免得被
+  // 「未登记导出」刷屏。measure / main 要全量扫 2GB 语料（实测 120s），与 measure-*
+  // 系列同处置 —— 由 measure-gate-ceiling.test.mjs 的小目录端到端用例覆盖。
+  const GATE_CEILING_FNS = [
+    'gateReadsFixedOf', 'readWindowText', 'windowReadPaths', 'subagentPathSet',
+    'looseSubagentPathSet', 'upstreamOf', 'toolCallCount', 'evidenceOf', 'variantSets',
+    'contentReads', 'alignWithBaseline', 'parserEquivalence', 'byToolCalls', 'byDate',
+    'dropLargestProject', 'measure', 'main', 'BASE_THRESHOLD', 'BASELINE_SNAPSHOT',
+  ];
+  for (const k of GATE_CEILING_FNS) REGISTERED.add(k);
+
+  // probe-parser-divergence.mjs（2026-11-14 量化重放器与闸门的分叉）：纯函数进 PROBE_ARGS，
+  // `probe` 要扫全量语料，与 measure-* 系列同处置 —— 由 probe-parser-divergence.test.mjs
+  // 的小目录用例覆盖。
+  const PROBE_DIVERGENCE_FNS = [
+    'gatePathsOfText', 'windowTextOf', 'diffOf', 'attributeDivergence',
+    'syntheticCases', 'probe', 'formatProbe', 'main',
+  ];
+  for (const k of PROBE_DIVERGENCE_FNS) REGISTERED.add(k);
 
   const files = readdirSync(dir).filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs') && !CLI_SCRIPTS.has(f));
   if (!files.length) return;

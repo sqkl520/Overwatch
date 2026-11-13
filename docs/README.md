@@ -10,6 +10,7 @@
 | 「每条能力对应的命令是什么」 | [CAPABILITIES.md](CAPABILITIES.md) | 能力 → 可运行的命令，硬门会核 |
 | 「我该敲什么、会看到什么」 | [GUIDE.md](GUIDE.md) | 使用手册：输出怎么读、出问题怎么办 |
 | 「状态怎么判、阈值多少」 | [spec/state-model.md](spec/state-model.md) | 可执行判据的唯一真源 |
+| 「写前闸按什么判、怎么验收」 | [spec/2026-11-14-pre-write-gate-split.md](spec/2026-11-14-pre-write-gate-split.md) | 首写工具拆分的判据表 + 7 条 AC + 已知残留问题 |
 | 「为什么只能手动接力」 | [adr/0001-config-only.md](adr/0001-config-only.md) | 纯配置库的取舍与代价 |
 | 「**现在到底什么是真的**」 | [FACTS.md](FACTS.md) | 逐条实测的事实清单：证据等级 + 复跑命令 + 已被推翻的结论 |
 | 「这条结论还成立吗」 | [research/README.md](research/README.md) | 研究索引 + **已推翻结论清单** |
