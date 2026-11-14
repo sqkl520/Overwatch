@@ -289,4 +289,4 @@ hook 命令里的裸 `node` 在缺 `PATHEXT` 时解析不到。带 `PATHEXT` 触
 | 干净登录态（有 `oauthAccount` 或真实 `ANTHROPIC_API_KEY`）下 `claude -p` 是否需要任何环境变量 | **未验证**。本机无此条件 |
 | `claude -p --output-format json` 的 `result` 为空，是**本机网关**的行为还是 CLI 的行为 | **未验证**。只有本机一种环境 |
 | macOS / Linux 上 `--plugin-dir` 与 hook 的行为 | **未验证**。只在 Windows 实测 |
-| 打包后的 plugin 载荷与仓内 `.claude/` 的**同源生成**方案 | **未实现**，本文只决定方向 |
+| 打包后的 plugin 载荷与仓内 `.claude/` 的**同源生成**方案 | **已实现**（2026-11-14）：`scripts/build-payload.mjs` 从 `.claude/` **生成** plugin 布局载荷到 gitignored 的 `dist/payload/`，`--check` 以七条判据验同源、`--print-dir` 供入口脚本消费。方案选「生成，不维护」；实测生成物 `claude plugin list` 为 `Status: ✔ loaded`（12 agents + 1 skill），`plugin validate --strict` 通过。37 条测试，其中第 4 组 10 条是负向（漂移/伪造必须红）。**载荷不含 hooks**：实测 hook 脚本的 import 闭包漏一跳时 `claude` 退出码仍是 0（静默失去介入能力），故 hooks 归应用用 `--settings` 挂。设计、四个实测问题（布局必填项 / 同名 agent / hooks 声明 / 多 `--plugin-dir`）与未验证项见 [`../design/2026-11-14-payload-generation.md`](../design/2026-11-14-payload-generation.md) |

@@ -343,7 +343,18 @@ test('--json 与人类输出出自同一份数据（字段全在、且逐项对�
     const proj = join(root, 'slug-a');
     mkdirSync(proj, { recursive: true });
     writeFileSync(join(proj, 's1.jsonl'), '{"type":"user"}\n');
-    const env = { CLAUDE_PROJECTS_DIR: root };
+    const env = {
+      CLAUDE_PROJECTS_DIR: root,
+      OVERWATCH_RUNS_DIR: join(dir, 'no-runs'),
+      // **还要隔离 watcher 的状态目录**。`plan` 我隔离过了，但 `watcher` 那一项
+      // spawn 真实的 `watch.mjs --health`、读真实的 state 目录 —— 那里的 `lastTick`
+      // 每次 tick 都在变，于是「两次渲染必须一致」会随机红（实测约 1/8）。
+      // 指到一个空目录 → 稳定报「没有 state.json（从未运行过）」。
+      OVERWATCH_STATE_DIR: join(dir, 'no-state'),
+    };
+    // `OVERWATCH_RUNS_DIR` 必须一起注入：`plan` 那一项默认读真实的 `tasks/runs/`，
+    // 而它在两次运行之间会变（Agent 正在往里写），于是「两次渲染必须一致」随机红。
+    // 指到一个不存在的目录 → plan 报「还没有 run」，是个稳定的空状态。
     // 参考时刻定在「文件写入之后 + 5 分钟」，两次运行看到的年龄必然一致。
     const pinned = ['--now', new Date(Date.now() + 5 * 60_000).toISOString()];
 

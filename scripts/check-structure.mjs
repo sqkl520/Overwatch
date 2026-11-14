@@ -668,6 +668,21 @@ const PROBE_ARGS = {
   byDate: '[{ threshold: 3, rows: { real: [] } }]',
   dropLargestProject: '[{ threshold: 3, rows: { real: [] } }]',
   BASE_THRESHOLD: '[]',
+
+  // build-payload.mjs（2026-11-14 plugin 载荷生成）：判定层全部纯函数，探针取最小输入。
+  // 读盘的两个（summarizeSources / planPayload）给不存在的路径 —— 「什么都没有」是它们的
+  // 正常分支，正好把空分支也验一遍。checkPayload 同理（载荷目录不存在时直接返回一条原因）。
+  // 会**写盘**的 buildPayload 不在这里：它拿到不存在的 root 会先攒 problems 并在写之前返回，
+  // 但这个「先返回」是一条将来可能被改掉的实现细节，不该被结构门当作安全保证 —— 所以
+  // 它和 main 一起登记在 INTENTIONALLY_PROBED_FREE，正确性由 build-payload.test.mjs 覆盖。
+  // 函数名刻意不叫 parseArgs：探针表是按名字命中所有模块的扁平表，重名会被另一份参数调用。
+  defaultOutDir: '["/nonexistent-ow-probe"]',
+  summarizeSources: '["/nonexistent-ow-probe"]',
+  payloadDigest: '[[{"source": ".claude/agents/a.md", "sha256": "bb"}]]',
+  pluginManifest: '"a"', pluginManifestBytes: '"a"',
+  planPayload: '[{"root": "/nonexistent-ow-probe"}]',
+  checkPayload: '[{"root": "/nonexistent-ow-probe"}]',
+  parseArgv: '[]',
 };
 
 /** 需要临时目录的导出，参数由探针注入 `_sandbox` */
@@ -1005,6 +1020,9 @@ function checkUnregisteredExports() {
     // 不能进结构门；正确性由 measure-ask-vs-tell.test.mjs 的小目录用例覆盖。
     // 这里只登记与上面重名的两个（summarize / formatReport 已在本表里）。
     // 它的其它常量已进注册表，不重复列。
+    // build-payload.mjs：buildPayload 会 rmSync + writeFileSync（真写盘），不能进结构门；
+    // 正确性由 build-payload.test.mjs 的生成 / 可复现 / 先清空 / 源坏一件不写 四条用例覆盖。
+    'buildPayload',
   ]);
   // measure-execution-phase.mjs 的纯函数：全部已进 PROBE_ARGS 实际调用，
   // 这里显式登记，免得被上面的「未登记导出」提示刷屏。
@@ -1089,6 +1107,19 @@ function checkUnregisteredExports() {
     'displayPath', 'findLatestRun', 'loadRun', 'formatPlan', 'buildPlan', 'renderPlan',
   ];
   for (const k of RENDER_PLAN_FNS) REGISTERED.add(k);
+
+  // build-payload.mjs（2026-11-14 plugin 载荷生成）：纯函数已进 PROBE_ARGS 实际调用，
+  // 这里显式登记，免得被「未登记导出」提示刷屏。
+  // buildPayload 会**写盘**（rmSync + writeFileSync），main 是 CLI 入口 —— 两个都进
+  // INTENTIONALLY_PROBED_FREE，由 build-payload.test.mjs 的 11 条生成/负向用例覆盖。
+  // 常量是数据（目录名 / 文件名 / 版本号 / 帮助文本），不是函数。
+  const BUILD_PAYLOAD_FNS = [
+    'PAYLOAD_VERSION', 'GENERATOR', 'MANIFEST_FILE', 'PLUGIN_NAME', 'DEFAULT_OUT',
+    'AGENTS_REL', 'SKILLS_REL', 'HELP',
+    'defaultOutDir', 'summarizeSources', 'payloadDigest', 'pluginManifest',
+    'pluginManifestBytes', 'planPayload', 'checkPayload', 'parseArgv',
+  ];
+  for (const k of BUILD_PAYLOAD_FNS) REGISTERED.add(k);
 
   // observe-reality-check.mjs（2026-11-14 写前闸的真实语料重放）：纯函数已进 PROBE_ARGS，
   // 这里显式登记免得被「未登记导出」提示刷屏。buildReport / main 要扫 2GB 语料，

@@ -148,6 +148,65 @@
   「读不出（Cannot find module）」——而那条负向测试恰好断言「变异体不该再有
   『读不出』的措辞」。**这是同一个词被两个不相干的原因共用造成的假红。**
 
+### Added
+
+- **`scripts/build-payload.mjs`：从 `.claude/` 生成可分发的 plugin 载荷。**
+  这是 ADR-0003 §5.2 那条「打包后的运行时载荷与仓内 `.claude/` 的同源生成方案」的第一次实现。
+  产出 `dist/payload/`（**gitignored，是构建产物不是第二真源**）：12 个 `agents/*.md` +
+  `skills/oversight/SKILL.md` + `.claude-plugin/plugin.json` + `payload-manifest.json`。
+  ```
+  $ node scripts/build-payload.mjs
+  ✔ 生成 15 个文件 → dist/payload · 2f6513f71576…
+  $ claude --plugin-dir <仓库>/dist/payload plugin list
+    ❯ overwatch@inline   Version: 0.0.0+g2f6513f71576   Status: ✔ loaded
+  ```
+  `--check` 七条判据验同源，其中最要紧的一条是**源摘要 vs 载荷摘要**：源改了但载荷没重建时
+  **exit 1 并点名改的是哪个文件**。实测：往 `oversight-probe.md` 追加一行 → `REAL_EXIT=1`，
+  报「源变了但载荷没重建（源摘要 bdae50ce88f5… ≠ 载荷 2f6513f71576…）：改动 agents/oversight-probe.md」。
+  `--print-dir` 供入口脚本消费。
+
+### Changed
+
+- **主路换成红队实测出的「第三条路」：`.claude/` 目录本身就是 plugin 根，不生成任何东西。**
+  在 `.claude/` 里放一个 `.claude-plugin/plugin.json`，同一个目录就有两种身份：
+  cwd=repo 时宿主按**项目布局**读 `.claude/agents`、`.claude/skills`；
+  `--plugin-dir <repo>/.claude` 时同一个目录就是 **plugin 根**。实测：
+  ```
+  $ claude --plugin-dir <repo>/.claude plugin details overwatch
+    Skills (1)  oversight
+    Agents (12)  oversight-acceptor … oversight-safety
+  ```
+  **零生成 → 零第二真源 → 零漂移。** 生成方案（A）保留为分发打包工具（将来 `npm pack` 用），
+  但不再是主路。**否掉 A 做主路的关键理由**（红队 §4.1 实测）：`dist/` 已 gitignore，
+  CI 里根本没有它 —— `build-payload.test.mjs` 全部用 `mkdtemp` 造 fixture、**从不 spawn 宿主**。
+  所以「载荷真的能被加载」只在作者机器上验证过，等于把「两份 markdown 漂移」换成了
+  「生成物与运行时行为漂移」。
+- **`build-payload.mjs --verify-self`：静态验证一个目录是不是合法 plugin 根。**
+  它守的是**布局**这一类会**静默失效**的改动：agents 挪进子目录（宿主只认一层）、
+  skill 平铺（`skills/x.md` 不被识别）、缺 manifest、agent 缺 frontmatter、往载荷里塞 hooks。
+  **已接进 CI**（`Payload layout` 一步）—— 这是「载荷能加载」第一次在 CI 里真的被测到。
+  负向实测：把 `agents/` 移走 → exit 1 并点名缺的目录。
+- **否掉另外两个备选，都是实测的。** 否掉 B（以 plugin 布局为真源）：根目录 `agents/`
+  **不会被当项目布局加载**，init 的 agents 清单里没有它 —— 选 B 本仓自己就不能用。
+  否掉 C（软链接）：本机 `core.symlinks=false`，软链接 `git add` 后 clone 出来变成
+  **9 字节普通文本文件**（内容是链接目标），静默失效。
+- **载荷不含 hooks。** 实测：只拷一个 hook 脚本会断在 `claim-ledger.mjs` → `verify-claims.mjs`
+  这一跳，报 `ERR_MODULE_NOT_FOUND` 而 **`claude` 退出码仍是 0** —— 静默失去介入能力。
+  所以 hooks 归应用用 `--settings` 挂。`--verify-self` 的判据里 `hooks/` 非空即报错。
+  （红队独立得出同一结论，并进一步指出：用 `${CLAUDE_PLUGIN_ROOT}` 会把 hook 的
+  6 文件 import 闭包一起绑进载荷，任何一跳断掉都是静默的。）
+
+### Fixed
+
+- **`--json 与人类输出同源` 那条测试会随机红（实测约 1/8）。** 根因是我新加的 `plan` 步骤
+  读真实 `tasks/runs/`（Agent 正在往里写），以及 `watcher` 步骤 spawn 真实
+  `watch.mjs --health` 读真实 state 目录（`lastTick` 每 tick 在变）。
+  修法两步：`renderPlan()` 接受 `runsDir` / `nowMs` 注入；测试里同时隔离
+  `OVERWATCH_RUNS_DIR` 与 `OVERWATCH_STATE_DIR`。
+  **第一次只隔离了前者，仍然 1/3 红** —— 说明变动源不止一处，必须逐个堵。
+  修完连跑 8 次 0 失败。
+  **这类缺陷不改不会让 CI 立刻红，只会让它随机红，而随机红的结局通常是被 `|| true` 掉。**
+
 ### Known（本轮登记但不修）
 
 - **`claude -p` 的失败语义不自洽，产品不能信 `subtype`。** 实测（本机）：

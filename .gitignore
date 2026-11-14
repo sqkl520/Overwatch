@@ -38,6 +38,19 @@ docs/research/2026-11-02-path-b-recount.md
 # 产物由  渲染出来。
 scripts/install/start-watch.vbs
 
+# ── plugin 载荷：构建产物，永不入库 ──────────────────────────────
+# `scripts/build-payload.mjs` 从 `.claude/agents/*.md` 与 `.claude/skills/`
+# 生成一份 plugin 布局的载荷（`.claude-plugin/plugin.json` + 根级 `agents/`
+# + `skills/<名>/SKILL.md`），由应用在起 `claude` 时用 `--plugin-dir` 挂载。
+#
+# 为什么不入库：这是**第二真源**，而且是会漂移的那种。`.claude/` 是本仓自用
+# 的**项目布局**（宿主自动加载），载荷是给用户跑应用时的**plugin 布局**
+# （两种布局不是一回事，实测把仓库根直接当 `--plugin-dir` 会得到 `plugins = []`）。
+# 两份都入库，漂移的那份必然没人测 —— 本仓已经吃过这个亏。
+# 所以载荷只生成不提交，`--check` 负责在漂移时报红。见
+# docs/design/2026-11-14-payload-generation.md 与 docs/adr/0003 §5.2。
+dist/
+
 # ── 注意 ──────────────────────────────────────────────
 # 本文件刻意不包含 .claude/ 、rules/ 、docs/ 、tasks/ 。
 # 那些目录就是本仓库的产品本体。参考项目的 .gitignore 忽略它们是有意的

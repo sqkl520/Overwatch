@@ -640,7 +640,12 @@ async function runDoctor(opts) {
     const t = Date.now();
     try {
       const mod = await import('./render-plan.mjs');
-      const { plan, lines } = mod.renderPlan({ runsDir: join(REPO, 'tasks', 'runs'), root: REPO });
+      // **`runsDir` 与 `nowMs` 都可注入**：不然这一项读的是真实的 `tasks/runs/`，
+      // 而它在两次运行之间会变（我们的 Agent 正在往里写）——`--json 与人类输出同源`
+      // 那条测试就会随机红，实测 3 次里 1 次。同源说的是「同一份事实渲染出两种形态」，
+      // 不是「两次真实运行碰巧一样」，所以必须能喂同一份输入。
+      const runsDir = env.OVERWATCH_RUNS_DIR || join(REPO, 'tasks', 'runs');
+      const { plan, lines } = mod.renderPlan({ runsDir, root: REPO, nowMs });
       const ms = Date.now() - t;
       if (plan.empty) {
         return { id: 'plan', ms, label: 'plan', text: '还没有 run —— 没有 tasks/runs/<id>/task-graph.json 可看（新机器上是正常的）', facts: { empty: true } };

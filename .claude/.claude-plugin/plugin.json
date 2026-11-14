@@ -1,0 +1,5 @@
+{
+  "name": "overwatch",
+  "version": "0.1.0",
+  "description": "OmniSight 运行时载荷：oversight-* 角色定义与 oversight 调度 skill。同一个目录既是本仓的项目布局（cwd=repo 时宿主自动加载），也是可分发的 plugin 根（应用用 --plugin-dir 挂载）。"
+}
