@@ -36,7 +36,7 @@
 | 结构硬门（改动后必跑） | `node scripts/check-structure.mjs` | 0 违规才绿；含测试数对账、文档路径、能力清单 |
 | 产出对账：子 agent 说产出的东西，磁盘上在不在 | `node scripts/claim-ledger.mjs verify --run <run-id>` | `COMPLETE` / `PARTIAL` / `MISSING` / `CONFLICT` 等逐任务结论 |
 | 从 transcript 抽子 agent 的写入痕迹（不需要它配合） | `node scripts/claim-ledger.mjs observe --run <run-id> --session <会话目录>` | 每条写文件的调用（`Write`/`Edit` + 路径可确定解析的 Bash 写入），含失败的调用，并打印「判不出」的逐类计数 |
-| 全量回归测试 | `node --test scripts/*.test.mjs` | 全绿；条数以命令输出为准 |
+| 全量回归测试 | `node --test scripts/` | 全绿；条数以命令输出为准 |
 | 文档相对链接不悬空 | `node scripts/check-links.mjs` | 断链数，非 0 即失败 |
 
 > 想确认某个数字：跑对应命令，**不要相信任何文档里写死的秒数/占比**。
