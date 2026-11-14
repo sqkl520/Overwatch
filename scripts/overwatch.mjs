@@ -552,6 +552,7 @@ const PLAN = [
   { id: 'gate', what: '写前闸的标记与密钥（由 pre-write-gate.mjs 报出）' },
   { id: 'watcher', what: '后台监视的安装与存活（由 install-watcher.mjs 报出）' },
   { id: 'platform', what: '平台，以及它对通知与开机自启的影响' },
+  { id: 'plan', what: '有没有 run 在做（由 render-plan.mjs 的同一个 renderPlan 报出）' },
 ];
 
 /** 下一步该跑什么。这也是数据 —— README 缺「第二次用」是审计的原话。 */
@@ -626,6 +627,40 @@ async function runDoctor(opts) {
   // 按 PLAN 的顺序放回去：耗时要落在它自己那一项上。
   steps.splice(4, 0, gate);
   steps.splice(5, 0, watcher);
+
+  // ── 第 8 项：有没有 run 在做。 ─────────────────────────────────────
+  //
+  // **import 而不 spawn**：`render-plan.mjs` 裸启动要 350–390ms，而其中约 270ms
+  // 是 Node 启动本身 —— spawn 等于付两份启动费，直接撞破 1000ms 预算。
+  // 进程内实测 import 57ms + render 29ms = 86ms，塞得下。
+  //
+  // **判据只有一份**：这里调的是 `renderPlan()` 本体，不是另写一个「轻量统计」。
+  // 本仓库已经因为「同一个概念写两遍」吃过好几次亏（`什么算读过` 分叉成 5 份）。
+  const planStep = await (async () => {
+    const t = Date.now();
+    try {
+      const mod = await import('./render-plan.mjs');
+      const { plan, lines } = mod.renderPlan({ runsDir: join(REPO, 'tasks', 'runs'), root: REPO });
+      const ms = Date.now() - t;
+      if (plan.empty) {
+        return { id: 'plan', ms, label: 'plan', text: '还没有 run —— 没有 tasks/runs/<id>/task-graph.json 可看（新机器上是正常的）', facts: { empty: true } };
+      }
+      // 摘要必须是**一行**（doctor 的每项都是一行）。所以只取进度行，
+      // 不取 `PLAN <run> · <goal>` —— goal 是子树的自然语言目标，长度不受控，
+      // 实测拼进去会到 306 字符，把整屏压垮。
+      // run 名取第一行里 `PLAN ` 之后、` · ` 之前那一段；进度取第二行。
+      const prog = lines[1] || '';
+      const runId = (lines[0] || '').replace(/^PLAN\s+/, '').split(' · ')[0];
+      return {
+        id: 'plan', ms, label: 'plan',
+        text: `${runId} · ${prog}`,
+        facts: { empty: false, ok: plan.ok, run: plan.run },
+      };
+    } catch (e) {
+      return { id: 'plan', ms: Date.now() - t, label: 'plan', text: `读不出（${e && e.message}）—— 不是「没有 run」`, facts: { error: String(e && e.message) } };
+    }
+  })();
+  steps.push(planStep);
 
   const elapsedMs = Date.now() - started;
   const wallMs = bootMs + elapsedMs;

@@ -186,7 +186,7 @@ test('doctor 在 1000ms 预算内跑完（默认预算、真实本机）', () =>
   //
   // 所以测两件**确定性**的事，它们才是 1000ms 这个设计约束的真身：
   //   1. 预算**真的在被执行**：给一个压到极限的预算，doctor 必须如实降级而非硬跑。
-  //   2. 每一项耗时**真的被量过**：7 项里至少有子进程那两项报了非零值。
+  //   2. 每一项耗时**真的被量过**：8 项里至少有子进程那两项报了非零值。
   const tiny = run(['doctor', '--budget', '150']);
   assert.match(tiny.out, /预算内没时间跑|超时|（下限）|（未完）/,
     `预算压到 150ms 时必须出现诚实降级，而不是照样跑满：\n${tiny.out}`);
@@ -203,7 +203,7 @@ test('doctor 在 1000ms 预算内跑完（默认预算、真实本机）', () =>
 test('doctor 的每一行都是「读到了什么」，不是红绿灯', () => {
   const r = run(['doctor']);
   const body = r.out.split('\n').filter((l) => /^\[\s*\d+ms\]/.test(l));
-  assert.ok(body.length >= 7, `应有 7 项带耗时的事实行，实际 ${body.length}：\n${r.out}`);
+  assert.ok(body.length >= 8, `应有 8 项带耗时的事实行，实际 ${body.length}：\n${r.out}`);
   for (const line of body) {
     // 前半段之外的正文里不许出现 ✓/✗ —— 一个 ✓ 会让人以为「没问题」，
     // 而「读到了 Node v26.12.1」才是事实。本文件只禁止本入口自己写的行用红绿灯。
@@ -354,7 +354,7 @@ test('--json 与人类输出出自同一份数据（字段全在、且逐项对�
     assert.doesNotThrow(() => { data = JSON.parse(json.out); }, `--json 必须是合法 JSON：\n${json.out}`);
     assert.equal(data.command, 'doctor');
     assert.equal(data.summary.code, human.code, 'summary.code 必须等于真实退出码');
-    assert.equal(data.plan.length, 7, 'plan 必须有 7 项');
+    assert.equal(data.plan.length, 8, 'plan 必须有 8 项（第 8 项是 run 进度，2026-11-14 加）');
 
     const humanRows = human.out.split('\n').filter((l) => /^\[\s*\d+ms\]/.test(l));
     assert.equal(data.steps.length, humanRows.length,
@@ -544,6 +544,13 @@ function mutateEntry(out, replacements) {
   // 三个相对 import → 绝对 URL
   for (const rel of ['tui-meta.mjs', 'notify.mjs', 'install-watcher.mjs']) {
     text = text.split(`from './${rel}'`).join(`from '${pathToFileURL(join(HERE, rel)).href}'`);
+  }
+  // **动态 import 也要改写**。`plan` 那一步用的是 `await import('./render-plan.mjs')`，
+  // 它不在上面那张 `from './x'` 的替换表里 —— 变异体放在临时目录，相对路径解析不到，
+  // 于是 plan 步骤报「读不出（Cannot find module）」，污染了「读不出」这个词，
+  // 让一条**与本改动无关**的负向测试误红。
+  for (const rel of ['render-plan.mjs']) {
+    text = text.split(`import('./${rel}')`).join(`import('${pathToFileURL(join(HERE, rel)).href}')`);
   }
   writeFileSync(out, text);
   return text;

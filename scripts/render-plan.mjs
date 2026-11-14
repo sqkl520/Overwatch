@@ -671,6 +671,17 @@ function main(argv) {
   const run = args.run && args.run !== true ? String(args.run) : null;
   const { plan, lines } = renderPlan({ runsDir, run, root });
 
+  // `--summary`：**只打第一行进度**。给 `overwatch doctor` 用 —— 它自己的预算是
+  // 1000ms，而完整渲染实测 350–375ms，内联进来就撞破预算。
+  // 但判据**不许有第二份**：summary 的文本就是 `lines[0]` 与 `lines[1]` 拼出来的，
+  // 仍出自同一个 `renderPlan()`，不是另写一个「轻量版统计」。
+  if (args.summary) {
+    // 前两行是 `PLAN <run> · <goal>` 与 `进度 …`；空状态时只有一行说明。
+    const head = lines.slice(0, 2).filter((l) => l && l.trim());
+    console.log(head.join('\n'));
+    return plan.empty ? 1 : 0;
+  }
+
   if (args.json) {
     console.log(JSON.stringify({ ...plan, lines }, null, 2));
   } else {

@@ -119,6 +119,35 @@
   **两个环境各跑一遍全量**：有语料 1463 pass / 0 fail，无语料 1461 pass / 0 fail
   （差 2 条是 Windows 专属 skip）。
 
+### Changed
+
+- **`overwatch doctor` 加了第 8 项 `plan`：现在它会报「有没有 run 在做」。**
+  此前 doctor 完全不提 plan（`grep -ci plan` = 0），而 `overwatch plan` 只打印
+  「未实现」——于是 `render-plan.mjs` 是一个**零消费者的孤儿**（红队原话）。
+  现在本机输出：
+  ```
+  [  55ms] plan  2026-11-13-output-reconciliation · 进度 2/5 完成 · 1 失败 · 2 待认领 · 0 待跑 · 预算 50%
+  合计 503ms（本进程 428ms + 启动 75ms）/ 预算 1000ms
+  ```
+  **import 而不 spawn**：`render-plan.mjs` 裸启动实测 350–392ms，而其中约 270ms 是
+  Node 启动本身（同机 `node -e "0"` 实测 269ms）—— spawn 等于付两份启动费，
+  直接撞破 1000ms 预算。进程内实测 **import 57ms + render 29ms = 86ms**，塞得下。
+  **判据只有一份**：调的是 `renderPlan()` 本体，不是另写一个「轻量统计」——
+  本仓库已经因为「同一个概念写两遍」吃过好几次亏（「什么算读过」分叉成 5 份）。
+- **`render-plan.mjs --summary`：只打第一行进度。** 它的用途就是给 doctor 用，
+  但实现上仍走同一个 `renderPlan()`，`lines` 只是被截断，不是另一套逻辑。
+  摘要**只取进度行，不取 `PLAN <run> · <goal>`**——goal 长度不受控，实测拼进去
+  306 字符，把 doctor 的一行压垮。
+
+### Fixed
+
+- **`mutateEntry()` 漏改动态 import，让一条无关的负向测试误红。**
+  变异体把 `overwatch.mjs` 复制到临时目录并改坏判据，只把三个**静态**
+  `from './x'` 换成了绝对 URL；新加的 plan 步骤用的是**动态**
+  `await import('./render-plan.mjs')`，相对路径在临时目录解析不到，于是它报
+  「读不出（Cannot find module）」——而那条负向测试恰好断言「变异体不该再有
+  『读不出』的措辞」。**这是同一个词被两个不相干的原因共用造成的假红。**
+
 ### Known（本轮登记但不修）
 
 - **`claude -p` 的失败语义不自洽，产品不能信 `subtype`。** 实测（本机）：
