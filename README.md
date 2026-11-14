@@ -154,7 +154,7 @@ Overwatch/
 
 新来的人从 [`docs/README.md`](docs/README.md) 开始——它按「你想知道什么」指路，并说清四类文档的可信度不同。
 
-改动后必跑 `node scripts/check-structure.mjs`（结构硬门）与 `node --test scripts/*.test.mjs`（1274 条回归测试；**这个数字由硬门与实跑对账，写错即红**，所以照抄即可、不必手工数）。
+改动后必跑 `node scripts/check-structure.mjs`（结构硬门）与 `node --test scripts/*.test.mjs`（1276 条回归测试；**这个数字由硬门与实跑对账，写错即红**，所以照抄即可、不必手工数）。
 
 ## 已知局限
 

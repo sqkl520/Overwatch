@@ -21,11 +21,16 @@ import {
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-install-'));
 
 test('启动器在仓库里，不在数据目录里（DF-022 的核心约束）', () => {
-  const repo = join('C:', 'repo');
-  const stateDir = join('C:', 'Users', 'x', 'AppData', 'Local', 'Overwatch');
+  // 用平台中立的临时目录，不用 `join('C:', 'repo')` 这类写死盘符的写法 ——
+  // 在 Linux 上那只是一个以字母 C: 开头的**相对路径**，`resolve()` 会把它接到
+  // 当前工作目录后面，于是这条断言在 CI 上必然失败（实测 Linux 8 条红，本机全绿）。
+  const base = tmp();
+  const repo = join(base, 'repo');
+  const stateDir = join(base, 'state');
   const out = launcherPath(repo);
   assert.ok(out.startsWith(resolve(repo)), `启动器应在仓库内：${out}`);
   assert.ok(!out.startsWith(resolve(stateDir)), `启动器不得位于数据目录：${out}`);
+  rmSync(base, { recursive: true, force: true });
 });
 
 test('renderLauncher 替换两个占位符，且不再残留 __ 标记', () => {
@@ -78,7 +83,9 @@ test('stateDirFor 与 watch.mjs 的 defaultStateDir 对同一个 env 给出同�
   }
 });
 
-test('shortcutPath 在启动文件夹里，且不在数据目录里', () => {
+test('shortcutPath 在启动文件夹里，且不在数据目录里', { skip: process.platform !== 'win32' }, () => {
+  // 启动文件夹是 Windows 概念：`startupDir()` 在非 win32 上**返回 null**（并给 launchd /
+  // systemd 建议）。所以这条断言只在 win32 有意义 —— 之前它无条件跑，Linux CI 上必红。
   const env = { APPDATA: 'C:\\Roaming', LOCALAPPDATA: 'C:\\Local' };
   const lnk = shortcutPath(env);
   assert.ok(lnk.includes('Startup'), `快捷方式应在启动文件夹：${lnk}`);

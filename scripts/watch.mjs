@@ -1521,8 +1521,15 @@ export function createObservationLog(dir, { maxBytes = OBS_MAX_BYTES } = {}) {
           // 归档而不是覆盖。旧实现是「轮转到 .1，只留一份」——最早的证据会被永久删掉，
           // 而观察期的全部价值来自积累。现在每次轮转另存一个带时间戳的文件，
           // **从不删除**。存档多了由人决定怎么处理，不由程序替你决定。
+          //
+          // **同名即丢数据。** 时间戳只到毫秒，快速连续轮转（测试里 40 条写 500 字节
+          // 上限＝10 次轮转）会在同一毫秒内生成相同的名字，后一次 `renameSync` 覆盖前一次
+          // —— Linux CI 上实测丢 30/40 条。所以撞名时加序号，直到找到一个没被占用的名字。
           const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-          const archived = join(target, `observations.${stamp}.jsonl`);
+          let archived = join(target, `observations.${stamp}.jsonl`);
+          for (let n = 1; existsSync(archived) && n < 1000; n++) {
+            archived = join(target, `observations.${stamp}-${n}.jsonl`);
+          }
           try { renameSync(file, archived); } catch { /* 归档失败就别动原文件，继续写 */ }
         }
         appendFileSync(file, buf);

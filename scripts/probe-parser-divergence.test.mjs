@@ -36,11 +36,19 @@ const box = () => {
 
 // ── ① diffOf ──────────────────────────────────────────────────────────
 
-test('diffOf 认出两侧等价，且按 pathKeyOf 归一（大小写/斜杠不算分歧）', () => {
+test('diffOf 认出两侧等价，且按 pathKeyOf 归一（大小写/斜杠不算分歧）', { skip: process.platform !== 'win32' }, () => {
+  // 大小写折叠**只在 win32 发生**（见 `pre-write-gate.mjs` 的 `pathKeyOf`）。
+  // Linux 上 `A.mjs` 与 `a.mjs` 是两个文件，折叠会把它们混成一个 —— 所以这条
+  // 「归一」断言是 Windows 语义，非 win32 上不成立，也不该成立。
   const d = diffOf(['C:\\A\\B.mjs'], ['c:/a/b.mjs']);
   assert.equal(d.diverged, false);
   assert.equal(d.gateCount, 1);
   assert.equal(d.replayCount, 1);
+});
+
+test('diffOf 在非 win32 上不折叠大小写——那是两个不同文件', { skip: process.platform === 'win32' }, () => {
+  const d = diffOf(['/a/B.mjs'], ['/a/b.mjs']);
+  assert.equal(d.diverged, true, 'Linux 上大小写不同 = 不同文件，必须报分歧');
 });
 
 test('diffOf 分别报出两侧独有项，不把差集混成一个数', () => {

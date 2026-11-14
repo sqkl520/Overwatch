@@ -465,9 +465,10 @@ test('target-read 只在目标真读过时成立：读的是同名不同目录�
   assert.equal(r.action, 'deny');
 });
 
-test('pathKeyOf 归一化：Edit 的目标与实际读到的路径只靠它比对', () => {
-  // 现有 pathKeyOf：反斜杠→正斜杠、折叠重复、去尾斜杠、**小写**。
-  // 所以大小写与分隔符差异都折叠掉；但**不做** `resolve()` 这类路径消解。
+test('pathKeyOf 归一化：Edit 的目标与实际读到的路径只靠它比对', { skip: process.platform !== 'win32' }, () => {
+  // 现有 pathKeyOf：反斜杠→正斜杠、折叠重复、去尾斜杠、**win32 上小写**。
+  // 所以大小写与分隔符差异在 Windows 上都折叠掉；但**不做** `resolve()` 这类路径消解。
+  // 非 win32 上不折叠大小写（那是两个不同文件），见下一条。
   const win = decide(EDIT_INPUT('C:\\a\\b.mjs'),
     stateFor({ cwd: 'C:\\a', config: { mode: 'deny', minReads: 3 }, reads: ['c:/a/B.mjs'] }));
   assert.equal(win.action, 'allow', 'Windows 大小写/分隔符差异必须判成同一个文件');
@@ -476,6 +477,14 @@ test('pathKeyOf 归一化：Edit 的目标与实际读到的路径只靠它比�
   const rel = decide(EDIT_INPUT('src/a.mjs'),
     stateFor({ cwd: '/repo', config: { mode: 'deny', minReads: 3 }, reads: ['/repo/src/a.mjs'] }));
   assert.equal(rel.action, 'deny', 'pathKeyOf 不做绝对化 —— 若将来改了它，这条会红并提醒你审一遍');
+});
+
+test('pathKeyOf 在非 win32 上不折叠大小写：读过 a.mjs 不得放行 Edit A.mjs', { skip: process.platform === 'win32' }, () => {
+  // 这是 `pathKeyOf` 加平台守卫的理由：Linux 的大小写敏感文件系统上，
+  // 无条件 toLowerCase 会让「读过 a.mjs」授权改 A.mjs —— Edit 侧判据直接失效。
+  const r = decide(EDIT_INPUT('/repo/a.mjs'),
+    stateFor({ cwd: '/repo', config: { mode: 'deny', minReads: 3 }, reads: ['/repo/A.mjs'] }));
+  assert.equal(r.action, 'deny', '大小写不同的另一个文件，不能算「读过目标」');
 });
 
 // ── 6c. 改动二：`satisfied_by:"auto"` 不可外部伪造 ──────────────────

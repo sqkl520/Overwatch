@@ -418,7 +418,11 @@ test('端到端: 读 0 个就写的真实会话被拦，读够 3 个的放行', 
   try {
     mkTranscript(dir, 'real-project', 'a', { readPaths: [], writePath: 'D:/real/a.txt' });
     mkTranscript(dir, 'real-project', 'b', { readPaths: ['D:/real/1.mjs', 'D:/real/2.mjs', 'D:/real/3.mjs'], writePath: 'D:/real/b.txt' });
-    mkTranscript(dir, 'sandbox', 'c', { readPaths: [], writePath: 'probe.txt', cwd: join(dir, 'sandbox', 'Temp') });
+    // 沙箱判据是「路径里含 `Temp/` 这一段」（判据在 `isSandbox`，与真实语料同源）。
+    // 夹具必须造出**真实沙箱的形状**：真实路径是 `.../Temp/<子目录>/...`，
+    // 而 `join(dir,'sandbox','Temp')` 恰好以 Temp 结尾，不含尾随分隔符 →
+    // 正则在 POSIX 上匹配不到 → 被算进「真实项目」桶 → 断言 3 !== 2。
+    mkTranscript(dir, 'sandbox', 'c', { readPaths: [], writePath: 'probe.txt', cwd: join(dir, 'sandbox', 'Temp', 'proj') });
     const rep = measure(dir, { threshold: 3 });
     assert.equal(rep.real.withWrite, 2);
     assert.equal(rep.real.variants.baseline, 1, '只有读 0 个的那个被拦');

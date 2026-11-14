@@ -12,9 +12,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, utimesSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, utimesSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 
 import {
   detectClaims, findEvidence, classifyEvidence, scanSession, summarizeClaims,
@@ -790,6 +790,20 @@ import {
 const SCRIPT = join(dirnameOf(fileURLToPath(import.meta.url)), 'verify-claims.mjs');
 const runCli = (args, opts = {}) => spawnSync(process.execPath, [SCRIPT, ...args], { encoding: 'utf8', ...opts });
 
+// 有几条测试要读**真实 transcript 语料**（`~/.claude/projects/`）。干净机器与 CI 上
+// 没有那个目录，于是它们报「至少要有一个会话」——那是环境缺失，不是产品坏了。
+// 语料不存在时跳过，存在时照跑：判据一条不软化，只是不再要求别人也有我的语料。
+const HAS_CORPUS = (() => {
+  try {
+    const root = join(homedir(), '.claude', 'projects');
+    return readdirSync(root).some((d) => {
+      try {
+        return readdirSync(join(root, d)).some((f) => f.endsWith('.jsonl'));
+      } catch { return false; }
+    });
+  } catch { return false; }
+})();
+
 // ── 8.1 --help 真的给帮助，而且不扫描 ───────────────────────────────
 
 test('--help 输出帮助并且**不扫描**：stdout 必须是帮助，不是统计报表', () => {
@@ -933,7 +947,7 @@ test('resolveSession：直接给 .jsonl 路径也能用，project 取父目录�
   });
 });
 
-test('--session 只读一个会话：stdout 里只出现该 id，耗时少于全量', () => {
+test('--session 只读一个会话：stdout 里只出现该 id，耗时少于全量', { skip: !HAS_CORPUS && '没有真实 transcript 语料' }, () => {
   // 用真实语料做一次：前缀取自 --json 的第一条，避免硬编码某个会话。
   const all = runCli(['--json', '--limit', '5', '--exit-zero'], { maxBuffer: 1e8 });
   assert.equal(all.status, 0, '--exit-zero 必须保证退出 0');
@@ -1014,7 +1028,7 @@ test('--json 结构完整：顶层字段、summary、rows、results 都在', () 
   }
 });
 
-test('--json 在单会话模式下带 session 块（id / project / path）', () => {
+test('--json 在单会话模式下带 session 块（id / project / path）', { skip: !HAS_CORPUS && '没有真实 transcript 语料' }, () => {
   const all = runCli(['--json', '--limit', '3', '--exit-zero'], { maxBuffer: 1e8 });
   const first = JSON.parse(all.stdout).rows[0];
   const r = runCli(['--session', first.sessionId.slice(0, 8), '--json', '--exit-zero'], { maxBuffer: 1e8 });
