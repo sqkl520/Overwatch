@@ -10,6 +10,7 @@
 | 「每条能力对应的命令是什么」 | [CAPABILITIES.md](CAPABILITIES.md) | 能力 → 可运行的命令，硬门会核 |
 | 「我该敲什么、会看到什么」 | [GUIDE.md](GUIDE.md) | 使用手册：输出怎么读、出问题怎么办 |
 | 「我刚装完，装对了吗」 | [spec/2026-11-14-entry-point.md](spec/2026-11-14-entry-point.md) | 唯一入口 `scripts/overwatch.mjs`：首屏契约、空/坏三态、1000ms 上限、退出码表 |
+| 「怎么起一个挂了载荷的会话」 | [spec/2026-11-14-launch.md](spec/2026-11-14-launch.md) | `launch`：四种启动形态哪个能用、认证预检的三态、静默失败的判定、roster 为什么只能整目录挂 |
 | 「状态怎么判、阈值多少」 | [spec/state-model.md](spec/state-model.md) | 可执行判据的唯一真源 |
 | 「写前闸按什么判、怎么验收」 | [spec/2026-11-14-pre-write-gate-split.md](spec/2026-11-14-pre-write-gate-split.md) | 首写工具拆分的判据表 + 7 条 AC + 已知残留问题 |
 | 「AI 问没问、先读后问还是先问后读」 | [spec/2026-11-14-question-audit.md](spec/2026-11-14-question-audit.md) | 四条判据哪条能判哪条不能 + `overwatch.config.json` 校验规则 + 本机实测分布 |

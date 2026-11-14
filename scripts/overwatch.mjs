@@ -56,8 +56,21 @@
  *   4  该子命令**未实现**，已打印等价的原生命令（有意为之：诚实的空壳，
  *      半成品的 wrapper 更坏 —— 它会假装实现了，然后和原命令悄悄分叉）
  *   5  用法错误（未知子命令 / 未知参数 / 参数缺值）
+ *   6  仅 `launch`：宿主没有被认证（见 `scripts/launch.mjs`）
+ *   7  仅 `launch`：宿主失败 —— 退出码非 0 / `is_error:true` /
+ *      **exit 0 但什么都没输出**（静默失败）。宿主的失败语义不自洽，这两个码是
+ *      包装层对它的纠正，不是转发。
  *
- * 零 npm 依赖，只用 node: 内置模块。不写任何文件。
+ * ── 唯一的例外：`launch` 真的**执行** ───────────────────────────────────
+ *
+ * 其余子命令只路由，因为它们各自的原生命令参数口径互相冲突（`--days` 在 scan 按
+ * transcript 内部时间、在 verify 按 mtime），替用户选一个口径不会有第二份判据测它。
+ * `launch` 不是这种情况：**没有**任何原生命令能替你拼 `--plugin-dir` + `--settings`，
+ * 而拼错了宿主不会报错。所以它是一条真 wrapper，判据在 `scripts/launch.mjs`
+ * 里只有一份（本文件 import 它的 `main`，不重写它的判定）。
+ *
+ * 零 npm 依赖，只用 node: 内置模块。`doctor` / 路由不写任何文件（`launch` 会写台账与
+ * settings，都在 `tasks/runs/launch/` 下，gitignored）。
  */
 
 import { existsSync, statSync, readdirSync, readFileSync } from 'node:fs';
@@ -73,7 +86,8 @@ import { stateDirFor, startupDir } from './install-watcher.mjs';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
 
-/** 每个码只有一个含义。改这里等于改对外契约，必须同步 docs/spec/2026-11-14-entry-point.md。 */
+/** 每个码只有一个含义。改这里等于改对外契约，必须同步 docs/spec/2026-11-14-entry-point.md
+ *  与 docs/spec/2026-11-14-launch.md（6 / 7 是 launch 专有，见那两个文件的退出码表）。 */
 const EXIT = Object.freeze({
   OK: 0,
   INTERNAL: 1,
@@ -81,6 +95,8 @@ const EXIT = Object.freeze({
   UNREADABLE: 3,
   ROUTED: 4,
   USAGE: 5,
+  AUTH: 6,
+  HOST: 7,
 });
 
 /** doctor 的总预算。超了是设计错误，不是环境慢 —— 所以它是常量，不是环境变量。 */
@@ -801,10 +817,12 @@ function renderRoute(name, extra) {
 
 const HELP = `用法：
   node scripts/overwatch.mjs              同 doctor
-  node scripts/overwatch.mjs doctor       报告 7 项前提的事实（版本 / 会话记录 / 数据来源 /
-                                          写前闸 / 后台监视 / 平台），<1000ms，不扫语料
+  node scripts/overwatch.mjs doctor       报告 8 项前提的事实（版本 / 会话记录 / 数据来源 /
+                                          写前闸 / 后台监视 / 平台 / run 进度），<1000ms，不扫语料
+  node scripts/overwatch.mjs launch       起一个挂了 .claude/ 载荷与 hooks 的宿主会话（唯一会执行的子命令）
   node scripts/overwatch.mjs <命令>       路由到原生命令（见下），只打印、不执行
   node scripts/overwatch.mjs --help       打印这份说明并立刻退出（不做任何检查）
+  node scripts/overwatch.mjs launch --help 打印 launch 自己的参数说明
 
 路由命令（本入口未实现，只给等价的原生命令）：
   scan     扫全部会话 → node scripts/scan-sessions.mjs --days 3
@@ -819,19 +837,32 @@ const HELP = `用法：
   --budget <ms>        doctor 的总预算，默认 ${DEFAULT_BUDGET_MS}
   --help, -h           这份说明，立刻退出
 
+launch 自己的选项（不起会话也能先看清楚：加 --dry-run）：
+  --dry-run            只打印将执行的命令行（逐字、可复制），不起任何子进程、不写任何文件
+  --print              非交互（宿主 -p）：拿得到输出，于是能自己判定成败
+  --verify             只验载荷：跑宿主一个不需要推理也不需要认证的子命令，核对 12 个角色
+  --no-hooks           不挂 hooks（也就不传 --settings）
+  --no-payload         不挂载荷（也就不传 --plugin-dir）
+  --host-bin <path>    宿主可执行文件（默认 claude，由 PATH 解析）
+  --skip-auth-check    跳过启动前的认证预检（不推荐）
+
 退出码：
-  0  前提都读到了
+  0  前提都读到了 / launch 正常结束
   1  本入口自己出了意外
   2  transcript 根不存在（这台机器上还没有 Claude Code 的会话记录）
   3  transcript 根在、但读不出（权限 / 类型问题）
   4  该子命令未实现（已打印原生命令）
   5  用法错误
+  6  仅 launch：宿主没有被认证（会话没起来，已给出修复命令）
+  7  仅 launch：宿主失败（非 0 退出 / is_error:true / exit 0 但什么都没输出）
 
 例子：
   node scripts/overwatch.mjs
   node scripts/overwatch.mjs --json
   node scripts/overwatch.mjs doctor --now 2026-11-14T00:00:00Z
-  node scripts/overwatch.mjs scan --days 1`;
+  node scripts/overwatch.mjs scan --days 1
+  node scripts/overwatch.mjs launch --dry-run
+  node scripts/overwatch.mjs launch --verify`;
 
 // ── CLI ───────────────────────────────────────────────────────────────
 
@@ -854,7 +885,16 @@ function parseArgs(argv) {
     const a = argv[i];
 
     // 本入口自己的选项：位置无关。
-    if (a === '--help' || a === '-h' || a === 'help') { out.help = true; continue; }
+    //
+    // `--help` 有一处例外：`launch --help` 要的是 **launch 的**说明，不是这份总说明。
+    // 不加这条，用户问「launch 有哪些参数」会拿到一份讲 doctor 的文档 —— 而 launch
+    // 的参数（--dry-run / --no-hooks / --host-bin）在总说明里一个都没有。
+    // `launch help` 也改写成 `--help` 交给 launch：否则那两个字会被当成 prompt，
+    // 在终端里真的起一个 prompt 是 "help" 的会话。
+    if (a === '--help' || a === '-h' || a === 'help') {
+      if (out.command === 'launch') { out.rest.push('--help'); continue; }
+      out.help = true; continue;
+    }
     if (a === '--json') { out.json = true; continue; }
     if (a === '--now') {
       const v = argv[++i];
@@ -925,7 +965,20 @@ function main(argv) {
     return Promise.resolve(EXIT.ROUTED);
   }
 
-  process.stderr.write(`未知子命令：${cmd}\n可用：doctor | scan | verify | tui | watch | plan | --help\n\n${HELP}\n`);
+  // `launch` 是唯一**真执行**的子命令。判定一份都不在这里写 ——
+  // import 的是 launch.mjs 的 `main`，它自己带着判据与退出码（6 / 7）。
+  // 为什么不在本文件里拼命令行：拼装规则（hooks 的 settings、内容寻址的落盘路径、
+  // 认证预检）各自都有实测来历，写两份必然漂移，而漂移的那份没人测。
+  if (cmd === 'launch') {
+    return import('./launch.mjs')
+      .then((m) => m.main(parsed.rest, { json: parsed.json, nowMs: parsed.nowMs }))
+      .catch((e) => {
+        process.stderr.write(`overwatch launch 自己出了意外（这是 bug，不是环境问题）：${(e && e.stack) || e}\n`);
+        return EXIT.INTERNAL;
+      });
+  }
+
+  process.stderr.write(`未知子命令：${cmd}\n可用：doctor | launch | scan | verify | tui | watch | plan | --help\n\n${HELP}\n`);
   return Promise.resolve(EXIT.USAGE);
 }
 

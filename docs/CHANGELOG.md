@@ -207,6 +207,49 @@
   修完连跑 8 次 0 失败。
   **这类缺陷不改不会让 CI 立刻红，只会让它随机红，而随机红的结局通常是被 `|| true` 掉。**
 
+### Added
+
+- **`scripts/launch.mjs` + `overwatch.mjs launch`：应用真的去起宿主，并把宿主的谎话纠正过来。**
+  这是把前面所有东西串起来的最后一环。默认起**交互式**会话，挂
+  `--plugin-dir <repo>/.claude`（12 角色 + 1 skill）与两条 observe 模式的 hook
+  （`--settings` 内容寻址落盘：同一份内容永远同一个文件名）。
+- **`launch --verify`：不推理、不需认证，验「载荷真的挂对了」。**
+  走 `plugin details`，让**宿主自己**列出角色再逐个对上：
+  ```
+  $ node scripts/overwatch.mjs launch --verify
+  载荷挂对了：宿主自己列出 12 个角色，逐个对上（不需要推理与认证）
+  ```
+  这是未登录机器（与 CI）上唯一能真跑的 launch 形态。
+  **它的存在修的是我今天早上犯的那个错**：当时我用 `git clone` 证明「干净副本能跑」，
+  那只证明了**已推送**的版本。现在有一条命令能在任何机器上验载荷，不靠「我这台能跑」。
+
+### Changed
+
+- **宿主失败语义不自洽，所以本文件自己判**（`judgeHostRun`，顺序刻意）：
+  ① 输出含认证字样（`Not logged in` / `Please run /login` / `authentication_failed` /
+  `Invalid API key` / `OAuth token expired`）→ **exit 6**；
+  ② stdout 是 JSON 且 `is_error===true`（**即使 `subtype=success`、exit 0**）→ **exit 7**；
+  ③ 退出码 ≠ 0 → **exit 7**；
+  ④ **exit 0 且 stdout/stderr 都空**（静默失败）→ **exit 7**；
+  ⑤ 否则 0。
+  前两条对应实测过的两个形态：`subtype:"success"` 配 `is_error:true` 配
+  `result:"Not logged in"`，以及网关配方下 exit 0 且输出完全为空。
+  交互式另加**启动前**预检 `auth status --json`，三态 ok / blocked / **inconclusive**
+  ——「不认识 auth 子命令」不许断成「没登录」。
+  实测本机：非 TTY 下 `launch` → **exit 5**（用法错误，拒绝静默降级）；`launch --print` → **exit 6**（认证）。
+- **`--settings` 只写 `hooks` 一个键。** 红队实测出这条的代价：`--settings` 对 `hooks` 是**扇出合并**
+  （用户 hooks 一条不少），但**标量键是覆盖** —— 用户项目写 `permissions.defaultMode:"plan"`，
+  挂上带 `defaultMode` 的 settings 后实测变成 `acceptEdits`、**文件当场落盘**；`model` 同样被顶掉。
+  我复验了 `model` 那条（应用值赢：宿主报 `unrecognized_model: app-model`，而用户写的是别的）。
+  所以本命令的 settings 里**只有 hooks**，并在 `--dry-run` 的人类输出里明写
+  「别的键（权限、模型）会覆盖你的项目设置」。
+- **roster 只影响调度，不影响挂载 —— 三处如实告知，不假装做了。**
+  实测 `--plugin-dir` 的单位是目录，没有「只挂一部分」的开关；`--agents <json>` 是**加法不是减法**
+  （传入 1 个，init 里仍是那 1 个 + `overwatch:*` 12 个全在）。所以 `--dry-run` 人类输出、
+  `--json` 的 `roster.applied:false`、台账三处都写明，并点名 9 个未启用角色。
+  **另需知道**：`agent.roster` 目前**没有一行代码在执行**（`grep -rn roster scripts/*.mjs`
+  排除 `question-audit` 后零命中），只有 `question-audit.mjs` 校验形状。已写进 spec §5。
+
 ### Known（本轮登记但不修）
 
 - **`claude -p` 的失败语义不自洽，产品不能信 `subtype`。** 实测（本机）：
