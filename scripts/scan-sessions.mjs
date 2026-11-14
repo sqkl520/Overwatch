@@ -793,12 +793,14 @@ function main(argv) {
   // 「现在」导出。纯命令行看不出问题，但 `runTick` 把 `nowMs` 一路传进来时，
   // 如果 CLU 子进程自己取挂钟，同一轮里两段时间基准就会打架。
   // 更直接的理由是测试：一个「结果随挂钟走动」的扫描器没法被固定时钟复现。
-  const nowMs = (() => {
+  // `--now` 一旦给了就全程用它（可复现）；没给时 idle 用现取的时钟，见 :940 的说明。
+  const injectedNow = (() => {
     const i = argv.indexOf('--now');
-    if (i >= 0) {
-      const t = Date.parse(argv[i + 1] || '');
-      if (Number.isFinite(t)) return t;
-    }
+    if (i < 0) return false;
+    return Number.isFinite(Date.parse(argv[i + 1] || ''));
+  })();
+  const nowMs = (() => {
+    if (injectedNow) return Date.parse(argv[argv.indexOf('--now') + 1]);
     return Date.now();
   })();
   const json = args.has('--json');
@@ -814,8 +816,16 @@ function main(argv) {
     // （全量扫描随语料线性变慢），但**不能有任何会话是「因为没加参数就永远看不见」**。
     if (args.has('--all')) return 0;
     if (i < 0) return 7;
-    const n = Number(argv[i + 1]);
-    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 7;
+    const raw = argv[i + 1];
+    const n = Number(raw);
+    // 静默回落曾经把 `--days abc` / `--days -5` 都变成 7 天、退出码 0 ——
+    // 用户以为换了窗口，实际看的是默认值。写错参数必须报错，不能装作没事。
+    if (raw === undefined || raw.startsWith('--') || !Number.isFinite(n) || n < 0) {
+      console.error(`--days 需要一个 ≥0 的数字，收到的是 ${raw === undefined ? '（缺失）' : JSON.stringify(raw)}。`);
+      console.error('例：node scripts/scan-sessions.mjs --days 3     （--days 0 或 --all = 不限窗口）');
+      process.exit(2);
+    }
+    return Math.floor(n);
   })();
   const unbounded = days === 0;
 
@@ -934,8 +944,11 @@ function main(argv) {
         hostSessionId: job?.sessionId ?? null,
         transcriptId: job?.transcriptId ?? null,
         // lastActivity / idleSec 用**内部活动时间**，与 --days 窗口同一个基准。
+        // 但 idle 的「现在」必须现取：`nowMs` 是扫描开始时取的，全量扫 40 秒以上时
+        // 它比真实时间旧 40 秒，任何在这 40 秒内活动过的会话都会算出**负数 idle**。
+        // --now 注入时仍用注入值（可复现性优先），否则现取。
         lastActivity: new Date(lastActivity).toISOString(),
-        idleSec: Math.round((nowMs - lastActivity) / 1000),
+        idleSec: Math.round(((injectedNow ? nowMs : Date.now()) - lastActivity) / 1000),
         calls: scanned.allCalls.length,
         // 零调用会话必须标出来：calls=0 与「没扫到」在界面上是两件事。
         hasTranscript: true,

@@ -638,25 +638,123 @@ export function isMutatingCommand(cmd) {
 
 // ── 文本处理 ──────────────────────────────────────────────────────────
 
-/** 去掉 fenced code block 与 blockquote。返回 { text, strippedCode, strippedQuote }。 */
+/** 切句用的分隔符。切点**紧跟在**句末标点之后，或吃掉一整段换行。
+ *
+ *  单独提出来是因为切句现在要同时给出「每句在文本里的 `[start, end)`」，
+ *  而那需要一个能自己走位置的分割器（见 `splitSentenceSpans`）。 */
+const SENTENCE_SPLIT_RE = /(?<=[。！？!?；;])|\n+/;
+
+/** 这一趟剥离：把 `text` 里所有 `re` 的命中换成 `makeOut(m)` 的结果，
+ *  同时把输入的下标映射（`map`）原样搬到输出上。
+ *
+ *  早先这里是三条 `String.replace`，能得出正确的清洗结果，但**丢掉了「这段清洗后
+ *  的文本对应原文哪一段」**。展示层需要后者：`quote` 必须是用户/AI 真正写下的话，
+ *  不能是检测器内部清洗过的样子。 */
+function applyStrip(text, map, re, makeOut) {
+  const out = [];
+  const outMap = [];
+  const spans = [];
+  let last = 0;
+  re.lastIndex = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    const start = m.index;
+    const end = start + m[0].length;
+    for (let i = last; i < start; i++) { out.push(text[i]); outMap.push(map[i]); }
+    const repl = makeOut(m);
+    // 每个被替换的字都指向该区段的起点：清洗后的文本里它只占一格，但原文里它
+    // 可能是几十个字。截断与还原都以「区段起点」为准才不会切出半截引用。
+    for (let k = 0; k < repl.length; k++) { out.push(repl[k]); outMap.push(map[start]); }
+    if (m[0].length === 0) re.lastIndex++;  // 零宽命中：兜底推进，否则死循环
+    if (end > start) spans.push([map[start], map[end - 1] + 1]);
+    last = end;
+  }
+  for (let i = last; i < text.length; i++) { out.push(text[i]); outMap.push(map[i]); }
+  return { text: out.join(''), map: outMap, spans };
+}
+
+/** 去掉 fenced code block、blockquote 与行内代码。
+ *
+ *  返回 `{ text, strippedCode, strippedQuote, map, codeSpans }`：
+ *    - `text`：清洗后的文本，**检测只在这一份上做**；
+ *    - `map[i]`：`text[i]` 在**原文**里的下标（严格递增）；
+ *    - `codeSpans`：每个被挖掉的行内代码在原文里的 `[start, end)`。
+ *
+ *  为什么清洗本身不能去掉：行内代码（`./gradlew test`、`git commit -m ...`）是命令/
+ *  标识符，不是完成声明。实测误报样本：「两种编译通过的实现绕过」里的 `if(false)`
+ *  让 build 族命中；把反引号内容整段挖掉，这类噪声才不会变成断言。
+ *
+ *  为什么必须同时给出 `map`：`detectClaims` 展示的 `quote` 曾经直接取清洗后的句子，
+ *  于是原话里的路径 / 文件名 / 目录被替换成空格，输出成了
+ *  「正式版导出只剩  。」—— 「AI 说了什么」被检测器的实现细节改写，
+ *  而这正是本模块的核心卖点。检测仍走 `text`，展示走 `map` 还原出的原文。 */
 export function stripQuoted(text) {
   const src = String(text || '');
   let strippedCode = 0, strippedQuote = 0;
-  let out = src.replace(FENCED_CODE_RE, () => { strippedCode++; return '\n'; });
-  out = out.replace(BLOCKQUOTE_LINE_RE, () => { strippedQuote++; return ''; });
-  // 行内代码（`./gradlew test`、`git commit -m ...`）是命令/标识符，不是完成声明。
-  // 实测误报样本：「两种编译通过的实现绕过」里的 `if(false)` 让 build 族命中；
-  // 把反引号内容整段挖掉，这类噪声才不会变成断言。
-  out = out.replace(/`[^`\n]*`/g, ' ');
-  return { text: out, strippedCode, strippedQuote };
+  let map = new Array(src.length);
+  for (let i = 0; i < src.length; i++) map[i] = i;
+  let cur = src;
+
+  const a = applyStrip(cur, map, FENCED_CODE_RE, () => { strippedCode++; return '\n'; });
+  cur = a.text; map = a.map;
+  const b = applyStrip(cur, map, BLOCKQUOTE_LINE_RE, () => { strippedQuote++; return ''; });
+  cur = b.text; map = b.map;
+  // 行内代码用模块级的这一份（带 g），建在手边是为了不与并发调用共享 lastIndex。
+  const c = applyStrip(cur, map, /`[^`\n]*`/g, () => ' ');
+  return {
+    text: c.text,
+    strippedCode,
+    strippedQuote,
+    map: c.map,
+    codeSpans: c.spans,
+  };
+}
+
+/** 切句，并给出每句在 `text` 里的 `[start, end)`。
+ *
+ *  切法与 `String.split(SENTENCE_SPLIT_RE)` 逐字节等价：这里借 `split` 的捕获组拿到
+ *  分隔符本身，再按「段 + 分隔符」交替走位置。分隔符**不进**任何区间 ——
+ *  句号、换行在 `quote` 里本来就不出现（旧行为如此，改动不扩大它）。
+ *
+ *  返回的 `text` 是 `trim()` 之后的句子，`start` / `end` 已经跟上 trim 的偏移，
+ *  所以直接拿 `text.slice(start, end)` 就是这一句。 */
+export function splitSentenceSpans(text) {
+  const s = String(text || '');
+  const parts = s.split(new RegExp('(' + SENTENCE_SPLIT_RE.source + ')'));
+  const out = [];
+  let pos = 0;
+  for (let i = 0; i < parts.length; i += 2) {
+    const raw = parts[i];
+    const base = pos;
+    pos += raw.length;
+    if (i + 1 < parts.length) pos += parts[i + 1].length;
+    const trimmed = raw.trim();
+    if (trimmed.length < 2) continue;
+    const lead = raw.length - raw.replace(/^\s+/, '').length;
+    out.push({ text: trimmed, start: base + lead, end: base + lead + trimmed.length });
+  }
+  return out;
 }
 
 /** 切句。分隔符本身被丢弃，所以「问号收尾」要在切之前记下来。 */
 export function splitSentences(text) {
-  return String(text || '')
-    .split(/(?<=[。！？!?；;])|\n+/)
-    .map((s) => s.trim())
-    .filter((s) => s.length >= 2);
+  return splitSentenceSpans(text).map((s) => s.text);
+}
+
+/** 取一段原话并截到 160 字（超长时是 157 + `…`），**不切半个行内代码**。
+ *
+ *  只切前半截会让「`npm run test -- --grep foo` 全绿」变成
+ *  「`npm run test -- --grep fo…」—— 那是一条无法核对的原话。命中区间时退到反引号前面。 */
+export function truncateQuote(quote, spans = [], limit = 160) {
+  const q = String(quote || '');
+  if (q.length <= limit) return q;
+  let cut = limit - 3;
+  for (const [a, b] of spans) {
+    // `a > 0` 是必要的：区间从第 0 格开始时退到 0 会得到一句只有 `…` 的「原话」，
+    // 那比切半个反引号更没用。
+    if (a > 0 && a < cut && cut < b) { cut = a; break; }
+  }
+  return q.slice(0, Math.max(0, cut)) + '…';
 }
 
 /** 这一段是不是「否定/失败」陈述。 */
@@ -674,19 +772,61 @@ export function isSpeculative(segment) {
   return SPECULATIVE_RE.test(String(segment || ''));
 }
 
+/** 一句话在**原文**里的区间。`faithful=false` 表示还原失败，调用方该退回 cleaned 句子。
+ *
+ *  判据用「原文区间里有没有换行」而不是「长度比」：`stripQuoted` 的两次替换
+ *  **都保留换行**（fenced → `\n`，blockquote 只删行内内容、行尾的 `\n` 还在），
+ *  而行内代码 `[^`\n]*` 本身不含换行。所以「一句 cleaned 文本的原文区间不含换行」
+ *  是**恒真的结构不变量**，一旦被破坏就说明剥离规则与切句对不上了。
+ *  实测 210,956 句真实语料，误报 0。
+ *
+ *  刻意**不**用「原文区间 > cleaned 句子长度 × 8」（最初的设想）：那条在真实语料上
+ *  误报 1,526 次 —— 一句里塞几个绝对路径（`- \`skill/.../index.ts:168\` —`）比例能到
+ *  51 倍，那是**正常的行内代码**，退回去等于把它们重新挖空。阈值型判据在这里注定
+ *  两边不讨好。
+ *
+ *  抽成导出函数是为了让「退化」这条分支能被直接测到：它由构造保证**不会**在真实
+ *  输入上触发，所以只能对着函数本身验，否则那段保险就是死代码。 */
+export function quoteRangeOf(src, seg, map) {
+  const from = map && Number.isInteger(seg.start) ? map[seg.start] : undefined;
+  const to = map && Number.isInteger(seg.end) ? map[seg.end - 1] + 1 : undefined;
+  const faithful = Number.isInteger(from) && Number.isInteger(to) && to > from
+    && !String(src).slice(from, to).includes('\n');
+  return { from, to, faithful };
+}
+
 /**
  * 从最后一条 assistant 文本里认出可核对的完成性断言。
  *
  * 返回 `[{ family, familyLabel, checkable, quote, index }]`，同一句里命中同一族只记一条。
  * 不做去重聚合：同一族出现两句不同的原话时，两句都要留 —— 逐条核对才有意义。
+ *
+ * **检测与展示走两份文本。** 检测在 `stripQuoted()` 的 `text`（已挖掉行内代码 /
+ * 代码块 / 引用块）上做，一字不改；`quote` 则用 `map` 还原出这一句在**原文**里的区间。
+ * 早先两者是同一条字符串，后果是原话里的路径、文件名、目录被替换成空格 ——
+ * 输出成了「正式版导出只剩  。」。那不是 AI 说的话，是检测器实现细节的泄漏，
+ * 而「AI 说了什么」正是本模块要摆到台面上的东西。
+ *
+ * 切句时句末标点（`。！？；`）留在句子尾部，与被切分处**之后**的换行一起被丢掉 ——
+ * 与旧 `splitSentences` 完全一致，所以 `quote` 除了补回被挖空的内容，形状不变。
  */
-export function detectClaims(text) {
-  const { text: cleaned } = stripQuoted(text);
+export function detectClaims(text, stats = null) {
+  const src = String(text || '');
+  const { text: cleaned, map, codeSpans } = stripQuoted(src);
   const out = [];
-  for (const sentence of splitSentences(cleaned)) {
+  for (const seg of splitSentenceSpans(cleaned)) {
+    const sentence = seg.text;
     if (isNegated(sentence)) continue;
     if (isInterrogative(sentence)) continue;
     if (isSpeculative(sentence)) continue;
+    // 句子在原文里的区间。说明与取舍见 `quoteRangeOf`。
+    const { from, to, faithful } = quoteRangeOf(src, seg, map);
+    if (!faithful && stats) stats.quoteFallbacks = (stats.quoteFallbacks || 0) + 1;
+    const quoteText = faithful ? src.slice(from, to) : sentence;
+    // 行内代码区间换算到 quoteText 自己的坐标，供截断时避免切半个反引号。
+    const quoteSpans = faithful
+      ? codeSpans.filter(([a, b]) => a >= from && b <= to).map(([a, b]) => [a - from, b - from])
+      : [];
     for (const fam of CLAIM_FAMILIES) {
       if (!fam.re.test(sentence)) continue;
       if (fam.guard && !fam.guard.test(sentence)) continue;
@@ -703,7 +843,7 @@ export function detectClaims(text) {
         family: fam.id,
         familyLabel: fam.label,
         checkable: fam.checkable,
-        quote: sentence.length > 160 ? sentence.slice(0, 157) + '…' : sentence,
+        quote: truncateQuote(quoteText, quoteSpans, 160),
         index: out.length,
       });
     }
@@ -1237,7 +1377,10 @@ export function scanSession(session, {
 } = {}) {
   const tail = readTailRecords(session.path, CLAIM_TAIL_BYTES);
   const text = lastAssistantText(tail.records);
-  const claims = text ? detectClaims(text) : [];
+  // `quoteStats` 只统计「原话还原退化成 cleaned 句子」的次数，由汇总层打印。
+  // 不传它时行为完全不变 —— `detectClaims` 的第二参数是可选的。
+  const quoteStats = {};
+  const claims = text ? detectClaims(text, quoteStats) : [];
   const checkable = claims.filter((c) => c.checkable);
   const row = {
     sessionId: session.sessionId,
@@ -1249,6 +1392,7 @@ export function scanSession(session, {
     truncated: false,
     bytesRead: CLAIM_TAIL_BYTES,
     windowBytes: CLAIM_TAIL_BYTES,
+    quoteFallbacks: quoteStats.quoteFallbacks || 0,
     // 子 agent 的数量**永远**要数出来，哪怕不读内容：前序研究「15 个会话 0 个子 agent」
     // 这条结论全靠这个数字，而数目录是 241 次 stat，成本可忽略。
     subagentCount: checkable.length ? subagentFiles(session).length : null,
@@ -1328,11 +1472,12 @@ export function summarizeClaims(rows) {
   for (const s of EVIDENCE_STATUS) sessionsByStatus[s] = 0;
   const noEvidence = [];
   const unknown = [];
-  let claims = 0, truncatedSessions = 0, bytesRead = 0;
+  let claims = 0, truncatedSessions = 0, bytesRead = 0, quoteFallbacks = 0;
 
   for (const r of list) {
     bytesRead += r.bytesRead || 0;
     if (r.truncated) truncatedSessions++;
+    quoteFallbacks += r.quoteFallbacks || 0;
     if (!r.results || !r.results.length) continue;
     sessionsWithClaims.add(r.sessionId);
     const seen = new Set();
@@ -1368,6 +1513,9 @@ export function summarizeClaims(rows) {
     sessionsByStatus,
     truncatedSessions,
     bytesRead,
+    // 「原话还原退化成 cleaned 句子」的次数。恒为 0 才是常态；非 0 说明 `map`
+    // 与切句对不上，展示的是清洗后的文本 —— 这项要能被看到，不能静默。
+    quoteFallbacks,
     noEvidence,
     unknown,
   };
@@ -1777,6 +1925,10 @@ export function renderSummary(summary, opts = {}) {
   lines.push('覆盖 ' + (summary.sessions || 0) + ' 个 transcript，其中 ' + (summary.sessionsWithClaims || 0)
     + ' 个含可核对断言；读盘 ' + (((summary.bytesRead || 0) / 1e9).toFixed(2)) + ' GB · 截断 '
     + (summary.truncatedSessions || 0) + ' 个' + (opts.elapsedMs != null ? ' · ' + opts.elapsedMs + ' ms' : ''));
+  // 只在真发生退化时才提一句：全绿时多印一行是噪声，真退化时不说则是隐瞒。
+  if (summary.quoteFallbacks > 0) {
+    lines.push('（有 ' + summary.quoteFallbacks + ' 条断言的原话还原失败，已退回清洗后的句子 —— 见 --verbose）');
+  }
   if (totalChecked > 0) {
     lines.push('（四档比例按 ' + totalChecked + ' 条计：SUPPORTED ' + pct(summary.byStatus.SUPPORTED || 0, totalChecked) + '）');
   }

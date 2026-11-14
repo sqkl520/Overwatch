@@ -217,9 +217,15 @@ export function secretPathFor(cwd) {
 
 // ── 写操作的识别 ──────────────────────────────────────────────────────
 
-/** 归一化路径用于比较。Windows 下大小写不敏感，所以一律小写 + 正斜杠。 */
+/** 归一化路径用于比较。Windows 下大小写不敏感，所以一律小写 + 正斜杠。
+ *
+ *  **大小写折叠必须按平台分**：Linux 的 `a.mjs` 与 `A.mjs` 是两个文件。
+ *  无条件小写会把它俩折成同一个 key，于是「读过 `a.mjs`」会放行 `Edit A.mjs` ——
+ *  Edit 侧那条「读过目标文件本身」的判据（18/18 实测）在 Linux 上直接失效。
+ *  同仓 `claim-ledger.mjs` 的 `pathKey()` 本来就有这个守卫，两处口径必须一致。 */
 export function pathKeyOf(p) {
-  return String(p || '').replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, '').toLowerCase();
+  const s = String(p || '').replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, '');
+  return process.platform === 'win32' ? s.toLowerCase() : s;
 }
 
 /** 这个路径是不是**闸门自己的**文件（标记 / 刹车计数 / 闸门日志）。

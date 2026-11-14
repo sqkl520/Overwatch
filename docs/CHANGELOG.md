@@ -21,7 +21,133 @@
 
 ---
 
-## [Unreleased] - 2026-11-14（写前闸：按首写工具拆判据 + 堵掉伪造标记）
+## [Unreleased] - 2026-11-14（产品形态审计：干净 clone 上硬门必红，CI 连续 9 次失败）
+
+> 六份审计（陌生人走查 / 能力核验 / 命题落差 / 可移植性 / 红队拆解 / 产品层设计）
+> 加本机复核。**结论是产品形态没有搭起来，缺口在产品定义而非工程量。**
+> 本节只记「因此改了什么」；六份报告的判断见 `docs/research/README.md` 的 11-14 索引。
+
+### Fixed
+
+- **`check-structure.mjs` 在干净 clone 上必红（3 条），CI 因此连续 9 次失败。**
+  三条都是 `checkDocReferences()` 判「引用的文件不存在：`.claude/settings.local.json`」——
+  而那个文件是 **gitignored 的本机私有配置**，陌生人的 clone 里永远不会有。
+  修法：`PRIVATE_PATHS` 里的路径在文档引用检查中豁免（提到它们是在说「这个文件不在仓里」，
+  不是引用一个该存在的文件）。
+  **负向证据**：在 `%TEMP%` 下 `git clone` 一份真副本，把修改后的 `check-structure.mjs`
+  拷进去跑 → `✓ 结构检查全部通过`；改动前同一副本是 `✗ 3 项违规`。
+  **这类缺陷的名字叫「作者环境遮蔽」**：我们所有的自检都在一个预设了答案的环境里跑，
+  所以它在作者机器上永远不会红。
+- **`pathKeyOf()` 无条件 `toLowerCase()`，没有平台守卫。** Linux 上 `a.mjs` 与 `A.mjs`
+  是两个文件，折叠成一个 key 后「读过 `a.mjs`」会放行 `Edit A.mjs` ——
+  Edit 侧那条「读过目标文件本身」的判据（18/18 实测）在 Linux 上直接失效。
+  同仓 `claim-ledger.mjs` 的 `pathKey()` 本来就有 `process.platform === 'win32'` 守卫，
+  两处口径不一，现在对齐。本机 spot-check：`/repo/a.mjs` 与 `/repo/A.mjs` 改动前
+  `collide: true`。
+- **`scan-sessions.mjs` 的 `idle` 会出现负数。** 实测 `--days 3` 有 4 行 `idle=-42s`。
+  根因：`nowMs` 在扫描开始时取一次，`idleSec` 在 43 秒后才算。修法：`--now` 注入时用注入值
+  （可复现优先），否则现取。复跑 `--days 3` → **负数 0 行**。
+- **`scan-sessions.mjs --days` 写错会静默回落 7 天并 exit 0。** `--days abc`、`--days -5`、
+  `--days`（缺值）三种实测都是这样。修法：报错并 exit 2。复跑 `--days abc` → exit 2。
+- **`README.md` 的「30 秒上手」示例与真实输出不符**：首行口径、缺 transcript 统计行、
+  耗时（33 秒 vs 实测 40–60 秒）、`--days` 默认值全文 0 命中。全部换成实测输出，
+  并补上默认值与「写错会报错」。
+- **`README.md` 全文不链 GUIDE（0 处）**，而「我该敲什么、看到什么、看到之后做什么」
+  全在 GUIDE 里（含全仓最好的一段 before/after 叙事）。补了一条明确指路。
+
+### Added
+
+- `docs/research/README.md` 登记 11-14 的六份审计报告；`check-structure.mjs` 的
+  `AUDIT_PROBE_FNS` 登记审计期三个探针脚本的导出（一次性测量装置，不是生产纯函数）。
+
+### Known（本轮登记但不修，每条都要先做一个决定）
+
+- **核心卖点有假阳性**：`VERIFY_CMD_RE` 认 `npm run lint`，不认 `node scripts/lint.cjs`
+  （本机实测 MISS），而后者是本仓库自己用的形式。唯一「抓到 AI 撒谎」的案例因此是错的。
+- **核心指标命中率 2.5%**：`--days 7` 真实 81 会话只有 2 次硬命中；`--days 3` 的 10 次里
+  9 次是测试沙箱。TUI 首屏「48 条无证据」里 96% 来自我们自己的沙箱。
+- **`S3 动手前问 / S4 每轮 plan / S5 可配置` 三条零行实现**，而命题把 S3 称为「主题」。
+  卡点是一个未做的决定（默认该问还是不该问），不是工程量。
+- **`.claude/` 那一层装不进别人的项目**：ADR-0001 的 plugin 形态被拒（`clone 即用` 优先于
+  `可安装`），而四条「反悔信号」里没有一条是「产品要给别人用」，所以这个决定从未被复核。
+- **39 个脚本里 33 个没有 `--help`**；`node scripts/verify-claims.mjs --help` 之外，
+  `scan-sessions.mjs --help` 会把 `--help` 当普通参数忽略并直接全量扫描。
+- **最低 Node 版本**：只用工具 18.20.4 够，**跑测试需 20.16.0**（`import.meta.dirname` 20.11、
+  `process.getBuiltinModule` 20.16），README/GUIDE 写的「≥18」对测试是错的。
+
+---
+
+## [Unreleased] - 2026-11-14（verify-claims：原话被挖空 —— 展示改走 `map` 还原原文）
+
+> **缺陷已实测复现，不是设计推演。** `scripts/verify-claims.mjs --days 1` 原样输出：
+>
+> ```
+> AI 说：「三套测试最后又跑了一遍全绿，正式版导出只剩  。」
+> AI 说：「现在   下只剩  （3.1 MB，209 个文件，与   同步，提交  ）。」
+> AI 说：「Skill 跑通了，两份文案都在 [skill/output/](skill/output/) 下，lint 零 error。」
+> ```
+>
+> 第一、二句里的路径 / 文件名 / 目录全变成了空格；第三句完整，因为 markdown 链接
+> `[x](y)` 不是反引号 —— **规律就是「被清洗的都被挖空，没被清洗的都在」**。
+
+### Fixed
+
+- **`verify-claims.mjs`：`detectClaims` 的 `quote` 改为还原原文。**
+  根因三处：`stripQuoted()` 的 `` out.replace(/`[^`\n]*`/g, ' ') `` 把行内代码整段换成一个空格；
+  `detectClaims()` 在 `stripQuoted().text` 上切句；`quote: sentence` 直接取那个被清洗过的 `sentence`。
+  三处叠加，**检测器的实现细节泄漏成了「AI 说了什么」** —— 而 `AI 说：「<原话>」` 正是本模块的卖点。
+  **清洗本身是对的、不许去掉**：`:647-649` 的注释记着实测误报（「两种编译通过的实现」里的
+  `if(false)` 让 build 族命中）。所以修的是「清洗后的文本被当成了原话」，不是清洗。
+- **做法**：`stripQuoted()` 额外返回 `map`（cleaned 的每个字对应原文哪个下标）与 `codeSpans`
+  （被挖掉的行内代码在原文里的区间）。三次 `String.replace` 换成逐段构造（`applyStrip`），
+  每保留一个原文字符 push 它的原始下标，每个被替换的区段 push 该区段的起始下标。
+  切句改用新增的 `splitSentenceSpans()`，同时给出句子在 cleaned 里的 `[start, end)`；
+  `quoteRangeOf()` 用 `map[start]` / `map[end-1]+1` 还原原文区间，`quote` 取原文。
+  **检测仍然只读 `cleaned`，一行未改。**
+- **`truncateQuote()`**：160 字上限不变（超长仍是 157 + `…`），但截断基于原文，
+  且截断点落进行内代码区间时**向前退到区间外** —— 否则会得到一条无法核对的原话。
+  `a > 0` 是必要的：区间从第 0 格开始时不退，否则会得到一句只有 `…` 的原话。
+
+### Changed
+
+- **退化保险的判据换了，原因写清楚。** 任务书建议「原文区间长度 > cleaned 句子长度 × 8 就退回
+  cleaned 句子」。**实测这条不能用**：真实语料里一句塞几个绝对路径很正常
+  （`- \`skill/.../index.ts:168\` —`），比例能到 51 倍，`×8` 在 4,309 段真实末尾文本上
+  **误报 1,526 次** —— 退回去等于把正常行内代码又挖空了，等于没修。
+  改用**结构不变量**：`stripQuoted` 的两次替换都保留换行（fenced → `\n`；blockquote 只删行内
+  内容、行尾 `\n` 还在），行内代码 `[^`\n]*` 本身不含换行 —— 所以「一句 cleaned 文本的原文区间
+  不含换行」是恒真的。破了就是剥离规则与切句脱钩。**实测 210,956 句真实语料，误报 0。**
+  退化次数进 `quoteFallbacks`（`row.quoteFallbacks` → `summary.quoteFallbacks`），
+  `renderSummary` 只在 >0 时印一行 —— 静默降级是不允许的。
+
+### 实测数字（都是真跑出来的）
+
+- **新旧 `family` 序列逐条比对**：`~/.claude/projects/` 下全量 **4,441** 份 `.jsonl`，
+  其中 **4,309** 份有末尾 assistant 文本。比对结果：**family 序列不同的 0 份**；
+  `stripQuoted().text` 字节不同的 **0 份**；`map` 非严格递增的 **0 份**；
+  退化触发 **0** 次。`quote` 字段：1,064 条不变（本来就没有行内代码），612 条变长（补回了被挖空的内容）。
+- **端到端**（`--days 1`）：
+  - 前：`AI 说：「三套测试最后又跑了一遍全绿，正式版导出只剩  。」`
+  - 后：`AI 说：「三套测试最后又跑了一遍全绿，正式版导出只剩 \`InitializeASI\`。」`
+  - 前：`AI 说：「现在   下只剩  （3.1 MB，209 个文件，与   同步，提交  ）。」`
+  - 后：`AI 说：「现在 \`<仓库根>\` 下只剩 \`old\`（3.1 MB，209 个文件，与 \`origin/main\` 同步，提交 \`b23ff5b\`）。」`
+    （实际输出里 `<仓库根>` 处是那个会话的真实绝对路径，本文件不抄本机路径 —— `check-structure` 会拦。）
+
+### 测试
+
+- **测试数 1261 → 1274**（`verify-claims.test.mjs` 156 → 169，+13）。四份声明文件已同步。
+- 覆盖：单个 / 多个行内代码保留；fenced code block 剥掉后不出现在 `quote` 里；markdown 链接
+  回归保护；截断到 160 不切半个反引号区间；截断仍基于原文（158 = 157 + `…`）；
+  `map` 严格单调；`map` 能从 cleaned 还原原文片段；`splitSentenceSpans` 与旧 `splitSentences`
+  逐字节等价（13 组边界输入，含 `a.\n/b`、`a。。b`、`\r\n`）；`quoteRangeOf` 的退化判据
+  （跨换行 → 不 faithful、不跨 → faithful、`map` 缺失/空 → 退化不抛）。
+- **钉住设计意图的那条没动**：`fams('Done — \`npm run test\` is green (10/10).')` 仍是
+  `['vague-completion']`，不带反引号时仍是 `['test-count', 'vague-completion']`。
+  **`quote` 变回原文 ≠ 检测变回去**，两者是分开的两件事。
+- **负向验证（真跑过）**：把 `quote` 改回 `splitSentences(stripQuoted(text).text)`，
+  「`InitializeASI` 还在」「路径还在」「没有连续空格」三条同时变红 —— 已还原。
+
+---
 
 > 两件事都是**已实测确认**的缺陷，不是设计推演。依据：
 > `docs/research/2026-11-14-gate-widening-resolution.md`（P1 的裁决）与

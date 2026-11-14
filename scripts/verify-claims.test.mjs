@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 
 import {
   detectClaims, findEvidence, classifyEvidence, scanSession, summarizeClaims,
-  splitSentences, stripQuoted, isNegated, isInterrogative, isSpeculative,
+  splitSentences, splitSentenceSpans, truncateQuote, quoteRangeOf, stripQuoted, isNegated, isInterrogative, isSpeculative,
   lastAssistantText, buildEvidenceIndex, claimedCount, readBack, readTailRecords,
   listSessions, enoughForClaim, enoughForClaims, evidenceSufficient,
   CLAIM_FAMILIES, EVIDENCE_STATUS,
@@ -1803,4 +1803,197 @@ test('P6 防误伤：`all ... are` 的描述性句子不认', () => {
   }
   // `All tests are passing` 是一条**真断言**，只是属于另一族 —— 它绝不能被本族吞掉再丢掉。
   assert.deepEqual(fams('All tests are passing usually.'), ['test-count']);
+});
+
+// ── 11. 原话必须原样（2026-11-14 F1）────────────────────────────────
+//
+// 缺陷：`detectClaims` 的 `quote` 取的是 `stripQuoted()` 的输出。行内代码被换成
+// 一个空格，于是**原话被检测器改写**：
+//
+//   node scripts/verify-claims.mjs --days 1
+//     AI 说：「三套测试最后又跑了一遍全绿，正式版导出只剩  。」
+//     AI 说：「现在   下只剩  （3.1 MB，209 个文件，与   同步，提交  ）。」
+//
+// 而 `AI 说：「<原话>」` 正是本模块的核心卖点。清洗本身**是对的**（不许去掉）：
+// 行内代码是命令/标识符，不是完成声明；去掉它，「两种编译通过的实现绕过」里的
+// `if(false)` 会让 build 族命中。要修的是「清洗后的文本被当成了原话」。
+//
+// 修法：`stripQuoted()` 额外返回 `map`（cleaned 的每个字对应原文哪个下标），
+// 切句时拿到句子在 cleaned 里的 `[start, end)`，用 `map` 还原出原文区间。
+// **检测仍然在 cleaned 上做，一行不改。**
+
+test('F1：quote 保留行内代码原样（这是核心卖点，不是装饰）', () => {
+  const out = detectClaims('三套测试最后又跑了一遍全绿，正式版导出只剩 `InitializeASI`。');
+  assert.equal(out.length, 1);
+  assert.equal(out[0].quote, '三套测试最后又跑了一遍全绿，正式版导出只剩 `InitializeASI`。',
+    '原话里的标识符必须原样出现');
+  assert.ok(!/只剩\s+。$/.test(out[0].quote), '不许留着被挖空的痕迹');
+});
+
+test('F1：多个行内代码同时保留', () => {
+  // 与真实会话 a495f754 的原话同形。用普通字符串 + 显式转义：路径里的 `\\` 是
+  // 一个反斜杠，反引号本身不转义（`String.raw` 里的 `\`` 会留下字面反斜杠）。
+  const BS = '\\';
+  const text = '现在 `D:' + BS + 'Projects' + BS + 'Github` 下只剩 `old`'
+    + '（3.1 MB，209 个文件，与 `origin/main` 同步，提交 `b23ff5b`）。';
+  const out = detectClaims(text);
+  assert.equal(out.length, 1);
+  for (const bit of ['`D:' + BS + 'Projects' + BS + 'Github`', '`old`', '`origin/main`', '`b23ff5b`']) {
+    assert.ok(out[0].quote.includes(bit), `丢了 ${bit}：${out[0].quote}`);
+  }
+  // 旧输出长这样（`现在` 后面紧跟一串空格 + `下只剩`）—— 不许再出现。
+  assert.ok(!/现在\s{2,}下只剩/.test(out[0].quote), out[0].quote);
+});
+
+test('F1：检测仍走清洗后的文本 —— 这条是设计意图，不许被本次修复改掉', () => {
+  // 不带反引号时，`npm run test` + `10/10` 两个族都命中。
+  assert.deepEqual(fams('Done — npm run test is green (10/10).'), ['test-count', 'vague-completion']);
+  // 带上反引号后命令行被挖掉，test-count 那族的 guard（要有测试语汇）失效 ——
+  // 只剩笼统的 Done。**quote 变回原文不等于检测变回去**：两者是分开的两件事。
+  assert.deepEqual(fams('Done — `npm run test` is green (10/10).'), ['vague-completion']);
+  // 同一条输入，quote 里必须看得到那条命令。
+  assert.equal(detectClaims('Done — `npm run test` is green (10/10).')[0].quote,
+    'Done — `npm run test` is green (10/10).');
+});
+
+test('F1：fenced code block 剥掉后不许出现在 quote 里', () => {
+  const text = '## 结果\n\n```bash\nnpm test\n# 42 tests passed\n```\n已全部修好了';
+  const out = detectClaims(text);
+  assert.ok(out.length >= 1);
+  for (const c of out) {
+    assert.ok(!c.quote.includes('npm test'), `代码块内容漏进了原话：${c.quote}`);
+    assert.ok(!c.quote.includes('42 tests passed'), `代码块内容漏进了原话：${c.quote}`);
+  }
+  assert.ok(out.some((c) => c.quote.includes('已全部修好了')));
+});
+
+test('F1：markdown 链接本来就没被剥，回归保护', () => {
+  const out = detectClaims('Skill 跑通了，两份文案都在 [skill/output/](skill/output/) 下，lint 零 error。');
+  assert.equal(out.length, 1);
+  assert.ok(out[0].quote.includes('[skill/output/](skill/output/)'), out[0].quote);
+});
+
+test('F1：截断到 160 时不切半个反引号区间', () => {
+  // 把反引号区间放在第 157 个字附近，让截断点落进区间内部。
+  const pad = '测'.repeat(150);
+  const text = '全部测试通过 ' + pad + ' `npm run test -- --grep verylongname` 完成';
+  const out = detectClaims(text);
+  assert.equal(out.length, 1);
+  const q = out[0].quote;
+  assert.ok(q.length <= 160, `截断后长度 ${q.length}`);
+  assert.ok(q.endsWith('…'));
+  // 截断点必须退到反引号区间之前，所以结果里一个反引号都不该出现。
+  assert.ok(!q.includes('`'), `截断点落进了反引号区间：${q.slice(-40)}`);
+  assert.ok(!q.includes('npm run test'), `命令被切了一半：${q.slice(-40)}`);
+});
+
+test('F1：截断仍基于原文（长度上限 160，超长 157 + …）', () => {
+  const long = '全部测试通过 ' + '补充说明'.repeat(60);
+  const out = detectClaims(long);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].quote.length, 158, '157 + 省略号');
+  assert.ok(out[0].quote.endsWith('…'));
+  // 负向：不截断的话这条 quote 会是 247 字 —— 确认上面那 158 不是碰巧。
+  assert.ok(long.length > 160);
+});
+
+test('F1：map 严格单调 —— 否则还原出的原文区间会错位', () => {
+  const cases = [
+    '正文 `code` 尾巴',
+    '前 `a` 中 `bbbb` 后',
+    '```js\nx\n```\n> 引用 `q`\n正文',
+    '混合 `一` 与 `二` 与 `三` 结束。',
+  ];
+  for (const src of cases) {
+    const { text, map } = stripQuoted(src);
+    assert.equal(map.length, text.length, `map 长度必须与 text 一致：${src}`);
+    for (let i = 1; i < map.length; i++) {
+      assert.ok(map[i] > map[i - 1], `map 非严格递增于 ${i}（${src}）`);
+    }
+    assert.ok(map.every((v) => v >= 0 && v < src.length || src.length === 0));
+  }
+});
+
+test('F1：stripQuoted 的 map 能还原出原文片段', () => {
+  const src = '导出只剩 `InitializeASI`。';
+  const { text, map } = stripQuoted(src);
+  // cleaned 里「导出只剩 」的那几个字，映射回原文必须是同样的字。
+  const i = text.indexOf('导出只剩');
+  assert.ok(i >= 0);
+  assert.equal(src[map[i]], '导');
+  // 「。」还在（切句之前），它映射回原文的「。」。
+  const j = text.indexOf('。');
+  assert.equal(src[map[j]], '。');
+});
+
+test('F1：退化保险 —— 正常输入不计数，区间坏了才退回 cleaned 句子', () => {
+  // 正常路径：quote 是原文，计数器不动。
+  const ok = {};
+  detectClaims('全部测试通过 `x` 了。', ok);
+  assert.equal(ok.quoteFallbacks || 0, 0, '正常输入不该触发退化');
+  assert.equal(detectClaims('全部测试通过。')[0].quote, '全部测试通过。', '句末标点与旧行为一致，留在原话里');
+
+  // 退化分支只有一种真实成因：`map` 还原出的原文区间跨了换行（剥落规则与切句
+  // 脱钩时就会这样）。它由构造保证不会在干净输入上出现，所以直接对着判据函数验 ——
+  // 否则那段保险就是死代码（**教训**：本节最初写的是「×8 长度比」阈值，
+  // 在真实语料上误报 1,526 次，把正常的绝对路径又挖空了）。
+  const src = '第一行\n第二行全部测试通过';
+  const map = [...Array(src.length).keys()];
+  // `[0,4)` 在原文里含第 4 格那个换行 —— 必须判成不 faithful。
+  const r = quoteRangeOf(src, { start: 0, end: 4 }, map);
+  assert.equal(r.faithful, false, '原文区间跨换行时必须判不 faithful');
+  // 同一份输入里，不含换行的区间必须判 faithful（否则上面那条只是恒 false）。
+  const r2 = quoteRangeOf(src, { start: 0, end: 3 }, map);
+  assert.equal(r2.faithful, true, '不含换行的区间必须放行');
+  // map 缺失 / 越界也要判退化，不许抛。
+  assert.equal(quoteRangeOf(src, { start: 0, end: 3 }, null).faithful, false);
+  assert.equal(quoteRangeOf(src, { start: 0, end: 3 }, []).faithful, false);
+});
+
+test('F1：真实文本里 faithfulness 恒成立（所以退化计在真实语料上为 0）', () => {
+  const src = '第一行全部测试通过\n\n第二行构建成功\n```\nfenced 336/336 测试通过\n```\n';
+  const { text, map } = stripQuoted(src);
+  for (const seg of splitSentenceSpans(text)) {
+    const r = quoteRangeOf(src, seg, map);
+    assert.equal(r.faithful, true, `句「${seg.text}」的原文区间不该跨换行`);
+    assert.ok(!src.slice(r.from, r.to).includes('\n'), `跨了换行：${JSON.stringify(src.slice(r.from, r.to))}`);
+  }
+});
+
+test('F1：splitSentenceSpans 与旧 splitSentences 逐字节等价', () => {
+  const cases = [
+    '构建成功。测试通过！没 push\n还有一件事',
+    'a。\nb', 'a。。b', '\nabc', 'a。\n\nb', 'x\n\n\ny', '。', 'a。',
+    'a\r\nb', 'a。\r\nb', 'Done. Next; ok! Fine? Yes',
+    '全部测试通过 `x` 了。\n\n`y` 也行',
+  ];
+  const old = (t) => String(t || '').split(/(?<=[。！？!?；;])|\n+/).map((s) => s.trim()).filter((s) => s.length >= 2);
+  for (const c of cases) {
+    assert.deepEqual(splitSentences(c), old(c), `切句变了：${JSON.stringify(c)}`);
+    assert.deepEqual(splitSentenceSpans(c).map((s) => s.text), old(c));
+    // start/end 必须真的圈住那句
+    for (const seg of splitSentenceSpans(c)) {
+      assert.equal(c.slice(seg.start, seg.end), seg.text);
+    }
+  }
+});
+
+test('F1 负向：把 quote 改回 cleaned 句子，上面这些必须变红', () => {
+  // 复刻缺陷：直接拿 cleaned 的句子当 quote（正是修之前 `detectClaims` 干的事）。
+  const regression = (text) => splitSentences(stripQuoted(text).text);
+  const src = '三套测试最后又跑了一遍全绿，正式版导出只剩 `InitializeASI`。';
+  const bad = regression(src)[0];
+  assert.ok(!bad.includes('InitializeASI'), '前提：旧做法确实把标识符挖空了');
+  assert.ok(!detectClaims(src)[0].quote.includes('   '), '修复后的原话不该有连续空格');
+  assert.ok(detectClaims(src)[0].quote.includes('InitializeASI'), '修复后才看得出来');
+
+  // 端到端第二句（a495f754）的形态：路径被整段挖掉。
+  // 注意必须带「209 个文件」这种数量 + 同步语汇，否则这一句本身不命中任何族
+  // —— 那不是修复的问题，是 detector 的族正则要求。
+  const BS = '\\';
+  const real = '现在 `D:' + BS + 'Projects' + BS + 'Github` 下只剩 `old`'
+    + '（3.1 MB，209 个文件，与 `origin/main` 同步）。';
+  assert.ok(!regression(real)[0].includes('Github'), '前提：旧做法把路径挖空');
+  assert.ok(/现在\s{2,}下只剩/.test(regression(real)[0]), '前提：旧输出确实留了挖空痕迹');
+  assert.ok(detectClaims(real)[0].quote.includes('Github'), '修复后路径还在');
 });

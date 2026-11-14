@@ -441,6 +441,8 @@ const PROBE_ARGS = {
   // 目的是让「导出但调用即炸」在结构门暴露，而不是等到对 1.5 GB 语料跑完才发现。
   detectClaims: '""', findEvidence: '[[], "test-count"]', classifyEvidence: '[{}]',
   splitSentences: '""', stripQuoted: '""', isNegated: '""', isInterrogative: '""',
+  // 原话还原（2026-11-14）：切句带位置 + 不切断行内代码的截断。两者都是纯函数。
+  splitSentenceSpans: '""', truncateQuote: '["x", []]', quoteRangeOf: '["x", {}, []]',
   isSpeculative: '""', lastAssistantText: '[[]]', buildEvidenceIndex: '[[]]',
   claimedCount: '""', readBack: '["/nonexistent"]', readTailRecords: '["/nonexistent"]',
   listSessions: '["/nonexistent"]', enoughForClaim: '[[]]', enoughForClaims: '[[], []]',
@@ -829,6 +831,8 @@ function checkUnregisteredExports() {
     'POLL_INTERVAL_MS', 'DEFAULT_MIN_IDLE_SWEEP', 'DEFAULT_DELAYS_SEC',
     // verify-claims.mjs：断言 vs 证据配对（2026-11-03）。纯函数逐个进了 PROBE_ARGS。
     'detectClaims', 'findEvidence', 'classifyEvidence', 'splitSentences', 'stripQuoted',
+    // verify-claims.mjs 原话还原（2026-11-14）：都已进 PROBE_ARGS 实际调用。
+    'splitSentenceSpans', 'truncateQuote', 'quoteRangeOf',
     'isNegated', 'isInterrogative', 'isSpeculative', 'lastAssistantText', 'buildEvidenceIndex',
     'claimedCount', 'readBack', 'readTailRecords', 'listSessions', 'enoughForClaim',
     'enoughForClaims', 'evidenceSufficient', 'normalizeCommand', 'isTestCommand',
@@ -998,6 +1002,8 @@ function checkUnregisteredExports() {
     'readSessionDetail', 'sessionCost', 'undoAroundInterruptions', 'density',
     'groupRow', 'stratified', 'summarize', 'PRIMARY_TIER', 'REWORK_EXT_RE',
     'MIN_FRAGMENT_LEN', 'RESUME_PREFIX_RATIO', 'RESUME_MIN_COMMON',
+    // 2026-11-14 加：返工需求率的两个随机窗口对照（审计期间新增，当时漏登记）。
+    'redoShareAfterInterruptions', 'redoShareRandomWindows',
   ];
   for (const k of COST_FNS) REGISTERED.add(k);
 
@@ -1019,6 +1025,21 @@ function checkUnregisteredExports() {
     'WRITE_TOOLS', 'SHELL_TOOLS', 'READ_TOOLS',
   ];
   for (const k of PRE_WRITE_GATE_FNS) REGISTERED.add(k);
+
+  // 2026-11-14 审计期间新加的三个探针脚本。它们是**一次性测量工具**，
+  // 导出的是测量装置本身（读真实语料、算统计），不是被生产代码调用的纯函数。
+  // 逐条登记避免刷屏；正确性由各自的报告里给出的复算命令覆盖。
+  const AUDIT_PROBE_FNS = [
+    // redteam-gate-evidence.mjs —— 读结果质量统计
+    'readOutcomes', 'evidenceQuality', 'report',
+    // redteam-gate-widening.mjs —— 逐会话消融与跨项目污染
+    'gateReadsFixed', 'readPathsInText', 'tailText', 'evidenceSets',
+    'isRealPathEvidence', 'subagentSet', 'predecessorCandidates', 'build',
+    // probe-evidence-sources.mjs —— 证据来源四段探针
+    'gateReadsFromToolUse', 'idNamespace', 'listMainTranscripts', 'subagentDirOf',
+    'toolUsesOf', 'sectionA', 'sectionB', 'sectionC', 'sectionD',
+  ];
+  for (const k of AUDIT_PROBE_FNS) REGISTERED.add(k);
 
   // observe-reality-check.mjs（2026-11-14 写前闸的真实语料重放）：纯函数已进 PROBE_ARGS，
   // 这里显式登记免得被「未登记导出」提示刷屏。buildReport / main 要扫 2GB 语料，
@@ -1439,6 +1460,11 @@ function checkDocReferences() {
         const target = m[1];
         // 模板占位符与省略号是示意，不是路径
         if (/[*<>]|\.\.\.|NNN|xxx|YYYY/.test(target)) continue;
+        // 本机私有路径被 gitignore，**在干净 clone 上必然不存在**。
+        // 文档里提到它们是在说「这个文件不在仓里」，不是在引用一个该存在的文件。
+        // 不加这条豁免，硬门就只有「作者本机」一个环境是绿的 —— 实测干净 clone
+        // 上必红 3 条，CI 从首次提交起连续失败 9 次而无人察觉。
+        if (PRIVATE_PATHS.some((pp) => target === pp || target.startsWith(pp + '/'))) continue;
         if (!existsSync(join(ROOT, target))) {
           fail(relPath, `第 ${i + 1} 行引用的文件不存在：${target}`
             + '（若是有意保留的计划，请在该行标注「待建」/「未实现」）');

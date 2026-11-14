@@ -29,17 +29,24 @@ cd Overwatch
 node scripts/scan-sessions.mjs --days 3
 ```
 
-真实输出格式（项目名已替换）：
+真实输出格式（项目名已替换，行数与耗时随语料变化）：
 
 ```
-OmniSight 会话扫描 · 最近 3 天 · 19 个有活动的会话
+OmniSight 会话扫描 · 最近 3 天 · 138 个会话
+transcript 436 个：窗口内 136 · 窗口外 299 · 时间未知 1 · job 10 个（补入 2）
 liveness: reconstructed（事后重建，非实时上报）
 
 [PRODUCING] Projects/<repo>     calls=  988 sub=    13 depth=1 novelty=0.97 hb=0s/120s    idle=5s   persistent-change-in-window
 [EXPLORING] Projects/<repo-2>   calls= 5840 sub=100/272~ depth=1 novelty=1.00 hb=0s/120s  idle=67.5h dormant
 ```
 
-`--days 3` 一次全量实测约 **33 秒**。`dormant` 不告警——会话只是结束了，不是坏了。
+`--days N` **默认是 7**（不写就是一周），写错（`--days abc`、负数）会报错而不是静默回落。
+耗时按你的 transcript 总量线性增长：本机 436 份约 40–60 秒，干净环境 1 秒内。
+`dormant` 不告警——会话只是结束了，不是坏了。
+
+**跑完不知道下一步做什么？读 [GUIDE](docs/GUIDE.md)。** 那里每条命令都有「什么时候用」，
+还有一个完整的 before/after 叙事（一个会话停了 22 天，按提示回了一句话之后继续干活）。
+README 只讲「它是什么、能做什么」；GUIDE 讲「我该敲什么、会看到什么、看到之后做什么」。
 
 ```bash
 node scripts/oversight-tui.mjs            # 面板：列表 → Enter 详情 → c 复制接力草稿
@@ -147,7 +154,7 @@ Overwatch/
 
 新来的人从 [`docs/README.md`](docs/README.md) 开始——它按「你想知道什么」指路，并说清四类文档的可信度不同。
 
-改动后必跑 `node scripts/check-structure.mjs`（结构硬门）与 `node --test scripts/*.test.mjs`（1261 条回归测试；**这个数字由硬门与实跑对账，写错即红**，所以照抄即可、不必手工数）。
+改动后必跑 `node scripts/check-structure.mjs`（结构硬门）与 `node --test scripts/*.test.mjs`（1274 条回归测试；**这个数字由硬门与实跑对账，写错即红**，所以照抄即可、不必手工数）。
 
 ## 已知局限
 
