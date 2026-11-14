@@ -92,6 +92,21 @@ test('shortcutPath 在启动文件夹里，且不在数据目录里', { skip: pr
   assert.ok(!lnk.startsWith(join('C:\\Local', 'Overwatch')), `快捷方式不得在数据目录：${lnk}`);
 });
 
+test('shortcutPath 在该平台没有启动文件夹时返回 null，而不是抛异常', () => {
+  // 这条钉的是一个真实缺陷：`startupDir()` 在非 win32 上返回 null，而旧实现直接把它
+  // 传给 `join()` → `ERR_INVALID_ARG_TYPE: The "path" argument must be of type string.
+  // Received null`。Linux CI 上它炸掉了 `overwatch doctor`（本机永远 win32，从没触发）。
+  // 这里用 `OVERWATCH_STARTUP_DIR=''` 模拟「该平台没这个概念」，不依赖真实 platform。
+  const saved = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+  try {
+    assert.equal(startupDir({}), null, '非 win32 且没设 OVERWATCH_STARTUP_DIR 时应返回 null');
+    assert.equal(shortcutPath({}), null, '没有启动文件夹时必须是 null，不能抛，也不能编一个路径');
+  } finally {
+    Object.defineProperty(process, 'platform', { value: saved, configurable: true });
+  }
+});
+
 test('模板是纯 ASCII——VBScript 按 ANSI 读，非 ASCII 会截断字符串字面量', () => {
   const tpl = readFileSync(templatePath(resolve(import.meta.dirname, '..')), 'utf8');
   const bad = [...tpl].filter((ch) => ch.charCodeAt(0) > 127);

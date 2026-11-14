@@ -96,7 +96,14 @@ export function autostartAdvice(platform = process.platform) {
 }
 
 export function shortcutPath(env = process.env) {
-  return join(startupDir(env), 'Overwatch Watch.lnk');
+  // 启动文件夹是 Windows 概念：`startupDir()` 在非 win32 上返回 **null**（并给
+  // launchd / systemd 建议）。这里必须原样把 null 传出去，不能丢给 `join()` ——
+  // 否则 `join(null, ...)` 抛 `ERR_INVALID_ARG_TYPE`，而调用方通常只想知道
+  // 「有没有快捷方式」。（Linux CI 上实测炸了 `overwatch doctor`，本机因永远是
+  // win32 而从没触发过。）
+  const dir = startupDir(env);
+  if (!dir) return null;
+  return join(dir, 'Overwatch Watch.lnk');
 }
 
 /** 把模板渲染成可运行的 .vbs 内容。

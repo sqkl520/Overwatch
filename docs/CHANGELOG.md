@@ -78,6 +78,33 @@
   实测抓到时已「超时 49m / 限 8m」。改为相对真实 `Date.now()` 算登记时刻。
   **这是本仓库「用固定时钟保证可复现」这条好习惯的一个反例边界：子进程读的是真挂钟。**
 
+### Fixed（CI 上 13 条红：`shortcutPath` 把 null 传给 `join`）
+
+> 这一批**全部是本机绿、Linux 红**，而且根因是**一个**：`startupDir()` 在非 win32 上
+> 返回 `null`，`shortcutPath()` 直接把它传给 `join()` →
+> `TypeError: The "path" argument must be of type string. Received null`。
+> 从 CI 日志拿到的确切栈：
+> ```
+> at join (node:path:1305:7)
+> at Module.shortcutPath (scripts/install-watcher.mjs:99:10)
+> at checkWatcherLive (scripts/overwatch.mjs:476:41)
+> at async runDoctor (scripts/overwatch.mjs:611:23)
+> ```
+
+- **`install-watcher.mjs` 的 `shortcutPath()` 在没有启动文件夹时返回 `null`，不再抛。**
+  启动文件夹是 Windows 概念，非 win32 上本就没有这个东西；把它当「必有一个路径」是错的。
+  **负向证据**：把实现改回 `join(startupDir(env), ...)`，新加的回归测试变红（12 pass / 1 fail），
+  恢复后全绿。本机 spot-check：`startupDir({}) => null`、`shortcutPath({}) => null`。
+- **`overwatch.mjs` 的 `checkWatcherLive()` 先判 null 再判存在。**
+  `existsSync(null)` 在部分 Node 版本上抛，所以不能依赖它兜底。
+- **`overwatch doctor` 区分「该平台没有这个概念」与「有但没建」。** 前者不再是「未认出」，
+  而是明写「该平台没有启动文件夹（用 launchd / systemd）」——合并成一档会让 Linux 用户
+  以为自己启动项坏了。
+- **`overwatch.test.mjs` 的 `run()` 补了 `timeout` 并显式报告挂住。**
+  `spawnSync` 不带 timeout 时，子进程一挂就返回 `status: null` + 空 stdout，
+  下游断言只能看到「首行不是 doctor 的头」，真正的原因（挂了）被完全吞掉
+  —— CI 上那次「doctor 只用 48ms 且 stdout 为空」就是这么被误读成「提前退出」的。
+
 ### Known（本轮登记但不修）
 
 - **`claude -p` 的失败语义不自洽，产品不能信 `subtype`。** 实测（本机）：

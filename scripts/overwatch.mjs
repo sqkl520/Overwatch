@@ -473,7 +473,10 @@ async function checkWatcherLive(env, timeoutMs, nowMs) {
     return { ok: false, code: null, out: '', err: String(e && e.message), timedOut: false, ms: Date.now() - started, facts };
   }
   facts.launcherPresent = existsSync(iw.launcherPath(REPO));
-  facts.shortcutPresent = existsSync(iw.shortcutPath(env));
+  // `shortcutPath()` 在非 Windows 上返回 **null**（启动文件夹是 Windows 概念）。
+  // `existsSync(null)` 在旧版 Node 上会抛，所以先判 null 再判存在。
+  const shortcut = iw.shortcutPath(env);
+  facts.shortcutPresent = shortcut ? existsSync(shortcut) : null;
 
   // 先自己确认状态文件读得出来 —— 只读地读，**不交给会改名的 loadState**。
   const stateFile = join(facts.stateDir, 'state.json');
@@ -523,10 +526,15 @@ function checkWatcher(result, env) {
     raw: f.raw || String(result.out || result.err || '').trim(),
   };
   const yes = (v) => (v === null ? '未认出' : (v ? '在' : '没有'));
+  // 「该平台没有这个概念」与「有这个概念但没建」必须分开说 —— 前者不是缺失，
+  // 后者才是。合并成「未认出」会让 Linux 用户以为自己的启动项坏了。
+  const shortcutText = facts.shortcutPresent === null
+    ? '快捷方式 该平台没有启动文件夹（用 launchd / systemd）'
+    : `快捷方式 ${yes(facts.shortcutPresent)}`;
   const range = Object.entries(facts.layers).map(([k, v]) => (k === 'log' ? `log ${v}` : `${k} 上次 ${v}前`)).join(' · ');
   const text = [
     `启动器 ${yes(facts.launcherPresent)}`,
-    `快捷方式 ${yes(facts.shortcutPresent)}`,
+    shortcutText,
     facts.stateNote ? `状态：${facts.stateNote}` : `health 说 ${facts.verdict === null ? '未认出' : facts.verdict}`,
     range || null,
     `数据目录 ${facts.stateDir}`,

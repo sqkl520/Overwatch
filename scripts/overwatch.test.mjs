@@ -28,15 +28,29 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ENTRY = join(HERE, 'overwatch.mjs');
 
-/** 起一次入口。返回 {code, out, err, ms}。 */
-function run(args, { env = {}, cwd = resolve(HERE, '..') } = {}) {
+/** 起一次入口。返回 {code, out, err, ms}。
+ *
+ *  **必须给 timeout**：`spawnSync` 不带 timeout 时，子进程一旦挂住就返回
+ *  `status: null` 且 `stdout` 为空 —— 测试只会看到「首行不是 doctor 的头」，
+ *  而真正的原因（挂住了）被完全吞掉。CI 上实测就是这样：doctor 报 48ms、
+ *  stdout 空，看起来像「提前退出」，实际是同步调用没能拿到任何东西。 */
+function run(args, { env = {}, cwd = resolve(HERE, '..'), timeout = 30000 } = {}) {
   const started = Date.now();
   const r = spawnSync(process.execPath, [ENTRY, ...args], {
     cwd,
     encoding: 'utf8',
+    timeout,
     env: { ...process.env, ...env },
   });
-  return { code: r.status, out: String(r.stdout || ''), err: String(r.stderr || ''), ms: Date.now() - started };
+  const out = String(r.stdout || '');
+  const err = String(r.stderr || '');
+  // 挂住时 `signal` 是 'SIGTERM'、`status` 是 null。把它变成可读的失败，
+  // 而不是让下游断言去猜「为什么首行是空的」。
+  if (r.error || r.signal) {
+    throw new Error(`入口超时或被信号终止（signal=${r.signal} error=${r.error && r.error.message}）`
+      + ` args=${JSON.stringify(args)} outLen=${out.length} err=${err.slice(0, 400)}`);
+  }
+  return { code: r.status, out, err, ms: Date.now() - started };
 }
 
 /** 一个临时目录，测试完删掉。**不碰真实 ~/.claude** —— 所有路径都从这里注入。 */
