@@ -22,7 +22,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -63,6 +63,35 @@ function withTmp(fn) {
   }
 }
 
+/** 造一个最小的「有语料」根，让 doctor 走正常分支而不是空状态。
+ *
+ *  有几条测试测的是 `watcher` 步骤（损坏的 state.json、会不会变成 watch），
+ *  与「这台机器有没有真实会话」无关。可 doctor 在没有 transcript 根时会 exit 2，
+ *  于是它们在本机绿、在干净机器上红。注入一个假根就把环境耦合切断了 ——
+ *  判据一字不改，只是不再要求别人也有我的语料。 */
+function fakeRoot(dir) {
+  const root = join(dir, 'fake-projects');
+  mkdirSync(join(root, 'proj-a'), { recursive: true });
+  writeFileSync(join(root, 'proj-a', 's1.jsonl'), JSON.stringify({ type: 'user', message: { content: 'x' } }) + '\n');
+  return root;
+}
+
+/** 这台机器上有没有真实 transcript 语料。
+ *
+ *  有几条测试断言的是「有语料时的行为」（doctor exit 0、计划头、预算对账）。
+ *  干净机器与我本机 CI 上都没有 `~/.claude/projects/`，doctor 会**正确地** exit 2
+ *  （「transcript 根不存在」）。那不是产品坏了，是环境不同 —— 所以这些断言只在
+ *  有语料时跑，没有时改跑「空状态行为正确」那一条。
+ *  **不软化判据**：有语料时一条不许跳，判据一字不改。 */
+const HAS_CORPUS = (() => {
+  try {
+    const root = join(homedir(), '.claude', 'projects');
+    return readdirSync(root).some((d) => {
+      try { return readdirSync(join(root, d)).some((f) => f.endsWith('.jsonl')); } catch { return false; }
+    });
+  } catch { return false; }
+})();
+
 // ── 1. --help 不触发任何检查 ─────────────────────────────────────────
 
 test('--help 立刻退出、退出码 0、且不跑 doctor（无 PLAN、无耗时行）', () => {
@@ -87,16 +116,29 @@ test('--help 在有坏 transcript 根的机器上也 exit 0（不因环境失败
   });
 });
 
-test('--help 比一次 doctor 明显快（钉住「不扫描」这件事本身）', () => {
-  // **取最小值，不取单次**。单次比较在全量测试并发时会随机红（本机实测：`node --test`
-  // 同时跑 30 个测试文件时，一次 node 启动能被拖到 700ms+）。最小值才反映「这个命令
-  // 本身要多少工作」—— 负载只会加时间，不会减。
-  const minOf = (args, n = 3) => Math.min(...Array.from({ length: n }, () => run(args).ms));
-  const help = minOf(['--help']);
-  const doc = minOf(['doctor']);
-  // help 只打一段字符串（约等于 node 自身启动成本）；doctor 至少要把 watch.mjs spawn
-  // 起来。两者相差两倍以上才算分离干净 —— 若 help 偷偷做了检查，这个差距会消失。
-  assert.ok(help * 2 < doc, `--help 应明显快于 doctor：help ${help}ms vs doctor ${doc}ms`);
+test('--help 不产出任何 doctor 的东西（用产物判，不用计时判）', () => {
+  // 原来这条断言 `help * 2 < doc`。**这个判据太脆**：全量 `node --test scripts/`
+  // 并发跑三十个测试文件时，Node 启动本身被拖到几百毫秒，help 与 doctor 落进同一个
+  // 量级 —— 实测 `help 358ms vs doctor 675ms`，只差 1.9 倍，随机红。
+  //
+  // 计时测的是「这台机器多忙」，不是「help 有没有偷偷扫描」。改成测**产物**：
+  // help 的输出里不许出现任何一个只有跑过检查才有的东西。这条与负载无关。
+  const h = run(['--help']);
+  assert.equal(h.code, 0, '--help 必须 exit 0');
+  assert.match(h.out, /用法|overwatch/, '--help 必须打印帮助');
+
+  // doctor 才会产生的痕迹，help 里一个都不许有。
+  // **只挑「只有跑过检查才会出现」的形态**，不挑词汇 —— HELP 里本来就会解释
+  // 「transcript 根不存在 → exit 2」，那是文档，不是检查痕迹。
+  assert.ok(!/合计 \d+ms/.test(h.out), 'help 不得打印 doctor 的合计行');
+  assert.ok(!/\[\s*\d+ms\]/.test(h.out), 'help 不得打印任何带耗时的检查行');
+  assert.ok(!/查 \d+ 项前提 · 预算/.test(h.out), 'help 不得打印 doctor 的 PLAN 头');
+
+  // 交叉验证：doctor 在**任何**环境下都至少会产生 PLAN 头或空状态措辞之一。
+  // 若 doctor 什么也不产，上面那几条「help 里没有」就没有意义。
+  const d = run(['doctor']);
+  const doctorHasSomething = /overwatch doctor/.test(d.out) || /transcript 根/.test(d.out);
+  assert.ok(doctorHasSomething, `doctor 必须产出可识别的内容，否则本测试的前提不成立：code=${d.code} out=${d.out.slice(0, 200)}`);
 });
 
 test('--help 不做任何 I/O：连 transcript 根都不碰', () => {
@@ -121,6 +163,13 @@ test('无参数运行 = doctor', () => {
 
 test('doctor 在 1000ms 预算内跑完（默认预算、真实本机）', () => {
   const r = run(['doctor']);
+  // 没有语料时 doctor 会正确地 exit 2（「transcript 根不存在」）—— 这不是失败，
+  // 是这台机器还没用过宿主。此时这条测试改钉空状态的行为，其余断言一律跳过。
+  if (!HAS_CORPUS) {
+    assert.equal(r.code, 2, '没有 transcript 根时 exit 2');
+    assert.match(r.out, /transcript 根不存在/, '必须明说「不存在」，不能装作没会话');
+    return;
+  }
   assert.equal(r.code, 0, `doctor 应 exit 0：${r.err}`);
   // 报出来的数是 wallMs（含 Node 启动），用它和预算对账 —— 否则「1000ms 上限」
   // 会变成一句只统计函数耗时的自欺。
@@ -346,8 +395,8 @@ test('doctor 只读：不新建 state.json、不改 state 目录里的文件', (
     const stateDir = join(dir, 'state');
     mkdirSync(stateDir, { recursive: true });
     const before = readdirSync(stateDir).join(',');
-    run(['doctor'], { env: { OVERWATCH_STATE_DIR: stateDir } });
-    run(['doctor', '--json'], { env: { OVERWATCH_STATE_DIR: stateDir } });
+    run(['doctor'], { env: { OVERWATCH_STATE_DIR: stateDir, CLAUDE_PROJECTS_DIR: fakeRoot(dir) } });
+    run(['doctor', '--json'], { env: { OVERWATCH_STATE_DIR: stateDir, CLAUDE_PROJECTS_DIR: fakeRoot(dir) } });
     assert.equal(readdirSync(stateDir).join(','), before,
       'doctor 在空状态目录里写文件了（它必须只读）');
   });
@@ -360,7 +409,7 @@ test('doctor 遇到损坏的 state.json 不说「没在工作」，也不改名�
     // watch.mjs 的 loadState() 在解析失败时会把文件改名成 *.corrupt-<ts>。
     // doctor 若 import 它并调 loadState，就会**改动现场**。这里钉住不改。
     writeFileSync(join(stateDir, 'state.json'), '{ this is not json');
-    const r = run(['doctor', '--json'], { env: { OVERWATCH_STATE_DIR: stateDir } });
+    const r = run(['doctor', '--json'], { env: { OVERWATCH_STATE_DIR: stateDir, CLAUDE_PROJECTS_DIR: fakeRoot(dir) } });
     assert.equal(r.code, 0, `损坏的 state.json 不该让 doctor 失败：${r.code}`);
     const data = JSON.parse(r.out);
     const w = data.steps.find((s) => s.id === 'watcher');
@@ -381,7 +430,7 @@ test('★ doctor 不会变成 watch：入口名以 watch.mjs 结尾，导入 wat
     // 且进程永不退出（定时器还活着）。
     //
     // 判据：doctor 的输出里不许出现 watch 自己的启动日志；退出码必须是 0 而不是挂住。
-    const r = run(['doctor'], { env: { OVERWATCH_STATE_DIR: join(dir, 'state') } });
+    const r = run(['doctor'], { env: { OVERWATCH_STATE_DIR: join(dir, 'state'), CLAUDE_PROJECTS_DIR: fakeRoot(dir) } });
     assert.equal(r.code, 0, `doctor 必须正常退出（挂住/变成 watch 都是缺陷）：${r.code}`);
     assert.ok(!/watch 启动|tick=\d+ms/.test(r.out + r.err),
       `doctor 把 watch 的守护进程日志打出来了 —— 它 import 了 watch.mjs：\n${r.out}\n${r.err}`);
