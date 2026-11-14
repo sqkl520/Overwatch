@@ -9,9 +9,12 @@
 | 「这东西能替我做什么」 | [README.md](../README.md) | 产品定位、能力边界、30 秒上手 |
 | 「每条能力对应的命令是什么」 | [CAPABILITIES.md](CAPABILITIES.md) | 能力 → 可运行的命令，硬门会核 |
 | 「我该敲什么、会看到什么」 | [GUIDE.md](GUIDE.md) | 使用手册：输出怎么读、出问题怎么办 |
+| 「我刚装完，装对了吗」 | [spec/2026-11-14-entry-point.md](spec/2026-11-14-entry-point.md) | 唯一入口 `scripts/overwatch.mjs`：首屏契约、空/坏三态、1000ms 上限、退出码表 |
 | 「状态怎么判、阈值多少」 | [spec/state-model.md](spec/state-model.md) | 可执行判据的唯一真源 |
 | 「写前闸按什么判、怎么验收」 | [spec/2026-11-14-pre-write-gate-split.md](spec/2026-11-14-pre-write-gate-split.md) | 首写工具拆分的判据表 + 7 条 AC + 已知残留问题 |
-| 「为什么只能手动接力」 | [adr/0001-config-only.md](adr/0001-config-only.md) | 纯配置库的取舍与代价 |
+| 「AI 问没问、先读后问还是先问后读」 | [spec/2026-11-14-question-audit.md](spec/2026-11-14-question-audit.md) | 四条判据哪条能判哪条不能 + `overwatch.config.json` 校验规则 + 本机实测分布 |
+| 「这东西是什么形态、装在哪、怎么升级」 | [adr/0003-application-not-plugin.md](adr/0003-application-not-plugin.md) | **应用**：不是插件、不是配置库、不是样板间；逐条取代 ADR-0001 |
+| 「为什么只能手动接力」 | [adr/0001-config-only.md](adr/0001-config-only.md) | 纯配置库的取舍与代价（**定位部分已被 ADR-0003 取代**） |
 | 「**现在到底什么是真的**」 | [FACTS.md](FACTS.md) | 逐条实测的事实清单：证据等级 + 复跑命令 + 已被推翻的结论 |
 | 「这条结论还成立吗」 | [research/README.md](research/README.md) | 研究索引 + **已推翻结论清单** |
 | 「这个设计做出来了吗」 | [design/README.md](design/README.md) | 设计存档索引，**全部未实现** |

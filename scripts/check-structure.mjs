@@ -505,6 +505,16 @@ const PROBE_ARGS = {
   readSessionDetail: '["/nonexistent-ow-probe"]', sessionCost: '[{ writes: [], humans: [], asks: [], seq: [], path: "/x", bytes: 0 }]',
   undoAroundInterruptions: '[{ writes: [], humans: [] }]', density: '[[], "x"]',
   groupRow: '[[]]', stratified: '[[]]',
+  // measure-ask-vs-tell.mjs（2026-11-14 主指标重定义）：全部纯函数，参数取最小可构造输入。
+  // readAskTimeline / cwdOf 读盘，用不存在的路径——readAskTimeline 会抛，由
+  // checkImportable 吞掉（它只关心 ReferenceError）；cwdOf 自己 catch 后返回空串。
+  // run / formatReport 要全量扫 2.1 GB，登记在 INTENTIONALLY_PROBED_FREE。
+  isAskCall: '"AskUserQuestion"', classifyExecHuman: '"继续"', isCostly: '"继续"',
+  readAskTimeline: '["/nonexistent-ow-probe"]',
+  sessionRow: '[{ writes: [], humans: [], asks: [], seq: [], path: "/x", bytes: 0 }, { execTools: 0 }]',
+  countOf: '[[], ["correction"]]', perSessionDensity: '[[]]', cleanRate: '[[]]',
+  densityDiffTest: '[[], []]', cleanDiffTest: '[[], []]',
+  matchedOnWork: '[[], []]', stratifyByWork: '[[]]',
   // tui-theme.mjs 的宽度算法（2026-11-05 宽度表修复）：Unicode 官方数据 + grapheme 聚类。
   // 参数取最小可构造输入，让「导出了但调用即炸」在结构门就暴露。
   codePointWidth: '"a"', truncateDisplay: '["x", 5]', hasColor: '"red"',
@@ -634,6 +644,15 @@ const PROBE_ARGS = {
   // / isContinuation / CONTINUATION_RE / ATTRIBUTION_CLASSES / attribute）不重复登记 ——
   // PROBE_ARGS 按名字命中所有模块，上面那份探针会同样调用它们。
   gateReadsFixedOf: '["Bash", { command: "head -n 20 a.mjs" }]',
+  // question-audit.mjs（2026-11-14 提问形态审计）：判定层全是纯函数，逐个实际调用。
+  // 参数取最小可构造输入：空对象 / 空数组 / 空串 —— 都要安全返回，不抛。
+  questionsOfAsk: '[{}]', normalizeText: '""', judgeReadFirst: '[{}]',
+  judgeSession: '[{}, { ask: { mode: "always", maxQuestions: 5, requireReadFirst: true } }]',
+  summarize: '[[], {}]', docTokenOverlap: '["x", []]',
+  nearDuplicateQuestions: '[[]]', scanSession: '[[]]', validateConfig: '[{}]',
+  loadConfig: '["/nonexistent-ow-probe.json"]',
+  formatReport: '[{ summary: { sessions: 0, verdicts: {}, narrowVerdicts: {}, violCounts: {}, violations: 0 } }]',
+  parseArgs: '[[]]',
   readWindowText: '["/nonexistent-ow-probe", 0]',
   windowReadPaths: '["/nonexistent-ow-probe", 0]',
   subagentPathSet: '[{ path: "/nonexistent-ow-probe/x.jsonl" }, []]',
@@ -982,6 +1001,10 @@ function checkUnregisteredExports() {
     // 三个常量是数据（工具白名单 / 文本截断长度 / 空闲切分参数），不是函数。
     'run', 'summarize', 'formatReport', 'WRITE_TOOLS', 'READ_TOOLS', 'SHELL_TOOLS',
     'TEXT_CAP', 'IDLE_GAP_MS',
+    // measure-ask-vs-tell.mjs：run 要全量扫 2.1 GB transcript（实测 72s），
+    // 不能进结构门；正确性由 measure-ask-vs-tell.test.mjs 的小目录用例覆盖。
+    // 这里只登记与上面重名的两个（summarize / formatReport 已在本表里）。
+    // 它的其它常量已进注册表，不重复列。
   ]);
   // measure-execution-phase.mjs 的纯函数：全部已进 PROBE_ARGS 实际调用，
   // 这里显式登记，免得被上面的「未登记导出」提示刷屏。
@@ -1006,6 +1029,23 @@ function checkUnregisteredExports() {
     'redoShareAfterInterruptions', 'redoShareRandomWindows',
   ];
   for (const k of COST_FNS) REGISTERED.add(k);
+
+  // measure-ask-vs-tell.mjs（2026-11-14 主指标重定义）：纯函数已全部进 PROBE_ARGS；
+  // run / formatReport 要全量扫 2.1 GB，登记在 INTENTIONALLY_PROBED_FREE；
+  // 常量与正则/冻结表是数据，不是函数。
+  const ASK_VS_TELL_FNS = [
+    'isAskCall', 'classifyExecHuman', 'isCostly', 'cwdOf', 'readAskTimeline',
+    'sessionRow', 'density', 'countOf', 'perSessionDensity', 'cleanRate', 'groupRow',
+    'densityDiffTest', 'cleanDiffTest', 'matchedOnWork', 'stratifyByWork',
+    'summarize', 'formatReport',
+    'ASK_TOOLS', 'COST_TIER', 'SECONDARY_TIERS', 'PER', 'MATCH_LOG_TOLERANCE',
+    'PERM_ITERS', 'PERM_SEED', 'SANDBOX_RE', 'SANDBOX_SLUG_RE', 'TIER_FIELD',
+    // isSandbox 与 observe-reality-check.mjs 里的同名导出重名：PROBE_ARGS 是按名字
+    // 命中的扁平表，两个同名函数收到的参数完全不同（那边是 session 对象）。
+    // 这里单独登记，不参加强制调用，避免用一个模块的形状去调另一个模块的函数。
+    'isSandbox',
+  ];
+  for (const k of ASK_VS_TELL_FNS) REGISTERED.add(k);
 
   // pre-write-gate.mjs（2026-11-14 写前闸）：函数全部已进 PROBE_ARGS 实际调用，
   // 这里显式登记，免得被「未登记导出」提示刷屏。同名的六个导出
@@ -1040,6 +1080,15 @@ function checkUnregisteredExports() {
     'toolUsesOf', 'sectionA', 'sectionB', 'sectionC', 'sectionD',
   ];
   for (const k of AUDIT_PROBE_FNS) REGISTERED.add(k);
+
+  // render-plan.mjs（2026-11-14 每轮开头一屏 plan）：渲染器的全部导出。
+  // 它读 `tasks/runs/` 下的台账，测试用合成 graph + 注入 probe 覆盖（28 条），
+  // 所以不塞进结构门的探针表；常量是数据（版本号 / 行数上限 / 行宽）。
+  const RENDER_PLAN_FNS = [
+    'PLAN_VERSION', 'MAX_LINES', 'ROW_WIDTH',
+    'displayPath', 'findLatestRun', 'loadRun', 'formatPlan', 'buildPlan', 'renderPlan',
+  ];
+  for (const k of RENDER_PLAN_FNS) REGISTERED.add(k);
 
   // observe-reality-check.mjs（2026-11-14 写前闸的真实语料重放）：纯函数已进 PROBE_ARGS，
   // 这里显式登记免得被「未登记导出」提示刷屏。buildReport / main 要扫 2GB 语料，
@@ -1077,6 +1126,19 @@ function checkUnregisteredExports() {
     'dropLargestProject', 'measure', 'main', 'BASE_THRESHOLD', 'BASELINE_SNAPSHOT',
   ];
   for (const k of GATE_CEILING_FNS) REGISTERED.add(k);
+
+  // question-audit.mjs（2026-11-14 提问形态审计）：判据层纯函数已进 PROBE_ARGS 实际调用，
+  // 这里显式登记免得被「未登记导出」刷屏。scanCorpus / cli 要读全量语料（实测 22s），
+  // 与 measure-* 系列同处置 —— 由 question-audit.test.mjs 的小目录端到端用例覆盖。
+  const QUESTION_AUDIT_FNS = [
+    'CONFIG_FILE', 'ASK_MODES', 'AUTO_COMPLEX_FILES', 'AUTO_COMPLEX_TOOLCALLS', 'KNOWN_ROLES',
+    'questionsOfAsk', 'normalizeText', 'judgeReadFirst', 'judgeSession', 'summarize',
+    'docTokenOverlap', 'nearDuplicateQuestions', 'scanSession', 'validateConfig', 'loadConfig',
+    'formatReport', 'parseArgs', 'defaultConfig', 'exitCodeFor',
+    'BLOCKING_CODES', 'ADVISORY_CODES',
+    'scanCorpus', 'cli',
+  ];
+  for (const k of QUESTION_AUDIT_FNS) REGISTERED.add(k);
 
   // probe-parser-divergence.mjs（2026-11-14 量化重放器与闸门的分叉）：纯函数进 PROBE_ARGS，
   // `probe` 要扫全量语料，与 measure-* 系列同处置 —— 由 probe-parser-divergence.test.mjs

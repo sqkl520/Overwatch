@@ -21,6 +21,77 @@
 
 ---
 
+## [Unreleased] - 2026-11-14（三个决定落地：应用形态、主指标、入口与 plan）
+
+> 用户当日拍板三条：**「留，并且改主指标」**（命题保留）、**「我们这个项目是应用不是插件」**、
+> **「都做」**。本节记因此产生的代码。
+> 逐条裁定与反证见 `docs/research/2026-11-14-three-decisions-counterargument.md`（红队）。
+
+### Added
+
+- **`scripts/overwatch.mjs` —— 这个应用的唯一入口（无参数 = `doctor`）。**
+  1000ms 内报告 7 项前提事实（Node 版本 + 两个 API / transcript 根 / 宿主状态来源 /
+  `.claude/` / 写前闸 / 后台监视 / 平台），每行只说出**读到了什么**，不出红绿灯。
+  空（根不存在，exit 2）与坏（路径在但不是目录，exit 3）分开呈现，空目录（0 份）exit 0。
+  `scan`/`verify`/`tui`/`watch`/`plan` 目前只路由到原生命令（exit 4），不代跑。
+  `--help` 立即退出，不做任何检查。本机实测 691ms（预算 1000ms）。
+  **判据全部复用，未重写一份**：`gate` 走 `pre-write-gate.mjs` 的 `cli(['status'])`，
+  `transcripts` 走 `tui-meta.projectsRoot()`，`platform` 走 `notify.isNotificationAvailable()`
+  + `install-watcher.startupDir()`，`watcher` spawn `watch.mjs --health`。
+  **踩到一个会锁死的坑**：`watch.mjs:2855` 用 `/watch\.mjs$/` 判主模块，而 `overwatch.mjs`
+  **以 `watch.mjs` 结尾** —— import 它会让 doctor 变成守护进程且永不退出。已改 spawn 并加回归测试。
+- **`scripts/render-plan.mjs` —— 每轮开头一屏 plan。** 把 `task-graph.json` 的 `subtrees`
+  渲染成 ≤20 行（+ `--json`，`lines` 与人读同源）。进度一律取自既有台账
+  （`claims.jsonl` 的 expect/claim/observe/consume、`prompts.jsonl`、`outputs` 磁盘状态），
+  判定直接调 `claim-ledger.mjs` 的 `reconcile()`，不自创第二套。
+  失败行必须带「卡在哪 + 下一步」；超时只标超时不判失败；被行数上限挤掉的内容必须印出来。
+  `docs/spec/output-format.md` 与 `SKILL.md` 里那句「渲染器还没有」至此第一次有了实现。
+- **`scripts/question-audit.mjs` + `overwatch.config.json` —— 提问层（S3/S5）第一次有实现。**
+  抽 `AskUserQuestion` / `ExitPlanMode` 调用，算「问发生在首次读文件之前还是之后」、
+  问了几件事、有没有重复问已知信息。配置 `ask.mode`（`always` 默认 / `never` / `auto`）、
+  `ask.maxQuestions`（默认 5）、`ask.requireReadFirst`（默认 true）。非法配置**报错**，不静默回落。
+- **`scripts/measure-ask-vs-tell.mjs` + `docs/adr/0004-ask-is-investment.md` —— 主指标重定义。**
+- **`docs/adr/0003-application-not-plugin.md` —— 产品形态是应用。**
+  ADR-0001 的「纯配置库」定位作废。它不是被自己的四条反悔信号触发，是**被产品目标变更推翻**。
+  逐条判断 ADR-0001 其余结论，详见该 ADR §5。
+
+### Changed
+
+- **主指标：提问不再计入成本。** 新主指标 = 执行期纠正密度
+  （Σ纠正 ÷ Σ(执行期工具 − 执行期提问) × 100）。旧口径三处缺陷可指：
+  `measure-interventions.mjs:572` 把提问作答计入 `interventions`；
+  `measure-execution-phase.mjs:503` 把执行期**每一句**人类发言算成本；两者都不认 `ExitPlanMode`
+  （实测 14 次：6 报错 / 7 批准 / 1 拒绝，2 个会话被错分进 C 组）。
+  **全量实跑（571 份 / 2.18GB / 去沙箱 n=85）：A 0.035 / B 0.019 / C 0.017，p=0.41 / 0.56；
+  1:1 工作量匹配 A vs B 0 胜 2 负 3 平。A 在新口径下仍然最差 —— 如实记录，未为了让决定好看而调口径。**
+  正确读法是「没有证据支持 A 更低」，不是「A 更高」也不是「相同」。
+
+### Fixed
+
+- **旧「一次性完成率」被自己的测试沙箱污染。** 执行期零发言的 94 个会话里 **92 个是本仓 e2e 沙箱**
+  （97.9%），提示词就是 `Create bq.txt containing HI. Then stop.` —— 没活可干，当然「一次完成」。
+  去沙箱后 C 组从 68.6% 塌到 **4.4%**，A 组从 0.0% 升到 **71.4% 无纠正**。
+  **此前用「A 0.0% vs C 31.4%」论证命题不成立是错的，那个数一半是沙箱污染。**
+- **`render-plan.test.mjs` 的一条 CLI 端到端测试是定时炸弹。** 它跑真子进程（拿不到注入时钟），
+  而夹具用了模块级的 `at()`——它锚在固定常量 `NOW = 2026-11-14T12:00:00Z` 上。
+  于是随着真实时钟流逝，登记时刻越来越旧，那条测试必然从 OK 变成 OVERDUE 并 exit 1。
+  实测抓到时已「超时 49m / 限 8m」。改为相对真实 `Date.now()` 算登记时刻。
+  **这是本仓库「用固定时钟保证可复现」这条好习惯的一个反例边界：子进程读的是真挂钟。**
+
+### Known（本轮登记但不修）
+
+- **`claude -p` 的失败语义不自洽，产品不能信 `subtype`。** 实测（本机）：
+  `"subtype":"success"` 配 `"is_error":true` 配 `"result":"Not logged in · Please run /login"`。
+  另有一次网关配方下 **exit 0 且输出完全为空**。任何只看 `subtype` 判成功的代码，
+  都会把「根本没登录」当成「跑成功了」。
+- **`--plugin-dir` 已实测能加载**（`claude plugin list` 报 `Status: ✔ loaded`，从无关 cwd），
+  这是「应用不装进用户项目也能挂载 agents/skills/hooks」的技术基础。
+  但**推理仍借本机凭据**：改 `HOME` 立即 `Not logged in`。所以「应用」的边界是
+  「观测 + 判定 + 借宿主介入」，不是「自己当大脑」。
+- **精简环境 spawn 时缺 `PATHEXT` 会让全部 hook 静默不触发，退出码仍是 0。**
+
+---
+
 ## [Unreleased] - 2026-11-14（产品形态审计：干净 clone 上硬门必红，CI 连续 9 次失败）
 
 > 六份审计（陌生人走查 / 能力核验 / 命题落差 / 可移植性 / 红队拆解 / 产品层设计）

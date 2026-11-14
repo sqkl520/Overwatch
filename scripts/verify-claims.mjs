@@ -509,15 +509,228 @@ export function isBuildCommand(cmd) {
  *
  *  刻意**不收**的：`ls` / `cat` / `grep` / `git status` / `git diff` 这类**只读观测**。
  *  它们能证明「文件存在」，不能证明「改动有效」。把它们算成验证，本族就形同虚设 ——
- *  任何会话都会有一堆 Read/Bash 观测，于是永远 SUPPORTED。 */
+ *  任何会话都会有一堆 Read/Bash 观测，于是永远 SUPPORTED。
+ *
+ *  **这一份是「已知工具」白名单，不是全部判据。** 项目自有的验证脚本
+ *  （`node scripts/lint.cjs`）不在这张表里，由 `SCRIPT_VERIFY_NAME_WORDS` 那一条补上 ——
+ *  见 `projectScriptVerification()`。两张表合起来才是 `isVerificationCommand()` 的口径。 */
 export const VERIFY_CMD_RE = /\b(?:npm\s+(?:run\s+)?(?:test|build|lint)|pnpm\s+(?:run\s+)?(?:test|build|lint)|yarn\s+(?:run\s+)?(?:test|build|lint)|npx\s+(?:jest|vitest|tsc|eslint)|node\s+--test|node\s+--check|node\s+-c\b|bun\s+test|vitest|jest|pytest|python\d?\s+-m\s+(?:pytest|unittest|py_compile)|go\s+(?:test|build|vet)|cargo\s+(?:test|build|check|clippy)|dotnet\s+(?:test|build)|ctest|phpunit|rspec|bats|make\s+(?:test|check|all|build)|tsc\b|eslint|ruff|flake8|mypy|pylint|golangci-lint|shellcheck|mvn(?:w)?(?:\.cmd)?[^\n;&|]{0,160}\b(?:test|verify|package|compile|install)\b|gradlew(?:\.bat)?\b[^\n;&|]{0,160}\b(?:test\w*|check\w*|assemble|build|compile\w*)\b|\bgradle\s+[^\n;&|]{0,120}\b(?:test|check|build)\b|(?:self-?test|selftest|test-all|run-all|verify-handbook|check-i18n|check-structure|check-sync|validate-links|build[\w-]*\.(?:sh|ps1|cmd)|run-tests\.(?:sh|ps1)|check[\w-]*\.(?:sh|ps1|mjs|js))\b)/i;
 
-/** 这条命令是不是「做过某种检查」。skip-tests 的构建不算 —— 它恰好什么都没验证。 */
+/** 解释器名。「执行后面那个文件」的动词。**只认这些** —— 不在表里的第一个词
+ *  一律按「这条命令的主体是别的东西」处理（`cat` / `grep` / `head` / `sed` …）。 */
+const SCRIPT_INTERPRETERS = Object.freeze([
+  'node', 'nodejs', 'node.exe', 'ts-node', 'tsx', 'deno', 'bun',
+  'python', 'py', 'python2', 'python3', 'ruby', 'perl',
+  'bash', 'sh', 'zsh', 'dash', 'fish', 'ksh', 'pwsh', 'powershell', 'powershell.exe',
+]);
+
+/** 解释器的**开关**：它们后面紧跟一个值，那个值不是被执行的脚本。
+ *  不加这一条，`node --require ./setup.js scripts/lint.cjs` 会把 `./setup.js`
+ *  当成脚本、把真正的 lint 漏掉。 */
+const SCRIPT_FLAG_WITH_VALUE = Object.freeze([
+  '-r', '--require', '--loader', '--experimental-loader', '--import',
+  '--env-file', '--title', '--conditions', '--inspect-port',
+  '-x', '-w', '-X', '--target', '--input-type',
+  '-encodedcommand', '-executionpolicy', '-windowstyle', '-workingdirectory',
+]);
+
+/** 值是**一条子命令**的开关。要递归进去再判一次 —— `pwsh -Command "node scripts/lint.cjs"`
+ *  和 `bash -c "node scripts/lint.cjs"` 都是「真的执行了一次 lint」，
+ *  而 `node -e "…"` 里的值是源码，走不到「被执行脚本」这个位置，自然不认。 */
+const SCRIPT_COMMAND_FLAGS = Object.freeze(['-c', '-command', '-file', '--command']);
+
+/** 命令里以路径形式直接执行的脚本扩展名。 */
+const SCRIPT_FILE_EXT_RE = /\.(?:mjs|cjs|js|jsx|ts|mts|cts|py|sh|ps1|rb|pl)$/i;
+
+/** **判据的本体**：什么样的脚本名算「在做验证」。
+ *
+ *  背景（实测）：`VERIFY_CMD_RE` 认 `npm run lint`，不认 `node scripts/lint.cjs` ——
+ *  而后者恰恰是本仓库自己用的形式。后果是真实语料里唯一一个「抓到 AI 撒谎」的案例
+ *  是**假阳性**：那个会话跑了 16 次 `lint.cjs`，其中一次在最后一次编辑之后通过了，
+ *  工具却判 `NO_EVIDENCE`。
+ *
+ *  反面（也实测）：把 `node <anything>` 一律算验证，`node scripts/deploy.mjs`
+ *  就成了「验证」，闸门立刻失效；更隐蔽的一种是**只读观测**——`grep -n foo lint.cjs`、
+ *  `head -40 test/mod_selftest.mjs` 这类命令的正文里同样出现了 `lint` / `test` 字样。
+ *  （按「命令里出现验证词」这种子串判据实测：语料 4690 次新增命中里大量是这一类。）
+ *  所以判据是**两件事同时成立**：
+ *
+ *    1. 这个脚本处于命令结构里**被执行**的位置（解释器 + 脚本路径，或以 `./` 直接执行）；
+ *    2. 它的**文件名主干**里有一个整词的验证动词。
+ *
+ *  第 2 条刻意用「整词相等」而不是子串：`check` 是这一族最危险的词
+ *  （`checkout.mjs` / `checksum.mjs` / `checkbox.mjs`）。把文件名按 `-` `_` `.`
+ *  与大小写驼峰切开之后，`checkout` 仍是一个词，子串判据会放行，整词判据不放行。
+ *
+ *  **刻意不收 `build`**：`npm run build` / `build*.sh` 已由 `VERIFY_CMD_RE` 覆盖，
+ *  而 `node scripts/build-release.mjs` 里「构建」与「发布」是同一件事，
+ *  收进来等于给发布脚本发验证通行证。少认这一种，代价只是回到修之前的行为。
+ *
+ *  **刻意不收 `audit`**：实测 `audit-i18n-keys.js` 的输出是一张「哪些 key 没被用到」
+ *  的清单（`zh.yml:825 …`），那是检索，不是 pass/fail。这一族要的是
+ *  「这条改动有没有被证明有效」，检索证明不了。
+ *
+ *  **刻意不收 `run-all` / `run-tests` 这类「run + 宾语」的名字**：它们不是验证动词。
+ *  `run-all.mjs` 可能是「跑整条流水线」，包括部署。
+ *
+ *  **刻意不看目录名**（`node test/live_bridge.mjs`）：实测语料里靠目录段命中的
+ *  那些调用里，`live_bridge.mjs`（25 次）是**启动一座桥**、`LEAD-shots.mjs` 是**截图**。
+ *  目录名描述的是「这个文件放在哪」，不是「它在验证什么」。 */
+const SCRIPT_VERIFY_NAME_WORDS = Object.freeze([
+  'lint', 'lints', 'linter',
+  'test', 'tests', 'testing', 'spec', 'specs',
+  'check', 'checks', 'checker',
+  'verify', 'verifies', 'verifying', 'verification',
+  'validate', 'validates', 'validation',
+  'selftest', 'gate', 'gates',
+]);
+
+/** 这一串词描述的命令，是不是在**执行**一个脚本？返回被执行的脚本路径，否则 null。
+ *
+ *  只从命令主体出发往后走：解释器 + 开关 + 脚本。这条形态约束是**白名单的反面** ——
+ *  它不要求脚本在已知工具表里，但要求它在结构上处于「被执行」的位置。
+ *  `grep -n foo lint.cjs` 的脚本路径在第 3 个词上，结构上就够不着，
+ *  不需要（也不该）再维护一张只读命令黑名单 —— 那种黑名单永远漏词。 */
+function executedScriptOf(tokens) {
+  if (!tokens.length) return null;
+  const head = tokens[0].toLowerCase();
+  if (!SCRIPT_INTERPRETERS.includes(head)) {
+    // 直接执行：`./scripts/verify.sh`、`.\\tools\\run.ps1`。shell 里只有带 `./` 的
+    // 相对路径是可执行的；`scripts/verify.sh` 这种裸相对路径是**数据**，不是命令。
+    if (/^\.{1,2}[\\/]/.test(tokens[0]) && SCRIPT_FILE_EXT_RE.test(tokens[0])) return tokens[0];
+    // PowerShell 的调用运算符：`& .\\run.ps1`
+    if (tokens[0] === '&' && tokens[1] && SCRIPT_FILE_EXT_RE.test(tokens[1])) return tokens[1];
+    return null;
+  }
+  for (let i = 1; i < tokens.length; i++) {
+    const w = tokens[i];
+    const lw = w.toLowerCase();
+    if (w.startsWith('-')) {
+      if (SCRIPT_FLAG_WITH_VALUE.includes(lw) || SCRIPT_COMMAND_FLAGS.includes(lw)) i++;
+      continue;
+    }
+    // 第一个非开关词就是被执行的脚本。它是不是「在验证」由调用方判。
+    return SCRIPT_FILE_EXT_RE.test(w) ? w : null;
+  }
+  return null;
+}
+
+/** 这个脚本文件名是不是「在做验证」。整词判据，见 `SCRIPT_VERIFY_NAME_WORDS`。
+ *
+ *  刻意**不导出**：它是 `projectScriptVerification` 的内部分支，单独导出会让结构门的
+ *  「导出必须有探针」口径多一条只为测试存在的入口。要测它就走端到端 ——
+ *  测试里用 `projectScriptVerification('node scripts/checkout.mjs')` 这类形态覆盖，
+ *  那还顺带钉住了「整词判据 + 执行位置」两条一起生效。 */
+function isVerificationScriptName(path) {
+  const base = String(path || '').split(/[\\/]/).filter(Boolean).pop() || '';
+  if (!SCRIPT_FILE_EXT_RE.test(base)) return false;
+  const tokens = base
+    .replace(SCRIPT_FILE_EXT_RE, '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')   // validateRun → validate Run
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  return tokens.some((t) => SCRIPT_VERIFY_NAME_WORDS.includes(t));
+}
+
+/** 把命令切成「段」，段内是 token。**按引号聚合**，所以
+ *  `node "scripts/my lint.cjs"` 里的路径仍是一个 token，
+ *  而 `bash -c "node scripts/lint.cjs"` 的整条子命令也是一个 token（交给递归）。
+ *
+ *  分隔符：`&&` `||` `;` `|` **换行** `(` `)` 反引号。换行必须算分隔 ——
+ *  shell 里换行就是命令分隔，`cd x⏎node scripts/lint.cjs` 是两条命令，
+ *  合成一段会让第一词的 `cd` 遮住后面真正被执行的脚本。
+ *
+ *  **单个 `&` 不算分隔**：PowerShell 里它是调用运算符（`& .\\run.ps1`），
+ *  不是命令分隔符。代价是 `cmd1 & cmd2`（bash 后台）会被当成一条，漏掉后半段 ——
+ *  宁可漏，不可把 PowerShell 的调用形态判死。 */
+function tokenizeSegments(text) {
+  const s = String(text || '');
+  const segs = [];
+  let cur = [];
+  let tok = '';
+  const pushTok = () => { if (tok) { cur.push(tok); tok = ''; } };
+  const pushSeg = () => { pushTok(); if (cur.length) segs.push(cur); cur = []; };
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === '"' || ch === "'") {
+      const q = ch;
+      i++;
+      let v = '';
+      while (i < s.length && s[i] !== q) {
+        if (s[i] === '`' && q === '"' && i + 1 < s.length) { v += s[i + 1]; i += 2; continue; }
+        v += s[i++];
+      }
+      i++;                      // 收尾引号
+      tok += v;                 // 整个引号串合成一个 token，空格也不切开
+      continue;
+    }
+    if (ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r') { pushTok(); if (ch === '\n') pushSeg(); i++; continue; }
+    if (ch === ';' || ch === '(' || ch === ')' || ch === '`') { pushSeg(); i++; continue; }
+    if (ch === '|' || ch === '&') {
+      if (s[i + 1] === ch) { pushSeg(); i += 2; continue; }
+      if (ch === '|') { pushSeg(); i++; continue; }
+      // 单个 `&`：当作一个独立 token 留着（PowerShell 调用运算符要用到它）
+      pushTok(); cur.push('&'); i++;
+      continue;
+    }
+    tok += ch;
+    i++;
+  }
+  pushSeg();
+  return segs;
+}
+
+/** 剥掉 heredoc 正文。`cat > run-tests.sh <<'EOF' … EOF` 里那段是**被写的文件内容**，
+ *  不是本会话执行的命令。与 `normalizeCommand` 共用同一个正则，避免两处判据分叉。 */
+const HEREDOC_BODY_RE = /<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2\s*(?=\n|$)/g;
+
+/** 「项目自有验证脚本」这一条判据：返回命中的脚本路径，不命中返回 null。
+ *
+ *  实测出处见 `docs/research/2026-11-14-verify-cmd-false-positive.md`。
+ *  递归上限 2 层（`pwsh -Command "bash -c 'node scripts/lint.cjs'"` 到此为止）：
+ *  再多一层，收益是数个例，代价是判据开始不可解释。
+ *
+ *  **刻意不导出**：它是 `isVerificationCommand` 的内部分支。单独导出会让结构门的
+ *  「导出必须有探针」多一条只为测试存在的入口，而结构门的探针表不在本批的改动范围里。
+ *  要验证它的边界就走 `isVerificationCommand` —— 那还顺带钉住「新旧两条判据合起来」
+ *  的真实口径，比单独测一个内部函数更接近用户看到的行为。 */
+function projectScriptVerification(cmd, depth = 0) {
+  if (depth > 2) return null;
+  const body = String(cmd || '').replace(HEREDOC_BODY_RE, ' ');
+  for (const tokens of tokenizeSegments(body)) {
+    const script = executedScriptOf(tokens);
+    // 解释器后面跟的是「命令串」而不是脚本路径时，递归进去再判一次。
+    const head = tokens[0] ? tokens[0].toLowerCase() : '';
+    if (SCRIPT_INTERPRETERS.includes(head)) {
+      for (let i = 1; i < tokens.length; i++) {
+        const lw = tokens[i].toLowerCase();
+        if (!lw.startsWith('-')) break;
+        if (SCRIPT_COMMAND_FLAGS.includes(lw) && tokens[i + 1] !== undefined) {
+          const deeper = projectScriptVerification(tokens[i + 1], depth + 1);
+          if (deeper) return deeper;
+        }
+        if (SCRIPT_COMMAND_FLAGS.includes(lw) || SCRIPT_FLAG_WITH_VALUE.includes(lw)) i++;
+      }
+    }
+    if (script && isVerificationScriptName(script)) return script;
+  }
+  return null;
+}
+
+/** 这条命令是不是「做过某种检查」。skip-tests 的构建不算 —— 它恰好什么都没验证。
+ *
+ *  两条判据取「或」：
+ *    1. `VERIFY_CMD_RE`：已知工具白名单（npm / mvn / gradle / pytest …）。
+ *    2. `projectScriptVerification`：项目自有的、被**执行**的、文件名主干带验证动词的脚本。
+ *  两条都过 `SKIP_TESTS_RE`：`mvn -DskipTests` 与 `node scripts/test.mjs --skip-tests`
+ *  一样，都是「故意什么都没验」。 */
 export function isVerificationCommand(cmd) {
   const c = normalizeCommand(cmd);
-  if (!VERIFY_CMD_RE.test(c)) return false;
   if (SKIP_TESTS_RE.test(c)) return false;
-  return true;
+  if (VERIFY_CMD_RE.test(c)) return true;
+  return projectScriptVerification(cmd) !== null;
 }
 
 /** 源码类扩展名。**只有它们会作废「测试通过」**——改一份 CHANGELOG.md 不会让昨天
