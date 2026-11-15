@@ -103,8 +103,21 @@ const EXIT = Object.freeze({
 const DEFAULT_BUDGET_MS = 1000;
 /** 留给「打印 + 进程退出」的余量。真到点才收尾会连结果都印不全。 */
 const PRINT_RESERVE_MS = 80;
-/** transcript 枚举的分片上限：到点就停并如实标注「没数全」。 */
-const ENUM_SLICE_MS = 400;
+/** transcript 枚举的分片上限：到点就停并如实标注「没数全」。
+ *
+ *  **从 400 降到 200**：实测 868 份 transcript / 150 个项目时，枚举要 378ms，
+ *  把预算的大半吃掉，后面 `watcher`（spawn 两次，实测 409ms）只能硬挤，
+ *  合计冲到 919–1396ms，**撑破了 spec 写的「1000ms 是硬约束」**。
+ *  spec 的原话是「超了是设计错误，不是环境慢」——所以正确的修法是重新分配，
+ *  不是放宽上限。
+ *
+ *  代价如实说：语料很大时会更早停下，报出的是**下限**（「≥N 份」），
+ *  不是准确计数。这个降级本来就在（`（下限）`），这里只是让它更常触发。 */
+const ENUM_SLICE_MS = 200;
+/** `watcher` 那项的实测成本：spawn `install-watcher` 状态 + 它内部再 spawn 一个
+ *  `watch.mjs --health`，本机实测 380–430ms。**预算判断必须用它当阈值** ——
+ *  剩得比它少还硬跑，等于明知超支还要垫进去。 */
+const WATCHER_COST_MS = 420;
 
 /** Node 下限。**不是 18**，逐版本实测见 portability-audit §1.1：
  *  18.20.4 能跑全部生产脚本；跑测试要 20.16.0（`process.getBuiltinModule`）。
@@ -630,8 +643,14 @@ async function runDoctor(opts) {
     // 顺序固定下来，慢机器上的行为才可预测。
     gateResult = await checkGateInProcess(left);
     const left2 = remaining();
-    if (left2 < 80) {
-      watcherResult = { skipped: `预算内没时间跑（剩 ${Math.max(0, left2)}ms / 预算 ${budgetMs}ms）—— 直接跑原命令` };
+    // **阈值必须按 watcher 的真实成本定，不是按「还有一点时间」定。**
+    // watcher 要 spawn 两次（它内部还要再 spawn 一个 `watch.mjs --health`），
+    // 实测 409ms。原来写 `left2 < 80`，意味着「剩 81ms」也照样硬跑 ——
+    // 那不是省时间，是**先垫进去 409ms 再超支**，而超支的直接后果是
+    // spec 里那句「1000ms 是硬约束」变成假话。
+    // 现在：剩余不够它跑完，就如实说「没时间跑」，让用户直接跑原命令。
+    if (left2 < WATCHER_COST_MS) {
+      watcherResult = { skipped: `预算内没时间跑（剩 ${Math.max(0, left2)}ms / 预算 ${budgetMs}ms，它自己要约 ${WATCHER_COST_MS}ms）—— 直接跑 node scripts/watch.mjs --health` };
     } else {
       watcherResult = await checkWatcherLive(env, left2, nowMs);
     }

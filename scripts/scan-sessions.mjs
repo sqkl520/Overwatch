@@ -24,6 +24,28 @@ import { resolveJobEventTime } from './job-event-time.mjs';
 
 // ── 常量（与 docs/spec/state-model.md 一一对应）────────────────────────
 
+/** `--help` 打的内容。**与文件头的用法注释同源** —— 改一处要改两处是隐患，
+ *  但把文件头注释变成运行时常量更糟（注释是给读源码的人看的，格式不同）。
+ *  所以这里只是把同一份信息重排成终端里读得舒服的样子，并在测试里断言两者列出的
+ *  参数集合一致。 */
+const HELP_TEXT = `scan-sessions — 扫描本机全部 Claude Code 会话，判定状态
+
+用法：
+  node scripts/scan-sessions.mjs                    全部项目，最近 7 天（默认）
+  node scripts/scan-sessions.mjs --days 2           最近 2 天
+  node scripts/scan-sessions.mjs --project <名字>   只扫某个项目
+  node scripts/scan-sessions.mjs --json             机器可读输出
+  node scripts/scan-sessions.mjs --recalibrate      重算 novelty 权重
+  node scripts/scan-sessions.mjs --all              不限窗口（同 --days 0）
+  node scripts/scan-sessions.mjs --now <ISO>        注入时钟（可复现，测试用）
+
+注意：
+  · 耗时随语料线性增长 —— 本机 868 份 transcript 时，7 天窗口约 45 秒。
+    想知道多久，跑一次看实际值，不要照抄文档里的数字。
+  · 只有宿主上报的 FAILED / BLOCKED / WAITING 有区分度。其余状态是描述，不是判据。
+
+退出码：0 = 正常；1 = 发现 FAILED 会话；2 = 无法定位 transcript 根目录 / 参数错误。`;
+
 const WINDOW = 20;
 const STRIDE = 5;
 const STALL_THRESHOLD = 0.2;
@@ -786,6 +808,16 @@ export function recalibrateWeights(counts) {
 }
 
 function main(argv) {
+  // `--help` / `-h` 必须**立即退出，不做任何扫描**。
+  //
+  // 原来 `--help` 只是被当成一个普通参数忽略掉，于是它直接跑了全量扫描 ——
+  // 陌生人第一条命令就会撞上：实测输出 868 份 transcript / 660 个会话，耗时 45 秒。
+  // 那不只是慢，是**错得明确**：敲 `--help` 得到扫描结果而不是帮助。
+  // （本仓库已经为这个问题在 `overwatch.mjs` 里写过一条判据，这里是同一个教训的第二处。）
+  if (argv.includes('--help') || argv.includes('-h')) {
+    process.stdout.write(`${HELP_TEXT}\n`);
+    return 0;
+  }
   const args = new Set(argv);
   // `--now <ISO>`：**注入时钟**。默认取真实当前时间，行为与以前完全一致。
   //

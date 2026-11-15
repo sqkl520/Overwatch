@@ -1108,6 +1108,13 @@ function checkUnregisteredExports() {
   ];
   for (const k of RENDER_PLAN_FNS) REGISTERED.add(k);
 
+  // launch.mjs（2026-11-14 应用起宿主）：验收后补的三个导出。
+  //   AUTH_RE / expectedAgents / maskDeep —— 它们**就是被测试直接 import 的**
+  //   （2026-11-14 那条「负向测试没有牙」的教训：从源码正则提取被测物 = 自证，
+  //   必须 import 真身，所以它们必须是导出）。
+  const LAUNCH_FNS = ['AUTH_RE', 'expectedAgents', 'maskDeep', 'payloadInfo', 'verifyPluginRoot'];
+  for (const k of LAUNCH_FNS) REGISTERED.add(k);
+
   // build-payload.mjs（2026-11-14 plugin 载荷生成）：纯函数已进 PROBE_ARGS 实际调用，
   // 这里显式登记，免得被「未登记导出」提示刷屏。
   // buildPayload 会**写盘**（rmSync + writeFileSync），main 是 CLI 入口 —— 两个都进
