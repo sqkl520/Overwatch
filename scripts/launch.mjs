@@ -505,6 +505,17 @@ function settingsPathFor(root, json) {
   return join(runsRoot(root), 'launch', `settings-${digest}.json`);
 }
 
+/** 把提问协议落盘，返回路径；写不了返回 `null`（调用方退回内联）。 */
+function askPromptPath(root, text) {
+  const digest = createHash('sha256').update(text).digest('hex').slice(0, 8);
+  const file = join(runsRoot(root), 'launch', `ask-${digest}.md`);
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, text);
+    return file;
+  } catch { return null; }
+}
+
 // ── 判定：宿主说了什么，和它**实际**怎么了 ────────────────────────────
 
 /** 从 `-p --output-format json` 的输出里取 `is_error`。取不到返回 null（不是 false）。 */
@@ -697,7 +708,23 @@ async function planLaunch(opts) {
   // 措辞刻意具体：给判定条件而不是「请多提问」。笼统的要求会被忽略，
   // 而「什么时候必须问、问几个、问之前必须先读什么」是可执行的。
   const askPrompt = askProtocol(config, mode);
-  if (askPrompt) hostArgs.push('--append-system-prompt', askPrompt);
+  if (askPrompt) {
+    // **真跑用文件，`--dry-run` 用内联（且单行化）。**
+    //  - 真跑：协议二十多行，内联进 argv 又长又难读；宿主支持
+    //    `--append-system-prompt-file`（`--help` 里的 `--append-system-prompt[-file]`）。
+    //  - `--dry-run`：它承诺「不写任何文件」，所以不能落盘。但它打印的那条命令
+    //    承诺「逐字可复制」，而多行协议会让命令在第一个换行处断掉、引号不闭合 ——
+    //    实测用户会复制到一个残缺命令。所以 dry-run 时把协议**压成单行**再内联：
+    //    命令完整可复制，只是读起来密一点。这两条要求只能这样同时满足。
+    if (opts.dryRun || opts.verify) {
+      hostArgs.push('--append-system-prompt', askPrompt.replace(/\n+/g, ' ⏎ '));
+    } else {
+      const p = askPromptPath(root, askPrompt);
+      // 写盘失败退回内联：宁可命令长一点，也不能因为写不了临时文件就不带协议
+      if (p) hostArgs.push('--append-system-prompt-file', p);
+      else hostArgs.push('--append-system-prompt', askPrompt.replace(/\n+/g, ' ⏎ '));
+    }
+  }
 
   if (mode === 'print') hostArgs.push('-p');
   if (mode === 'print' && opts.prompt !== null) hostArgs.push(opts.prompt);

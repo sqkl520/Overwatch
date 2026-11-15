@@ -80,8 +80,13 @@ test('ask.mode=never 时不得追加提问协议（配置项必须真的有执�
   const src = readFileSync(join(HERE, 'launch.mjs'), 'utf8');
   assert.match(src, /function askProtocol/, 'askProtocol 必须存在——它是 ask.mode 的唯一执行侧');
   assert.match(src, /if \(ask\.mode === 'never'\) return null/, 'never 必须短路');
-  assert.match(src, /hostArgs\.push\('--append-system-prompt', askPrompt\)/,
-    '协议必须真的进命令行，否则它只是文档里的一句话');
+  // 协议必须真的进命令行 —— 无论走内联还是 `-file` 变体，两种都算数。
+  // （2026-11-15 改成：真跑用 `--append-system-prompt-file`（协议二十多行，内联太长），
+  //  `--dry-run` 用单行化内联（它承诺不写文件，又多行会让打印的命令行断掉）。）
+  assert.match(src, /hostArgs\.push\('--append-system-prompt-file', p\)/,
+    '真跑必须把协议落盘再用 -file 传，否则命令行会长到读不了');
+  assert.match(src, /hostArgs\.push\('--append-system-prompt', askPrompt\.replace/,
+    'dry-run 必须用单行化内联，否则打印的命令行会断在第一个换行、引号不闭合');
 });
 
 test('负向：把 ask 段从 configInfo 里丢掉，三种模式就全都加协议', () => {

@@ -7,6 +7,7 @@
 | 你想知道 | 读这个 | 一句话 |
 |---|---|---|
 | 「这东西能替我做什么」 | [README.md](../README.md) | 产品定位、能力边界、30 秒上手 |
+| **「我凭什么信它」** | **[FOR-USERS.md](FOR-USERS.md)** | **给新用户的上手说明：每条声称后跟一条你能自己跑的命令，输出全是真跑出来的** |
 | 「每条能力对应的命令是什么」 | [CAPABILITIES.md](CAPABILITIES.md) | 能力 → 可运行的命令，硬门会核 |
 | 「我该敲什么、会看到什么」 | [GUIDE.md](GUIDE.md) | 使用手册：输出怎么读、出问题怎么办 |
 | 「我刚装完，装对了吗」 | [spec/2026-11-14-entry-point.md](spec/2026-11-14-entry-point.md) | 唯一入口 `scripts/overwatch.mjs`：首屏契约、空/坏三态、1000ms 上限、退出码表 |
