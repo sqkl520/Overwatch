@@ -99,3 +99,30 @@ test('mode=never 时 maxQuestions 允许 0（否则「关掉提问」无法表�
   assert.match(src, /ask\.mode === 'never' \? 0 : 1/,
     'never 模式下 maxQuestions 的下限必须是 0');
 });
+
+// ── `PATHEXT`：缺了它 hook 一条都不触发（2026-11-15）──────────────────
+//
+// 红队实测：Windows 上 hook 命令里的裸 `node` 靠 `PATHEXT` 才知道去找 `node.exe`。
+// 缺了它，**全部 hook 静默不触发**，而宿主退出码仍是 0 —— 用户看到「装好了、一切正常」，
+// 实际一条闸都没生效。这是本仓库最怕的失败形态。
+//
+// `launch` 原来靠继承 `process.env`：用户从干净环境启动时，我们把残缺原样传给宿主。
+
+test('launch 必须显式传 env 并补齐 PATHEXT，不能靠继承', () => {
+  const src = readFileSync(join(HERE, 'launch.mjs'), 'utf8');
+  assert.match(src, /function childEnv\(\)/, 'childEnv 必须存在');
+  assert.match(src, /env: childEnv\(\),/, 'spawn 必须显式传 env —— 靠继承就无法兜底');
+  assert.match(src, /env\.PATHEXT = '\.COM;\.EXE;\.BAT;\.CMD'/, '必须补齐 PATHEXT');
+  // 只在缺失时补：覆盖用户已有值 = 越界
+  assert.match(src, /!env\.PATHEXT/, '只在用户没有时才补，不覆盖');
+  // 只在 win32 上补：POSIX 没这个概念
+  assert.match(src, /process\.platform === 'win32' && !env\.PATHEXT/, '只在 win32 上补');
+});
+
+test('负向：把 env 传参去掉，测试必须红', () => {
+  // 这条不是再断言一次，而是把「为什么必须有」写成可读的形式：
+  // 没有 env: childEnv() 那一行，上面三条都会失去依据。
+  const src = readFileSync(join(HERE, 'launch.mjs'), 'utf8');
+  const spawnBlock = src.slice(src.indexOf('proc = spawn(plan.execFile'), src.indexOf('proc = spawn(plan.execFile') + 900);
+  assert.match(spawnBlock, /env: childEnv\(\)/, 'env 必须在 spawn 的那一段里，不是写在别处');
+});

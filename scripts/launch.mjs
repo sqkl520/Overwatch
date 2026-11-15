@@ -397,6 +397,23 @@ function askProtocol(config, mode) {
   return lines.join('\n');
 }
 
+/** 传给宿主的子进程环境。**只做一件事：补齐 `PATHEXT`（Windows）。**
+ *
+ *  为什么必须补：hook 命令里写的是裸 `node`，Windows 靠 `PATHEXT` 才知道去找
+ *  `node.exe`。缺了它，hook **一条都不触发**，而宿主的退出码仍是 0 ——
+ *  这是本仓库最怕的失败形态（看起来装好了，实际什么都没生效）。
+ *
+ *  只补这一个键，别的原样传：改用户的环境是越界，补一个「没有它功能必然坏」的
+ *  系统变量是兜底。非 win32 上原样返回（POSIX 没有这个概念）。
+ */
+function childEnv() {
+  const env = { ...process.env };
+  if (process.platform === 'win32' && !env.PATHEXT) {
+    env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+  }
+  return env;
+}
+
 /** 按 roster 现场生成一份只含启用角色的载荷目录。返回 `null` = 不筛。
  *
  *  **为什么必须现场生成而不是维护第二份**：本仓库已经把「两份形态必然漂移」吃过好几次亏
@@ -1103,6 +1120,12 @@ async function launchMain(argv, { json = false, nowMs = Date.now() } = {}) {
         // 是合法用法（宿主会从 stdin 读 prompt）。
         stdio: plan.mode === 'print' ? ['inherit', 'pipe', 'pipe'] : 'inherit',
         windowsHide: false,
+        // **必须显式给 env，不能靠继承。** 红队实测：缺 `PATHEXT` 时 hook 命令里的裸
+        // `node` 解析不到（Windows 上它靠 PATHEXT 找 .EXE/.CMD），于是**全部 hook 静默不触发**，
+        // 而宿主退出码仍是 0 —— 用户看到的是「装好了、一切正常」，实际一条闸都没生效。
+        // 继承 `process.env` 意味着「用户从干净环境启动时，我们把这个残缺原样传给宿主」；
+        // 补齐它，是我们能替用户兜住的一件事。
+        env: childEnv(),
       });
     } catch (e) {
       finish({ code: null, out: '', err: String((e && e.message) || e), spawnError: true });
