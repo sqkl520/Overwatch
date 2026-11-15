@@ -437,6 +437,10 @@ const PROBE_ARGS = {
   contextPressure: '[[]]', isHumanMessage: '[{}]', humanMessages: '[[]]',
   originalGoalFrom: '[[]]', questionAnswered: '[[]]', lastTextIsQuestion: '[[]]',
   classifySession: '[{}]', summarize: '[[]]', listTranscripts: '["/nonexistent"]',
+  // stop-delta.mjs（2026-11-16 交还 delta）：判据层全是纯函数，探针取最小可构造输入。
+  // 空记录 / 空文本 / 空数组都必须安全返回 —— 一个没有内容的会话不该让报告崩掉。
+  computeDelta: '[{}]', summarizeDelta: '[[]]', deltaSlotsOf: '""',
+  changeSetOf: '[[], {}]', lastHumanIndex: '[[]]',
   // verify-claims.mjs：断言 vs 证据配对。全部是纯函数，参数取最小可构造输入。
   // 目的是让「导出但调用即炸」在结构门暴露，而不是等到对 1.5 GB 语料跑完才发现。
   detectClaims: '""', findEvidence: '[[], "test-count"]', classifyEvidence: '[{}]',
@@ -815,6 +819,10 @@ function checkUnregisteredExports() {
     'errorOf', 'hasRecentError', 'toolFingerprint', 'toolCallSequence', 'detectLoop',
     'contextPressure', 'isHumanMessage', 'humanMessages', 'originalGoalFrom',
     'questionAnswered', 'lastTextIsQuestion', 'classifySession', 'summarize',
+    // stop-delta.mjs（2026-11-16）：交还 delta 的正交轴。四个函数已进 PROBE_ARGS 实际调用；
+    // 两个冻结表是数据，不是函数。
+    'computeDelta', 'summarizeDelta', 'deltaSlotsOf', 'changeSetOf', 'lastHumanIndex',
+    'DELTA_VERDICTS', 'SLOT_STATES',
     'signatureOf', 'normalizeBash', 'heartbeatThreshold', 'isPersistentChange', 'parseJsonl', 'SUBAGENT_READ_BYTES',
     'displayWidth', 'padDisplay', 'paint', 'badge', 'colorEnabled', 'stripAnsi',
     'sanitize', 'truncateToWidth', 'wrapToWidth', 'buildDraft', 'detailLines',

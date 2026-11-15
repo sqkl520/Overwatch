@@ -30,6 +30,7 @@ import { join, resolve, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { endsWithQuestion } from './asked.mjs';
+import { computeDelta, summarizeDelta } from './stop-delta.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -125,13 +126,15 @@ export function endsWithoutToolUse(records) {
 /** 错误记录的识别。实测语料里的形态见 2026-11-02-deterministic-signals.md 第四节：
  *  `isApiErrorMessage: true` + `error: "authentication_failed"`，
  *  或 `error: { message: "524 {\"error\":{\"type\":\"bad_response_status_code\"...}" }`。 */
-export function errorOf(rec) {
+export function errorOf(rec, index = null) {
   if (!rec || rec.type !== 'assistant') return null;
   const err = rec.error ?? (rec.isApiErrorMessage ? rec.message && rec.message.content : null);
   if (err === null || err === undefined || err === false) return null;
   const text = typeof err === 'string' ? err : JSON.stringify(err);
   if (!text || text === 'null' || text === 'false') return null;
-  return { text: text.slice(0, 200), at: rec.timestamp || null };
+  // index 是给 stop-delta 用的：它要判「错误记录之后有没有回合可写」，只有时间戳不够
+  // ——同一毫秒内的多条记录无法排序，而下标就是时间。
+  return { text: text.slice(0, 200), at: rec.timestamp || null, index };
 }
 
 /**
@@ -140,9 +143,9 @@ export function errorOf(rec) {
  */
 export function hasRecentError(records, window = 20) {
   const arr = Array.isArray(records) ? records : [];
-  const tail = arr.slice(-window);
-  for (let i = tail.length - 1; i >= 0; i--) {
-    const e = errorOf(tail[i]);
+  const start = Math.max(0, arr.length - window);
+  for (let i = arr.length - 1; i >= start; i--) {
+    const e = errorOf(arr[i], i);
     if (e) return { hit: true, value: e, evidence: 'assistant-error-field' };
   }
   return { hit: false, value: null, evidence: 'no-error-field-in-window' };
@@ -366,7 +369,7 @@ export function lastTextIsQuestion(records) {
  * AI 没有在等任何东西。真正判不了的是「它说的『做完了』是不是真的」——
  * 这属于 COMPLETION 语义，代码里单独标出来，不计入 1–6。
  */
-export function classifySession({ tailRecords, headRecords = [], historyRecords = null, nowMs = Date.now() } = {}) {
+export function classifySession({ tailRecords, headRecords = [], historyRecords = null, nowMs = Date.now(), windowTruncated = null } = {}) {
   const tail = Array.isArray(tailRecords) ? tailRecords : [];
   // 死循环必须看**前文**，不能只看本轮的记录：一次轮次里通常只有 1–3 次工具调用，
   // 窗口永远凑不够 repeat。实测这个 bug 让轮次级 LOOP_SUSPECT 从 50 掉到 0。
@@ -386,31 +389,51 @@ export function classifySession({ tailRecords, headRecords = [], historyRecords 
   };
   const goalOk = signals.goal.hit;
 
+  // delta 是**正交轴**，与 KINDS 并列，不参与下面的判定顺序。
+  // 不拆 KINDS 的理由：KINDS 冻在 :419、登记在 check-structure.mjs、被 CAPABILITIES 引用、
+  // 被几十条测试断言；拆掉它会让「70.7% 是 STOPPED_SILENT」这个已被引用的数字失去可比性。
+  // 加轴的话分母不变，772 条可以逐条前后对比。
+  // 只在停下来的会话上算：还在干活的会话没有「交还」这件事，给它一个 delta 是造数。
+  const deltaOf = (kind, errorIndex) => {
+    if (kind === 'NOT_STOPPED') return null;
+    return computeDelta({ records: tail, windowTruncated, errorIndex });
+  };
+
   // 先判「结构化提问未答」再判「还在干活」：AskUserQuestion / ExitPlanMode 的
   // 停止点**确实带着一个未执行的 tool_use**（见 classify-stop.mjs 文件头）。按
   // 「有 tool_use 就是在干活」先判，会把真正在等人回答的会话全部算成在干活。
   // 实测这个顺序错误让 WAITING_ANSWER 从应有的数量掉到 0。
   if (signals.question.hit) {
-    return { kind: 'WAITING_ANSWER', confidence: 'measured', signals, goalOk, detail: signals.question.value.name };
+    return { kind: 'WAITING_ANSWER', confidence: 'measured', signals, goalOk, delta: deltaOf('WAITING_ANSWER', null), detail: signals.question.value.name };
   }
   if (!stop.hit) {
-    return { kind: 'NOT_STOPPED', confidence: 'measured', signals, goalOk, detail: stop.evidence };
+    return { kind: 'NOT_STOPPED', confidence: 'measured', signals, goalOk, delta: null, detail: stop.evidence };
   }
   if (signals.error.hit) {
-    return { kind: 'ERROR_STOP', confidence: 'measured', signals, goalOk, detail: signals.error.value.text };
+    return { kind: 'ERROR_STOP', confidence: 'measured', signals, goalOk, delta: deltaOf('ERROR_STOP', signals.error.value.index), detail: signals.error.value.text };
   }
   // compact 边界出现在尾部 = 刚压缩过；此时「停下」多半是压缩后的重启点
   const cm = tail.filter((r) => r && r.type === 'system' && r.compactMetadata).length;
   if (cm > 0) {
-    return { kind: 'CONTEXT_RESET', confidence: 'measured', signals, goalOk, detail: `compact_boundary x${cm}` };
+    return { kind: 'CONTEXT_RESET', confidence: 'measured', signals, goalOk, delta: deltaOf('CONTEXT_RESET', null), detail: `compact_boundary x${cm}` };
   }
   if (signals.loop.hit) {
-    return { kind: 'LOOP_SUSPECT', confidence: 'measured', signals, goalOk, detail: `${signals.loop.value.name} x${signals.loop.value.repeats}` };
+    return { kind: 'LOOP_SUSPECT', confidence: 'measured', signals, goalOk, delta: deltaOf('LOOP_SUSPECT', null), detail: `${signals.loop.value.name} x${signals.loop.value.repeats}` };
   }
   if (signals.textQuestion.hit) {
-    return { kind: 'QUESTION_TEXT', confidence: 'low', signals, goalOk, detail: signals.textQuestion.value };
+    return { kind: 'QUESTION_TEXT', confidence: 'low', signals, goalOk, delta: deltaOf('QUESTION_TEXT', null), detail: signals.textQuestion.value };
   }
-  return { kind: 'STOPPED_SILENT', confidence: 'measured', signals, goalOk, detail: 'said-something-then-stopped' };
+  // detail 按**实际发生了什么**写。原先是写死的一句，但 endsWithoutToolUse 在 :119 明确
+  // 区分了 assistant-text-no-tool 与 assistant-silent-no-tool —— 一个字都没说的会话
+  // 也被标成「说了点什么然后停了」，那是文案撒谎。
+  return {
+    kind: 'STOPPED_SILENT',
+    confidence: 'measured',
+    signals,
+    goalOk,
+    delta: deltaOf('STOPPED_SILENT', null),
+    detail: stop.value && stop.value.hasText ? 'said-something-then-stopped' : 'said-nothing-then-stopped',
+  };
 }
 
 export const KINDS = Object.freeze([
@@ -451,7 +474,7 @@ export function scanAll({ projectsRoot = join(homedir(), '.claude', 'projects'),
     const head = f.size > TAIL_BYTES ? readHead(f.path) : { records: [] };
     // 小文件头尾重叠：头就是全部，不必再读一次
     const headRecords = head.records.length ? head.records : tail.records;
-    const verdict = classifySession({ tailRecords: tail.records, headRecords, nowMs });
+    const verdict = classifySession({ tailRecords: tail.records, headRecords, nowMs, windowTruncated: tail.truncated });
     rows.push({
       sessionId: f.sessionId,
       project: f.project,
@@ -479,6 +502,10 @@ export function summarize(rows) {
     deterministicCause: deterministic.length,
     // 结构性事实（非文本代理）能给出结论的占比
     structuralShare: stopped.length ? Number((deterministic.length / stopped.length).toFixed(4)) : 0,
+    // 交还时带了接地 delta 的分档。与 structuralShare **并列**，不是它的替代：
+    // 前者问「停下时磁盘上多了什么、它有没有说」，后者问「停机原因是哪一类」。
+    // 分母同样是 stopped —— 见 stop-delta.mjs 里 summarizeDelta 的注释。
+    delta: summarizeDelta(rows),
     goalRecoverable: withGoal,
     goalShare: rows.length ? Number((withGoal / rows.length).toFixed(4)) : 0,
   };
@@ -518,6 +545,18 @@ function main(argv) {
     if (!s.byKind[k]) continue;
     const n = s.byKind[k];
     console.log(`  ${k.padEnd(16)} ${String(n).padStart(4)}  ${pct(n, s.stopped).padStart(6)}`);
+  }
+  console.log('');
+  console.log('交还时的 delta（分母恒为「停下来」的会话，EXEMPT 只减分子不减分母）：');
+  const d = s.delta;
+  const dline = (label, n) => console.log(`  ${label.padEnd(24)} ${String(n).padStart(4)}  ${pct(n, d.stopped).padStart(6)}`);
+  dline('接地（引用了本轮改动）', d.grounded);
+  dline('写了但没接地', d.ungrounded);
+  dline('没交还 delta', d.noDelta);
+  dline('没机会写（豁免）', d.exempt);
+  const unknownN = (d.noDeltaByAttribution && d.noDeltaByAttribution.unknown) || 0;
+  if (unknownN) {
+    console.log(`    其中归因不明 ${unknownN} 条（窗口被截断，本轮边界不可判 —— 不等于「确实没写」）`);
   }
   console.log('');
   console.log(`结构性判据给出具体原因：${s.deterministicCause} / ${s.stopped} = ${pct(s.deterministicCause, s.stopped)}`);
