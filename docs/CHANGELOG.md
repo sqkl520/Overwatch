@@ -25,6 +25,18 @@
 
 ### Fixed
 
+- **闸门的上限实际是「每 10 分钟 6 次」，不是「每会话 6 次」**（`stop-verify-hook.mjs`）。两条路径合起来把预算变成了突发配额：
+
+  ```
+  拦 6 次 → prevCount >= MAX_BLOCKS 放行（不 bump 也不 reset，count 停在 6）
+        → 模型安静 10 分钟
+        → readBlockCount 读到 0
+        → 又拿到 6 次
+  ```
+
+  外加 `resetBlockCount` 在**任何一次放行**时都被调用，且实现是 `delete state[sessionId]` —— 把累计一起删了。所以「拦一次 → 模型正常结束 → 下一回合再拦」每回合都从 0 重新计。**6 天能拦出 5,184 次。** 那个六天烧掉 $15,066.79 的真实事故不需要破解宿主的上限，我们的上限同样挡不住。
+
+  现在拆成两个数：`count`（连续，按时间归零，**只用于 reason 的语气**）与 `total`（会话累计，永不按时间归零，**用于预算**）。`resetBlockCount` 只清 `count` 保留 `total`。`outcome` 从 `allowed-cap` 改名 `allowed-budget-exhausted` —— 旧名只说了「到顶」，没说清是什么到顶，且与「证据齐全所以放行」在日志里分不开。**负向验证**：把 `resetBlockCount` 改回 `delete` → 「累计计数不因放行而清零」变红。
 - **`stop_hook_active` 被记了但从未参与判定**（`stop-verify-hook.mjs` 的 `decide()`）。它在 `record` 里被记进日志，而 `decide()` 的函数签名里根本没有它 —— 宿主文档明确要求检查这个值「否则会对一个永远不成立的条件反复 block」，本仓自己也引过这条（`docs/research/2026-11-11-untapped-capabilities.md:87`）。**照文档写了一半。** 现在它在 `decide()` 最前面判，且在 `no-checkable-claim` **之前** —— 两者放行结果一样，但 `allowReason` 必须记更具体的那个，否则「因 hook 已激活而放行」会被记成「没有可核对断言」，事后统计又变成「同一个桶里装两件事」（115/115 = 100% 那次的形态）。**负向验证**：摘掉新分支 → 2 条测试变红。
 - **`overwatch plan` 说自己「未实现」，而 doctor 的第 8 项正在用同一个 `renderPlan()` 输出真实进度**。同一仓库对同一件事说了两句话。现在 `plan` 真的转发（`ROUTES.plan.forward = true`），不再打印一条要用户自己复制的命令——那个入口存在的理由就是「干净 clone 上不知道第一条命令该跑什么」，打印命令解决不了那个问题。为此给 `render-plan.mjs` 的 `main()` 加了导出。
   - 同时删掉一条已失效的测试（它断言「渲染器不存在时 plan 说还没做」，而渲染器现在存在），换成「plan 真的转发、拿得到渲染器的真实产物」。

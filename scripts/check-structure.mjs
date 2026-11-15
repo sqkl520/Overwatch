@@ -373,6 +373,7 @@ const PROBE_ARGS = {
   modeOf: '[{}]', parseHookInput: '""', resolveAssistantText: '[{}, []]',
   decide: '[{ input: {}, records: [] }]', buildReason: '[{}]',
   logPathFor: '[{}]', statePathFor: '[{}]', readBlockCount: '["s", { env: {} }]',
+  readTotalBlocks: '["s", { env: {} }]',
   resetBlockCount: '["s", { env: {} }]',
   appendLog: '[{}, { OVERWATCH_STOP_VERIFY_LOG: "/nonexistent-dir-ow/x.jsonl" }]',
   bumpBlockCount: '["s", { env: { OVERWATCH_STOP_VERIFY_STATE: "/nonexistent-dir-ow/x.json" } }]',
@@ -977,7 +978,7 @@ function checkUnregisteredExports() {
     'BLOCKING_STATUS', 'DEFAULT_BACKTRACK_MB', 'DEFAULT_BUDGET_MS', 'ESCALATE_AT',
     'MAX_BLOCKS', 'RESET_AFTER_MS', 'modeOf', 'parseHookInput', 'readStdin',
     'resolveAssistantText', 'decide', 'buildReason', 'logPathFor', 'appendLog',
-    'statePathFor', 'bumpBlockCount', 'resetBlockCount', 'readBlockCount', 'runHook',
+    'statePathFor', 'bumpBlockCount', 'resetBlockCount', 'readBlockCount', 'readTotalBlocks', 'runHook',
     'loadRecords', 'loadSubagentRecords', 'SUBAGENT_TAIL_BYTES',
     // stop-verify-hook.mjs 的放行样本记录（2026-11-13）。纯记账层：写入失败一律
     // 吞掉，所以探针只需要证明「给了最小输入也不抛」。分析命令的导出同批登记。

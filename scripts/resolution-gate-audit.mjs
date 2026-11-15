@@ -27,7 +27,7 @@
  * 只读：不写任何文件，不碰 git。
  */
 
-import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, statSync, realpathSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -538,6 +538,13 @@ function main(argv = process.argv.slice(2)) {
   return 0;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+/** 「我是不是被直接执行」——比的是**真实路径**。`resolve()` 只规范化路径、不解析符号
+ *  链接，而 `fileURLToPath(import.meta.url)` 已经是真实路径；通过目录符号链接执行
+ *  （`npm link` / `npm i -g .` / pnpm 的 store）时两边必然不等，程序会静默 exit 0、零输出。
+ *  realpath 失败（路径不存在）退回 resolve：一次失败不能让正常执行也坏掉。 */
+const realOrResolve = (p) => {
+  try { return realpathSync(p); } catch { return resolve(p); }
+};
+if (process.argv[1] && realOrResolve(process.argv[1]) === realOrResolve(fileURLToPath(import.meta.url))) {
   process.exit(main());
 }

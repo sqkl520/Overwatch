@@ -48,7 +48,7 @@
  * 它只是语料，**不参与判定** —— 现在是采集阶段，不是规则阶段。
  */
 
-import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -386,9 +386,28 @@ export function appendLog(record, env = process.env, nowMs = Date.now()) {
  * 拦截计数。同一 session 的连续拦截次数决定 reason 的语气，也是判断
  * 「是不是卡死在循环里」的依据。
  *
- * 存法：`tasks/runs/stop-hook/state.json` 里按 sessionId 记 `{ count, lastAt }`。
- * 超过 `RESET_AFTER_MS`（10 分钟）没有新拦截就归零 —— 用户去泡了杯咖啡回来，
- * 不该看到「第 5 次拦截」。
+ * 存法：`tasks/runs/stop-hook/state.json` 里按 sessionId 记 `{ count, lastAt, total }`。
+ *
+ * **两个数，用途完全不同：**
+ *   · `count`  连续拦截数，超过 `RESET_AFTER_MS`（10 分钟）没有新拦截就归零。
+ *              只用于 **reason 的语气**（「第 5 次拦截」在用户泡了杯咖啡回来之后
+ *              还这么说很奇怪）。
+ *   · `total`  **会话累计**拦截数，永不因时间归零，只有 `resetBlockCount` 能清。
+ *              用于 **预算**。
+ *
+ * **为什么要拆成两个（2026-11-16 修正）**：原实现只有一个 `count`，既当语气又当预算，
+ * 于是上限的实际语义是「**每 10 分钟 6 次**」而不是「每会话 6 次」：
+ *
+ *   拦 6 次 → prevCount >= MAX_BLOCKS 放行（不 bump 也不 reset，count 停在 6）
+ *          → 模型安静 10 分钟
+ *          → readBlockCount 读到 0
+ *          → 又拿到 6 次
+ *
+ * 且 `resetBlockCount` 在**任何一次放行**时都被调用，所以「拦一次、模型正常结束、
+ * 下一个回合再拦」也会把预算清零。6 天能拦出 5,184 次。
+ * 那个六天烧掉 $15,066.79 的真实事故不需要破解宿主的上限 —— 我们的上限同样挡不住。
+ *
+ * 一个会到期的闸门不是闸门。`total` 是不再到期的那一半。
  *
  * 注意：这里**不**读 transcript、不读宿主内部状态，只用我们自己写的文件。
  * 代价是进程崩溃会丢计数；那只是语气降级，不是安全问题，值得。
@@ -406,8 +425,10 @@ export function bumpBlockCount(sessionId, { env = process.env, nowMs = Date.now(
     let state = {};
     try { state = JSON.parse(readFileSync(p, 'utf8')); } catch { state = {}; }
     const cur = state[sessionId];
+    // `count` 按时间窗归零（语气用）；`total` 只增不减（预算用）。
     const count = cur && nowMs - Number(cur.lastAt || 0) < RESET_AFTER_MS ? Number(cur.count || 0) : 0;
-    state[sessionId] = { count: count + 1, lastAt: nowMs };
+    const total = Number(cur && cur.total || 0);
+    state[sessionId] = { count: count + 1, lastAt: nowMs, total: total + 1 };
     mkdirSync(dirname(p), { recursive: true });
     writeFileSync(p, JSON.stringify(state));
     return count;
@@ -416,14 +437,22 @@ export function bumpBlockCount(sessionId, { env = process.env, nowMs = Date.now(
   }
 }
 
+/** 清**连续**计数（语气用）。**保留 `total`** —— 预算不因「这次放行了」而清零。
+ *
+ *  原实现是 `delete state[sessionId]`，把整个条目连同累计一起删掉，于是
+ *  「拦一次 → 模型正常结束 → 下一回合再拦」每一次都从 0 重新计预算。
+ *  这是预算实际变成「每 10 分钟 6 次」的第二条路径（第一条是 `count` 按时间归零）。
+ *
+ *  现在只把 `count` 归零并保留 `total`；条目本身留着，`lastAt` 也留着（语气判断要用）。 */
 export function resetBlockCount(sessionId, { env = process.env } = {}) {
   try {
     const p = statePathFor(env);
     if (!existsSync(p)) return;
     let state = {};
     try { state = JSON.parse(readFileSync(p, 'utf8')); } catch { return; }
-    if (!(sessionId in state)) return;
-    delete state[sessionId];
+    const cur = state[sessionId];
+    if (!cur) return;
+    state[sessionId] = { count: 0, lastAt: Number(cur.lastAt || 0), total: Number(cur.total || 0) };
     writeFileSync(p, JSON.stringify(state));
   } catch { /* ignore */ }
 }
@@ -660,7 +689,11 @@ export function runHook({ input, env = process.env, nowMs = Date.now(), sampleLo
     project = detectProjectCommands(safeString(i.cwd) || process.cwd());
 
     // 计数在读之前算，好让 buildReason 拿到的是「之前拦过几次」。
+    // 两个数，用途不同（见 `RESET_AFTER_MS` 上方）：
+    //   prevCount → reason 的语气（会随安静时间归零）
+    //   prevTotal → 预算（会话累计，不归零）
     const prevCount = mode === 'block' ? readBlockCount(sessionId, { env, nowMs }) : 0;
+    const prevTotal = mode === 'block' ? readTotalBlocks(sessionId, { env }) : 0;
 
     // 先只看主 transcript。只有它说要拦时，才花钱读子 agent —— 见 decide 的注释。
     const firstPass = decide({
@@ -696,6 +729,9 @@ export function runHook({ input, env = process.env, nowMs = Date.now(), sampleLo
       action: d.action,
       allowReason: d.allowReason || null,
       blockCount: prevCount,
+      // 会话累计，与 `blockCount`（连续）分开记。事后想知道「这个会话一共被拦过几次」
+      // 只能看这个数 —— `blockCount` 会因安静 10 分钟而归零。
+      totalBlocks: prevTotal,
       blocking: (d.blocking || []).map((b) => ({
         family: b.claim.family,
         quote: b.claim.quote,
@@ -704,7 +740,11 @@ export function runHook({ input, env = process.env, nowMs = Date.now(), sampleLo
       })),
       reason: d.action === 'block' ? d.reason : '',
       // 本行记录的是**本次判定**：该拦 / 不拦，以及实际做了什么。
-      outcome: d.action === 'block' ? (mode === 'block' ? (prevCount >= MAX_BLOCKS ? 'allowed-cap' : 'blocked') : 'observed-only') : 'allowed',
+      // `allowed-budget-exhausted` 是 2026-11-16 新增：预算耗尽与「证据齐全」在界面上
+      // 必须能分开，否则「闸门用完配额」和「全部验证通过」显示成同一件事。
+      outcome: d.action === 'block'
+        ? (mode === 'block' ? (prevTotal >= MAX_BLOCKS ? 'allowed-budget-exhausted' : 'blocked') : 'observed-only')
+        : 'allowed',
     };
     appendLog(record, env, nowMs);
 
@@ -731,7 +771,8 @@ export function runHook({ input, env = process.env, nowMs = Date.now(), sampleLo
     if (mode !== 'block') return null; // 观测模式：只记账，不拦。
 
     // 我们自己的上限：到顶就放行。不依赖宿主的 CLAUDE_CODE_STOP_HOOK_BLOCK_CAP。
-    if (prevCount >= MAX_BLOCKS) return null;
+    // **用 prevTotal（会话累计）而不是 prevCount（连续）** —— 一个会到期的闸门不是闸门。
+    if (prevTotal >= MAX_BLOCKS) return null;
 
     bumpBlockCount(sessionId, { env, nowMs });
     return { decision: 'block', reason: d.reason };
@@ -755,7 +796,7 @@ function safeString(v) {
   try { return v == null ? '' : String(v); } catch { return ''; }
 }
 
-/** 读当前连续拦截次数（不递增）。 */
+/** 读当前连续拦截次数（不递增）。只用于 reason 的语气。 */
 export function readBlockCount(sessionId, { env = process.env, nowMs = Date.now() } = {}) {
   try {
     const p = statePathFor(env);
@@ -765,6 +806,24 @@ export function readBlockCount(sessionId, { env = process.env, nowMs = Date.now(
     if (!cur) return 0;
     if (nowMs - Number(cur.lastAt || 0) >= RESET_AFTER_MS) return 0;
     return Number(cur.count || 0);
+  } catch {
+    return 0;
+  }
+}
+
+/** 读**会话累计**拦截次数（不递增、**不**按时间归零）。这是预算的唯一依据。
+ *
+ *  与 `readBlockCount` 分开的理由见 `RESET_AFTER_MS` 上方那段：一个数不能既当语气
+ *  又当预算 —— 语气该随安静时间归零，预算不该。
+ *  老状态文件没有 `total` 字段时返回 0（迁移：已有会话从此刻开始计预算，不追溯）。 */
+export function readTotalBlocks(sessionId, { env = process.env } = {}) {
+  try {
+    const p = statePathFor(env);
+    if (!existsSync(p)) return 0;
+    const state = JSON.parse(readFileSync(p, 'utf8'));
+    const cur = state && state[sessionId];
+    if (!cur) return 0;
+    return Number(cur.total || 0);
   } catch {
     return 0;
   }
@@ -816,6 +875,13 @@ async function main() {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+/** 「我是不是被直接执行」——比的是**真实路径**。`resolve()` 只规范化路径、不解析符号
+ *  链接，而 `fileURLToPath(import.meta.url)` 已经是真实路径；通过目录符号链接执行
+ *  （`npm link` / `npm i -g .` / pnpm 的 store）时两边必然不等，程序会静默 exit 0、零输出。
+ *  realpath 失败（路径不存在）退回 resolve：一次失败不能让正常执行也坏掉。 */
+const realOrResolve = (p) => {
+  try { return realpathSync(p); } catch { return resolve(p); }
+};
+if (process.argv[1] && realOrResolve(process.argv[1]) === realOrResolve(fileURLToPath(import.meta.url))) {
   main().then(() => process.exit(0)).catch(() => process.exit(0));
 }

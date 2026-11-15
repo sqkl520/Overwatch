@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 
 import {
   decide, buildReason, modeOf, parseHookInput, resolveAssistantText,
-  readBlockCount, bumpBlockCount, resetBlockCount, appendLog, logPathFor, statePathFor,
+  readBlockCount, readTotalBlocks, bumpBlockCount, resetBlockCount, appendLog, logPathFor, statePathFor,
   runHook, loadSubagentRecords, BLOCKING_STATUS, MAX_BLOCKS, ESCALATE_AT, RESET_AFTER_MS,
   samplePathFor, sampleLogEnabled, toolSummaryOf, buildSample, appendSample,
   rawFamilyHits, SAMPLE_TEXT_LIMIT,
@@ -398,16 +398,19 @@ test('到自己的 MAX_BLOCKS 后主动放行，不依赖宿主的强制放行',
       const out = runHook({ input, env });
       assert.ok(out && out.decision === 'block', '第 ' + (i + 1) + ' 次应拦');
     }
-    // 第 MAX_BLOCKS+1 次：我们主动放行
+    // 第 MAX_BLOCKS+1 次：我们主动放行。
+    // outcome 在 2026-11-16 从 `allowed-cap` 改名 `allowed-budget-exhausted`：
+    // 旧名只说了「到顶」，没说清是什么到顶；新名说清是**预算**耗尽，且与
+    // 「证据齐全所以放行」在日志里能分开 —— 两者在界面上不该同形。
     const out = runHook({ input, env });
     assert.equal(out, null, '到上限必须放行');
     const rows = readFileSync(env.OVERWATCH_STOP_VERIFY_LOG, 'utf8').trim().split('\n').map(JSON.parse);
-    assert.equal(rows[rows.length - 1].outcome, 'allowed-cap');
-    assert.equal(rows[rows.length - 1].blockCount, MAX_BLOCKS);
+    assert.equal(rows[rows.length - 1].outcome, 'allowed-budget-exhausted');
+    assert.equal(rows[rows.length - 1].totalBlocks, MAX_BLOCKS);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('放行一次后计数清零 —— 下一次是新的一轮', () => {
+test('放行一次后**连续**计数清零，但**累计**计数保留 —— 预算不因一次放行而重置', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-stophook-'));
   try {
     const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'), OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
@@ -415,8 +418,13 @@ test('放行一次后计数清零 —— 下一次是新的一轮', () => {
     const good = inputOf({ cwd: dir, last_assistant_message: '我改了文件，准备跑测试。' });
     runHook({ input: bad, env });
     assert.equal(readBlockCount('sess-test', { env }), 1);
+    assert.equal(readTotalBlocks('sess-test', { env }), 1);
     runHook({ input: good, env }); // 放行
+    // 语气计数归零（用户泡了杯咖啡回来不该看到「第 1 次」）
     assert.equal(readBlockCount('sess-test', { env }), 0);
+    // **预算不归零**。这是本次修正的核心：原实现 `delete state[sessionId]` 把累计
+    // 一起删了，于是「拦 → 正常结束 → 再拦」每回合都从 0 重新计预算。
+    assert.equal(readTotalBlocks('sess-test', { env }), 1, '累计拦截数不因放行而清零');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
