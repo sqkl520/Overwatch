@@ -331,13 +331,70 @@ async function configInfo(root) {
     const roster = (r.config && r.config.agent && Array.isArray(r.config.agent.roster))
       ? r.config.agent.roster.slice()
       : [];
+    // **`ask` 段必须一起带出来。** 原来这里只取 `roster`，把 `ask` 丢了 ——
+    // 于是 `askProtocol()` 收到的是 `{}`，`mode` 是 undefined，永远不等于 "never"，
+    // 三种模式全都加协议。那正是「配置项存在但不生效」的同一种病，只是换了个位置。
+    const ask = (r.config && r.config.ask && typeof r.config.ask === 'object')
+      ? { ...r.config.ask }
+      : {};
     return {
-      file, found: r.found, roster,
+      file, found: r.found, roster, ask,
       errors: (r.errors || []).map((e) => `${e.path}: ${e.msg}`),
     };
   } catch (e) {
-    return { file, found: existsSync(file), roster: [], errors: [`读不了 ${CONFIG_FILE}：${(e && e.message) || e}`] };
+    return { file, found: existsSync(file), roster: [], ask: {}, errors: [`读不了 ${CONFIG_FILE}：${(e && e.message) || e}`] };
   }
+}
+
+/** 把 `ask` 配置变成一段**可执行的**系统提示。返回 `null` = 不问（`mode: "never"`）。
+ *
+ *  这是 `ask.mode` 唯一的执行侧。没有它，那个配置项只是 `overwatch.config.json` 里
+ *  的一行字 —— 而实测 71% 的会话整场零提问，配置却说「必须问」，那是假承诺。
+ *
+ *  为什么用 `--append-system-prompt` 而不是 hook：`PreToolUse` 只能问
+ *  「允许这次调用吗」，**不能替模型发起一次提问**（本仓库实测过，`ask` 没有那个能力）。
+ *  系统提示是唯一能真正约束模型开局行为的地方。
+ *
+ *  措辞的取舍：只写**可判定的条件**，不写「请多提问」。后者会被当成客套忽略。
+ */
+function askProtocol(config, mode) {
+  const ask = (config && config.ask) || {};
+  if (ask.mode === 'never') return null;
+  // verify 只是让宿主列一下挂载清单，不跑推理 —— 给它加提问协议没有意义，
+  // 而且会污染 `plugin details` 的输出解析。
+  if (mode === 'verify') return null;
+
+  const max = Number.isFinite(ask.maxQuestions) ? ask.maxQuestions : 5;
+  const needRead = ask.requireReadFirst !== false;
+  const minReads = Number.isFinite(ask.minReads) ? ask.minReads : 3;
+  const auto = ask.mode === 'auto';
+
+  const lines = [
+    '【提问协议 · 由 Overwatch 追加】',
+    '',
+    auto
+      ? '本项目的约定是：动手前先把需求问清楚。若你判断这次任务没有需要澄清的地方，直接做。'
+      : '本项目的约定是：**动手前先把需求问清楚**。这不是建议，是这一轮的前置条件。',
+    '',
+    '什么时候必须问（命中任意一条就要问，不要猜）：',
+    '  · 需求里出现你无法从项目本身确定的选择（用 A 还是 B、改哪个文件、删不删）。',
+    '  · 同一个词在你的理解里有两种以上合理解读。',
+    '  · 你要做的改动会影响用户没提到的地方（依赖、公开接口、数据）。',
+    '  · 用户说的「做好」有多个可验收标准，而你不知道按哪个判。',
+    '',
+    `一次问清，最多 ${max} 个问题，用 AskUserQuestion 一次提交 —— 不要分多轮追问。`,
+    '不要问你已经能从项目里读到的信息（那说明你还没读）。',
+    '',
+  ];
+  if (needRead) {
+    lines.push(
+      `**问之前必须先读项目**：至少 ${minReads} 个不同文件，或者等效的结构性探索`,
+      '（Glob / Grep / 看目录结构）。先读再问，问的才是这个项目的问题。',
+      '',
+    );
+  }
+  lines.push('没有需要澄清的就直接开始做 —— 不要为了遵守协议而问无意义的问题。');
+  return lines.join('\n');
 }
 
 /** 从 roster 算出**没被启用**的角色。用途只有一个：把「挂载 ≠ 调度」说清楚时给出具体名字。 */
@@ -547,6 +604,21 @@ async function planLaunch(opts) {
   if (settingsPath) hostArgs.push('--settings', settingsPath);
 
   const mode = opts.verify ? 'verify' : (opts.print ? 'print' : 'interactive');
+
+  // **提问协议：`ask.mode` 的执行侧。**
+  //
+  // 在此之前 `ask.mode: "always"` 只是配置里的一行字，没有任何东西读它去约束行为 ——
+  // 实测 71% 的会话整场零提问，而配置说「必须问」。那是假承诺。
+  //
+  // `PreToolUse` 拦不了「没问就写」（hook 只能问「允许这次调用吗」，不能替模型发起提问，
+  // 本仓库实测过）。但宿主有 `--append-system-prompt`：把协议追加进系统提示，
+  // 那是模型在会话开头就会读到的东西。**这是唯一可行的执行侧。**
+  //
+  // 措辞刻意具体：给判定条件而不是「请多提问」。笼统的要求会被忽略，
+  // 而「什么时候必须问、问几个、问之前必须先读什么」是可执行的。
+  const askPrompt = askProtocol(config, mode);
+  if (askPrompt) hostArgs.push('--append-system-prompt', askPrompt);
+
   if (mode === 'print') hostArgs.push('-p');
   if (mode === 'print' && opts.prompt !== null) hostArgs.push(opts.prompt);
   if (mode === 'verify') {

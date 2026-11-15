@@ -174,9 +174,14 @@ export function validateConfig(raw) {
     } else {
       cfg.ask.mode = ask.mode;
     }
-    if (!Number.isInteger(ask.maxQuestions) || ask.maxQuestions < 1 || ask.maxQuestions > 20) {
+    // **`mode: "never"` 时 `maxQuestions` 允许 0。** 原来无条件下限是 1，于是
+    // 「关掉提问」这个配置**无法表达** —— 用户写 `{mode:"never", maxQuestions:0}`
+    // 会被判 `bad-range`，而写 `maxQuestions:1` 又说不通（都关了还问几个）。
+    // 校验器把合法配置判成非法，等于强迫用户填一个语义上撒谎的数字。
+    const maxLower = ask.mode === 'never' ? 0 : 1;
+    if (!Number.isInteger(ask.maxQuestions) || ask.maxQuestions < maxLower || ask.maxQuestions > 20) {
       err('bad-range', 'ask.maxQuestions',
-        `ask.maxQuestions 必须是 1..20 的整数（当前：${JSON.stringify(ask.maxQuestions)}）。`
+        `ask.maxQuestions 必须是 ${maxLower}..20 的整数（当前：${JSON.stringify(ask.maxQuestions)}）。`
         + '字符串 "5" 也拒绝——隐式类型转换正是静默校验失效的来源');
     } else {
       cfg.ask.maxQuestions = ask.maxQuestions;

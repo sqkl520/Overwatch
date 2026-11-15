@@ -10,7 +10,43 @@
 
 ## 2. 五分钟上手
 
-Node ≥ 18，零 npm 依赖，`package.json` 不存在。不需要安装、登录或配置。
+Node ≥ 18（**跑测试要 20.16+**，因为用了 `import.meta.dirname` 与 `process.getBuiltinModule`），
+零 npm 依赖，`package.json` 不存在。不需要安装、登录或配置。
+
+### 命令 0：先自检（推荐从这里开始）
+
+```bash
+node scripts/overwatch.mjs
+```
+
+这是**唯一入口**。不加参数跑 `doctor`：一秒内报告 8 项前提事实——Node 版本、transcript 根、
+宿主状态来源、`.claude/`、写前闸、后台监视、平台、有没有任务在跑。
+
+每行只说**读到了什么**，不替你判通过。三种空状态分开：
+
+| 情况 | 退出码 |
+|---|---|
+| 根不存在（还没用过宿主） | **2** |
+| 根在但读不出（权限 / 类型） | **3** |
+| 根在且 0 份 | 0 |
+
+### 命令 0b：在我自己的项目里用一个挂了 12 个角色的会话
+
+```bash
+cd ~/your-project
+node /path/to/Overwatch/scripts/overwatch.mjs launch --cwd . --dry-run   # 先看会挂什么
+node /path/to/Overwatch/scripts/overwatch.mjs launch --cwd .             # 真起
+```
+
+载荷是 Overwatch 自己的 `.claude/`（12 个 `oversight-*` 角色 + 1 个调度 skill），
+**工作目录是你的项目**。所以你在自己的代码里干活，同时拿到这套角色和两条闸
+（写前闸 + 收工验证闸，默认都是 observe：只记账、不拦）。
+
+只想验载荷挂对没有（不需要登录、不需要推理）：
+
+```bash
+node /path/to/Overwatch/scripts/overwatch.mjs launch --verify
+```
 
 ### 命令 1：看一眼所有会话
 
@@ -448,7 +484,7 @@ node --test scripts/state-model.test.mjs
 
 `+ actual` 是脚本现在算出的，`- expected` 是测试认为应该的。先判断哪边对——测试也可能过期。改判定逻辑时先想清楚这个测试保护的是什么行为；行为本身要变就改测试并在提交信息里写明为什么，不要为了让测试变绿而把断言改软。
 
-**28 个测试文件，1537 项全绿**（2026-11-14 实测，`ls scripts/*.test.mjs | wc -l` 可核）。分管范围：`state-model.test.mjs` 管六态判定、novelty、心跳阈值、Bash 归一化、权重重估；`tui-theme.test.mjs` / `tui-layout.test.mjs` / `tui-meta.test.mjs` / `app-router.test.mjs` / `tui-redesign.test.mjs` / `tui-bugfixes.test.mjs` 管 TUI 的字形、布局、元信息、键位路由与两轮重做；`oversight-tui.test.mjs` 管渲染、净化、草稿拼装、纯文本输出；`watch.test.mjs` 管通知去重与候选派发；`verify-claims.test.mjs` / `stop-signals.test.mjs` / `asked.test.mjs` / `classify-stop.test.mjs` / `measure-interventions.test.mjs` / `measure-execution-phase.test.mjs` / `measure-intervention-cost.test.mjs` 管各条确定性判据与两轮测量口径；`stop-verify-hook.test.mjs` / `analyze-hook-samples.test.mjs` 管 Stop hook 闸门与放行样本分析；`validate-run.test.mjs` / `install-watcher.test.mjs` / `replay-observe.test.mjs` 管运行图校验、自启动与回放；`claim-ledger.test.mjs` 管产出对账（期望 / 自述 / 磁盘 / transcript 四方交叉，含端到端 CLI 链）；`reconciliation-wiring.test.mjs` 管对账**有没有接进派发链路**（模板 / 角色定义 / SKILL.md 的 Phase E 前置门）；`observe-reality-check.test.mjs` 管写前闸在真实语料上的重放口径（窗口截断、沙箱分桶、fork 去重、计数与 decide 复算一致）。`compose-agent-prompt.test.mjs` 管提示词分层拼装（四层顺序、验收需求 × 工具白名单相容、停机条件可判定性、hash 台账与 transcript 对账）。
+**28 个测试文件，1540 项全绿**（2026-11-14 实测，`ls scripts/*.test.mjs | wc -l` 可核）。分管范围：`state-model.test.mjs` 管六态判定、novelty、心跳阈值、Bash 归一化、权重重估；`tui-theme.test.mjs` / `tui-layout.test.mjs` / `tui-meta.test.mjs` / `app-router.test.mjs` / `tui-redesign.test.mjs` / `tui-bugfixes.test.mjs` 管 TUI 的字形、布局、元信息、键位路由与两轮重做；`oversight-tui.test.mjs` 管渲染、净化、草稿拼装、纯文本输出；`watch.test.mjs` 管通知去重与候选派发；`verify-claims.test.mjs` / `stop-signals.test.mjs` / `asked.test.mjs` / `classify-stop.test.mjs` / `measure-interventions.test.mjs` / `measure-execution-phase.test.mjs` / `measure-intervention-cost.test.mjs` 管各条确定性判据与两轮测量口径；`stop-verify-hook.test.mjs` / `analyze-hook-samples.test.mjs` 管 Stop hook 闸门与放行样本分析；`validate-run.test.mjs` / `install-watcher.test.mjs` / `replay-observe.test.mjs` 管运行图校验、自启动与回放；`claim-ledger.test.mjs` 管产出对账（期望 / 自述 / 磁盘 / transcript 四方交叉，含端到端 CLI 链）；`reconciliation-wiring.test.mjs` 管对账**有没有接进派发链路**（模板 / 角色定义 / SKILL.md 的 Phase E 前置门）；`observe-reality-check.test.mjs` 管写前闸在真实语料上的重放口径（窗口截断、沙箱分桶、fork 去重、计数与 decide 复算一致）。`compose-agent-prompt.test.mjs` 管提示词分层拼装（四层顺序、验收需求 × 工具白名单相容、停机条件可判定性、hash 台账与 transcript 对账）。
 
 全跑 `node --test scripts/`。**这个数字以该命令的输出为准**，`check-structure.mjs` 会把它与本文件、`README.md`、`CLAUDE.md` 里写的数字对账——写错了硬门会红。加测试后不需要手改这里，跑一次硬门就知道该改成多少。
 

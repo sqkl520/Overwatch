@@ -26,7 +26,48 @@ Overwatch 给这三件事可见性：扫全部 transcript → 判状态 → 只�
 ```bash
 git clone https://github.com/sqkl520/Overwatch.git
 cd Overwatch
-node scripts/scan-sessions.mjs --days 3
+node scripts/overwatch.mjs
+```
+
+`overwatch.mjs` 是**唯一入口**。不加参数跑的是自检：它在一秒内告诉你这台机器能干什么、缺什么、
+现在有没有任务在跑——只报**读到的事实**，不替你判通过。
+
+```
+overwatch doctor · 查 8 项前提 · 预算 1000ms（只查前提，不扫语料）
+[   0ms] node        v26.12.1 · 工具下限 18.20.4 满足 · 测试下限 20.16.0 满足
+[ 203ms] transcripts <home>/.claude/projects · 71 个（未完）项目 · 415 份 .jsonl（下限）
+[  39ms] sources     jobs 11 个 state.json · sessions 15 个 .json
+[   2ms] claude/     agents 12 个 · skills 1 个
+[  62ms] gate        mode=observe · brake=halt · marker=absent
+[ 409ms] watcher     启动器 在 · health 说 未认出
+[   1ms] platform    win32 · 桌面通知可用（Toast）
+[  80ms] plan        <run-id> · 进度 2/5 完成 · 1 失败 · 2 待认领
+合计 795ms / 预算 1000ms —— 前提齐了，可以跑 scan
+```
+
+然后：
+
+```bash
+node scripts/overwatch.mjs launch              # 起一个挂了 12 个角色的会话
+node scripts/overwatch.mjs launch --dry-run    # 先看它会挂什么，不执行
+node scripts/overwatch.mjs launch --verify     # 只验载荷挂对没有（不需登录）
+```
+
+**`launch` 最有用的一点：在你自己的项目里用它。** 载荷挂的是本仓库的 `.claude/`，
+工作目录是你的项目，所以你在自己的代码里干活，同时拿到 12 个角色和两条闸：
+
+```bash
+cd ~/your-project
+node /path/to/Overwatch/scripts/overwatch.mjs launch --cwd . --dry-run
+```
+
+不想用入口也行，四条原生命令等价（`overwatch.mjs` 只是路由到它们，不代跑）：
+
+```bash
+node scripts/scan-sessions.mjs --days 3        # 扫描：每个会话一行
+node scripts/oversight-tui.mjs                 # 面板：列表 → Enter 详情 → c 复制接力草稿
+node scripts/watch.mjs --inbox                 # 谁在等你
+node scripts/verify-claims.mjs --days 3        # 「AI 说它做完了」有没有证据
 ```
 
 真实输出格式（项目名已替换，行数与耗时随语料变化）：
@@ -154,7 +195,7 @@ Overwatch/
 
 新来的人从 [`docs/README.md`](docs/README.md) 开始——它按「你想知道什么」指路，并说清四类文档的可信度不同。
 
-改动后必跑 `node scripts/check-structure.mjs`（结构硬门）与 `node --test scripts/`（1537 条回归测试；**这个数字由硬门与实跑对账，写错即红**，所以照抄即可、不必手工数）。
+改动后必跑 `node scripts/check-structure.mjs`（结构硬门）与 `node --test scripts/`（1540 条回归测试；**这个数字由硬门与实跑对账，写错即红**，所以照抄即可、不必手工数）。
 
 ## 已知局限
 

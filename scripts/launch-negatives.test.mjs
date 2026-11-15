@@ -66,3 +66,36 @@ test('负向：--print 必须有真超时，且 host-timeout 分支可达', () =
   assert.doesNotMatch(src, /timedOut: false\s*\}\)/,
     '任何写死 timedOut: false 的调用点都是缺陷');
 });
+
+// ── `ask.mode` 的执行侧（2026-11-15）──────────────────────────────────
+//
+// 在此之前 `ask.mode: "always"` 只是 `overwatch.config.json` 里的一行字：
+// `question-audit.mjs` 只做**事后统计**，不改任何行为。实测 71% 的会话整场零提问，
+// 而配置说「必须问」——那是假承诺。
+//
+// 现在它为真的办法是 `--append-system-prompt`：把提问协议追加进系统提示。
+// hook 做不到这件事（`PreToolUse` 只能问「允许这次调用吗」，不能替模型发起提问）。
+
+test('ask.mode=never 时不得追加提问协议（配置项必须真的有执行侧）', () => {
+  const src = readFileSync(join(HERE, 'launch.mjs'), 'utf8');
+  assert.match(src, /function askProtocol/, 'askProtocol 必须存在——它是 ask.mode 的唯一执行侧');
+  assert.match(src, /if \(ask\.mode === 'never'\) return null/, 'never 必须短路');
+  assert.match(src, /hostArgs\.push\('--append-system-prompt', askPrompt\)/,
+    '协议必须真的进命令行，否则它只是文档里的一句话');
+});
+
+test('负向：把 ask 段从 configInfo 里丢掉，三种模式就全都加协议', () => {
+  // 这是我实际踩到的：`configInfo` 只返回 roster、把 ask 丢了，于是
+  // `askProtocol()` 收到 `{}`，`mode` 是 undefined，永远不等于 'never'。
+  // 三种模式全加协议，而配置里明明写着 never。
+  const src = readFileSync(join(HERE, 'launch.mjs'), 'utf8');
+  assert.match(src, /roster, ask,/, 'configInfo 必须把 ask 一起带回，否则 never 失效');
+});
+
+test('mode=never 时 maxQuestions 允许 0（否则「关掉提问」无法表达）', () => {
+  // 原来下限无条件是 1，于是 `{mode:"never", maxQuestions:0}` 被判 bad-range，
+  // 而写 1 又语义不通。校验器把合法配置判成非法，等于强迫用户填一个撒谎的数字。
+  const src = readFileSync(join(HERE, '..', 'scripts', 'question-audit.mjs'), 'utf8');
+  assert.match(src, /ask\.mode === 'never' \? 0 : 1/,
+    'never 模式下 maxQuestions 的下限必须是 0');
+});
