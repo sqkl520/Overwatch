@@ -23,7 +23,7 @@
 | 看某个命令怎么用（不执行） | `node scripts/scan-sessions.mjs --help` | 用法与退出码；0.4 秒返回，**不做任何扫描** |
 | 机器可读的同一份数据 | `node scripts/scan-sessions.mjs --json` | `sessions[]`，TUI 与下游脚本的输入 |
 | 透传宿主的 `needs` / `suggestedReply` | `node scripts/scan-sessions.mjs --days 3` | `[BLOCKED]` 行下面的「等待输入 / 建议回复」两行 |
-| 只列出**此刻在等你**的 | `node scripts/watch.mjs --inbox` | 后台已发现的等待/失败条目，带宿主原话 |
+| 只列出**此刻在等你**的 | `node scripts/watch.mjs --inbox` | 后台已发现的等待/失败条目，带宿主原话。**退出码**：0 = 确实没有要处理的；**3 = 空但守护进程没在跑**（这个「空」不可信，它会直说并给你拿到真实状态的命令） |
 | 面板：列表 → 详情 → 复制接力草稿 | `node scripts/oversight-tui.mjs` | 列表页按 `Enter` 进详情、按 `c` 复制草稿 |
 | 面板的纯文本快照（非 TTY / CI） | `node scripts/oversight-tui.mjs --plain` | 打印一次即退出，无 ANSI |
 | 把完成声明与支持它的工具调用配对 | `node scripts/verify-claims.mjs` | `SUPPORTED` / `STALE_ONLY` / `FAILED_ONLY` / `NO_EVIDENCE` / `UNKNOWN` |

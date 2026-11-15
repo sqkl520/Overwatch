@@ -11,7 +11,29 @@
 ## 2. 五分钟上手
 
 Node ≥ 18（**跑测试要 20.16+**，因为用了 `import.meta.dirname` 与 `process.getBuiltinModule`），
-零 npm 依赖，`package.json` 不存在。不需要安装、登录或配置。
+零 npm 依赖，`package.json` 不存在。**不需要安装、不需要配置。**
+
+**但「不需要登录」只对一部分能力成立**，这条以前写成了无条件的，是错的：
+
+| 能力 | 要不要登录 |
+|---|---|
+| `scan` / `verify` / `watch` / `tui` / 写前闸 / 收工闸 | **不要**。它们只读 transcript 与自己写的状态文件 |
+| `overwatch.mjs`（自检）、`launch --verify` | **不要**。`--verify` 让宿主列一下挂载清单，不跑推理 |
+| `launch`（真的起会话）、`launch --print` | **要**。它们要宿主发起推理，而没有凭据时宿主会拒 |
+
+没登录时 `launch` 不会装作跑过了：它自己判认证失败并 **exit 6**，还解释为什么
+不能转发宿主的判断（宿主会返回 `subtype: "success"` 配 `is_error: true`，光看前者会以为成功）。
+
+想知道自己属于哪种，先跑：
+
+```bash
+node scripts/overwatch.mjs          # 自检，不需要登录
+claude auth status --json           # loggedIn: true / false
+```
+
+> `auth status` 未登录时 **exit 1**（实测），所以退出码本身就能用。
+> 但**内容也要看**：`loggedIn` 是权威字段，退出码只是它的投影。
+> 这与 `subtype: "success"` 正好相反 —— 那个是**状态码说成功、内容说失败**。
 
 ### 命令 0：先自检（推荐从这里开始）
 

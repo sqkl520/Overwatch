@@ -11,7 +11,12 @@
 > **把「AI 说它做完了」变成一句可核对的断言。** 其余能力是围绕这件事的观测面。
 > 每一条能力对应的命令见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md)。
 
-零 npm 依赖（仓库里没有 `package.json`），只要 Node ≥ 18。不安装、不登录、不配置。
+零 npm 依赖（仓库里没有 `package.json`），只要 Node ≥ 18。**不安装、不配置。**
+
+「不登录」只对观测类能力成立：`scan` / `verify` / `watch` / `tui` / 两条闸 / `overwatch.mjs`
+自检 / `launch --verify` 都**不需要凭据**。只有 `launch`（真的起会话）要——它得让宿主发起推理。
+没登录时 `launch` 自己判认证失败并 **exit 6**，不会假装跑过了。详见
+[GUIDE 第 2 节](docs/GUIDE.md) 那张表。
 
 ---
 
