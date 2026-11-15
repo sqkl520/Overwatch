@@ -654,3 +654,4 @@ test('负向：把「is_error」判据删掉之后，subtype:success + is_error:
     assert.equal(r.status, 0, `退化后 is_error:true 拿到了 0：实际 ${r.status}\n${err}`);
   });
 });
+

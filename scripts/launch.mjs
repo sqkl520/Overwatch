@@ -89,6 +89,21 @@ const CONFIG_FILE = 'overwatch.config.json';
 const AUTH_TIMEOUT_MS = 20000;
 /** `--verify` 要宿主加载整个 plugin，本机实测 ~4 秒。 */
 const VERIFY_TIMEOUT_MS = 60000;
+/** `--print` 的上限。宿主的 print 模式可能永久挂住，而 `judgeHostRun` 早就写好了
+ *  `timedOut` 分支、只是**从来没有人传过它**（唯一调用点写死 `false`，那条分支不可达）。 */
+const PRINT_TIMEOUT_MS = Number(process.env.OVERWATCH_PRINT_TIMEOUT_MS) || 15 * 60 * 1000;
+
+/** 期望的 agent 清单的**兜底常量**（只在 git 不可用时用，见 `expectedAgents()`）。
+ *
+ *  它必须与 `.claude/agents/` 里已跟踪的 12 份角色定义一致。
+ *  **改角色定义时忘了改这里，`--verify` 会红** —— 那是提醒，不是噪音：
+ *  期望清单是验证的地基，地基变了就该有人看一眼。
+ */
+const AGENTS_EXPECTED = Object.freeze([
+  'oversight-acceptor', 'oversight-critic', 'oversight-executor', 'oversight-planner',
+  'oversight-probe', 'oversight-redteam', 'oversight-relay', 'oversight-repair',
+  'oversight-research', 'oversight-resolution', 'oversight-review', 'oversight-safety',
+]);
 
 /** 两条随仓库发布的 hook。它们**默认都是观测模式**（不设环境变量时只记账、不拦），
  *  所以默认挂上是安全的；`--no-hooks` 或下面的环境变量可以关掉。
@@ -226,15 +241,28 @@ function maskArgv(argv, opts) {
   return (Array.isArray(argv) ? argv : []).map((a) => maskPath(a, opts));
 }
 
+/** 深遮一个任意结构里的字符串。**给 `judge` 这种「整块塞进来」的对象用。 */
+function maskDeep(v, opts) {
+  if (typeof v === 'string') return maskPath(v, opts);
+  if (Array.isArray(v)) return v.map((x) => maskDeep(x, opts));
+  if (v && typeof v === 'object') {
+    const out = {};
+    for (const [k, x] of Object.entries(v)) out[k] = maskDeep(x, opts);
+    return out;
+  }
+  return v;
+}
+
 /** 载荷摘要。**判据来自 `build-payload.mjs` 的 `verifyPluginRoot()`**，不另写一份
- *  「布局对不对」的实现 —— 同一个问题有两份判据，两份必然漂移。 */
+ *  「布局对不对」的实现 —— 同一个问题有两份判据，两份必然漂移。
+ */
 function payloadInfo(root) {
   const dir = join(root, '.claude');
   let verdict = null;
   try {
     verdict = verifyPluginRoot({ root, dir });
   } catch (e) {
-    return { dir, ok: false, agents: [], skills: 0, name: null, reasons: [`校验抛错：${(e && e.message) || e}`] };
+    return { dir, ok: false, agents: [], expected: [], skills: 0, name: null, reasons: [`校验抛错：${(e && e.message) || e}`] };
   }
   let name = null;
   try {
@@ -248,7 +276,48 @@ function payloadInfo(root) {
     }
   } catch { /* 同上 */ }
   agents.sort();
-  return { dir, ok: verdict.ok, agents, skills: verdict.skills, name, reasons: verdict.reasons };
+  return {
+    dir, ok: verdict.ok, agents, expected: expectedAgents(root), skills: verdict.skills, name, reasons: verdict.reasons,
+  };
+}
+
+/** **期望的 agent 清单，取自一个独立于「宿主当前输出」的来源。**
+ *
+ *  为什么必须独立：`--verify` 原来的做法是拿 `readdirSync(.claude/agents/)` 当期望，
+ *  再去宿主输出里找这些名字。**期望与实有是同一份数据的两个投影** —— 挪走两个 agent，
+ *  期望也跟着变成 10，于是「10 个角色，逐个对上」exit 0。那不是验证，是照镜子。
+ *  验收实测：挪走 2 个仍然报「挂对了」。
+ *
+ *  现在的来源分级（**逐级降级，每级都写明来源，不假装**）：
+ *    1. `git ls-files .claude/agents/*.md` —— **已跟踪的文件**，独立于磁盘当前状态。
+ *       挪走一个未提交的文件，这份清单不变，差异立刻暴露。这是主路。
+ *    2. git 不可用（发布包 / 没有 .git）时，退到 `AGENTS_EXPECTED` 常量。
+ *    3. 两者都拿不到 → 返回 `null`，调用方必须**判为不可验证**（exit 非 0），
+ *       绝不允许「没有期望」被当成「全都对上了」。
+ *
+ *  @returns {string[]|null} null = 没有独立来源，无法验证
+ */
+function expectedAgents(root) {
+  // 1) git 跟踪的文件 —— 最硬的来源
+  try {
+    const r = spawnSync('git', ['ls-files', '--', '.claude/agents'], {
+      cwd: root, encoding: 'utf8', timeout: 5000, windowsHide: true,
+    });
+    if (r.status === 0 && typeof r.stdout === 'string') {
+      const list = r.stdout.split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l.endsWith('.md'))
+        .map((l) => basename(l, '.md'));
+      if (list.length) return [...new Set(list)].sort();
+    }
+  } catch { /* 没有 git，走下一级 */ }
+
+  // 2) 常量兜底。**只在没有 git 时用**，且它必须与仓库里的 12 份角色定义一致 ——
+  //    改角色定义时忘了改这里，`--verify` 会红，那是提醒，不是噪音。
+  if (AGENTS_EXPECTED.length) return [...AGENTS_EXPECTED].sort();
+
+  // 3) 什么都没有 —— 如实说「无法验证」，不许当成通过
+  return null;
 }
 
 /** 读 `overwatch.config.json` 的 roster。
@@ -328,7 +397,26 @@ function jsonIsError(text) {
 /** 认证相关的字样。**只收实测出现过、且不会误伤的**：
  *  本机宿主原话是 `Not logged in · Please run /login`；
  *  `--output-format stream-json` 的 assistant 消息带 `"error":"authentication_failed"`。 */
-const AUTH_RE = /Not logged in|Please run \/login|authentication_failed|Invalid API key|OAuth token (?:has )?expired/i;
+// **认证字样的清单必须盖住实测见到的每一种写法。** 原来只有五种，而本机网关返回的原话
+// 是 `Failed to authenticate. API Error: 401 认证失败: ...` —— 一个都不命中，于是
+// 认证失败被判成 exit 0、`judge.failed:false`，台账里记成「成功」。
+// 这不是理论缺口：那条文本是本机 `claude -p` 最常见的失败形态。
+const AUTH_RE = new RegExp([
+  'Not logged in',
+  'Please run \\/login',
+  'authentication_failed',
+  'Invalid API key',
+  'OAuth token (?:has )?expired',
+  // ↓ 2026-11-14 补：本机网关 / 第三方 provider 的写法
+  'Failed to authenticate',
+  '认证失败',
+  '缺少 Authorization',
+  // `401` 必须带 HTTP 语境。裸数字会误判 —— 实测 `Build succeeded in 401 packages`
+  // 会被当成认证失败，而那是完全正常的构建输出。
+  '\\b401\\s*(?:Unauthorized|认证)|(?:API|HTTP|status|Error)[^\\n]{0,8}\\b401\\b',
+  'unauthorized',
+  'invalid_api_key',
+].join('|'), 'i');
 
 /** 判一次 `-p` 运行。
  *
@@ -628,8 +716,12 @@ function ledgerEntry(p, { exitCode, judge, startedMs, nowMs, note }) {
       ? { mounted: false }
       : { mounted: true, ids: HOOKS.map((h) => h.id), settings: maskPath(p.settingsPath, opts) },
     exitCode,
-    judge: judge || null,
-    note: note || null,
+    // **`judge` 必须整体过一遍 `maskPath`。** 它的 `detail` 里会原样夹带宿主输出与
+    // 我们自己的错误消息 —— 实测漏出去两条：`Z:/nope/none.exe`（`--host-bin` 不存在的
+    // 情形）与 `<home>/AppData/Local/Temp/acc-r/hang.mjs`（超时那条）。
+    // 上面每个字段都逐个遮过，唯独 `judge` 是整块塞进来的，于是它成了唯一的缺口。
+    judge: judge ? maskDeep(judge, opts) : null,
+    note: note ? maskPath(note, opts) : null,
   };
 }
 
@@ -693,16 +785,46 @@ function runVerify(p) {
   const out = String(r.stdout || '');
   const err = String(r.stderr || '');
   const body = `${out}\n${err}`;
-  const missing = p.payload.agents.filter((a) => !body.includes(a));
+
+  // **期望清单必须独立于宿主输出。** `expected` 来自 git 跟踪的文件（或兜底常量），
+  // 而 `body` 是宿主说的。拿磁盘上「现在有几个」当期望是照镜子 ——
+  // 挪走两个 agent 期望也跟着少两个，于是「10 个，逐个对上」exit 0。
+  const expected = p.payload.expected;
   const spawnFailed = Boolean(r.error);
-  const ok = !spawnFailed && r.status === 0 && p.payload.agents.length > 0 && missing.length === 0;
+
+  // **没有独立期望 = 无法验证**，不是通过。这一支比「缺名字」更重要：
+  // 一个拿不到真源的验证器说「通过了」，比它说「我不知道」坏得多。
+  if (!spawnFailed && !Array.isArray(expected)) {
+    const text = '无法验证：拿不到独立的期望清单（git 不可用，且兜底常量为空）—— 这是「不知道」，不是「通过」';
+    return { ok: false, text, code: EXIT.HOST, judge: { failed: true, kind: 'verify-no-expectation', detail: text }, raw: body };
+  }
+
+  // 宿主实际报了几个（解析它自己的计数行），与期望数对比 —— 这是第二道正交判据。
+  // 名字对得上但数量不对，说明宿主在别处多挂了东西。
+  const declared = (() => {
+    const m = body.match(/Agents\s*\((\d+)\)/i);
+    return m ? Number(m[1]) : null;
+  })();
+
+  const missing = (expected || []).filter((a) => !body.includes(a));
+  const extra = p.payload.agents.filter((a) => expected && !expected.includes(a));
+  const ok = !spawnFailed
+    && r.status === 0
+    && Array.isArray(expected) && expected.length > 0
+    && missing.length === 0
+    && extra.length === 0
+    && (declared === null || declared === expected.length);
+
   const text = spawnFailed
     ? `宿主跑不起来（${r.error.code || r.error.message}）：${p.hostBin}`
     : ok
-      ? `载荷挂对了：宿主自己列出 ${p.payload.agents.length} 个角色，逐个对上（不需要推理与认证）`
+      ? `载荷挂对了：宿主列出 ${declared === null ? expected.length : declared} 个角色，与 git 跟踪的 ${expected.length} 个逐个对上（不需要推理与认证）`
       : [
         `载荷没挂全（宿主退出码 ${String(r.status)}）`,
         missing.length ? `宿主清单里缺：${missing.join(', ')}` : null,
+        extra.length ? `磁盘上有但 git 里没有（多出来的不会进发布包）：${extra.join(', ')}` : null,
+        declared !== null && Array.isArray(expected) && declared !== expected.length
+          ? `宿主报 ${declared} 个，期望 ${expected.length} 个` : null,
         r.status !== 0 && body.trim() ? `宿主说：${body.trim().split('\n')[0].slice(0, 200)}` : null,
       ].filter(Boolean).join(' · ');
   return { ok, text, code: ok ? EXIT.OK : EXIT.HOST, judge: { failed: !ok, kind: ok ? 'verified' : 'verify-failed', detail: text }, raw: body };
@@ -835,6 +957,28 @@ async function launchMain(argv, { json = false, nowMs = Date.now() } = {}) {
     if (proc.stderr) proc.stderr.on('data', (d) => { err += d; process.stderr.write(d); });
     proc.on('error', (e) => finish({ code: null, out, err, spawnError: true, spawnReason: e && e.code }));
     proc.on('close', (code, signal) => finish({ code, out, err, signal }));
+
+    // **`--print` 必须有超时。** 原来 `judgeHostRun` 的 `timedOut` 参数唯一调用点写死
+    // 了 `false`，于是 `host-timeout` 那条分支永远不可达 —— 宿主挂住时本命令会一起挂着，
+    // 实测要靠外层工具才停得下来。用户看到的是一动不动，分不清「在跑」和「死了」。
+    // 交互式**不加**超时：那是用户自己在里面干活，挂多久是他的事。
+    if (plan.mode === 'print') {
+      const killer = setTimeout(() => {
+        if (settled) return;
+        // Windows 上 `kill()` 只杀直接子进程，孙进程会留在那里继续烧 token。
+        // `taskkill /T` 杀整棵树。
+        try {
+          if (process.platform === 'win32') {
+            spawnSync('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+          } else {
+            try { process.kill(-proc.pid, 'SIGKILL'); } catch { proc.kill('SIGKILL'); }
+          }
+        } catch { /* 杀不掉也别让本命令崩 —— 下面的 finish 已经能交代清楚 */ }
+        finish({ code: null, out, err, timedOut: true, signal: 'TIMEOUT' });
+      }, PRINT_TIMEOUT_MS);
+      killer.unref?.();
+      proc.on('close', () => clearTimeout(killer));
+    }
   });
 
   // 交互式的输出已经进了终端（stdio: inherit），这里没有东西可转发；
@@ -847,7 +991,7 @@ async function launchMain(argv, { json = false, nowMs = Date.now() } = {}) {
     judge = { failed: true, kind: 'spawn-failed', detail: `宿主起不来：${child.spawnReason || child.err}` };
     code = EXIT.HOST;
   } else if (plan.mode === 'print') {
-    judge = judgeHostRun({ code: child.code, out: child.out, err: child.err, timedOut: false });
+    judge = judgeHostRun({ code: child.code, out: child.out, err: child.err, timedOut: child.timedOut === true });
     code = !judge.failed ? EXIT.OK : (judge.kind === 'auth' ? EXIT.AUTH : EXIT.HOST);
   } else {
     // 交互式：输出直接进了终端，本命令读不到。**不把「交出去了」说成「成功了」。**
@@ -895,4 +1039,4 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import
 /** 唯一的导出。名字叫 `main` 是**有意的**：结构硬门的「未登记导出」提示把 `main`
  *  当已知的 CLI 入口（它在 INTENTIONALLY_PROBED_FREE 里），所以本文件不会因为
  *  「多了一个导出」而给硬门添提示。`overwatch.mjs` 用 `import { main as launchMain }`。 */
-export { launchMain as main };
+export { launchMain as main, AUTH_RE, expectedAgents, maskDeep };

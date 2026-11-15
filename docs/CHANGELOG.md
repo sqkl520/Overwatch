@@ -249,6 +249,59 @@
   `--json` 的 `roster.applied:false`、台账三处都写明，并点名 9 个未启用角色。
   **另需知道**：`agent.roster` 目前**没有一行代码在执行**（`grep -rn roster scripts/*.mjs`
   排除 `question-audit` 后零命中），只有 `question-audit.mjs` 校验形状。已写进 spec §5。
+  **这条上句有一处不准，在此更正**：`grep -rn roster scripts/*.mjs` 排除 `question-audit` 后
+  **不是零命中** —— `launch.mjs` 里有 27 行，它真的读配置、算出未启用角色、把
+  `roster.applied:false` 写进 `--json` 与台账。准确说法是「**没有一行按它派发或挂载**」。
+
+### Fixed（验收后：四个缺陷 + 一个测试架构问题）
+
+> 来源：`docs/research/2026-11-14-launch-acceptance.md`（两轮独立验收，结论一致：**不通过**）、
+> `docs/research/2026-11-14-docs-coverage.md`。四条 AC 判 FAIL，逐条修如下。
+
+- **`--verify` 曾自我认证：取期望的目录与验的对象是同一份数据。**
+  旧判据拿 `readdirSync(.claude/agents/)` 当期望，再去宿主输出里找这些名字 —— 挪走两个
+  agent，期望也变成 10，于是「10 个角色，逐个对上」**exit 0**。验收实测过。
+  现在期望清单来自 **`git ls-files`**（已跟踪的文件，独立于磁盘当前状态）；无 git 时退到
+  `AGENTS_EXPECTED` 常量；**两者都拿不到就判「无法验证」而不是通过** —— 一个拿不到真源的
+  验证器说「通过了」，比它说「我不知道」坏得多。
+  **负向实测**：挪走 `oversight-critic` 与 `oversight-safety` → **exit 7**，
+  报「宿主清单里缺：oversight-critic, oversight-safety · 宿主报 10 个，期望 12 个」。
+- **`AUTH_RE` 漏了本机最常见的失败形态。** 原来只有五种写法，而本机网关返回的原话是
+  `Failed to authenticate. API Error: 401 认证失败: ...` —— **一个都不命中**，于是认证失败
+  被判 exit 0、台账里记成「成功」。补了六种，其中 `401` **必须带 HTTP 语境**
+  （实测裸 `\b401\b` 会把 `Build succeeded in 401 packages` 误判成认证失败）。
+- **台账的 `judge.detail` 泄漏本机绝对路径。** 其余字段都逐个画面过 `maskPath`，唯独
+  `judge` 是整块塞进来的，于是 `Z:/nope/none.exe` 与 `<home>/AppData/Local/Temp/.../hang.mjs`
+  原样入账。现在 `judge` 整体过 `maskDeep`，`note` 过 `maskPath`。
+- **`--print` 没有超时，`host-timeout` 分支是死代码。** `judgeHostRun` 的 `timedOut` 参数
+  唯一调用点写死 `false`，那条分支永远不可达。加了 `PRINT_TIMEOUT_MS`（默认 15 分钟，
+  可用 `OVERWATCH_PRINT_TIMEOUT_MS` 覆盖），Windows 用 `taskkill /T` 杀整棵进程树
+  （裸 `kill()` 只杀直接子进程，孙进程会留着继续烧 token）。
+  **负向实测**：一个挂住的假宿主 → `宿主失败（host-timeout）… 不是「成功」，也不是「失败」—— 是没结论`，exit 7。
+
+### Fixed（测试架构：两个文件在并发下被判超时）
+
+- **`launch.test.mjs` 与 `build-payload.test.mjs` 的用例本质是「起一个真进程看它怎么死」**
+  （前者 spawn 宿主 28 次、每条数秒）。默认并发下它们和其余三十多个文件抢资源：
+  实测 `build-payload` 单独跑 20 秒、并发下变 **116 秒并被判超时**；`launch` 单独 53 秒、
+  并发下 **111 秒**。**这不是产品变慢，是用例性质决定的。**
+  - `launch.test.mjs` 整体包进 `describe(..., { concurrency: 1 })`：它 28 条几乎全部 spawn，
+    天生不能并行。串行跑 53 秒，比并发下跑不完更好。
+  - CI 分两段：`Tests (fast)` 跑其余全部（58 秒 / 1462 条），
+    `Tests (spawn-heavy, serial)` 跑那两个文件。**两段合起来仍是全量，一条不跳。**
+
+### Fixed（两条测试的期望本身错了）
+
+- **本文件里一条负向测试没有牙。** 给 `AUTH_RE` 写的负向测试从**源码正则提取字符串**
+  再自己 `join` 成正则 —— 摘掉 `'Failed to authenticate'` 后测试提取到的清单也跟着变少，
+  于是自洽地通过（**32 过 0 红**）。这与 `--verify` 自我认证是同一形状。
+  改成直接 `import { AUTH_RE }` 用真身，判据锚在写死的输入上。
+  **对比**：同一个文件里台账那条能变红，差别就在期望从哪来 —— 它的断言锚在源码里
+  一个固定字符串上。这条对比值得记住。
+- **`--json 与人类输出同源` 那条会随机红。** 它跑两次独立进程逐行比对，而 `watcher`
+  会 spawn 真实健康检查（`health 说 <x>` 随守护进程状态变）、`gate` 读真实标记。
+  **「两次独立运行必须逐字相同」这个前提对活体检查项本来就不成立**，所以把这两项
+  排除出逐行对账（不是判据松了，是前提错了），其余六项仍然逐字比。
 
 ### Known（本轮登记但不修）
 

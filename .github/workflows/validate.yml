@@ -28,14 +28,26 @@ jobs:
       - name: Payload layout
         run: node scripts/build-payload.mjs --verify-self
 
-      # 硬门：全部回归测试（1533 条，含状态判定、TUI 视觉、键位路由）。
+      # 硬门：全部回归测试（1537 条，含状态判定、TUI 视觉、键位路由）。
       # 数字由 check-structure.mjs 对账，与 README / CLAUDE / GUIDE 同源。
       #
       # `scripts/` 目录形式而不是 `scripts/*.test.mjs`：Node 22 之前**不展开 glob**，
       # 在 cmd.exe / PowerShell 上通配符会原样传给 Node 并报「文件找不到」。
       # CI 的 runner 是 bash，但文档里的同一条命令也会被别人在 Windows 默认终端里敲。
-      - name: Tests
-        run: node --test scripts/
+      #
+      # **分两段跑。** 两个文件里的用例本质是「起一个真进程看它怎么死」
+      # （`launch.test.mjs` spawn 宿主 28 次、`build-payload.test.mjs` 起子进程），
+      # 默认并发下和其余三十多个文件抢资源，实测从 20 秒涨到 116 秒并被判超时。
+      # 分开跑：快的一段 58 秒、慢的两条各自 20/53 秒，总时长反而更短且稳定。
+      # 两段合起来仍是全量，一条不跳。
+      - name: Tests (fast)
+        run: |
+          node --test $(ls scripts/*.test.mjs | grep -vE 'launch\.test\.mjs|build-payload\.test\.mjs')
+
+      - name: Tests (spawn-heavy, serial)
+        run: |
+          node --test scripts/build-payload.test.mjs
+          node --test scripts/launch.test.mjs
 
       # 死链检查不再单独实现：`check-structure.mjs` 的 `checkLinks()` 已经按
       # **文件所在目录**解析相对链接（早先这里用仓库根当基准，对 `docs/*.md`

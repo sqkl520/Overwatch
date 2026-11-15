@@ -372,10 +372,21 @@ test('--json 与人类输出出自同一份数据（字段全在、且逐项对�
       `人类输出 ${humanRows.length} 行 vs JSON ${data.steps.length} 个 step`);
     // 逐行对账：每个 step 的 text 必须**就是**那一行正文。任何人给人类输出
     // 另写一套散文，这条就红。
+    //
+    // **但要排除读活体状态的那几项。** 这条测试跑两次独立进程，而：
+    //   · `watcher` 会 spawn 真实的 `watch.mjs --health`，`health 说 <x>` 随守护进程
+    //     状态变；它还会打印 `%LOCALAPPDATA%` 路径。两次运行本来就不会一致。
+    //   · `gate` 读真实的闸门标记，标记存在与否会变。
+    // 把它们排除**不是因为判据松了**，是因为「两次独立运行必须逐字相同」这个前提
+    // 对活体检查项本来就不成立。同一份 facts 渲染成两种形态——那是 `--json` 内部的事，
+    // 由「JSON 与人类输出都从 report 这一个对象渲染」这段代码保证。
+    const VOLATILE = new Set(['watcher', 'gate']);
     for (let i = 0; i < humanRows.length; i++) {
       const text = humanRows[i].replace(/^\[\s*\d+ms\]\s*\S+\s*/, '').trim();
-      assert.equal(data.steps[i].text, text, `第 ${i + 1} 行人类输出与 JSON 的 text 不一致（两套渲染）`);
-      assert.ok(typeof data.steps[i].ms === 'number', `step ${data.steps[i].id} 缺 ms`);
+      const step = data.steps[i];
+      assert.ok(typeof step.ms === 'number', `step ${step.id} 缺 ms`);
+      if (VOLATILE.has(step.id)) continue;
+      assert.equal(step.text, text, `第 ${i + 1} 行（${step.id}）人类输出与 JSON 的 text 不一致（两套渲染）`);
     }
     // summary.line 也必须出现在人类输出的最后一行里 —— 两者是同一句话。
     assert.ok(human.out.includes(data.summary.line), `人类输出的结论行应来自 summary.line：\n${human.out}`);
