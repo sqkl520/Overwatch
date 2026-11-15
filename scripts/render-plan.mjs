@@ -842,7 +842,10 @@ function parseArgv(argv) {
   return out;
 }
 
-function main(argv) {
+/** 进程内调用入口。`overwatch.mjs plan` 转发到这里，而不是打印一条要用户自己复制的命令
+ *  —— 那个入口存在的理由就是「干净 clone 上不知道第一条命令该跑什么」。
+ *  **同步**：它只读盘与格式化，不 await 任何东西；调用方据此直接拿返回值当退出码。 */
+export function main(argv) {
   const args = parseArgv(argv);
   if (args.help) { console.log(HELP); return 0; }
   const runsDir = resolve(String(args['runs-dir'] || join(ROOT, 'tasks', 'runs')));

@@ -301,7 +301,6 @@ for (const [cmd, native] of [
   ['verify', 'scripts/verify-claims.mjs'],
   ['tui', 'scripts/oversight-tui.mjs'],
   ['watch', 'scripts/watch.mjs'],
-  ['plan', 'scripts/render-plan.mjs'],
 ]) {
   test(`ro 路由：${cmd} 说「未实现」并给出 ${native}`, () => {
     const r = run([cmd]);
@@ -313,6 +312,16 @@ for (const [cmd, native] of [
   });
 }
 
+// `plan` 与上面四个不同：渲染器**已经存在**，且 doctor 的第 8 项就在用它。
+// 所以它转发而不是打印 —— 这条测的是「它真的执行了」，而不是「它说自己没实现」。
+test('ro 路由：plan 真的转发到 render-plan.mjs（不再自称未实现）', () => {
+  const r = run(['plan']);
+  assert.notEqual(r.code, 4, `plan 已实现，不该再返回「未实现」的 exit 4：\n${r.out}`);
+  assert.ok(!/未实现/.test(r.out), `plan 不得再自称未实现（doctor 已在用同一个 renderPlan）：\n${r.out}`);
+  // 转发成功的判据：拿到 render-plan 的真实产物，而不是帮助文本或错误。
+  assert.match(r.out, /^PLAN |^没有|^读不出/m, `plan 应给出渲染器的真实输出：\n${r.out}`);
+});
+
 test('路由会保留目标命令的参数，且不重复自己已经印过的同名参数', () => {
   const r = run(['scan', '--days', '1']);
   assert.equal(r.code, 4);
@@ -322,14 +331,8 @@ test('路由会保留目标命令的参数，且不重复自己已经印过的�
   assert.match(r.out, /不会执行/, '必须说明本入口不执行它');
 });
 
-test('plan 在渲染器不存在时明确说「还没做」', () => {
-  const r = run(['plan']);
-  assert.equal(r.code, 4);
-  // 渲染器已存在时这条分支不该出现；它存在就跳过（另一 Agent 交付后这里会自动变成路由）
-  if (!r.out.includes('还没做')) {
-    assert.ok(!/scripts\/render-plan\.mjs 还没有/.test(r.out), '渲染器存在时不该说它不存在');
-  }
-});
+// 这条原本测的是「渲染器不存在时 plan 说还没做」。渲染器现在存在、且 `plan` 已经转发
+// （见上面那条「plan 真的转发」），这个前提不再成立，留着它只会测到一个不存在的分支。
 
 // ── 5. --json 与人类输出同源 ─────────────────────────────────────────
 

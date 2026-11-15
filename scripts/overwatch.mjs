@@ -798,10 +798,13 @@ const ROUTES = {
     why: '`--inbox` 只读通知历史，首跑必空 —— 那是历史为空，不是宿主没有 blocked 会话。',
   },
   plan: {
-    // 渲染器由另一个 Agent 在做，可能还不存在 —— 不存在就直说「还没做」。
+    // 渲染器已经存在，且 doctor 的第 8 项就在用它（`renderPlan()` 本体，不是另写统计）。
+    // 这里此前写的是「渲染器还没做」，与 doctor 的输出自相矛盾 —— 同一仓库对同一件事
+    // 说了两句话。现在 `plan` 直接转发。
     native: ['node scripts/render-plan.mjs'],
-    why: '计划渲染器还没做；它一旦存在，这里改成直接转发。',
+    why: '渲染器已经存在；doctor 的第 8 项就是调它的 `renderPlan()`。',
     probe: 'scripts/render-plan.mjs',
+    forward: true,
   },
 };
 
@@ -975,6 +978,23 @@ function main(argv) {
   }
 
   if (Object.prototype.hasOwnProperty.call(ROUTES, cmd)) {
+    // `forward: true` 的路由**真的转发**，不打印命令。这是本入口与原生脚本的分工差异：
+    // 它存在的理由是「干净 clone 上不知道第一条命令该跑什么」，打印一条要用户自己复制的
+    // 命令解决不了那个问题。只有那些**尚未实现**（或需要用户先做别的准备）的路由才只印。
+    if (ROUTES[cmd].forward) {
+      return import('./render-plan.mjs')
+        .then((m) => {
+          if (typeof m.main !== 'function') {
+            process.stderr.write('render-plan.mjs 没有导出 main()，本入口无法转发\n');
+            return EXIT.INTERNAL;
+          }
+          return m.main(parsed.rest);
+        })
+        .catch((e) => {
+          process.stderr.write(`overwatch plan 自己出了意外（这是 bug，不是环境问题）：${(e && e.stack) || e}\n`);
+          return EXIT.INTERNAL;
+        });
+    }
     const text = renderRoute(cmd, parsed.rest);
     // 一次写完。分成「正文 + 单独一次 '\n'」两次写会让 `cat -A` 看到一个空行 ——
     // 不是致命缺陷，但输出面的每个字节都该是有意的。

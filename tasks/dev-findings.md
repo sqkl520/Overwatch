@@ -318,4 +318,34 @@
   验收标准的 R7 是**修完之后才要核**的条目，不是本次的修复目标。
 - **建议归属**：独立任务，与标题统一（§2.1 的标签真源）一起做。
 
+### DF-025 [open] 入口判断不解析符号链接 —— 经 `npm link` 安装后静默不执行
+
+- **发现于**：2026-11-16 可用性侦察，复核「陌生人的分发路径」时实测
+- **位置**：17 个 `scripts/*.mjs` 的同一行：
+  `if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url)))`
+- **证据**：在仓库内建真实目录符号链接（`mklink /D`，与 `npm link` 同形态）后执行：
+
+  ```
+  argv1          : D:\...\symtest\link\m.mjs
+  import.meta.url: D:\...\symtest\real\m.mjs
+  resolve 比较   : false      ← 当前实现
+  realpath 比较  : true       ← 修复后
+  ```
+
+  根因：`resolve()` 只做路径规范化，**不解析符号链接**；而
+  `fileURLToPath(import.meta.url)` 拿到的已经是 Node 解析过的真实路径。
+  一边解析过、一边没有，必然不等。
+- **影响**：`npm link` / `npm install -g .` / pnpm（整个存储模型就是符号链接）
+  在 Windows 与 Linux 上都建目录符号链接。所以这个仓库**无法作为一种「全局命令」交付**，
+  而断法是最隐蔽的一种：不报错，只是什么都不做、exit 0。
+  这是分发路径里唯一一条「现在就断了」的路，而它恰好是陌生人最期待的形态。
+- **需要什么**：改用 `realpathSync`，并防御性处理「路径不存在会抛」。
+  抽共享函数 vs 逐文件改要权衡：`pre-write-gate.mjs` / `stop-verify-hook.mjs`
+  被 hook 频繁调用，fast exit 路径上多一次模块解析是有代价的。
+- **测试约束**：Windows 建符号链接需要权限。测试若因 `EPERM` 而 `skip`，
+  必须写清原因并**不能假装通过**——一个在 CI 里静默跳过的测试等于没有测试。
+- **为什么之前没发现**：扩展名判断、路径正则、`import.meta.dirname` 三条路都被
+  考虑过并否掉了（注释「用『解析后的路径相等』而不是文件名正则」记录了理由），
+  但没有人问过「这个相等关系在符号链接下还成立吗」。
+
 _（新增条目追加在此行上方）_
