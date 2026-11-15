@@ -426,17 +426,23 @@ export function truncateDisplay(str, width) {
   const max = Math.floor(Number(width));
   if (!Number.isFinite(max) || max <= 0) return '';
   const s = String(str ?? '');
-  // 回退版：每追加一个字符就重算整个前缀
-  if (displayWidth(s) <= max) return s;
+  const units = measure(s);
+  let total = 0;
+  for (const u of units) total += u.width;
+  if (total <= max) return s;
   if (max === 1) return '…';
+
+  const limit = max - 1;          // 留 1 列给省略号
+  let used = 0;
+  let sawAnsi = false;
   let out = '';
-  let styled = false;
-  for (const ch of s) {
-    if (ch === '\x1b') { styled = true; out += ch; continue; }
-    if (displayWidth(out + ch) > max - 1) break;
-    out += ch;
+  for (const unit of units) {
+    if (unit.ansi) { out += unit.text; sawAnsi = true; continue; }
+    if (used + unit.width > limit) break;
+    out += unit.text;
+    used += unit.width;
   }
-  return out + '…' + (styled ? RESET : '');
+  return out + '…' + (sawAnsi ? RESET : '');
 }
 
 /**
