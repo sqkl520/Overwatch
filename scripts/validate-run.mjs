@@ -44,6 +44,19 @@ export const SHAPES = Object.freeze(['artifact', 'exploration', 'hybrid']);
  *  判 `NO-EXPECTATION`（CLAUDE.md 硬约束 8：未声明产出形态视为规划缺陷）。 */
 export const SHAPES_REQUIRING_OUTPUTS = Object.freeze(['artifact']);
 
+/** `subtrees[].on_dependency_failed` 的合法取值。缺省 = `block`。
+ *
+ *  `block`：前置失败/卡住时本子树判 `UPSTREAM_FAILED`，等前置被处置。
+ *  `degrade`：前置倒了也照样开工——「我要的是那批数据，拿不到就用手上这些」。
+ *
+ *  **为什么必须有 `degrade`**：research / critic 型子树的输入往往只是「素材之一」，
+ *  一个不相关的失败前置能把整条研究线永久冻住，而它其实完全能产出。没有这个开关，
+ *  `on_dependency_failed` 的默认严格性会把「诚实」变成「僵死」。
+ *
+ *  非枚举值**报错而不是回落**：拼错成 `"degraded"` 时静默当 `block` 处理，
+ *  规划者的意图与校验器的行为就会长期不一致，而屏幕上两个状态长得一样。 */
+export const ON_DEP_FAILED = Object.freeze(['block', 'degrade']);
+
 /** 相对路径判据。返回错误描述，合法时返回 null。
  *
  *  为什么在派发图这一层就拦，而不是等派发出去再让 claim-ledger 报：
@@ -121,6 +134,53 @@ export function checkOutputs(st) {
   return { errors, warnings, okPaths };
 }
 
+/** 依赖图环检测。返回**成环的子树 id 列表**（按图序、去重），有环时非空。
+ *
+ *  **为什么必须在派发前判死**：`render-plan.mjs` 把「没派过的子树」按前置状态分成
+ *  `WAITING_ON` / `PENDING` / `UPSTREAM_FAILED`。这套判据在无环图上必然收敛，
+ *  但在环上不收敛 —— `A 等 B、B 等 A` 两边都会判 `WAITING_ON`，谁也不在
+ *  `ATTENTION` 里，于是**两件事都永远没人处理，而且屏幕上看起来一切正常**。
+ *  渲染器那边有一道防御性深度上限，但那只能不让它挂住，救不回被吞掉的待办。
+ *  「没人管」必须在图进入系统的那一刻就被判死，不能等到渲染时才降级。
+ *
+ *  只走 `depends_on`（有向边 A→B 表示 A 依赖 B）。`parallel_with` 是无向的
+ *  并列关系，成环对它没有意义。
+ *
+ *  实现用三色 DFS（0 未访问 / 1 在栈上 / 2 已完成）：`1` 是回边的判据。
+ *  递归深度就是最长链长，而 `validate-run` 的输入是一张手写的小图，
+ *  不为它改成迭代——真需要时环检测早就先报了。 */
+export function checkDependencyCycles(subtrees) {
+  const nodes = new Map();
+  for (const st of Array.isArray(subtrees) ? subtrees : []) {
+    if (!st || typeof st.id !== 'string') continue;
+    nodes.set(st.id, Array.isArray(st.depends_on) ? st.depends_on.filter((d) => typeof d === 'string') : []);
+  }
+  const color = new Map(); // id → 0/1/2
+  const inCycle = new Set();
+
+  const visit = (id, pathStack) => {
+    const c = color.get(id) || 0;
+    if (c === 2) return;
+    if (c === 1) {
+      // 回边：栈上从 id 起到当前的全部节点都在环里（这是最小环，报它最有指向性）
+      const at = pathStack.indexOf(id);
+      for (const x of pathStack.slice(at)) inCycle.add(x);
+      return;
+    }
+    color.set(id, 1);
+    pathStack.push(id);
+    for (const dep of nodes.get(id) || []) {
+      if (nodes.has(dep)) visit(dep, pathStack);
+    }
+    pathStack.pop();
+    color.set(id, 2);
+  };
+
+  for (const id of nodes.keys()) if (!color.get(id)) visit(id, []);
+  // 按图序返回，输出稳定 —— 否则同一次图的错误列表会随 Map 迭代顺序漂移
+  return [...nodes.keys()].filter((id) => inCycle.has(id));
+}
+
 export function validateGraph(graph, { requireComplex = false } = {}) {
   const errors = [];
   const warnings = [];
@@ -177,6 +237,13 @@ export function validateGraph(graph, { requireComplex = false } = {}) {
       }
     }
 
+    // `on_dependency_failed` 是**选填**（缺省 block），但一旦写了就必须是枚举值。
+    // 非法值不回落成 block：那会让「拼错」与「明确要求严格」在屏幕上同形。
+    if (st.on_dependency_failed !== undefined && !ON_DEP_FAILED.includes(st.on_dependency_failed)) {
+      err(`${p}.on_dependency_failed`,
+        `"${st.on_dependency_failed}" 不在合法取值内（${ON_DEP_FAILED.join(' / ')}；不写等于 block）`);
+    }
+
     if (!Array.isArray(st.acceptance) || !st.acceptance.length) {
       // CLAUDE.md 硬约束 4：验收标准必须预先声明
       err(`${p}.acceptance`, '必须是非空数组——验收标准不能事后编');
@@ -223,6 +290,16 @@ export function validateGraph(graph, { requireComplex = false } = {}) {
       } else outputOwners.set(k, st.id);
     }
   });
+
+  // ── 依赖成环 ──────────────────────────────────────────────────────
+  // 悬空引用与自引用已经在上面逐条报过；这里查的是**引用都合法但互相等**。
+  // 那比悬空更坏：图上每条边都能在 id 表里对上，看起来完全正常，而实际
+  // 没有任何一条能先开始（详见 checkDependencyCycles 的注释）。
+  const cyclic = checkDependencyCycles(graph.subtrees);
+  if (cyclic.length) {
+    err('subtrees', `depends_on 成环：${cyclic.join(' → ')} —— 环上每一条都会永远「等前置」，`
+      + '没有任何一条能先开始，会一起静默停在屏幕外。断环后再派发。');
+  }
 
   // 复杂度约束
   const caps = graph.subtrees.map((s) => s && s.capability);

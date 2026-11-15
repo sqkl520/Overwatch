@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 
 import {
   META_TAIL_BYTES, createMetaCache, metaFromRecords, readTailRecords,
-  transcriptPathFor, lastSpeakerOf, pendingQuestionOf,
+  transcriptPathFor, lastSpeakerOf, pendingQuestionOf, askedVerdictOf,
 } from './tui-meta.mjs';
 
 // ── transcriptPathFor ─────────────────────────────────────────────────
@@ -112,12 +112,33 @@ test('pendingQuestionOf：只有「助手问、之后没人说话」才算问了
   assert.equal(pendingQuestionOf([ask], { text: '' }), null, '空文本');
 });
 
-test('metaFromRecords：question 字段与 lastSpeaker 一致（助手问句才填）', () => {
+test('metaFromRecords：questionText 与 lastSpeaker 一致（助手问句才填）', () => {
   const ask = rec({ type: 'assistant', message: { content: [{ type: 'text', text: '继续吗？' }] } });
-  assert.ok(metaFromRecords([ask]).question, '助手问句应被识别');
+  // 元数据里**只有原始事实**（`questionText` / `questionAt` / `questionContinued`），
+  // 没有成品 `question` 字段：判定要过四道时间门，取决于调用时刻，不能进 mtime 缓存。
+  // 判定在 `askedVerdictOf()` 里现算，见 `oversight-tui.viewOf`。
+  assert.ok(metaFromRecords([ask]).questionText, '助手问句应被识别');
+  assert.equal(metaFromRecords([ask]).question, undefined, '元数据不该有成品判定字段');
   const back = rec({ type: 'user', message: { content: [{ type: 'text', text: '继续吗？' }] } });
-  assert.equal(metaFromRecords([back]).question, null, '真人问句不该算「它在等我回答」');
+  assert.equal(metaFromRecords([back]).questionText, null, '真人问句不该算「它在等我回答」');
 });
+
+test('askedVerdictOf：与 asked.mjs 同源的四道门（负向：摘掉时间门会变红）', () => {
+  const nowMs = Date.parse('2026-11-16T12:00:00Z');
+  const at = (hoursAgo) => new Date(nowMs - hoursAgo * 3600e3).toISOString();
+  const mk = (hoursAgo) => ({
+    questionText: '继续吗？', questionAt: at(hoursAgo), questionContinued: null,
+  });
+  // 刚问完（< minHours）：先别催 —— 这正是 TUI 曾经漏掉的那道门
+  assert.equal(askedVerdictOf(mk(0.2), { nowMs }).keep, false);
+  assert.equal(askedVerdictOf(mk(0.2), { nowMs }).why, 'too-recent');
+  // 太久（> maxHours）：别催了 —— `asked.mjs:280` 记录的 244 小时假阳性
+  assert.equal(askedVerdictOf(mk(240), { nowMs }).keep, false);
+  assert.equal(askedVerdictOf(mk(240), { nowMs }).why, 'too-old');
+  // 中间窗口：过门后交给 `assessAsked`，no-question 时不该 keep
+  assert.equal(askedVerdictOf({ questionAt: null }, { nowMs }).keep, false);
+});
+
 
 // ── readTailRecords（真实临时文件）──────────────────────────────────
 

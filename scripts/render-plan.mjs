@@ -60,6 +60,7 @@ import { fileURLToPath } from 'node:url';
 import { probeDisk, reconcile, readLedger } from './claim-ledger.mjs';
 import { readPromptLedger } from './compose-agent-prompt.mjs';
 import { truncateDisplay } from './tui-theme.mjs';
+import { checkDependencyCycles } from './validate-run.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -82,20 +83,71 @@ const GOAL_WIDTH = 32;
 /** 每个需要处理的行**最多**带几条细节行。两条：卡在哪、下一步。 */
 const DETAIL_LINES = 2;
 
-/** 状态 → 记号与中文名。记号沿用 `claim-ledger.mjs` 的 `VERDICT_MARK` 风格（几何/丁方符号，不是 emoji）。 */
+/** 状态 → 记号与中文名。记号沿用 `claim-ledger.mjs` 的 `VERDICT_MARK` 风格（几何/丁方符号，不是 emoji）。
+ *
+ *  **选记号的三条硬标准**（`docs/spec/tui-visual.md` §3.1 + §2.1）：
+ *    1. 四款等宽字体（Consolas / Lucida Console / Cascadia Mono / Cascadia Code）的 `cmap`
+ *       都得原生覆盖——缺一个，conhost 下就是豆腐块。U+25B8 `▸` 与 U+26A0 `⚠` 正是栽在这里。
+ *    2. 真实终端里非豆腐块。ASCII 天然满足；非 ASCII 只收 §6 已实测过的那几个。
+ *    3. 显示宽度为 1 列（`tui-theme.mjs` 的 `displayWidth`）。EAW=Ambiguous 的码点在有
+ *       VS16 或终端设成双宽时变 2 列，整屏会抖列——`⚠`(U+26A0) 属这一类。
+ *  另外还有一条**同屏唯一**：同一屏里一个记号只能表示一个状态。跨屏复用允许
+ *  （plan 与列表页是两套状态体系），同屏复用会让「这一行到底是失败还是超时」无解。
+ *  下面这张表就按这两条重排过：`FAILED` 与列表页对齐成 `×`（此前这里是 `✗`，
+ *  同一个概念两个字形），`STUCK` 从豆腐块 `◐` 退成 `~`，`RUNNING` 的 `▸` 在 Lucida
+ *  的 cmap 里没有，退成 `>`；`DEFECT` 的 `⚠` 是 Ambiguous 宽度，退成 `#`
+ *  ——它不能退成 `!`，因为 `!` 已经被 `OVERDUE` 占用，同屏两个 `!` 违反上面那条。 */
 const STATE_META = Object.freeze({
-  DONE: { mark: '✓', label: '已完成' },
+  DONE: { mark: '√', label: '已完成' },
   LANDED_UNCLAIMED: { mark: '?', label: '产出在未认领' },
-  FAILED: { mark: '✗', label: '失败' },
-  STUCK: { mark: '◐', label: '卡住' },
+  FAILED: { mark: '×', label: '失败' },
+  UPSTREAM_FAILED: { mark: '<', label: '前置失败' },
+  STUCK: { mark: '~', label: '卡住' },
+  DEFECT: { mark: '#', label: '规划缺陷' },
   OVERDUE: { mark: '!', label: '超时' },
-  RUNNING: { mark: '▸', label: '进行中' },
+  RUNNING: { mark: '>', label: '进行中' },
+  WAITING_ON: { mark: '·', label: '等待前置' },
   PENDING: { mark: '○', label: '待跑' },
-  DEFECT: { mark: '⚠', label: '规划缺陷' },
 });
 
-/** 需要人动手的状态。顺序即严重度：细节行按这个顺序分配行数预算。 */
-const ATTENTION = Object.freeze(['FAILED', 'STUCK', 'DEFECT', 'OVERDUE', 'LANDED_UNCLAIMED']);
+/** 已验证字形 → 码位与证据。`STATE_META` 里每个记号都必须在这里有据可查，
+ *  由 `render-plan.test.mjs` 断言（新增一个没验证过的字形会直接变红）。
+ *
+ *  证据形态：`cmap` 四款等宽字体全覆盖（本机用 WPF `GlyphTypeface.CharacterToGlyphMap`
+ *  读真字体文件），宽度 1 列（`tui-theme.displayWidth`）。ASCII 的字形无需 `cmap` 论证。 */
+export const VERIFIED_GLYPHS = Object.freeze({
+  '√': { cp: 'U+221A', why: '四款 cmap 全覆盖，列宽 1（WGL4 数学算符区，Consolas/Lucida 原生含）' },
+  '?': { cp: 'U+003F', why: 'ASCII' },
+  '×': { cp: 'U+00D7', why: 'tui-visual.md §6 三终端实测，四款 cmap 全覆盖，列宽 1' },
+  '<': { cp: 'U+003C', why: 'ASCII' },
+  '~': { cp: 'U+007E', why: 'ASCII' },
+  '#': { cp: 'U+0023', why: 'ASCII' },
+  '!': { cp: 'U+0021', why: 'ASCII' },
+  '>': { cp: 'U+003E', why: 'ASCII' },
+  '·': { cp: 'U+00B7', why: '四款 cmap 全覆盖，列宽 1（claim-ledger 的 EMPTY 已用它）' },
+  '○': { cp: 'U+25CB', why: 'tui-visual.md §6 三终端实测，四款 cmap 全覆盖，列宽 1' },
+});
+
+/** 需要人动手的状态。顺序即严重度：细节行按这个顺序分配行数预算。
+ *
+ *  `UPSTREAM_FAILED` 排在 `FAILED` 之后、`STUCK` 之前：它说的是「本子树没问题，
+ *  是前置倒了」，处置上比「自己卡住」更靠上游一步——先修前置，本行才可能动。
+ *  `WAITING_ON` **不在这里**：它表示「还没轮到，且有人会推进它」，不需要人动手。 */
+const ATTENTION = Object.freeze(['FAILED', 'UPSTREAM_FAILED', 'STUCK', 'DEFECT', 'OVERDUE', 'LANDED_UNCLAIMED']);
+
+/** 依赖里出现就意味着「本子树现在不该派」的状态。 */
+const DEP_BLOCKS = Object.freeze(['PENDING', 'WAITING_ON', 'RUNNING', 'OVERDUE']);
+
+/** 依赖里出现就意味着「前置没有交付，本子树的前置条件不成立」的状态。
+ *  `DEFECT` **不在**这里：它的处置是「退回 planner」，由它自己那一行说；把它也算成
+ *  前置失败会让下游一并变红，掩盖「问题只有一处」。下游此时落在 `PENDING`，
+ *  也就是「轮到你看了」——那个判断没错。 */
+const DEP_FAILED = Object.freeze(['FAILED', 'STUCK', 'UPSTREAM_FAILED']);
+
+/** `subtrees[].on_dependency_failed` 的合法取值。缺省视为 `block`。
+ *  `degrade` 的意思是「前置倒了我也能做我能做的」——research 型子树常属此类，
+ *  没有它，一个不相关的失败前置会把整条研究线永久冻在 `UPSTREAM_FAILED` 上。 */
+export const ON_DEP_FAILED_MODES = Object.freeze(['block', 'degrade']);
 
 /** 台账里出现即算「这个子树被派过」的行类型。`consume` 也是 —— 有人认领过它。 */
 const CAPABILITY_LABEL = Object.freeze({
@@ -237,11 +289,128 @@ function pathList(paths, max = 2) {
   return `${ps.slice(0, max).join('、')} 等 ${ps.length} 个`;
 }
 
-/** 单个子树 → 一行状态。**纯函数**：所有外部事实都由参数注入。
+/** 「没派过，且盘上没有产出」那一行的默认形态。`resolveStates` 会在依赖判定后
+ *  把它改写成 `WAITING_ON` / `UPSTREAM_FAILED` / 原样保留 `PENDING`。
+ *  单独抽出来是因为三条分支的 note/next_step 各不相同，但「待跑」这一份必须只有一处。 */
+function mkPending(mk, outputs) {
+  return mk('PENDING', {
+    note: '未派发',
+    blocker: null,
+    next_step: outputs.length ? '派发前先 claim-ledger declare 登记 outputs' : '探索型可见，派发前先登记',
+  });
+}
+
+/** 把「本子树自己」的本地状态 + 兄弟状态解析成最终状态。**纯函数**，不读盘。
+ *
+ *  只有 `PENDING` 会被改写——其余状态是台账或时间给出的硬事实，依赖推不动它们。
+ *
+ *  为什么必须有这一步：`localStateOf` 对「没派过」一律给 `PENDING`，于是
+ *  「还没轮到」与「没人管」在屏幕上完全同形。三态的判据全部从图 + 台账 + 已算出的
+ *  兄弟状态导出，**不引入新输入**：
+ *
+ *    WAITING_ON       前置里有人还在跑/还没轮到时它也不该动，不用人处理
+ *    UPSTREAM_FAILED  前置倒了且本子树不允许降级，要人处理（先修前置）
+ *    PENDING          前置全 DONE 或没有前置 —— 轮到你派了，要人处理
+ *
+ *  取「无进展」的那一档做合并，不看图里的书写顺序：`A 等 B、B 等 A` 在有环的图里
+ *  两边都永远 `WAITING_ON`，所以 `validate-run.mjs` 必须在派发前就把环判死
+ *  （见那边的 `checkDependencyCycles`）。这里另加一道**防御性**上限：状态回溯
+ *  深度超过子树数就是图有问题，判 `DEFECT` 而不是死循环——渲染器读的图可能
+ *  没经过校验器，它不能因为一张坏图就挂住。 */
+function resolveStates(rows) {
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const LIMIT = Math.max(1, rows.length); // 深度上限 = 子树数：合法的最长链就是 n-1 跳
+  // 环的判定**不在这里重写一份**：`checkDependencyCycles` 是同一件事的唯一实现，
+  // 两份实现必然分叉，而分叉之后「哪个是真的」没人回答得了。它只在派发前拒绝有环的图，
+  // 但渲染器读到的图可能没经过校验器，所以这里也用它——复用判据，不是复用流程。
+  const cyclic = new Set(checkDependencyCycles(rows.map((r) => ({ id: r.id, depends_on: r.depends_on }))));
+  const done = new Map(); // id → 解析后的状态
+
+  const resolve = (row, depth) => {
+    if (done.has(row.id)) return done.get(row.id);
+    if (row.state !== 'PENDING') { done.set(row.id, row); return row; }
+    if (cyclic.has(row.id)) {
+      const out = {
+        ...row,
+        ...STATE_META.DEFECT,
+        state: 'DEFECT',
+        note: '依赖成环',
+        blocker: `${row.depends_on.join('、')} 与它互相等待——环上没有哪一条能先开始`,
+        next_step: '改 task-graph.json 断环；validate-run.mjs 会在派发前拒绝这种图',
+      };
+      done.set(row.id, out);
+      return out;
+    }
+    // 防御性上限：环已经被上面拦住了，走到这里仍超深就说明图还有别的毛病
+    // （例如悬空引用被写成自指）。判 DEFECT 而不是让它无限递归把进程挂住。
+    if (depth > LIMIT) {
+      const out = {
+        ...row, ...STATE_META.DEFECT, state: 'DEFECT',
+        note: '依赖层级超限',
+        blocker: `回溯 ${depth} 层仍未收敛（子树共 ${rows.length} 个）——图里有环或悬空引用`,
+        next_step: '跑 node scripts/validate-run.mjs 定位',
+      };
+      done.set(row.id, out);
+      return out;
+    }
+    const depStates = row.depends_on.map((d) => {
+      const dep = byId.get(d);
+      // 悬空引用（图里写了不存在的 id）：当「不可判定」，不当作失败——
+      // `validate-run.mjs` 会在派发前把这种图判死，这里只求不崩。
+      if (!dep) return null;
+      return resolve(dep, depth + 1).state;
+    });
+    const resolved = resolveDependency(row, depStates);
+    done.set(row.id, resolved);
+    return resolved;
+  };
+
+  const out = rows.map((r) => resolve(r, 0));
+  return { rows: out, cycles: [...cyclic] };
+}
+
+/** 一条 `PENDING` 子树 + 已解析的前置状态 → 最终那一行。 */
+function resolveDependency(row, depStates) {
+  const mk = (state, extra) => ({ ...row, ...STATE_META[state], state, ...extra });
+  const known = depStates.filter(Boolean);
+  const blockedDeps = row.depends_on.filter((d, i) => DEP_BLOCKS.includes(depStates[i]));
+  const failedDeps = row.depends_on.filter((d, i) => DEP_FAILED.includes(depStates[i]));
+
+  if (failedDeps.length && row.on_dependency_failed !== 'degrade') {
+    return mk('UPSTREAM_FAILED', {
+      note: `前置 ${failedDeps.join('、')} 没交付`,
+      blocker: `${failedDeps.join('、')} 已经失败/卡住，它承诺的产出不会来了——本子树的输入缺了这一块`,
+      next_step: `先处置 ${failedDeps.join('、')}；若本子树本来就不需要它，在图里把它标成 on_dependency_failed: "degrade"`,
+    });
+  }
+  if (blockedDeps.length) {
+    return mk('WAITING_ON', {
+      note: `等 ${blockedDeps.join('、')}`,
+      blocker: null,
+      next_step: null,
+    });
+  }
+  if (known.length !== depStates.length) {
+    // 有前置引用在图里找不到：不猜。交给 validate-run 判死，这一行只说出事实。
+    return mk('DEFECT', {
+      note: '前置引用不可判定',
+      blocker: `${row.depends_on.filter((d, i) => !depStates[i]).join('、')} 在图上找不到`,
+      next_step: '先跑 node scripts/validate-run.mjs 把图修对',
+    });
+  }
+  return row; // deps 全 DONE 或没有 deps —— 真正的 `PENDING`（轮到你派了）
+}
+
+/** 单个子树 → 一行状态，**只看它自己**（不看 `depends_on`）。**纯函数**：所有外部事实都由参数注入。
  *
  *  判定顺序就是「哪个信号更硬就用哪个」：宿主/台账判出的终局结论优先于时间推断，
- *  时间推断只用来区分「还在跑」与「超时未收活」。 */
-function stateOf({ sub, task, disp, nowMs, probe }) {
+ *  时间推断只用来区分「还在跑」与「超时未收活」。
+ *
+ *  取名叫「本地状态」是因为 `PENDING` 还要再过一道 `resolveStates` 的依赖判定：
+ *  「没派过」有三种成因，处置完全不同（等前置 / 该派了 / 前置倒了）。判据全部从
+ *  图 + 台账 + 兄弟状态导出，不引入任何新输入——本函数不读 `depends_on`，
+ *  是因为它算的是「与别人无关的那部分事实」。 */
+function localStateOf({ sub, task, disp, nowMs, probe }) {
   const id = String(sub.id);
   const outputs = Array.isArray(sub.outputs) ? sub.outputs.map(String) : [];
   const shape = String(sub.shape || '');
@@ -265,6 +434,8 @@ function stateOf({ sub, task, disp, nowMs, probe }) {
     timeout_min: limitMin,
     depends_on: Array.isArray(sub.depends_on) ? sub.depends_on.map(String) : [],
     parallel_with: Array.isArray(sub.parallel_with) ? sub.parallel_with.map(String) : [],
+    on_dependency_failed: ON_DEP_FAILED_MODES.includes(sub.on_dependency_failed)
+      ? sub.on_dependency_failed : 'block',
     verdict,
     items: items.map((i) => ({ path: i.path, status: i.status })),
   };
@@ -343,11 +514,7 @@ function stateOf({ sub, task, disp, nowMs, probe }) {
       });
     }
     if (!disp.dispatched) {
-      return mk('PENDING', {
-        note: '未派发',
-        blocker: null,
-        next_step: outputs.length ? '派发前先 claim-ledger declare 登记 outputs' : '探索型可见，派发前先登记',
-      });
+      return mkPending(mk, outputs);
     }
   }
 
@@ -403,13 +570,18 @@ function emptyReasonText(reason, ctx) {
   return ['没有可渲染的 plan。', '这不是「计划为空」——是「没有输入」。'];
 }
 
-/** 摘要行：完成/总数 + 非零的分类 + 预算 + 最长限时。 */
+/** 摘要行：完成/总数 + 非零的分类 + 预算 + 最长限时。
+ *
+ *  零项一律不印（除了「待跑」：它是进度分母里唯一还该动的部分，0 也要说），
+ *  否则 25 个子树的一行摘要会退化成一张表。`WAITING_ON` 归到「等前置」——
+ *  它与「待跑」是两种不同的处境，合并就回到修改前的同形问题。 */
 function summaryLine(plan) {
   const t = plan.totals;
   const bits = [`进度 ${t.done}/${t.total} 完成`];
   const pairs = [
-    ['failed', '失败'], ['stuck', '卡住'], ['defect', '规划缺陷'],
-    ['overdue', '超时'], ['landed_unclaimed', '待认领'], ['running', '进行中'], ['pending', '待跑'],
+    ['failed', '失败'], ['upstream_failed', '前置失败'], ['stuck', '卡住'], ['defect', '规划缺陷'],
+    ['overdue', '超时'], ['landed_unclaimed', '待认领'], ['running', '进行中'],
+    ['waiting_on', '等前置'], ['pending', '待跑'],
   ];
   for (const [k, label] of pairs) {
     if (k === 'pending' || t[k] > 0) bits.push(`${t[k]} ${label}`);
@@ -545,7 +717,7 @@ export function buildPlan({
       reason,
       empty_lines,
       subtrees: [],
-      totals: { total: 0, done: 0, landed_unclaimed: 0, failed: 0, stuck: 0, defect: 0, overdue: 0, running: 0, pending: 0 },
+      totals: { total: 0, done: 0, landed_unclaimed: 0, failed: 0, upstream_failed: 0, stuck: 0, defect: 0, overdue: 0, running: 0, waiting_on: 0, pending: 0 },
       budget_pct: 0,
       max_timeout_min: null,
       needs_attention: [],
@@ -557,12 +729,17 @@ export function buildPlan({
   const rec = reconcile({ rows: claimRows, probe: probeFn, nowMs, base: root });
   const byTask = new Map(rec.tasks.map((t) => [String(t.task), t]));
 
-  const subtrees = graph.subtrees.map((sub) => {
+  // 两段式：先算「与别人无关」的本地状态，再让依赖把它们解析成终态。
+  // 分两步的理由是**判据不混**——本地状态只吃台账与磁盘（可逐个子树独立复算），
+  // 依赖判定只吃「兄弟算完了没」。合在一起写，任何一次图上的改序都会悄悄改变结论。
+  const local = graph.subtrees.map((sub) => {
     const id = String(sub && sub.id);
     const task = byTask.get(id) || null;
     const disp = dispatchOf(id, claimRows, promptRows);
-    return stateOf({ sub: sub || {}, task, disp, nowMs, probe: probeFn });
+    return localStateOf({ sub: sub || {}, task, disp, nowMs, probe: probeFn });
   });
+  const { rows: subtrees, cycles } = resolveStates(local);
+  if (cycles.length) notes.push(`依赖成环（${cycles.join(' → ')}）—— 有环的图里「等前置」不收敛，先跑 validate-run.mjs`);
 
   const count = (state) => subtrees.filter((r) => r.state === state).length;
   const totals = {
@@ -570,10 +747,12 @@ export function buildPlan({
     done: count('DONE'),
     landed_unclaimed: count('LANDED_UNCLAIMED'),
     failed: count('FAILED'),
+    upstream_failed: count('UPSTREAM_FAILED'),
     stuck: count('STUCK'),
     defect: count('DEFECT'),
     overdue: count('OVERDUE'),
     running: count('RUNNING'),
+    waiting_on: count('WAITING_ON'),
     pending: count('PENDING'),
   };
   const budget = graph.subtrees.reduce((s, x) => s + (Number.isFinite(x && x.token_budget_pct) ? x.token_budget_pct : 0), 0);

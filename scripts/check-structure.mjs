@@ -551,10 +551,20 @@ const PROBE_ARGS = {
   checklistSentence: '[{}]', checklistSummaryLine: '[4]',
   checklistLines: '[[], { cols: 80 }]', isQuietRow: '[{}]',
   footerLine: '[[], 80]', composeListScreen: '[{ cols: 80, rows: 24 }]',
+  // tui-layout.mjs（2026-11-15 分节窗口）：三个新导出。
+  //
+  // `composeListFrame` 的探针参数**必须带 action/running**：空三段时走不到分节循环，
+  // 于是「函数体里引用了未声明的变量」这类缺陷会被判成通过 —— 2026-11-15 的
+  // `windows is not defined` 正是这样漏过去的（35 条测试红，结构门却是绿的）。
+  // 探针要有牙，就得让它走到有分支的那条路上。
+  sectionWindow: '[{ count: 3, area: 2 }]',
+  sectionHiddenLine: '[{ label: "x", before: 1, after: 2, total: 5, cols: 80 }]',
+  composeListFrame: '[{ cols: 80, rows: 24, action: [{}], running: [{}] }]',
   // tui-meta.mjs（2026-11-10）：有界读取与缓存。file 不存在时必须安全返回，不抛。
   projectsRoot: '[{}]', transcriptPathFor: '[{}, "/nonexistent"]',
   metaFromRecords: '[[]]', readTailRecords: '["/nonexistent"]',
   createMetaCache: '[{}]', lastSpeakerOf: '[[]]', pendingQuestionOf: '[[], {}]',
+  askedVerdictOf: '[{}, {}]',
   // oversight-tui.mjs（2026-11-10）：三段视图与证据档位。
   viewOf: '[{}, null]', actionViewOf: '[{}]', buildSections: '[{}]',
   askedCountOf: '[{}]', waitingCountOf: '[{}]', claimsTally: '[[]]',
@@ -854,6 +864,10 @@ function checkUnregisteredExports() {
     // checkOutputs 走 PROBE_ARGS 真实调用一次（登记在下面）；另外两个是它内部的纯判据，
     // 由 validate-run.test.mjs 的合法/非法两组用例覆盖，这里按数据登记。
     'SHAPES_REQUIRING_OUTPUTS', 'checkOutputs', 'outputPathError', 'outputPathKey',
+    // validate-run.mjs 的依赖图判据（2026-11-15）：环检测 + 前置失败开关。
+    // `checkDependencyCycles` 有两条真调用（合法链 / 环），见 validate-run.test.mjs；
+    // `ON_DEP_FAILED` 是枚举数据，按数据登记。
+    'checkDependencyCycles', 'ON_DEP_FAILED',
     // install-watcher.mjs
     'launcherPath', 'templatePath', 'stateDirFor', 'startupDir', 'shortcutPath',
     'renderLauncher', 'needsRegenerate', 'createShortcut', 'autostartAdvice', 'witnessPath', 'writeWitness', 'readWitness', 'checkStateIntegrity', 'HOST_FACT_STATES',
@@ -920,9 +934,13 @@ function checkUnregisteredExports() {
     'shortPath', 'runningColumns', 'runningRowOf', 'actionRowOf', 'sectionHeaderLine',
     'checklistLine', 'checklistSentence', 'checklistSummaryLine', 'checklistLines', 'isQuietRow',
     'verdictLine', 'footerLine', 'composeListScreen',
+    // tui-layout.mjs（2026-11-15 分节窗口）：滚动时「需动作段不被切」的那一组。
+    'sectionWindow', 'sectionHiddenLine', 'composeListFrame',
     // tui-meta.mjs（2026-11-10）：标题 / 末条 assistant 的有界读取与 mtime 缓存。
     'META_TAIL_BYTES', 'projectsRoot', 'transcriptPathFor', 'metaFromRecords',
     'readTailRecords', 'createMetaCache', 'lastSpeakerOf', 'pendingQuestionOf',
+    // 2026-11-16：「问了没答」的判定与  同源（四道门），纯函数。
+    'askedVerdictOf',
     // oversight-tui.mjs（2026-11-10 TUI 重做）：分段视图与证据档位。
     'viewOf', 'actionViewOf', 'buildSections', 'askedCountOf', 'waitingCountOf',
     'claimsTally', 'scanAgeText', 'defaultClaimsScan',
@@ -1103,7 +1121,7 @@ function checkUnregisteredExports() {
   // 它读 `tasks/runs/` 下的台账，测试用合成 graph + 注入 probe 覆盖（28 条），
   // 所以不塞进结构门的探针表；常量是数据（版本号 / 行数上限 / 行宽）。
   const RENDER_PLAN_FNS = [
-    'PLAN_VERSION', 'MAX_LINES', 'ROW_WIDTH',
+    'PLAN_VERSION', 'MAX_LINES', 'ROW_WIDTH', 'VERIFIED_GLYPHS', 'ON_DEP_FAILED_MODES',
     'displayPath', 'findLatestRun', 'loadRun', 'formatPlan', 'buildPlan', 'renderPlan',
   ];
   for (const k of RENDER_PLAN_FNS) REGISTERED.add(k);

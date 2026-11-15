@@ -98,17 +98,45 @@ export function truncateWithDisclosure(text, width) {
   if (!Number.isFinite(max) || max <= 0) return { text: '', omitted: displayWidth(s), truncated: s.length > 0 };
   const total = displayWidth(s);
   if (total <= max) return { text: s, omitted: 0, truncated: false };
-  // 尾巴本身要占地方：先算它有多宽，再决定正文留多少
-  const omittedGuess = total - max + 1;
-  const tail = `… (+${omittedGuess} 列)`;
-  const tailWidth = displayWidth(tail);
-  const budget = Math.max(1, max - tailWidth);
-  const head = truncateDisplay(s, budget);
-  // truncateDisplay 自己在 budget 内会补一个 `…`；这里不要两个省略号
-  const body = head.endsWith('…') ? head.slice(0, -1) : head;
-  const used = displayWidth(body);
-  const omitted = Math.max(1, total - used);
-  return { text: `${body}… (+${omitted} 列)`, omitted, truncated: true };
+
+  // **尾巴本身也必须装得下。**
+  // 2026-11-15 实测：`truncateWithDisclosure(x, 8)` 返回 `… (+34 列)`（宽 10），
+  // 比它自己的预算还宽；调用方（layoutRow / padDisplay）只好再截一次，
+  // 屏幕上于是出现 `… (+38 …` —— 省略号里套省略号。读者既不知道丢了多少，
+  // 也不知道这行被切过第二刀。**披露尾巴若自己也溢出，披露就失效了。**
+  //
+  // 三档尾巴，按「装得下的最详细那一档」取，宽度不变式是 displayWidth(text) ≤ max：
+  //   ① `… (+34 列)` —— 与既定的列宽纪律同形（测试锁过这个写法）
+  //   ② `…+34`      —— 完整档装不下时的紧凑档
+  //   ③ `…`         —— 只剩 1 列
+  const attempt = (tailOf) => {
+    // 不动点迭代：尾巴宽度 → 正文预算 → 保留正文宽度 → omitted → 尾巴宽度。
+    // 正常两轮收敛；四轮只是防 `+9→+10` 这种位数跳变，超了就取最后一次结果。
+    let omitted = Math.max(1, total - max + 1);
+    let best = null;
+    for (let k = 0; k < 4; k++) {
+      const tail = tailOf(omitted);
+      const budget = Math.max(0, max - displayWidth(tail));
+      const head = budget > 0 ? truncateDisplay(s, budget) : '';
+      // truncateDisplay 自己在 budget 内会补一个 `…`；这里不要两个省略号
+      const body = head.endsWith('…') ? head.slice(0, -1) : head;
+      const used = displayWidth(body);
+      const next = Math.max(1, total - used);
+      best = { text: `${body}${tail}`, omitted: next };
+      if (next === omitted) break;
+      omitted = next;
+    }
+    return best;
+  };
+
+  const full = attempt((n) => `… (+${n} 列)`);
+  if (displayWidth(full.text) <= max) return { ...full, truncated: true };
+
+  const compact = attempt((n) => `…+${n}`);
+  if (displayWidth(compact.text) <= max) return { ...compact, truncated: true };
+
+  const bare = truncateDisplay('…', max);
+  return { text: bare, omitted: Math.max(0, total - displayWidth(bare)), truncated: true };
 }
 
 /** 右对齐到固定宽度（不足补空格，超出截断）。 */
@@ -975,31 +1003,84 @@ export function footerLine(parts, cols, useColor = true) {
 // ── 整屏组装 ──────────────────────────────────────────────────────────
 
 /**
- * 组装列表页的整屏。
+ * 行数维度的「丢了多少」：某一段因屏幕高度不够被切掉时必须画的那一行。
  *
- * **这是本次重构的主要收益**：整屏每一行都由它产出，于是「76 列下没有一行超宽」
- * 「判决行永远是第 1 行」「空段不画」「需动作段永不撤」全都能被断言。
+ * 为什么必须有它：`truncateWithDisclosure` 只为**列宽**建立了这条纪律
+ * （`… (+28 列)`），行数维度却一直是 `if (out.length < rows - 1) out.push(line)`
+ * —— 直接丢、不吭声。2026-11-15 实测复现：30 条需动作 + 20 条在跑 @ 100×30，
+ * 判决行说「30 件在等你 · 20 个会话在跑」，段标题说「需动作 (20)」，
+ * 屏上画了 12 条，在跑段**一条都没有**，而全屏**没有一处**说还有东西没画出来。
  *
- * @param {object} p
- * @param {number} p.cols
- * @param {number} p.rows
- * @param {Array<string>} p.verdict        判决行片段（来自 verdictParts）
- * @param {string} p.scanAge               右对齐的扫描新鲜度
- * @param {Array} p.checklist              来自 checklistRows
- * @param {Array} p.action                 需动作行（view 形态）
- * @param {Array} p.running                在跑行
- * @param {Array} p.stopped                已停行（仅在展开时进屏）
- * @param {boolean} p.stoppedExpanded
- * @param {Array<string>} p.footer
- * @param {string|null} p.cursorKey        光标所在行的 key
- * @param {boolean} p.useColor
- * @param {number|null} [p.nowMs]          老化判断用的注入时钟（只影响动作列画不画 `c`）
- * @param {object} p.layout                resolveLayout 的结果（不传则按 cols/rows 现算）
- * @param {Array<string>|null} p.body      替代三段会话区的正文（首扫/空/失败四种态）
- * @param {Array<string>|null} p.alert     判决行之后的告警行（监视没在跑时要进第一屏）
- * @returns {string[]} 恰好 rows 行，每行显示宽度 ≤ cols
+ * 这就是本仓库那条第一原则的直接违反：
+ * 「一个监控工具把『我没有数据』和『一切正常』说成一样，用户就永远无法信任它。」
+ *
+ * 三档候选按「装得下的最详细那一档」取 —— **披露行自己绝不能被二次截断**，
+ * 否则屏幕上会出现 `… 下面还有 8 …` 这种既没说清丢多少、也没说清是哪种披露的行。
+ *
+ * @param {{label:string, before?:number, after?:number, total:number, cols:number, whole?:boolean}} o
+ *   `whole` 为真表示整段连标题都没进屏，此时必须把**总数**说出来，并告诉用户怎么滚。
+ * @returns {string}
  */
-export function composeListScreen(p) {
+export function sectionHiddenLine({ label, before = 0, after = 0, total = 0, cols = 80, whole = false }) {
+  const max = Math.max(1, Math.floor(Number(cols) || 1));
+  const head = whole ? `  … ${label} (${total}) 未显示` : '  …';
+  if (whole) {
+    const candidates = [
+      `${head} · j 下滚`,
+      `${head}`,
+      `  … ${label} (${total})`,
+      `  … ${total} 条未显示`,
+    ];
+    for (const c of candidates) if (displayWidth(c) <= max) return c;
+    return truncateDisplay(head, max);
+  }
+  const bits = [];
+  if (before > 0) bits.push(`上面 ${before} 条`);
+  if (after > 0) bits.push(`下面 ${after} 条`);
+  const mid = bits.join(' · ');
+  const candidates = [
+    `${head} ${mid}未显示 · j/k 滚动`,
+    `${head} ${mid}未显示`,
+    `  … ${after || before} 条未显示`,
+    `  … ${after || before} 条`,
+  ];
+  for (const c of candidates) if (displayWidth(c) <= max) return c;
+  return truncateDisplay(head, max);
+}
+
+/** 段内窗口。**offset 是段内下标，不是扁平全局下标。**
+ *
+ *  2026-11-15 复现的缺陷二：`buildListFrame` 把扁平全局 offset 直接当成每段的
+ *  段内 offset 用，于是光标滚到第 14 条（全局 offset=4）时，需动作段被切掉前 4 条 ——
+ *  而那一段正是 `NEVER_DROP` 声明「永不撤除」的那一段。
+ *
+ *  语义在这里一次性钉死：**每个段各有自己的 offset 与段内光标**。
+ *  光标不在本段时，本段冻结在上一帧的 offset（不因别的段滚动而跳动）。
+ *
+ * @param {{count:number, area:number, offset?:number, cursor?:number|null}} p
+ * @returns {{offset:number, end:number}}
+ */
+export function sectionWindow({ count, area, offset = 0, cursor = null }) {
+  const n = Math.max(0, Math.floor(Number(count) || 0));
+  const a = Math.max(1, Math.floor(Number(area) || 1));
+  if (cursor === null || cursor === undefined) {
+    const off = Math.min(Math.max(0, Math.floor(Number(offset) || 0)), Math.max(0, n - a));
+    return { offset: off, end: Math.min(n, off + a) };
+  }
+  return windowOf({ count: n, cursor, area: a, offset });
+}
+
+/**
+ * 组装列表页的整屏（含窗口计划的版本）。
+ *
+ * 与 `composeListScreen` 的唯一区别：它把**每段实际画了哪几条**也返回，
+ * 调用方据此把「段内 offset」存到下一帧（见 `sectionWindow` 的语义说明）。
+ * 只取行字符串的调用方用 `composeListScreen` 即可，两者同源。
+ *
+ * @param {object} p 同 composeListScreen
+ * @returns {{lines: string[], windows: object}}
+ */
+export function composeListFrame(p) {
   const cols = Math.max(1, Math.floor(Number(p.cols) || 80));
   const rows = Math.max(1, Math.floor(Number(p.rows) || 24));
   const layout = p.layout || resolveLayout({ cols, rows });
@@ -1039,43 +1120,149 @@ export function composeListScreen(p) {
 
   const cursorKey = p.cursorKey ?? null;
 
+  // 每段实际画了哪几条，供调用方下一帧把 offset 传回来（见 sectionWindow）。
+  // 走 `p.body`（首扫/空/失败态）时没有任何段，所以它是空对象 —— 调用方读到
+  // 缺段就当作「从 0 开始」，与 sectionOffsets 缺省同义。
+  const windows = {};
+
   // 正文区：四种空/等待态优先于三段列表
   if (Array.isArray(p.body) && p.body.length) {
     for (const l of p.body) push(l);
   } else {
-    // L2 需动作 —— 空则不画（画一个 0 行标题就是噪声）
+    // 三段各自渲染成「行数组的数组」，再交给行预算分配。
+    //
+    // **为什么先全量渲染再分配行**：一条是 1 行还是 2 行取决于 actionTwoLine
+    // 与有没有 needs，只有渲染完才知道。先按「条数」预算，窄档一条压成一行时
+    // 会白白空掉半个屏；先渲染再数行，预算是精确的。
+    const sections = [];
     if (Array.isArray(p.action) && p.action.length) {
       const right = layout.showIdle === false ? '怎么回' : '等了      怎么回';
-      push(sectionHeaderLine('需动作', p.action.length, cols, right, useColor));
-      for (const v of p.action) {
-        for (const l of actionRowOf(v, { cols, layout, selected: v.key === cursorKey, useColor, nowMs: p.nowMs ?? null })) push(l);
-      }
-      if (layout.showBlank) push('');
+      sections.push({
+        id: 'action',
+        label: '需动作',
+        total: p.action.length,
+        right,
+        blocks: p.action.map((v) => ({
+          key: v && v.key,
+          lines: actionRowOf(v, { cols, layout, selected: v.key === cursorKey, useColor, nowMs: p.nowMs ?? null }),
+        })),
+      });
     }
-
-    // L3 在跑
     if (Array.isArray(p.running) && p.running.length) {
       const right = layout.showNear === false ? '最后动静' : '最后动静     近';
-      push(sectionHeaderLine('在跑', p.running.length, cols, right, useColor));
-      for (const v of p.running) {
-        push(runningRowOf(v, { cols, layout, selected: v.key === cursorKey, useColor }));
+      sections.push({
+        id: 'running',
+        label: '在跑',
+        total: p.running.length,
+        right,
+        blocks: p.running.map((v) => ({
+          key: v && v.key,
+          lines: [runningRowOf(v, { cols, layout, selected: v.key === cursorKey, useColor })],
+        })),
+      });
+    }
+    if (Array.isArray(p.stopped) && p.stopped.length && layout.showStopped !== false) {
+      if (p.stoppedExpanded) {
+        sections.push({
+          id: 'stopped',
+          label: '已停',
+          total: p.stopped.length,
+          right: '最后动静',
+          blocks: p.stopped.map((v) => {
+            // 超龄降级来的条目标上「超龄」。没有这个后缀，它展开后与普通历史会话
+            // 长得一模一样，而这两类的含义完全不同（一个是「曾等你，别回了」，
+            // 一个是「从没等过你」）。
+            const shown = v && v.stale ? { ...v, title: `${v.title} · 超龄` } : v;
+            return {
+              key: v && v.key,
+              lines: [runningRowOf({ ...shown, kind: 'stopped' }, {
+                cols, layout, selected: v.key === cursorKey, useColor, showNear: false,
+              })],
+            };
+          }),
+        });
+      } else {
+        // L4 折叠：一行计数。它不参与行预算竞争 —— 它本来就是「压掉」的形态。
+        push(' ' + truncateDisplay(stoppedSummary(p.stopped) + ' · 大部分是历史', cols - 1));
       }
     }
 
-    // L4 已停 —— 折叠成一行；按 h 展开成列表
-    if (Array.isArray(p.stopped) && p.stopped.length && layout.showStopped !== false) {
-      if (p.stoppedExpanded) {
-        push(sectionHeaderLine('已停', p.stopped.length, cols, '最后动静', useColor));
-        for (const v of p.stopped) {
-          // 超龄降级来的条目标上「超龄」。没有这个后缀，它展开后与普通历史会话
-          // 长得一模一样，而这两类的含义完全不同（一个是「曾等你，别回了」，
-          // 一个是「从没等过你」）。
-          const shown = v && v.stale ? { ...v, title: `${v.title} · 超龄` } : v;
-          push(runningRowOf({ ...shown, kind: 'stopped' }, { cols, layout, selected: v.key === cursorKey, useColor, showNear: false }));
-        }
-      } else {
-        push(' ' + truncateDisplay(stoppedSummary(p.stopped) + ' · 大部分是历史', cols - 1));
+    const offsets = p.sectionOffsets && typeof p.sectionOffsets === 'object' ? p.sectionOffsets : {};
+    const cursorSectionIdx = sections.findIndex((s) => s.blocks.some((b) => b && b.key === cursorKey));
+    let remaining = Math.max(0, rows - 1 - out.length);
+
+    for (let i = 0; i < sections.length; i++) {
+      const sec = sections[i];
+      const headerCost = 1;
+      const bodyCost = (from, to) => sec.blocks.slice(from, to)
+        .reduce((n, b) => n + b.lines.length, 0);
+      const totalRows = bodyCost(0, sec.blocks.length);
+      const blankCost = layout.showBlank ? 1 : 0;
+      const fullCost = headerCost + totalRows + blankCost;
+
+      if (fullCost <= remaining) {
+        push(sectionHeaderLine(sec.label, sec.total, cols, sec.right, useColor));
+        for (const b of sec.blocks) for (const l of b.lines) push(l);
+        if (layout.showBlank) push('');
+        windows[sec.id] = { offset: 0, end: sec.total, hiddenBefore: 0, hiddenAfter: 0 };
+        remaining = Math.max(0, remaining - fullCost);
+        continue;
       }
+
+      // 装不下：**先扣掉一行披露**，再把剩下的行按整条分配（不切半条会话）。
+      //
+      // 给排在后面的段留出「至少一行」：否则它们会连一句「未显示」都写不下，
+      // 那就等于回到缺陷一（静默消失）。需动作段优先 —— 它先分，后面的用剩下的。
+      const laterWithItems = sections.slice(i + 1).filter((s) => s.blocks.length).length;
+      const reserveLater = laterWithItems; // 每段至少一行披露
+      let usable = Math.max(0, remaining - headerCost - 1 - reserveLater);
+      let fit = 0;
+      let used = 0;
+      for (const b of sec.blocks) {
+        if (used + b.lines.length > usable) break;
+        used += b.lines.length;
+        fit += 1;
+      }
+
+      // 一条都放不下：只写「整段未显示」，但**数字与总数不能丢**。
+      if (fit === 0) {
+        if (remaining < 1) continue;
+        push(sectionHiddenLine({ label: sec.label, total: sec.total, cols, whole: true }));
+        windows[sec.id] = { offset: 0, end: 0, hiddenBefore: 0, hiddenAfter: sec.total };
+        remaining = Math.max(0, remaining - 1);
+        continue;
+      }
+      if (fit >= sec.blocks.length) {
+        // 留一行给后面之后仍然装得下全部：不再披露，也不该说「未显示」。
+        push(sectionHeaderLine(sec.label, sec.total, cols, sec.right, useColor));
+        for (const b of sec.blocks) for (const l of b.lines) push(l);
+        windows[sec.id] = { offset: 0, end: sec.total, hiddenBefore: 0, hiddenAfter: 0 };
+        const spent = headerCost + used;
+        remaining = Math.max(0, remaining - spent);
+        if (layout.showBlank && remaining > 0) { push(''); remaining -= 1; }
+        continue;
+      }
+
+      const cursorLocal = sec.blocks.findIndex((b) => b && b.key === cursorKey);
+      const win = sectionWindow({
+        count: sec.total,
+        area: fit,
+        offset: offsets[sec.id],
+        cursor: cursorLocal >= 0 ? cursorLocal : null,
+      });
+      push(sectionHeaderLine(sec.label, sec.total, cols, sec.right, useColor));
+      for (const b of sec.blocks.slice(win.offset, win.end)) for (const l of b.lines) push(l);
+      const hiddenBefore = win.offset;
+      const hiddenAfter = Math.max(0, sec.total - win.end);
+      if (hiddenBefore || hiddenAfter) {
+        push(sectionHiddenLine({
+          label: sec.label, before: hiddenBefore, after: hiddenAfter, total: sec.total, cols,
+        }));
+      }
+      windows[sec.id] = { offset: win.offset, end: win.end, hiddenBefore, hiddenAfter };
+      const spent = headerCost + bodyCost(win.offset, win.end) + (hiddenBefore || hiddenAfter ? 1 : 0);
+      remaining = Math.max(0, remaining - spent);
+      if (layout.showBlank && remaining > 0) { push(''); remaining -= 1; }
     }
   }
 
@@ -1087,7 +1274,47 @@ export function composeListScreen(p) {
   // 严格裁剪/补齐到 rows 行
   const fixed = out.slice(0, rows);
   while (fixed.length < rows) fixed.push('');
-  return fixed.map((l) => (displayWidth(l) > cols ? truncateDisplay(l, cols) : l));
+  return {
+    lines: fixed.map((l) => (displayWidth(l) > cols ? truncateDisplay(l, cols) : l)),
+    windows,
+  };
+}
+
+/**
+ * 组装列表页的整屏（只要行）。
+ *
+ * **这是本次重构的主要收益**：整屏每一行都由它产出，于是「76 列下没有一行超宽」
+ * 「判决行永远是第 1 行」「空段不画」全都能被断言。
+ *
+ * 关于 `NEVER_DROP` 里的「需动作段永不撤」——**当前含义是**：它的**标题与第一条**
+ * 永远进屏，其他段只能用剩下的行（见上面的行预算）。它不等于「无限长的需动作段
+ * 全部进屏」，那在行数有限时不可能；超出部分由行数维度的可数披露写出来
+ * （`sectionHiddenLine`）。把旧注释读成「整段永不撤」是一句当时没人能兑现的话。
+ *
+ * @param {object} p
+ * @param {number} p.cols
+ * @param {number} p.rows
+ * @param {Array<string>} p.verdict        判决行片段（来自 verdictParts）
+ * @param {string} p.scanAge               右对齐的扫描新鲜度
+ * @param {Array} p.checklist              来自 checklistRows
+ * @param {Array} p.action                 需动作行（view 形态，**全量**，不要预先切片）
+ * @param {Array} p.running                在跑行（全量）
+ * @param {Array} p.stopped                已停行（仅在展开时进屏）
+ * @param {boolean} p.stoppedExpanded
+ * @param {Array<string>} p.footer
+ * @param {string|null} p.cursorKey        光标所在行的 key
+ * @param {boolean} p.useColor
+ * @param {number|null} [p.nowMs]          老化判断用的注入时钟（只影响动作列画不画 `c`）
+ * @param {object} p.layout                resolveLayout 的结果（不传则按 cols/rows 现算）
+ * @param {Array<string>|null} p.body      替代三段会话区的正文（首扫/空/失败四种态）
+ * @param {Array<string>|null} p.alert     判决行之后的告警行（监视没在跑时要进第一屏）
+ * @param {object} [p.sectionOffsets]      **段内** offset（`{action, running, stopped}`）。
+ *                                         调用方把上一帧 `composeListFrame().windows`
+ *                                         里各段的 `offset` 传回来即可；不传则从 0 开始。
+ * @returns {string[]} 恰好 rows 行，每行显示宽度 ≤ cols
+ */
+export function composeListScreen(p) {
+  return composeListFrame(p).lines;
 }
 
 // ── 内部小工具 ────────────────────────────────────────────────────────

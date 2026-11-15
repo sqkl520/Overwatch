@@ -579,15 +579,34 @@ function windowLabelOf(days) {
  *   L6 only : novelty / noveltyAll / calls / liveness / hbThresholdSec / lastGapSec / tokens
  *
  * @param {object} row      scan --json 的一行（或 liveToRow 补出来的行）
- * @param {object} [meta]   tui-meta 的读取结果（标题 / 末条 assistant / 未答问句）
+ * @param {object} [meta]   tui-meta 的读取结果（标题 / 末条 assistant / 问句事实）
+ * @param {object} [p]
+ * @param {number} [p.nowMs]  「问了没答」的时间门槛按这个时刻现算。
+ *   **必须现算，不能从 meta 里取结论**：meta 按 (路径, mtime) 缓存，mtime 不变
+ *   就不重读，于是缓存里的时间结论会冻在读取那一刻（一条 0.5 小时前的问题会
+ *   永远停在「刚问完」这一档，一条新过门槛的问题永远进不来）。
+ * @param {object|null} [p.host]  该会话的**宿主实时状态**（`{status, statusUpdatedAt}`），
+ *   来自 `data.live` 而不是扫描行的 `hostState` —— 后者是派生过的 job 结论
+ *   （`failed` / `blocked` / `waiting`），用它当 `status` 会让 `assessAsked` 的
+ *   「宿主说它现在是 idle 吗」恒为假，于是每一条问句都被判成 `host-not-idle`。
+ *   null 表示读不到：那是采集缺失，不是证据，`assessAsked` 不因此拦截。
  */
-export function viewOf(row, meta = null) {
+export function viewOf(row, meta = null, { nowMs = Date.now(), host = null } = {}) {
   const kind = binaryOf(row);
   // 身份优先级：transcript 的 cwd（最准）> 扫描行自带的 cwd > 项目目录名。
   // **绝不从目录编码反推路径**（`D--Projects-Overwatch` 反推会在项目名带连字符时
   // 画出不存在的层级 —— 见 dsh-TUI 分析 §2.4 末）。
   const where = (meta && meta.cwd) || row?.cwd || row?.project || '';
   const t = titleOf({ title: (meta && meta.title) ?? row?.name ?? null, path: where, key: sessionKey(row) });
+  // ── 「问了没答」：判据与 `asked.mjs` 同源（`askedVerdictOf` 直接转调 `assessAsked`）──
+  //
+  // 这里**没有**任何本地判据。此前本函数所在的链路上只判「末条是 assistant 且以
+  // 问号结尾」，于是 `asked.mjs:280` 修过的那个 bug（10 天前的问句照样报「问了没答」）
+  // 在 TUI 里又出现了一遍。现在四道门全在 `asked.mjs` 里，这里只负责把宿主事实喂进去。
+  const hostState = host;   // 由调用方从 `data.live` 精确匹配给出；null = 读不到，不猜
+  const verdict = meta && meta.questionText
+    ? askedVerdictOf(meta, { nowMs, host: hostState, hostStatus: hostState ? hostState.status : null })
+    : null;
   // **净化只做在这里，不做在渲染层。** 列表页与纯文本页都从本函数取 view，
   // 于是它是唯一必经之路；此前 title / path / needs / suggestedReply 全部原样放行，
   // 而它们来自 transcript 与宿主文件（不可信）。实测把 OSC 52 塞进 project
@@ -610,7 +629,18 @@ export function viewOf(row, meta = null) {
     // 这两段是**逐字**上屏的（relay-protocol §5.1），也就在终端上原样执行 —— 必须净化。
     needs: row?.needs == null ? null : sanitize(row.needs),
     suggestedReply: row?.suggestedReply == null ? null : sanitize(row.suggestedReply),
-    meta: meta ? { lastAssistant: sanitize(meta.lastAssistant ?? ''), question: sanitize(meta.question ?? '') } : null,
+    // `question` 是**判定后的结论**（`askedVerdictOf` 现算，见上方），不是元数据里
+    // 缓存的原始事实——`meta.questionText` 与它**不是**一回事：前者已经过了
+    // 「够不够久 / 静默多久 / 会话有没有自己继续 / 宿主现状」四道门。
+    // 只有 `keep` 为真才算「它在等我」，其余一律不上屏。`why` 保留下来，
+    // 详情页可以说清「为什么这条没被算进去」（`too-recent` / `too-old` / `continued` …）。
+    meta: meta
+      ? {
+        lastAssistant: sanitize(meta.lastAssistant ?? ''),
+        question: verdict && verdict.keep ? sanitize(meta.questionText ?? '') : '',
+        questionWhy: verdict ? (verdict.why || null) : null,
+      }
+      : null,
     row,
   };
 }

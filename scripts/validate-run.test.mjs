@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import {
   validateGraph, validateFile, CAPABILITIES, SHAPES,
   REQUIRED_FOR_COMPLEX, MIN_SUBTREES, SHAPES_REQUIRING_OUTPUTS,
-  outputPathError, outputPathKey,
+  outputPathError, outputPathKey, checkDependencyCycles, ON_DEP_FAILED,
 } from './validate-run.mjs';
 
 const ac = (id = 'AC1') => ({ id, criterion: 'scan --json 输出含 state 字段', evidence: 'src/a.mjs:12', fail_if: '缺字段' });
@@ -263,6 +263,152 @@ test('负向：把 outputs 校验摘掉（checkOutputs 的结果被丢弃），�
       '校验摘掉后，缺失 outputs 必须能通过——说明「必填」是这段代码给的');
     assert.equal(mod.validateGraph(graph([sub({ shape: 'artifact', outputs: [] })])).ok, true,
       '校验摘掉后，artifact + 空数组必须能通过——说明「artifact 非空」是这段代码给的');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── 依赖成环：checkDependencyCycles 的返回值 ────────────────────────────
+// 环检测与 render-plan.test.mjs 里那条「环上每条都判 DEFECT」是两件事：
+// 那条守的是 stateOf 的降级行为，这里守的是**图进入系统时就被判死**这条判据。
+// 两者都有才完整——只守渲染器等于允许环被带进系统。
+
+/** 三色 DFS 的返回语义：成环节点 id，按图序、去重。 */
+const cyc = (subs) => checkDependencyCycles(subs);
+
+test('无环图 → 环检测返回空数组（无环不能误报，否则合法图全被拦）', () => {
+  assert.deepEqual(cyc([]), []);
+  assert.deepEqual(cyc([{ id: 'A', depends_on: [] }]), []);
+  // 链 A→B→C：有依赖但不成环
+  assert.deepEqual(cyc([
+    { id: 'A', depends_on: ['B'] },
+    { id: 'B', depends_on: ['C'] },
+    { id: 'C', depends_on: [] },
+  ]), []);
+  // 菱形 A→B, A→C, B→D, C→D：分叉再汇合，不是环
+  assert.deepEqual(cyc([
+    { id: 'A', depends_on: ['B', 'C'] },
+    { id: 'B', depends_on: ['D'] },
+    { id: 'C', depends_on: ['D'] },
+    { id: 'D', depends_on: [] },
+  ]), []);
+});
+
+test('二元环 A→B→A → 两个都在返回里', () => {
+  const r = cyc([
+    { id: 'A', depends_on: ['B'] },
+    { id: 'B', depends_on: ['A'] },
+  ]);
+  assert.deepEqual(r, ['A', 'B']);
+});
+
+test('三元环 A→B→C→A → 三个都在', () => {
+  const r = cyc([
+    { id: 'A', depends_on: ['B'] },
+    { id: 'B', depends_on: ['C'] },
+    { id: 'C', depends_on: ['A'] },
+  ]);
+  assert.deepEqual(r, ['A', 'B', 'C']);
+});
+
+test('自环 A→A → 返回 [A]', () => {
+  // 自环在 validateGraph 里已被「不得引用自己」拦下，但环检测本身不能漏掉它：
+  // 它是「最小值环」，任何一个自环都是不可收敛的。
+  assert.deepEqual(cyc([{ id: 'A', depends_on: ['A'] }]), ['A']);
+});
+
+test('环外的节点不被卷进来（只报真正成环的那些）', () => {
+  const r = cyc([
+    { id: 'A', depends_on: ['B'] },
+    { id: 'B', depends_on: ['A'] },
+    { id: 'C', depends_on: ['A'] }, // C 依赖环上节点，但自己不在环上
+    { id: 'D', depends_on: [] },
+  ]);
+  assert.deepEqual(r, ['A', 'B']);
+  assert.ok(!r.includes('C'), 'C 只是依赖环上节点，自己不在环里');
+  assert.ok(!r.includes('D'));
+});
+
+test('返回顺序按图序稳定，不随遍历顺序漂移', () => {
+  // 同一次图的错误列表若顺序漂移，diff 会变成噪音，人就不看了。
+  const subs = [
+    { id: 'X', depends_on: [] },
+    { id: 'A', depends_on: ['B'] },
+    { id: 'B', depends_on: ['A'] },
+  ];
+  assert.deepEqual(cyc(subs), ['A', 'B']);
+  assert.deepEqual(cyc([...subs]), ['A', 'B']);
+});
+
+test('坏输入不抛：非数组、缺 id、depends_on 非数组都安全跳过', () => {
+  assert.deepEqual(cyc(null), []);
+  assert.deepEqual(cyc(undefined), []);
+  assert.deepEqual(cyc('不是数组'), []);
+  assert.deepEqual(cyc([null, { goal: '没有 id' }, { id: 'A', depends_on: 'oops' }]), []);
+  // 引用不存在的 id 不构成环（悬空引用由 validateGraph 另外逐条报）
+  assert.deepEqual(cyc([{ id: 'A', depends_on: ['不存在'] }]), []);
+});
+
+test('有环时 validateGraph 必须报错（这才是环检测真正的作用）', () => {
+  const g = graph([
+    sub({ id: 'A', goal: '甲', outputs: ['a.mjs'], depends_on: ['B'] }),
+    sub({ id: 'B', goal: '乙', outputs: ['b.mjs'], depends_on: ['A'] }),
+  ]);
+  const r = validateGraph(g);
+  assert.equal(r.ok, false, '成环的图必须整体判不合格');
+  const hit = r.errors.filter((e) => e.includes('成环'));
+  assert.equal(hit.length, 1, `成环应当只报一条（不重复刷屏）：${r.errors.join('\n')}`);
+  assert.ok(hit[0].includes('A') && hit[0].includes('B'), `错误信息要点出环上节点：${hit[0]}`);
+});
+
+test('三元环同样让 validateGraph 判不合格', () => {
+  const r = validateGraph(graph([
+    sub({ id: 'A', outputs: ['a.mjs'], depends_on: ['B'] }),
+    sub({ id: 'B', outputs: ['b.mjs'], depends_on: ['C'] }),
+    sub({ id: 'C', outputs: ['c.mjs'], depends_on: ['A'] }),
+  ]));
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.includes('成环')), r.errors.join('\n'));
+});
+
+test('无环的多依赖图不被成环判据误伤', () => {
+  const r = validateGraph(graph([
+    sub({ id: 'A', outputs: ['a.mjs'], depends_on: ['B', 'C'] }),
+    sub({ id: 'B', outputs: ['b.mjs'], depends_on: ['D'] }),
+    sub({ id: 'C', outputs: ['c.mjs'], depends_on: ['D'] }),
+    sub({ id: 'D', outputs: ['d.mjs'], depends_on: [] }),
+  ]));
+  assert.equal(r.ok, true, r.errors.join('\n'));
+  assert.ok(!r.errors.some((e) => e.includes('成环')), r.errors.join('\n'));
+});
+
+test('负向：把环检测调用摘掉，成环的图必须变合格', async () => {
+  // 与 outputs 那条负向测试同样的做法：真的做一次回退，证明这条测试守的是那段代码，
+  // 而不是「现在恰好通过」。只删调用点、不动 checkDependencyCycles 本体——
+  // 那正是一个人不小心把防御删掉时的形态。
+  const src = readFileSync(join(import.meta.dirname, 'validate-run.mjs'), 'utf8');
+  const find = 'const cyclic = checkDependencyCycles(graph.subtrees);';
+  assert.equal(src.split(find).length - 1, 1, '源码片段应当唯一');
+  const mutated = src.replace(find, 'const cyclic = []; // 回退：环检测被摘掉');
+  assert.doesNotMatch(mutated, /const cyclic = checkDependencyCycles\(graph\.subtrees\)/);
+
+  const dir = mkdtempSync(join(tmpdir(), 'ow-vr-cycle-neg-'));
+  try {
+    const target = join(dir, 'validate-run-mutated.mjs');
+    writeFileSync(target, mutated, 'utf8');
+    const mod = await import(pathToFileURL(target).href);
+
+    const cyclicGraph = graph([
+      sub({ id: 'A', outputs: ['a.mjs'], depends_on: ['B'] }),
+      sub({ id: 'B', outputs: ['b.mjs'], depends_on: ['A'] }),
+    ]);
+    assert.equal(validateGraph(cyclicGraph).ok, false, '原版必须拦下成环图');
+    assert.equal(mod.validateGraph(cyclicGraph).ok, true,
+      '摘掉调用后，成环图必须能通过——说明「成环被拒」是这段代码给的');
+    assert.ok(!mod.validateGraph(cyclicGraph).errors.some((e) => e.includes('成环')),
+      '摘掉调用后不该再有成环错误');
+    // 环检测本体还在：证明变异只摘了调用点，不是把函数改坏
+    assert.deepEqual(mod.checkDependencyCycles([{ id: 'A', depends_on: ['A'] }]), ['A']);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -28,7 +28,7 @@ import { spawnSync } from 'node:child_process';
 
 import {
   buildPlan, formatPlan, renderPlan, loadRun, findLatestRun, displayPath,
-  MAX_LINES, ROW_WIDTH, PLAN_VERSION,
+  MAX_LINES, ROW_WIDTH, PLAN_VERSION, VERIFIED_GLYPHS,
 } from './render-plan.mjs';
 
 // ── 夹具 ──────────────────────────────────────────────────────────────
@@ -225,9 +225,11 @@ test('失败行必须同时给出：记号、卡在哪、下一步 —— 缺一
   const lines = formatPlan(plan);
   const i = lines.findIndex((l) => l.includes('ST2'));
   assert.ok(i >= 0);
-  // 记号：✗ 而不是和其它行一样的 ○/✓
-  assert.match(lines[i], /✗/);
-  assert.equal(plan.subtrees.find((r) => r.id === 'ST2').mark, '✗');
+  // 记号：× 而不是其它行用的 ○/√。选 `×`（U+00D7）而不是 `✗`(U+2717) 的理由是
+  // 四款等宽字体里只有前者有 cmap 覆盖，且列表页已经把 `×` 用作 FAILED（同一个
+  // 概念两个字形是缺陷）。见 tui-visual.md §3.1 与本文件的「记号不得同屏复用」两条。
+  assert.match(lines[i], /×/);
+  assert.equal(plan.subtrees.find((r) => r.id === 'ST2').mark, '×');
   // 卡在哪：必须点名那个没落地的文件
   const detail = lines.slice(i + 1, i + 3).join('\n');
   assert.match(detail, /卡在：/);
@@ -519,3 +521,226 @@ test('displayPath 不输出本机绝对路径', () => {
   const outside = displayPath('/var/folders/xx/yy/task-graph.json', '/repo-root');
   assert.equal(outside, 'yy/task-graph.json');
 });
+
+// ── 组 7：depends_on 参与判定（PENDING 拆三态）──────────────────────────
+//
+// 这一组守的是「被前置阻塞」这件事**在屏幕上可见**。修改前 `depends_on` 被写进
+// `base` 对象之后全文再没有读过一次，于是「还没轮到」「没人管」「前置倒了」
+// 三种处境在屏幕上完全同形 —— 都是 `○ 待跑`。而它们的处置没有一条相同：
+// 前两者不用人动手，第三者必须先修前置。
+//
+// 每条都成对：**正向断言新状态，负向断言它不是 PENDING**。只断言前者的话，
+// 把整段依赖逻辑删掉、让所有子树都落 `UPSTREAM_FAILED` 也能过。
+
+/** 只造台账：某子树被派过且有终局结论。 */
+const failedRow = (task, path, minAgo = 5) => claimRow(task, path, minAgo, 10, 'declared-hash');
+
+/** A 失败、B 依赖 A 的图。`bOver` 用来改 B 的 on_dependency_failed。 */
+function scenarioUpstream(bOver = {}) {
+  const g = graph([
+    sub({ id: 'A', goal: '写基础库', outputs: ['a.mjs'] }),
+    sub({ id: 'B', goal: '在基础库上写上层', outputs: ['b.mjs'], depends_on: ['A'], ...bOver }),
+  ]);
+  // A：自述写了、磁盘上没有 → MISSING → FAILED（这是「前置真的倒了」的最硬形态）
+  const rows = [expectRow('A', ['a.mjs']), failedRow('A', 'a.mjs')];
+  return { g, rows, probe: probeOf({}) };
+}
+
+test('前置失败 → 下游是 UPSTREAM_FAILED，不是 PENDING（这是修改前最误导的一格）', () => {
+  const { g, rows, probe } = scenarioUpstream();
+  const plan = buildPlan({ graph: g, claimRows: rows, nowMs: NOW, probe, root: '/r' });
+  const byId = new Map(plan.subtrees.map((r) => [r.id, r]));
+
+  assert.equal(byId.get('A').state, 'FAILED', '前置本身必须是 FAILED（否则这一组测的不是这件事）');
+  assert.equal(byId.get('B').state, 'UPSTREAM_FAILED');
+  assert.notEqual(byId.get('B').state, 'PENDING', '前置倒了却显示「待跑」——等于让人去派一件派不出去的事');
+  // 要人处理：进 needs_attention，且排在 FAILED 之后、STUCK 之前
+  assert.deepEqual(plan.needs_attention, ['A', 'B']);
+  // 卡在哪与下一步必须点名那个前置，否则「先处理 A」这句无从执行
+  assert.match(byId.get('B').blocker, /A/);
+  assert.match(byId.get('B').next_step, /A/);
+  // 记号不能与 FAILED 相同：两者处置不同（一个是自己做砸了，一个是没拿到输入）
+  assert.notEqual(byId.get('B').mark, byId.get('A').mark);
+});
+
+test('on_dependency_failed: "degrade" → 前置失败也不冻住（research 型子树的活路）', () => {
+  const { g, rows, probe } = scenarioUpstream({ on_dependency_failed: 'degrade' });
+  const plan = buildPlan({ graph: g, claimRows: rows, nowMs: NOW, probe, root: '/r' });
+  const b = plan.subtrees.find((r) => r.id === 'B');
+  assert.equal(b.state, 'PENDING', 'degrade 的含义就是「前置倒了我也能做我能做的」，它该被派');
+  assert.notEqual(b.state, 'UPSTREAM_FAILED');
+  assert.equal(b.on_dependency_failed, 'degrade');
+  // 缺省必须是 block：没有这个字段时不许默默降级
+  const plain = buildPlan({ graph: scenarioUpstream().g, claimRows: rows, nowMs: NOW, probe, root: '/r' });
+  assert.equal(plain.subtrees.find((r) => r.id === 'B').on_dependency_failed, 'block');
+});
+
+test('前置还在跑 → 下游是 WAITING_ON，且**不进** ATTENTION（不用人处理）', () => {
+  const g = graph([
+    sub({ id: 'B', goal: '跑着的那个', outputs: ['b.mjs'] }),
+    sub({ id: 'A', goal: '等它', outputs: ['a.mjs'], depends_on: ['B'] }),
+  ]);
+  // B 派过、未超时、还没结论 → RUNNING
+  const rows = [expectRow('B', ['b.mjs'], 1, 30)];
+  const plan = buildPlan({ graph: g, claimRows: rows, nowMs: NOW, probe: probeOf({}), root: '/r' });
+  const byId = new Map(plan.subtrees.map((r) => [r.id, r]));
+  assert.equal(byId.get('B').state, 'RUNNING');
+  assert.equal(byId.get('A').state, 'WAITING_ON');
+  assert.notEqual(byId.get('A').state, 'PENDING');
+  // 不用人处理：这是本组的核心断言。它一旦进 needs_attention，「下一步：先处理 A」
+  // 就会把一个只是在等的子树报成待办，人于是去派一件派不出去的事。
+  assert.ok(!plan.needs_attention.includes('A'), `WAITING_ON 不该进 ATTENTION：${plan.needs_attention}`);
+  assert.equal(plan.ok, true, '全屏只有「在跑 + 等前置」时不该判「有事要处理」');
+  // 等谁必须写出来，否则用户不知道在等哪一件
+  assert.match(byId.get('A').note, /B/);
+});
+
+test('前置还没派 → 下游是 WAITING_ON（链条要一路传下去，不是只看一跳）', () => {
+  const g = graph([
+    sub({ id: 'C', goal: '第三环', outputs: ['c.mjs'] }),
+    sub({ id: 'B', goal: '第二环', outputs: ['b.mjs'], depends_on: ['C'] }),
+    sub({ id: 'A', goal: '第一环', outputs: ['a.mjs'], depends_on: ['B'] }),
+  ]);
+  const plan = buildPlan({ graph: g, claimRows: [], nowMs: NOW, probe: probeOf({}), root: '/r' });
+  const byId = new Map(plan.subtrees.map((r) => [r.id, r]));
+  assert.equal(byId.get('C').state, 'PENDING', '链条起点才是真正轮到你派的那一件');
+  assert.equal(byId.get('B').state, 'WAITING_ON');
+  assert.equal(byId.get('A').state, 'WAITING_ON', '两跳以外的下游也必须等');
+  // 三件在屏幕上必须**看得到区别**：一条链全显示「待跑」等于没做这次拆分。
+  const lines = formatPlan(plan);
+  for (const id of ['A', 'B', 'C']) {
+    const row = lines.find((l) => l.includes(id));
+    assert.ok(row, `${id} 没出现在输出里`);
+  }
+  assert.match(byId.get('B').note, /C/);
+  assert.match(byId.get('A').note, /B/);
+  // 且摘要必须把「在等」与「待跑」分开数 —— 合成一个数就回到修改前的同形问题
+  const summary = lines.find((l) => /进度/.test(l));
+  assert.match(summary, /2 等前置/, summary);
+  assert.match(summary, /1 待跑/, summary);
+});
+
+test('前置全 DONE → 下游仍是 PENDING（deps 齐了就该派，这条别被上面的分支吃掉）', () => {
+  const g = graph([
+    sub({ id: 'A', goal: '已完成', outputs: ['a.mjs'] }),
+    sub({ id: 'B', goal: '接着做', outputs: ['b.mjs'], depends_on: ['A'] }),
+  ]);
+  const rows = [expectRow('A', ['a.mjs']), claimRow('A', 'a.mjs', 5, 10, 'h'), consumeRow('A', 4)];
+  const plan = buildPlan({
+    graph: g, claimRows: rows, nowMs: NOW, root: '/r',
+    probe: probeOf({ 'a.mjs': { size: 10, sha256: 'h' } }),
+  });
+  const byId = new Map(plan.subtrees.map((r) => [r.id, r]));
+  assert.equal(byId.get('A').state, 'DONE');
+  assert.equal(byId.get('B').state, 'PENDING', '前置都交付了还不派，就是把「等」当成了结果');
+  // `PENDING` 不进 ATTENTION —— 这是本文件既有的退出码契约（1 = 失败/卡住/超时），
+  // 也是 doctor 依赖它的地方。它要靠摘要里的「N 待跑」被人看见，不靠 needs_attention。
+  assert.ok(!plan.needs_attention.includes('B'));
+  assert.match(formatPlan(plan).find((l) => /进度/.test(l)), /1 待跑/);
+});
+
+test('依赖成环 → 环上每一条都判 DEFECT，没有任何一条永远 WAITING_ON', () => {
+  // 这是「为什么必须有环检测」的直接证据：若把环当成普通的「等前置」，
+  // A 等 B、B 等 A 会双双落在 WAITING_ON —— 不在 ATTENTION 里，屏幕上看起来
+  // 一切正常，而实际上两件事永远不会有人做。
+  const g = graph([
+    sub({ id: 'A', goal: '甲', outputs: ['a.mjs'], depends_on: ['B'] }),
+    sub({ id: 'B', goal: '乙', outputs: ['b.mjs'], depends_on: ['A'] }),
+  ]);
+  const plan = buildPlan({ graph: g, claimRows: [], nowMs: NOW, probe: probeOf({}), root: '/r' });
+  const byId = new Map(plan.subtrees.map((r) => [r.id, r]));
+  for (const id of ['A', 'B']) {
+    assert.equal(byId.get(id).state, 'DEFECT', `${id} 在环上却判成 ${byId.get(id).state}`);
+    assert.notEqual(byId.get(id).state, 'WAITING_ON');
+    assert.ok(plan.needs_attention.includes(id), `${id} 在环上却不进 ATTENTION`);
+  }
+  assert.ok(plan.notes.some((n) => /成环/.test(n)), `成环必须在 notes 里说出来：${plan.notes}`);
+  // 有环的 summary 也要能跑通（不能因为 state 不在表里就 undefined）
+  const lines = formatPlan(plan);
+  assert.ok(lines.length <= MAX_LINES, lines.join('\n'));
+});
+
+// ── 组 8：记号消歧（同屏唯一 + 只允许已验证字形）──────────────────────
+
+test('每个记号都在 VERIFIED_GLYPHS 里有据可查（新加的字形不许蒙混过关）', () => {
+  const { g, rows, probe } = scenarioFive();
+  const plan = buildPlan({ graph: g, claimRows: rows, nowMs: NOW, probe, root: '/r' });
+  for (const r of plan.subtrees) {
+    assert.ok(VERIFIED_GLYPHS[r.mark],
+      `${r.id} 用了未验证的字形 ${JSON.stringify(r.mark)}（${r.state}）—— `
+      + '新增字形必须同时验 cmap 覆盖 / 真终端非豆腐 / 列宽 1（tui-visual.md §3.1）');
+  }
+});
+
+test('同屏一个记号只能表示一个状态（跨屏复用允许，同屏复用禁止）', () => {
+  // 造一张「所有状态都出现」的图，把屏幕上见得到的记号全部收集起来。
+  // 同屏复用会让「这一行到底是失败还是超时」无解，而记号是色盲/管道下唯一的信息通道。
+  const g = graph([
+    sub({ id: 'DONE1', outputs: ['d.mjs'] }),
+    sub({ id: 'FAIL1', outputs: ['f.mjs'] }),
+    sub({ id: 'STUCK1', outputs: ['s1.mjs', 's2.mjs'] }),
+    sub({ id: 'DEFECT1', shape: 'artifact', outputs: [] }),
+    sub({ id: 'OVERDUE1', outputs: ['o.mjs'], timeout_min: 1 }),
+    sub({ id: 'RUN1', outputs: ['r.mjs'], timeout_min: 600 }),
+    sub({ id: 'PEND1', outputs: ['p.mjs'] }),
+    sub({ id: 'WAIT1', outputs: ['w.mjs'], depends_on: ['RUN1'] }),
+    sub({ id: 'UP1', outputs: ['u.mjs'], depends_on: ['FAIL1'] }),
+    sub({ id: 'UNCL1', outputs: ['x.mjs'] }),
+  ]);
+  const rows = [
+    expectRow('DONE1', ['d.mjs']), claimRow('DONE1', 'd.mjs', 5, 10, 'h'), consumeRow('DONE1', 4),
+    expectRow('FAIL1', ['f.mjs']), claimRow('FAIL1', 'f.mjs', 5, 10, 'wrong-hash'),
+    expectRow('STUCK1', ['s1.mjs', 's2.mjs']), claimRow('STUCK1', 's1.mjs', 5, 10, 'hs1'),
+    expectRow('OVERDUE1', ['o.mjs'], 5, 1),
+    expectRow('RUN1', ['r.mjs'], 1, 600),
+  ];
+  const plan = buildPlan({
+    graph: g, claimRows: rows, nowMs: NOW, root: '/r',
+    probe: probeOf({
+      'd.mjs': { size: 10, sha256: 'h' }, 's1.mjs': { size: 10, sha256: 'hs1' },
+      'x.mjs': { size: 1, sha256: 'orphan' },
+    }),
+  });
+  // 十种状态都必须真的出现，否则这条测试只覆盖了一部分（会假绿）
+  const want = ['DONE', 'FAILED', 'STUCK', 'DEFECT', 'OVERDUE', 'RUNNING', 'PENDING',
+    'WAITING_ON', 'UPSTREAM_FAILED', 'LANDED_UNCLAIMED'];
+  const got = new Set(plan.subtrees.map((r) => r.state));
+  for (const s of want) assert.ok(got.has(s), `场景没造出 ${s}，这条断言覆盖不到它：${[...got]}`);
+
+  const markToStates = new Map();
+  for (const r of plan.subtrees) {
+    const set = markToStates.get(r.mark) || new Set();
+    set.add(r.state);
+    markToStates.set(r.mark, set);
+  }
+  const clashes = [...markToStates].filter(([, s]) => s.size > 1);
+  assert.deepEqual(clashes, [],
+    `同一屏里一个记号表示了多个状态：${JSON.stringify(clashes.map(([m, s]) => [m, [...s]]))}`);
+
+  // 屏幕上真的看得见的那几行也要满足同一条 —— 只看 JSON 不够，
+  // 因为 `formatPlan` 里另有字面量（`↳`、`…`），那些也必须与状态记号不撞。
+  const lines = formatPlan(plan);
+  for (const r of plan.subtrees) {
+    const row = lines.find((l) => l.includes(r.id));
+    assert.ok(row !== undefined, `${r.id} 没有出现在人读输出里`);
+    assert.ok(row.includes(r.mark), `${r.id} 的那一行没有用它的记号 ${r.mark}：${row}`);
+  }
+});
+
+test('已实测为豆腐块/宽度的字形不得回到记号表（负向：退化即红）', () => {
+  // 这四个是**有据可查的坏选择**，不是审美偏好：
+  //   ◐ U+25D0  conhost 豆腐块，四款等宽字体 cmap 全缺（tui-visual.md §6）
+  //   ✗ U+2717  cmap 四款全缺（同上实测），且与列表页的 FAILED(×) 是两个字形
+  //   ▲ U+25B2  已归 STALLED，同屏复用会与「卡住」混淆
+  //   ⚠ U+26A0  EAW=Ambiguous，带 VS16 时变 2 列会抖列，且 cmap 四款全缺
+  const banned = ['◐', '✗', '✕', '▲', '⚠'];
+  for (const [mark, meta] of Object.entries(VERIFIED_GLYPHS)) {
+    assert.ok(!banned.includes(mark), `记号 ${mark}（${meta.cp}）是被实测推翻过的字形`);
+  }
+  const { g, rows, probe } = scenarioFive();
+  const plan = buildPlan({ graph: g, claimRows: rows, nowMs: NOW, probe, root: '/r' });
+  for (const r of plan.subtrees) {
+    assert.ok(!banned.includes(r.mark), `${r.id} 用回了被推翻的字形 ${r.mark}`);
+  }
+});
+
