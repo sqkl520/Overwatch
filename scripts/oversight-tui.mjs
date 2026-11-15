@@ -354,8 +354,12 @@ function defaultScan({ days, exec = execFile }) {
           resolve({ data, warning: null });
           return;
         }
+        // **这里只给原因，不加「扫描失败：」前缀。**
+        // 展示层（`:756` / `:1618` / `:2028`）会各加一次 —— 原来两边都加，
+        // 实测输出是「扫描失败：扫描失败：Command failed: ...」，重复两遍。
+        // 前缀属于展示，原因属于采集，混在一起就会随调用点数量翻倍。
         const reason = err
-          ? (err.killed ? `扫描超时（>${Math.round(SCAN_TIMEOUT_MS / 1000)}s）` : `扫描失败：${err.message}`)
+          ? (err.killed ? `扫描超时（>${Math.round(SCAN_TIMEOUT_MS / 1000)}s）` : String(err.message || '子进程失败'))
           : '扫描输出不是合法 JSON';
         const extra = String(stderr ?? '').trim().split('\n').filter(Boolean)[0];
         resolve({ data: null, warning: extra ? `${reason}（${extra.slice(0, 80)}）` : reason });

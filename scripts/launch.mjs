@@ -60,7 +60,7 @@
  * 零 npm 依赖，只用 node: 内置模块。
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, dirname, resolve, basename, isAbsolute, sep } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
@@ -397,6 +397,56 @@ function askProtocol(config, mode) {
   return lines.join('\n');
 }
 
+/** 按 roster 现场生成一份只含启用角色的载荷目录。返回 `null` = 不筛。
+ *
+ *  **为什么必须现场生成而不是维护第二份**：本仓库已经把「两份形态必然漂移」吃过好几次亏
+ *  （`.claude/` 与 `dist/payload/` 那次）。这里的目录是 `dist/roster/`（gitignored），
+ *  每次启动**先清空再重建**，源永远只有一份：`.claude/agents/*.md`。
+ *  用户的 `.claude/` 一个字节都不动。
+ *
+ *  **什么时候不筛**（每种都写清楚，因为「静默地不筛」和「筛了」看起来一样）：
+ *    · roster 没配 / 空数组 —— 语义是「全都启用」，不是「一个都不挂」
+ *    · 筛完一个不剩 —— 那多半是配置写错了名字；挂空目录会让用户以为角色消失，
+ *      而 .claude 里的 SKILL.md 引用了全部 12 个角色，挂空必然派发失败
+ *    · 生成失败（磁盘满 / 权限）—— 退回整目录，并把原因记进 `why`
+ *
+ *  @returns {{dir: string, enabled: string[], skipped: string[], why?: string}|null}
+ */
+function applyRoster({ root, payload, roster }) {
+  const names = Array.isArray(roster) ? roster : [];
+  if (!names.length) return null;                 // 没配 = 全挂
+  if (!payload || !payload.agents || !payload.agents.length) return null;
+
+  const on = new Set(names);
+  const enabled = payload.agents.filter((a) => on.has(a));
+  const skipped = payload.agents.filter((a) => !on.has(a));
+  if (!enabled.length) return null;               // 筛空了 = 配置有问题，别真的挂空
+  if (!skipped.length) return null;               // 全启用 = 不需要筛
+
+  const out = join(root, 'dist', 'roster');
+  try {
+    // **先清空再重建**：残留的旧角色会让用户以为它还在。
+    rmSync(out, { recursive: true, force: true });
+    mkdirSync(join(out, 'agents'), { recursive: true });
+    mkdirSync(join(out, '.claude-plugin'), { recursive: true });
+    // manifest 必须带：宿主靠它认这个目录是 plugin 根（实测没有它 Version 会是 unknown）
+    writeFileSync(join(out, '.claude-plugin', 'plugin.json'), JSON.stringify({
+      name: 'overwatch-roster',
+      version: '0.0.0',
+      description: `Overwatch 运行时分身：只含 roster 启用的 ${enabled.length} 个角色（每次启动重建，不是第二份真源）`,
+    }, null, 2) + '\n');
+    for (const a of enabled) {
+      copyFileSync(join(payload.dir, 'agents', `${a}.md`), join(out, 'agents', `${a}.md`));
+    }
+    // **skills 不带**：`SKILL.md` 引用了全部 12 个角色名，
+    // 只给一部分会让它派发到不存在的角色 —— 那是比「少一个角色」更坏的失败。
+    // 所以分身只挂 agents，skill 留在整目录那份里（用户按需自己选）。
+  } catch (e) {
+    return { dir: payload.dir, enabled, skipped, why: `生成失败，退回整目录：${(e && e.message) || e}` };
+  }
+  return { dir: out, enabled, skipped };
+}
+
 /** 从 roster 算出**没被启用**的角色。用途只有一个：把「挂载 ≠ 调度」说清楚时给出具体名字。 */
 function rosterGap(roster, agents) {
   const on = new Set(roster || []);
@@ -599,8 +649,21 @@ async function planLaunch(opts) {
   const settingsJson = hooksSettings ? JSON.stringify(hooksSettings, null, 2) : null;
   const settingsPath = settingsJson ? settingsPathFor(root, settingsJson) : null;
 
+  // **roster 现在真的会筛。** 在此之前它只被读来「算出谁没启用」并写进台账，
+  // 没有一行按它挂载 —— 和 `ask.mode` 曾经一样是假承诺。
+  //
+  // 做法：`--plugin-dir` 只能挂整个目录，所以运行时**现场生成一份只含启用角色的目录**
+  // 到 gitignored 的 `dist/roster/`，再把 `--plugin-dir` 指过去。
+  // **不维护第二份真源**：它每次启动重建，源永远是 `.claude/agents/`，
+  // 用户的 `.claude/` 一个字节都不动。
+  //
+  // 没配 roster、或 roster 为空、或筛完一个不剩 → 不筛，挂整个目录。
+  // 「什么都不配」必须是「全都启用」，不是「一个都不挂」。
+  const applied = opts.noPayload ? null : applyRoster({ root, payload, roster: config.roster });
+  const mountDir = applied ? applied.dir : payload.dir;
+
   const hostArgs = [];
-  if (!opts.noPayload) hostArgs.push('--plugin-dir', payload.dir);
+  if (!opts.noPayload) hostArgs.push('--plugin-dir', mountDir);
   if (settingsPath) hostArgs.push('--settings', settingsPath);
 
   const mode = opts.verify ? 'verify' : (opts.print ? 'print' : 'interactive');
@@ -622,7 +685,11 @@ async function planLaunch(opts) {
   if (mode === 'print') hostArgs.push('-p');
   if (mode === 'print' && opts.prompt !== null) hostArgs.push(opts.prompt);
   if (mode === 'verify') {
-    hostArgs.push('plugin', 'details', String(payload.name || 'overwatch'));
+    // **名字必须跟着实际挂的那个目录走。** roster 筛过之后，`--plugin-dir` 指的是
+    // `dist/roster/`，它的 manifest 名叫 `overwatch-roster` —— 再按 `overwatch` 去问，
+    // 宿主会说 `Plugin "overwatch" not found`，而那是**我们问错了名字**，不是载荷没挂。
+    // 实测：筛过之后 `--verify` 直接误报「12 个全缺」。
+    hostArgs.push('plugin', 'details', String((applied && applied.dir !== payload.dir ? 'overwatch-roster' : payload.name) || 'overwatch'));
   }
   hostArgs.push(...opts.extra);
 
@@ -638,7 +705,7 @@ async function planLaunch(opts) {
   return {
     root, cwd, mode, hostBin: opts.hostBin, host, hostArgs, execFile, execArgs,
     payload, config, hooksOff, hooksSettings, settingsJson, settingsPath,
-    roster: config.roster, rosterGap: gap,
+    roster: config.roster, rosterGap: gap, rosterApplied: applied, mountDir,
     skipAuthCheck: Boolean(opts.skipAuthCheck),
     dryRun: Boolean(opts.dryRun),
     prompt: opts.prompt,
@@ -673,15 +740,21 @@ function renderPlan(p) {
   }
 
   if (p.config.found) {
-    lines.push(`  roster     ${p.config.roster.join(', ') || '（空）'} —— 来自 ${basename(p.config.file)}`);
+    lines.push(`  roster     ${p.config.roster.join(', ') || '（空 = 全都启用）'} —— 来自 ${basename(p.config.file)}`);
     if (p.payload.skipped) {
-      lines.push('             这部分只影响调度，不影响挂载；本次没挂载荷，所以谁都不在。');
+      lines.push('             本次没挂载荷（--no-payload），所以谁都不在。');
+    } else if (p.rosterApplied) {
+      // **roster 现在真的筛。** 2026-11-15 之前这段写的是「只影响调度，不影响挂载」——
+      // 那时它是真的：`--plugin-dir` 只能挂整个目录，roster 只被读来算谁没启用。
+      // 现在运行时现场生成一份只含启用角色的分身（`dist/roster/`，gitignored、每次重建），
+      // 所以那句话**变成了假话**，必须换掉 —— 陈旧文案比没有文案更坏。
+      lines.push(`             → 只挂启用的 ${p.rosterApplied.enabled.length} 个：${p.rosterApplied.enabled.join(', ')}`);
+      lines.push(`               没启用的 ${p.rosterApplied.skipped.length} 个**不会出现在这个会话里**：`);
+      lines.push(`               ${p.rosterApplied.skipped.join(', ')}`);
+      lines.push(`               分身目录 ${p.rosterApplied.dir}（每次启动重建，源永远是 .claude/agents/，不是第二份真源）`);
+      if (p.rosterApplied.why) lines.push(`               ⚠ ${p.rosterApplied.why}`);
     } else if (p.rosterGap.disabled.length) {
-      lines.push(`             ⚠ **只影响调度，不影响挂载**：--plugin-dir 的单位是目录，没有「只挂一部分」的开关。`);
-      lines.push(`               本次整目录挂载，${p.payload.agents.length} 个角色全部可见；没被 roster 启用的 ${p.rosterGap.disabled.length} 个是：`);
-      lines.push(`               ${p.rosterGap.disabled.join(', ')}`);
-      lines.push('               （筛一份目录出来挂是可行的，但那会变成第二份载荷、与 .claude/ 漂移，');
-      lines.push('                 且 skill 里引用了全部角色，筛掉一个就会派发到不存在的角色。所以本命令不做。）');
+      lines.push(`             ⚠ 筛了但没用上（${p.rosterGap.disabled.length} 个没启用）：见上面那行原因`);
     }
     for (const e of p.config.errors) lines.push(`             ⚠ 配置有错：${e}`);
   } else {
@@ -861,7 +934,14 @@ function runVerify(p) {
   // **期望清单必须独立于宿主输出。** `expected` 来自 git 跟踪的文件（或兜底常量），
   // 而 `body` 是宿主说的。拿磁盘上「现在有几个」当期望是照镜子 ——
   // 挪走两个 agent 期望也跟着少两个，于是「10 个，逐个对上」exit 0。
-  const expected = p.payload.expected;
+  // **roster 筛过之后，期望清单也要跟着筛。**
+  // 否则 `--verify` 会把「按配置没挂那 9 个」报成失败 —— 那不是缺陷，是配置本意。
+  // 期望仍来自 git 跟踪的清单（独立来源），只是按 roster 过滤一次：
+  // 「该挂的」= 配置说启用的 ∩ git 说存在的。两个来源仍然独立。
+  const expectedAll = p.payload.expected;
+  const expected = (Array.isArray(expectedAll) && p.rosterApplied)
+    ? expectedAll.filter((a) => !p.rosterApplied.skipped.includes(a))
+    : expectedAll;
   const spawnFailed = Boolean(r.error);
 
   // **没有独立期望 = 无法验证**，不是通过。这一支比「缺名字」更重要：
@@ -879,7 +959,12 @@ function runVerify(p) {
   })();
 
   const missing = (expected || []).filter((a) => !body.includes(a));
-  const extra = p.payload.agents.filter((a) => expected && !expected.includes(a));
+  // `extra` 的本意是「**实际挂载目录里有、但 git 里没有**」——防有人手工往载荷里塞东西。
+  // 所以它该比的是挂载目录的实际内容（roster 分身只有启用那几个），不是全量清单。
+  // 原来拿 `p.payload.agents`（全量 12 个）比筛过的 expected（3 个），
+  // 于是「按配置没挂的那 9 个」全被报成「多出来的」——判据用错了对象。
+  const extra = (p.rosterApplied ? p.rosterApplied.enabled : p.payload.agents)
+    .filter((a) => expected && !expected.includes(a));
   const ok = !spawnFailed
     && r.status === 0
     && Array.isArray(expected) && expected.length > 0

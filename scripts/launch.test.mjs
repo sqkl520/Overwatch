@@ -168,7 +168,7 @@ test('--dry-run 不写任何文件（台账目录与 settings 都必须是空的
   });
 });
 
-test('--dry-run 打印的命令行含 --plugin-dir <repo>/.claude（逐字可复制）', () => {
+test('--dry-run 打印的命令行含 --plugin-dir（逐字可复制，指向实际会挂的那个目录）', () => {
   withTmp((dir) => {
     const r = run(['launch', '--dry-run'], { env: { OVERWATCH_RUNS_DIR: isolatedRuns(dir) } });
     assert.equal(r.code, 0, r.err);
@@ -179,8 +179,15 @@ test('--dry-run 打印的命令行含 --plugin-dir <repo>/.claude（逐字可复
     const m = cmd.match(/--plugin-dir\s+'?([^'\s]+)'?/);
     assert.ok(m, `命令行里必须有 --plugin-dir：${cmd}`);
     // 归一化分隔符再比 —— Windows 上打印的是反斜杠，那是同一个路径。
-    assert.equal(m[1].split('\\').join('/'), PAYLOAD_DIR.split('\\').join('/'),
-      `--plugin-dir 应指向仓库的 .claude/，实际 ${m[1]}`);
+    const got = m[1].split('\\').join('/');
+    // **指向「实际会挂的那个目录」，不一定是 `.claude/`。**
+    // 2026-11-15 起 roster 会筛：有启用清单时挂的是 `dist/roster/` 分身。
+    // 这条测试的意图是「打印的命令行逐字可复制」—— 所以它该断言的是
+    // 「指向一个真实存在、且与输出里载荷那行一致的目录」，不是钉死某个路径名。
+    const underRepo = got.startsWith(REPO.split('\\').join('/'));
+    assert.ok(underRepo, `--plugin-dir 应指向本仓库内的目录，实际 ${m[1]}`);
+    assert.ok(got.endsWith('/.claude') || got.endsWith('/dist/roster'),
+      `--plugin-dir 应是 .claude/ 或按 roster 生成的分身，实际 ${m[1]}`);
     // 同时钉住「它自己说了这是要执行的、本次没执行」。
     assert.match(r.out, /没有执行任何东西|本次没有执行/, '必须说清本次没执行');
   });
@@ -245,33 +252,48 @@ test('--no-payload 关掉载荷（不传 --plugin-dir），--no-hooks 关掉 hoo
 
 // ── 2. roster：只能整目录挂，且必须说出来 ────────────────────────────
 
-test('roster 只影响调度、不影响挂载：整目录挂载 + 明确告知（钉住现状）', () => {
+test('roster 现在真的筛：只挂启用的角色（2026-11-15 起）', () => {
+  // 这条测试**改了断言的方向**。它原来钉的是「roster 只影响调度、不影响挂载」——
+  // 那时那是真的：`--plugin-dir` 只能挂整个目录，roster 只被读来算谁没启用。
+  // 现在运行时现场生成一份只含启用角色的分身（`dist/roster/`，gitignore、每次重建），
+  // 所以旧断言**变成了假的**，测试必须跟着改 —— 留着它就是在钉一个已经不存在的行为。
   withTmp((dir) => {
     const r = run(['launch', '--dry-run'], { env: { OVERWATCH_RUNS_DIR: isolatedRuns(dir) } });
     assert.equal(r.code, 0, r.err);
     const agents = realAgents();
     const roster = JSON.parse(readFileSync(join(REPO, 'overwatch.config.json'), 'utf8')).agent.roster;
     const disabled = agents.filter((a) => !roster.includes(a));
-    assert.ok(disabled.length > 0, '本测试的前提：配置里的 roster 确实比全量少（否则下面断言没意义）');
+    assert.ok(disabled.length > 0, '本测试的前提：配置里的 roster 确实比全量少');
 
-    // ① 命令行里**只有一个** --plugin-dir，指向整目录。若哪天有人做了筛选，
-    //    这里会出现第二个 / 一个临时目录 —— 那条改动必须同时改本测试与 spec。
     const cmd = commandLineOf(r.out);
     assert.ok(cmd, `输出里没有命令行段：\n${r.out}`);
     const hits = [...cmd.matchAll(/--plugin-dir/g)];
     assert.equal(hits.length, 1, `命令行里应只有一个 --plugin-dir：${cmd}`);
-    assert.ok(cmd.includes(PAYLOAD_DIR.split('\\').join('\\')) || cmd.includes(PAYLOAD_DIR),
-      `--plugin-dir 应指向整个 .claude/：${cmd}`);
+    assert.ok(cmd.includes(join(REPO, 'dist', 'roster')) || cmd.includes('dist/roster'),
+      `--plugin-dir 应指向按 roster 生成的分身目录：${cmd}`);
+    assert.ok(!cmd.includes(PAYLOAD_DIR), `不应该再挂整目录：${cmd}`);
 
-    // ② 输出里必须**明说**没被 roster 启用的角色仍然可见。
-    assert.match(r.out, /只影响调度，不影响挂载/, '必须说清 roster 的作用范围');
-    assert.match(r.out, /整目录挂载/, '必须说清是整目录挂载');
+    // 输出必须点名「挂了哪几个、没挂哪几个」—— 用户要能一眼看出这个会话里谁不在
+    assert.match(r.out, /只挂启用的 \d+ 个/, '必须说清只挂了启用的角色');
+    assert.match(r.out, /不会出现在这个会话里/, '没启用的必须明说「不会出现」');
     for (const a of disabled) {
-      assert.ok(r.out.includes(a), `没被启用的角色 ${a} 也要点名列出（否则用户以为它不在）：\n${r.out}`);
+      assert.ok(r.out.includes(a), `没被启用的角色 ${a} 也要点名列出：\n${r.out}`);
     }
-    // ③ 还要给出「为什么不做筛选」，否则下一轮又会有人问一遍。
-    assert.match(r.out, /第二份载荷|漂移/, '应说明筛一份目录会变成第二份载荷');
+    // 分身不是第二份真源，这件事必须写在输出里，否则下一个人会以为要手工同步
+    assert.match(r.out, /每次启动重建|不是第二份真源/, '要说明分身是运行时生成、不维护第二份');
   });
+});
+
+test('roster 为空 / 筛空 / 全启用时都不筛（挂整目录）', () => {
+  // 「什么都不配」必须是「全都启用」，不是「一个都不挂」。
+  // 筛空了则多半是配置写错了名字 —— 真的挂一个空目录会让用户以为角色全消失。
+  const src = readFileSync(join(HERE, 'launch.mjs'), 'utf8');
+  assert.match(src, /if \(!names\.length\) return null;\s*\/\/ 没配 = 全挂/,
+    '空 roster 必须退回整目录');
+  assert.match(src, /if \(!enabled\.length\) return null;\s*\/\/ 筛空了/,
+    '筛空必须退回整目录，不许真的挂空');
+  assert.match(src, /if \(!skipped\.length\) return null;\s*\/\/ 全启用/,
+    '全启用时不必筛');
 });
 
 test('roster 缺失/坏掉时不影响挂载，但如实说', () => {
@@ -487,11 +509,15 @@ test('仓内没有覆盖长行：每次真跑都记一行台账，且台账不�
 
 // ── 5. --verify：不需要认证也不需要推理 ──────────────────────────────
 
-test('--verify 逐个核对 12 个角色都在宿主印的清单里 → exit 0', () => {
+test('--verify 逐个核对「该挂的角色」都在宿主印的清单里 → exit 0', () => {
   withTmp((dir) => {
     const host = fakeHost(dir);
+    // **期望是「按 roster 筛过的」，不是全量 12 个。** 2026-11-15 起 roster 真的筛，
+    // 所以「该挂的」= 配置启用的那几个。假宿主只要印出这几个就能对上；
+    // 印全量反而会因为「多出来的」被判失败（那条判据防的是手工往载荷里塞东西）。
+    const roster = JSON.parse(readFileSync(join(REPO, 'overwatch.config.json'), 'utf8')).agent.roster;
     const r = run(['launch', '--verify', '--host-bin', host, '--no-hooks'], {
-      env: { FAKE_MODE: 'plugin', FAKE_AGENTS: realAgents().join(','), OVERWATCH_RUNS_DIR: isolatedRuns(dir) },
+      env: { FAKE_MODE: 'plugin', FAKE_AGENTS: roster.join(','), OVERWATCH_RUNS_DIR: isolatedRuns(dir) },
     });
     assert.equal(r.code, 0, `载荷齐全应 exit 0：${r.code}\n${r.out}\n${r.err}`);
     assert.match(r.out, /载荷挂对了/, '要说清结论');
