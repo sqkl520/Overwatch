@@ -239,6 +239,42 @@ test('session_crons 非空 → 同样放行', () => {
   assert.equal(d.allowReason, 'background-tasks-running');
 });
 
+// ── 3b. `stop_hook_active`：文档要求查它，否则会对永远不成立的条件反复拦 ──
+
+test('stop_hook_active=true → 无条件放行，且理由与「没有可核对断言」区分开', () => {
+  // 构造一个**本来会拦**的输入：可核对的断言 + 记录里零证据。
+  // 若 `stop_hook_active` 被忽略，这条会返回 block。
+  const recs = [{ type: 'user', timestamp: new Date().toISOString(), message: { content: [{ type: 'text', text: '做吧' }] } }];
+  const text = '测试全部通过，1565 项全绿。';
+  const blocking = decide({
+    input: inputOf({ last_assistant_message: text, stop_hook_active: false }),
+    records: recs, project: NODE_PROJ, mode: 'block',
+  });
+  assert.equal(blocking.action, 'block', '前置条件：不带 stop_hook_active 时这条应当被拦');
+
+  const d = decide({
+    input: inputOf({ last_assistant_message: text, stop_hook_active: true }),
+    records: recs, project: NODE_PROJ, mode: 'block',
+  });
+  assert.equal(d.action, 'allow', 'stop_hook_active=true 必须放行');
+  assert.equal(d.allowReason, 'stop-hook-active');
+  // **不许和 no-checkable-claim 混成一条**：两者原因完全不同，混了事后统计就又变成
+  // 「同一个桶里装两件事」—— 这个仓库为这个形态已经付过账（115/115 = 100% 那次）。
+  assert.notEqual(d.allowReason, 'no-checkable-claim');
+});
+
+test('stop_hook_active 的判定在 no-checkable-claim 之前（理由要写准，不能写错）', () => {
+  // 同时满足两个条件：stop_hook_active=true **且** 没有可核对断言。
+  // 放行结果一样，但 `allowReason` 必须记更具体的那个，否则日志会把「因 hook 已激活而放行」
+  // 记成「没有可核对断言」，两个不同的原因在统计里合并成一条。
+  const d = decide({
+    input: inputOf({ last_assistant_message: '我做了一些事。', stop_hook_active: true }),
+    records: [], project: NODE_PROJ, mode: 'block',
+  });
+  assert.equal(d.action, 'allow');
+  assert.equal(d.allowReason, 'stop-hook-active');
+});
+
 // ── 4. reason 的语气随拦截次数升级 ──────────────────────────────────
 
 test('第 1–3 次是普通提示，第 4 次起明说「宿主会强制放行」并给台阶', () => {

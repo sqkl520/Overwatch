@@ -171,6 +171,29 @@ export function decide({ input, records, cwd, project, blockCount = 0, mode = 'o
     assistantText: text,
   };
 
+  // ── `stop_hook_active`：**先判它，再判别的**。 ──
+  //
+  // 宿主文档的定义是「这次 Stop 已经是某次 Stop hook 导致继续的结果」。它的用途是
+  // 防止对一个永远不成立的条件反复 block —— 文档原话是「查这个值，否则会反复拦」。
+  //
+  // 这个字段此前只被记进日志（`record.stopHookActive`），`decide()` 从头到尾不读它，
+  // 等同「照文档写了一半」。现在它在最前面，因为它的语义是**关于这次调用本身**的，
+  // 而不是关于某个 claim 的。
+  //
+  // **为什么放在 `no-checkable-claim` 之前**：没有可核对断言时本来就放行，先判后判
+  // 结果一样；但把它放前面，日志里的 `allowReason` 会准确 —— 否则一个因
+  // `stop_hook_active` 而放行的调用会被记成「没有可核对断言」，两个完全不同的原因
+  // 混成一条，事后统计就又出现「同一个桶里装两件事」。
+  if (input && input.stop_hook_active) {
+    return {
+      ...base,
+      action: 'allow',
+      allowReason: 'stop-hook-active',
+      blocking: [],
+      reason: '',
+    };
+  }
+
   if (!checkable.length) {
     return { ...base, action: 'allow', allowReason: 'no-checkable-claim', blocking: [], reason: '' };
   }
