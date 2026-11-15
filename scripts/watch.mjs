@@ -2773,9 +2773,36 @@ async function main(argv) {
       console.log(JSON.stringify({ generatedAt: new Date().toISOString(), items }, null, 2));
     } else {
       console.log(formatInbox(items));
+      // **收件箱空的时候，当场查守护进程在不在跑。**
+      // 空有两种原因，而原来那句「也可能是守护进程没在跑」只是并列提一句，
+      // 用户看不出自己属于哪种：实测守护停了 25.4 小时，`--inbox` 说「空」，
+      // 而同一分钟 `scan` 报 4 个 BLOCKED —— 看起来像两个工具打架，
+      // 其实是**一个说得对（现场扫描）、一个读的是没人写的历史表**。
+      // 现在把原因直接判出来，而不是让用户自己去敲第二条命令。
+      if (!items.length) {
+        // 复用 `--health` 的同一个判据（`healthCheck`），不另写一份
+        // —— 「守护进程在不在工作」这个问题只能有一个答案来源。
+        const h = healthCheck(state, { nowMs: Date.now(), logHealth: readLogHealth(dir) });
+        if (h && h.healthy === false) {
+          console.log('');
+          console.log('↑ 这个「空」不可信：后台监视没有在工作。');
+          for (const r of (h.reasons || [])) console.log(`  · ${typeof r === 'string' ? r : JSON.stringify(r)}`);
+          console.log('  它没在写通知，所以这里当然什么都没有。要用**此刻的真实状态**，跑：');
+          console.log('    node scripts/scan-sessions.mjs --days 1');
+          // **退出码必须能分开这两种「空」。** 原来无论守护进程死活都是 0 ——
+          // 调用方（脚本、CI、别的 agent）拿到的信号是「没事要处理」，
+          // 而真相是「我根本不知道有没有事」。本仓库对「空 vs 坏了」分开报
+          // 已经有过判据（doctor 的 exit 2 / exit 3），这里是同一件事。
+          // 3 = 环境不可信；0 仍表示「确实没有要处理的」。
+          process.exitCode = 3;
+        }
+      }
     }
-    // 空收件箱不是错误：没有需要处理的事，退出 0。调用方靠文本判断。
-    process.exit(0);
+    // 空收件箱**通常**不是错误：没有需要处理的事，退出 0。
+    // 但「空且守护进程没在跑」是另一回事 —— 那时这个空不可信，上面已经设了 exitCode 3。
+    // 这里必须 `process.exit(exitCode)` 而不是 `process.exit(0)`：
+    // 后者会把上面那个 3 覆盖掉，等于什么都没说。
+    process.exit(process.exitCode || 0);
   }
 
 

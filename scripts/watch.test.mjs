@@ -2886,3 +2886,30 @@ test('缺陷3：pruneNotified 按 lastSeenAt 计时，老但仍在被看到的�
   assert.ok(notified.still, '30 小时前首次发现、但刚刚还在的条目必须保留');
   assert.equal(notified.gone, undefined);
 });
+
+// ── 空收件箱必须能分出「真的没事」与「我根本不知道」（2026-11-15）────────
+//
+// 实测：守护进程停了 25.4 小时，`--inbox` 说「空」并 exit 0，
+// 而同一分钟 `scan-sessions --days 1` 报 4 个 BLOCKED。用户看到的是两个工具打架，
+// 真相是**一个说得对（现场扫描）、一个读的是没人写的历史表**。
+// 本仓库对「空 vs 坏了」分开报已经有过判据（doctor 的 exit 2 / exit 3），这里是同一件事。
+
+test('空收件箱 + 守护进程没在跑 → 文案要说明「这个空不可信」并给替代命令', () => {
+  const src = readFileSync(join(import.meta.dirname, 'watch.mjs'), 'utf8');
+  // 判据必须复用 healthCheck，不许另写一份「守护进程在不在工作」
+  assert.match(src, /healthCheck\(state, \{ nowMs: Date\.now\(\), logHealth: readLogHealth\(dir\) \}\)/,
+    '「在不在工作」只能有一个答案来源 —— 复用 --health 的判据');
+  assert.match(src, /这个「空」不可信/, '必须直说这个空不可信，而不是并列提一句「也可能是」');
+  assert.match(src, /node scripts\/scan-sessions\.mjs --days 1/,
+    '必须给出拿到真实状态的替代命令');
+});
+
+test('空收件箱但守护进程没跑 → 退出码不为 0（调用方必须能分开两种空）', () => {
+  const src = readFileSync(join(import.meta.dirname, 'watch.mjs'), 'utf8');
+  assert.match(src, /process\.exitCode = 3/, '环境不可信必须有自己的退出码');
+  // 关键：不能又被后面的 process.exit(0) 覆盖掉 —— 那等于什么都没说
+  assert.match(src, /process\.exit\(process\.exitCode \|\| 0\)/,
+    '必须把 exitCode 传出去；写死 exit(0) 会覆盖上面的判断');
+  assert.doesNotMatch(src, /空收件箱不是错误[^\n]*\n\s*process\.exit\(0\)/,
+    '不能再用写死的 exit(0)');
+});
