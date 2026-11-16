@@ -373,6 +373,9 @@ const PROBE_ARGS = {
   modeOf: '[{}]', parseHookInput: '""', resolveAssistantText: '[{}, []]',
   decide: '[{ input: {}, records: [] }]', buildReason: '[{}]',
   logPathFor: '[{}]', statePathFor: '[{}]', readBlockCount: '["s", { env: {} }]',
+  // 2026-11-16 用户叫停三层：全部纯读，无副作用。
+  pausePathFor: '[{}]', isPaused: '[{}]', lastBlockAt: '["s", { env: {} }]',
+  userIntervenedSince: '["s", { records: [], env: {} }]',
   readTotalBlocks: '["s", { env: {} }]',
   resetBlockCount: '["s", { env: {} }]',
   appendLog: '[{}, { OVERWATCH_STOP_VERIFY_LOG: "/nonexistent-dir-ow/x.jsonl" }]',
@@ -979,6 +982,7 @@ function checkUnregisteredExports() {
     'MAX_BLOCKS', 'RESET_AFTER_MS', 'modeOf', 'parseHookInput', 'readStdin',
     'resolveAssistantText', 'decide', 'buildReason', 'logPathFor', 'appendLog',
     'statePathFor', 'bumpBlockCount', 'resetBlockCount', 'readBlockCount', 'readTotalBlocks', 'runHook',
+    'pausePathFor', 'isPaused', 'lastBlockAt', 'userIntervenedSince',
     'loadRecords', 'loadSubagentRecords', 'SUBAGENT_TAIL_BYTES',
     // stop-verify-hook.mjs 的放行样本记录（2026-11-13）。纯记账层：写入失败一律
     // 吞掉，所以探针只需要证明「给了最小输入也不抛」。分析命令的导出同批登记。
@@ -1310,6 +1314,81 @@ function checkChangelog() {
       `${missing.length} 个提交改动了源码/规格但没有 CHANGELOG 条目（本文件自己规定的硬规则）：\n      ` +
       missing.slice(0, 8).join('\n      ') +
       (missing.length > 8 ? `\n      …还有 ${missing.length - 8} 个` : ''));
+  }
+}
+
+/** 闸门门禁：把 Stop hook 的默认值改成 `block`，必须同时具备用户叫停路径。
+ *
+ *  **为什么这条必须是硬门而不是注释**：一个默认开启的强拦如果不给出叫停路径，
+ *  就是把用户锁在自己的会话里。真实事故（issue #108493）：用户说
+ *  「stop everything, you are done」之后，会话又起了子 agent 和一次外部 run 并截图。
+ *
+ *  设计（`docs/` 里「停要带 delta」§4）要求三层：
+ *    L1 文件闸   `isPaused()` + `pausePathFor()` —— 与上下文无关的一层
+ *    L2 用户发话 `userIntervenedSince()` —— 用户已经说话了（事故里正是这种）
+ *    L3 预算耗尽 `allowed-budget-exhausted` —— 闸门用完配额这件事必须可见
+ *
+ *  检查只在 `modeOf()` 的默认返回变成 `'block'` 时生效，所以现在是**空转**的 ——
+ *  那是对的：门禁的价值在于「有人想开门时它拦得住」，不在于现在报什么。
+ *  硬门里已经有同类先例（`checkLauncherPlacement` / `checkInboxWiring`）。 */
+function checkStopHookKillSwitch() {
+  const file = join(ROOT, 'scripts', 'stop-verify-hook.mjs');
+  let src;
+  try { src = readFileSync(file, 'utf8'); } catch { return; }
+
+  // 取 `modeOf()` 的函数体，判它的默认分支返回什么。
+  const m = src.match(/export function modeOf\([\s\S]*?\n\}/);
+  if (!m) return;
+  const body = m[0];
+  // `return 'block'` 出现在默认路径上（而不是只在某个 if 分支里）就算「默认开」。
+  // 判据刻意保守：只在**找不到任何 `return 'off'`** 时才认为默认是 block。
+  const defaultsToBlock = !/return\s+'off'/.test(body) && /return\s+'block'/.test(body);
+  if (!defaultsToBlock) return;
+
+  // **判据必须是「可调用」，不是「字符串出现过」。**
+  // 第一版只查 `src.includes('userIntervenedSince')`，于是把 `export function` 改名成
+  // `function` 之后门禁照样通过 —— 实现还在文件里，只是再也调不到。这正是本仓反复
+  // 批判的那类判据（「看见 ≠ 判红」）。
+  //
+  // 现在查两种形态：`export function X(` / `export const X =`（可被外部调用），
+  // 以及 `runHook` 里真的有对应分支（`isPaused(env)` / `userIntervenedSince(` 的调用点）。
+  const hasExport = (name) => new RegExp(
+    `export\\s+(?:async\\s+)?function\\s+${name}\\s*\\(|export\\s+const\\s+${name}\\s*=`,
+  ).test(src);
+  // 调用点判据不能拿 `src.includes('X(')` —— 它会被**函数定义那一行本身**命中
+  // （`export function X(` 里也有 `X(`）。第一版正是这么漏掉的：把 `runHook` 里的
+  // 调用删干净，门禁照样通过。所以逐行看，且跳过声明行。
+  const hasCall = (name) => src.split('\n').some((line) => {
+    if (!line.includes(`${name}(`)) return false;
+    if (/^\s*(export\s+)?(async\s+)?function\s+/.test(line)) return false; // 定义行
+    if (/^\s*export\s+const\s+/.test(line)) return false;
+    if (/^\s*(\/\/|\*|\/\*)/.test(line)) return false;                    // 注释行
+    return true;
+  });
+
+  const required = [
+    { name: 'isPaused', call: 'isPaused', label: 'L1 文件闸（`isPaused()` 且真被调用）' },
+    { name: 'pausePathFor', call: 'pausePathFor', label: 'L1 闸门文件路径（可调用）' },
+    { name: 'userIntervenedSince', call: 'userIntervenedSince', label: 'L2 用户发话（`userIntervenedSince()` 且真被调用）' },
+  ];
+  const missing = [];
+  for (const r of required) {
+    if (!hasExport(r.name)) { missing.push(`${r.label} —— 没有可调用的导出`); continue; }
+    if (!hasCall(r.call)) missing.push(`${r.label} —— 导出了但没有调用点`);
+  }
+  // 两个 outcome 标记与预算耗尽标记：它们是**可见性**，只需要出现。
+  for (const [needle, label] of [
+    ['allowed-user-paused', 'L1 的 outcome 标记'],
+    ['allowed-user-intervened', 'L2 的 outcome 标记'],
+    ['allowed-budget-exhausted', 'L3 预算耗尽可见'],
+  ]) {
+    if (!src.includes(needle)) missing.push(label);
+  }
+  if (missing.length) {
+    fail('scripts/stop-verify-hook.mjs',
+      `modeOf() 默认返回 'block'（闸门默认开启），但缺少用户叫停路径：\n      `
+      + missing.join('\n      ')
+      + '\n      一个默认开启的强拦不给叫停路径 = 把用户锁在会话里。见本函数上方注释。');
   }
 }
 
@@ -1773,6 +1852,7 @@ checkImportable();
 checkUnregisteredExports();
 checkLinks();
 checkChangelog();
+checkStopHookKillSwitch();
 checkLedger();
 checkLauncherPlacement();
 checkInboxWiring();

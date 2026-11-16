@@ -50,6 +50,7 @@
 
 import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -90,6 +91,79 @@ export function modeOf(env = process.env) {
   const v = String(env.OVERWATCH_STOP_VERIFY || '').trim().toLowerCase();
   if (v === 'block' || v === 'on' || v === '1' || v === 'true') return 'block';
   return 'off';
+}
+
+// ── 用户叫停路径（三层）。见 `docs/` 里那份「停要带 delta」的设计 §4。 ──
+//
+// **为什么需要这一层**：任何一个默认开启的强拦，都必须给出一个不可被 hook 逻辑
+// 覆盖的用户叫停路径，否则就是把用户锁在自己的会话里。真实事故：用户说
+// 「stop everything, you are done」之后，会话又起了子 agent 和一次外部 run 并截图。
+//
+// 三层各管一种情形，缺一层就有一种锁门方式：
+//   L1 文件闸   —— 用户想一劳永逸地关掉这个闸（不需要它理解任何上下文）
+//   L2 用户发话 —— 用户**已经说话了**（事故里正是这种：他说了停，hook 还在拦）
+//   L3 预算耗尽 —— 闸门自己用完了配额，且这件事必须可见
+//
+// 这里先说清它**不保证**什么：它只保证「我们不再增加轮次」。正在跑的
+// 子 agent / 后台任务 / 外部命令**停不了** —— 那需要宿主提供 abort 接口，
+// 本仓已把「实时干预运行中的会话」列为做不到（CAPABILITIES.md，ADR-0001 §代价·3）。
+
+/** L1 的闸门文件路径。放**仓库外**（`%LOCALAPPDATA%/Overwatch/`），两条理由：
+ *  ① 被 hook 的项目通常不是本仓库（模板里 `CLAUDE_PROJECT_DIR` 是用户当前项目），
+ *     放 `tasks/runs/` 会落到别人的仓库里去；
+ *  ② `DF-020` 记录过状态目录被整个清空且无告警，别把「唯一能关门的开关」也放进去。 */
+export function pausePathFor(env = process.env) {
+  if (env.OVERWATCH_STOP_VERIFY_PAUSE) return env.OVERWATCH_STOP_VERIFY_PAUSE;
+  const base = env.LOCALAPPDATA || env.XDG_STATE_HOME || join(homedir(), '.local', 'state');
+  return join(base, 'Overwatch', 'stop-hook.PAUSE');
+}
+
+/** L1：闸门文件存在 = 用户要求停止拦截。**必须在任何判定之前检查**。
+ *
+ *  「不可被 hook 覆盖」= hook 的任何分支都无法越过它。它**可以**被模型用 Bash 删掉 ——
+ *  但那是一次会在 transcript 里留痕的操作，事后可审计。这里不假装它是安全的。 */
+export function isPaused(env = process.env) {
+  try { return existsSync(pausePathFor(env)); } catch { return false; }
+}
+
+/** L2：最后一条**真人**消息是否晚于上次拦截 → 用户已经表态，此后不再拦。
+ *
+ *  **不用文本匹配**「stop everything」：多语言、多说法，而且那本身是不可判定的
+ *  意图识别。本仓已有反例（`measure-interventions.mjs` 的 NUDGE 正则要靠
+ *  `NUDGE_MAX_LEN` 兜住误判）。这里用结构性判据：`origin.kind === 'human'`。
+ *
+ *  与 `stop_hook_active` 的关系：那条说的是「这次 Stop 已经是某次 hook 拦下来的」，
+ *  说的是**机制**；这条说的是「用户在拦截之后又说话了」，说的是**人**。
+ *  两者会重叠，但语义不同，所以分开判、分开记。 */
+export function userIntervenedSince(sessionId, {
+  records = null, env = process.env, nowMs = Date.now(),
+} = {}) {
+  if (!sessionId || !Array.isArray(records) || !records.length) return null;
+  const lastBlock = lastBlockAt(sessionId, { env });
+  if (!lastBlock) return null;
+  let lastHuman = null;
+  for (const r of records) {
+    if (!r || r.origin && r.origin.kind !== 'human') continue;
+    if (r.type !== 'user' && r.role !== 'user') continue;
+    const t = Date.parse(r.timestamp || '');
+    if (!Number.isFinite(t)) continue;
+    if (lastHuman === null || t > lastHuman) lastHuman = t;
+  }
+  if (lastHuman === null || lastHuman <= lastBlock) return null;
+  return { lastHumanAt: new Date(lastHuman).toISOString(), lastBlockAt: new Date(lastBlock).toISOString() };
+}
+
+/** 上次拦截的时间戳（毫秒）。没有记录返回 0。只读，不修改状态。 */
+export function lastBlockAt(sessionId, { env = process.env } = {}) {
+  try {
+    const p = statePathFor(env);
+    if (!existsSync(p)) return 0;
+    const state = JSON.parse(readFileSync(p, 'utf8'));
+    const cur = state && state[sessionId];
+    return Number(cur && cur.lastAt || 0);
+  } catch {
+    return 0;
+  }
 }
 
 /** 读 stdin 全部内容。宿主可能不关管道，所以要靠上层超时兜底。 */
@@ -694,6 +768,38 @@ export function runHook({ input, env = process.env, nowMs = Date.now(), sampleLo
     //   prevTotal → 预算（会话累计，不归零）
     const prevCount = mode === 'block' ? readBlockCount(sessionId, { env, nowMs }) : 0;
     const prevTotal = mode === 'block' ? readTotalBlocks(sessionId, { env }) : 0;
+
+    // ── 用户叫停：L1 / L2 都在判定之前。 ──
+    //
+    // **位置是有意的**：这两层一旦生效，本函数**任何分支**都不许再拦。放在 `decide()`
+    // 之前，也就不可能被某个 claim 的判定绕过。
+    //
+    // L1（闸门文件）在最前，因为它是唯一与上下文无关的一层 —— 用户不需要理解
+    // 这个 hook 判什么，只要让文件存在就能关门。
+    if (mode === 'block' && isPaused(env)) {
+      appendLog({
+        at: new Date(nowMs).toISOString(), sessionId, mode,
+        hookEventName: safeString(i.hook_event_name) || null,
+        stopHookActive: Boolean(i.stop_hook_active),
+        outcome: 'allowed-user-paused',
+        pausePath: pausePathFor(env),
+      }, env, nowMs);
+      return null;
+    }
+    // L2（用户已发话）：只在 block 模式下才有意义 —— off 模式本来就不拦。
+    if (mode === 'block') {
+      const intervened = userIntervenedSince(sessionId, { records: loaded.records, env, nowMs });
+      if (intervened) {
+        appendLog({
+          at: new Date(nowMs).toISOString(), sessionId, mode,
+          hookEventName: safeString(i.hook_event_name) || null,
+          stopHookActive: Boolean(i.stop_hook_active),
+          outcome: 'allowed-user-intervened',
+          ...intervened,
+        }, env, nowMs);
+        return null;
+      }
+    }
 
     // 先只看主 transcript。只有它说要拦时，才花钱读子 agent —— 见 decide 的注释。
     const firstPass = decide({

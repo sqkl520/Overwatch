@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os';
 import {
   decide, buildReason, modeOf, parseHookInput, resolveAssistantText,
   readBlockCount, readTotalBlocks, bumpBlockCount, resetBlockCount, appendLog, logPathFor, statePathFor,
+  isPaused, pausePathFor, userIntervenedSince, lastBlockAt,
   runHook, loadSubagentRecords, BLOCKING_STATUS, MAX_BLOCKS, ESCALATE_AT, RESET_AFTER_MS,
   samplePathFor, sampleLogEnabled, toolSummaryOf, buildSample, appendSample,
   rawFamilyHits, SAMPLE_TEXT_LIMIT,
@@ -786,5 +787,124 @@ test('一条回合一条样本 —— 不去重、不丢字段', () => {
     assert.equal(rows.length, 2, '两次回合结束 = 两条样本（这是分布数据，不是去重数据）');
     assert.equal(rows[0].lastMessage, rows[1].lastMessage);
     for (const r of rows) assert.equal(r.reason, 'no-checkable-claim');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── 14. 用户叫停路径（L1 文件闸 / L2 用户发话） ─────────────────────
+//
+// 一个默认开启的强拦必须给出不可被 hook 覆盖的叫停路径，否则就是把用户锁在会话里。
+// 事故记录：用户说「stop everything, you are done」之后，会话又起了子 agent 并截图。
+
+test('L1：闸门文件存在 → 无论判定说该不该拦，都放行', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-pause-'));
+  try {
+    const pause = join(dir, 'stop-hook.PAUSE');
+    const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_PAUSE: pause,
+      OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'), OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+
+    // 前提：没有闸门文件时，这个输入**会**被拦。
+    const blocked = runHook({ input: inputOf({ cwd: dir }), env });
+    assert.ok(blocked && blocked.decision === 'block', '前提不成立：这个输入本来就该拦');
+
+    writeFileSync(pause, '');
+    assert.equal(isPaused(env), true);
+
+    const out = runHook({ input: inputOf({ cwd: dir }), env });
+    assert.equal(out, null, '闸门文件存在时必须放行');
+    const rows = readFileSync(env.OVERWATCH_STOP_VERIFY_LOG, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(rows[rows.length - 1].outcome, 'allowed-user-paused');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('L1：闸门文件的判定在 decide() 之前 —— 任何判定分支都绕不过它', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-pause-'));
+  try {
+    const pause = join(dir, 'stop-hook.PAUSE');
+    writeFileSync(pause, '');
+    const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_PAUSE: pause,
+      OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'), OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+    // 连带 `transcript_path` 都指错（读不到记录）也必须先被闸门放行，
+    // 而不是落到「读不到 → 按没有可核对断言放行」那条路上去。
+    const out = runHook({ input: inputOf({ cwd: dir, transcript_path: join(dir, 'nope.jsonl') }), env });
+    assert.equal(out, null);
+    const rows = readFileSync(env.OVERWATCH_STOP_VERIFY_LOG, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(rows[rows.length - 1].outcome, 'allowed-user-paused',
+      '理由必须是「用户关掉了闸」，不能记成别的原因');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('L2：最后一条真人消息晚于上次拦截 → 放行，且理由与预算耗尽分开', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-interv-'));
+  try {
+    const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'),
+      OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+    const t0 = Date.parse('2026-11-16T10:00:00Z');
+    // 先制造一次拦截（lastAt = t0）
+    const first = runHook({ input: inputOf({ cwd: dir }), env, nowMs: t0 });
+    assert.ok(first && first.decision === 'block');
+
+    // transcript 里出现一条**晚于**拦截的真人消息
+    const records = [
+      { type: 'user', timestamp: new Date(t0 + 60_000).toISOString(),
+        origin: { kind: 'human' }, message: { content: [{ type: 'text', text: '停，别改了' }] } },
+    ];
+    const hit = userIntervenedSince('sess-test', { records, env, nowMs: t0 + 120_000 });
+    assert.ok(hit, '用户在上次拦截之后说话了，应判为已介入');
+    assert.ok(Date.parse(hit.lastHumanAt) > Date.parse(hit.lastBlockAt));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('L2：工具结果类 user 记录不算「用户发话」（origin.kind !== human）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-interv-'));
+  try {
+    const env = { OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json'), OVERWATCH_STOP_VERIFY_LOG: join(dir, 'l.jsonl') };
+    const t0 = Date.parse('2026-11-16T10:00:00Z');
+    runHook({ input: inputOf({ cwd: dir }), env, nowMs: t0 });
+    // 一条 tool_result：`type` 是 user，但 `origin.kind` 不是 human。
+    const records = [
+      { type: 'user', timestamp: new Date(t0 + 60_000).toISOString(),
+        origin: { kind: 'tool' }, message: { content: [{ type: 'tool_result', content: 'ok' }] } },
+    ];
+    assert.equal(userIntervenedSince('sess-test', { records, env, nowMs: t0 + 120_000 }), null,
+      'tool_result 不是用户发话，不能因此放行');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('L2：真人消息早于上次拦截 → 不算介入（时间顺序要判对）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-interv-'));
+  try {
+    const env = { OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json'), OVERWATCH_STOP_VERIFY_LOG: join(dir, 'l.jsonl') };
+    const t0 = Date.parse('2026-11-16T10:00:00Z');
+    runHook({ input: inputOf({ cwd: dir }), env, nowMs: t0 });
+    const records = [
+      { type: 'user', timestamp: new Date(t0 - 60_000).toISOString(),
+        origin: { kind: 'human' }, message: { content: [{ type: 'text', text: '开始吧' }] } },
+    ];
+    assert.equal(userIntervenedSince('sess-test', { records, env, nowMs: t0 + 120_000 }), null,
+      '用户发话在拦截**之前**，是那次拦截的起因，不是叫停');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('L2 接线：runHook 真的在拦截前查了「用户是否已发话」（不只是纯函数对）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-interv-wire-'));
+  try {
+    const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'),
+      OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+    const t0 = Date.parse('2026-11-16T10:00:00Z');
+    // 一次拦，建立 lastAt
+    assert.ok(runHook({ input: inputOf({ cwd: dir }), env, nowMs: t0 }));
+
+    // 造一份**真的能读到**的 transcript，里面有一条晚于拦截的真人消息
+    const tp = join(dir, 'transcript.jsonl');
+    const lines = [
+      { type: 'user', timestamp: new Date(t0 + 60_000).toISOString(), origin: { kind: 'human' },
+        message: { content: [{ type: 'text', text: '停，别改了' }] } },
+    ];
+    writeFileSync(tp, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+
+    const out = runHook({ input: inputOf({ cwd: dir, transcript_path: tp }), env, nowMs: t0 + 120_000 });
+    assert.equal(out, null, '用户在上次拦截之后发话了，这一回合必须放行');
+    const rows = readFileSync(env.OVERWATCH_STOP_VERIFY_LOG, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(rows[rows.length - 1].outcome, 'allowed-user-intervened');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

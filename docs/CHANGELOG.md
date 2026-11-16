@@ -23,6 +23,16 @@
 
 ## [Unreleased] - 2026-11-16（屏幕不再隐瞒丢了什么；「问了没答」改走同一判据；停机交还要带接地引用）
 
+### Added
+
+- **用户叫停三层路径**（`stop-verify-hook.mjs`）。一个默认开启的强拦如果不给叫停路径，就是把用户锁在自己的会话里 —— 真实事故（issue #108493）：用户说「stop everything, you are done」之后，会话又起了子 agent 和一次外部 run 并截图。
+  - **L1 文件闸** `isPaused()` / `pausePathFor()`：闸门文件存在就放行，**在所有判定之前**。路径放仓库外（`%LOCALAPPDATA%/Overwatch/stop-hook.PAUSE`），两条理由：被 hook 的项目通常不是本仓库；`DF-020` 记录过状态目录被整个清空且无告警。「不可被 hook 覆盖」= hook 任何分支都越不过它；它**可以**被模型用 Bash 删掉，但那会留痕、可审计 —— 这里不假装它是安全的。
+  - **L2 用户发话** `userIntervenedSince()`：最后一条**真人**消息（`origin.kind === 'human'`）晚于上次拦截 → 放行并记 `allowed-user-intervened`。**不用文本匹配**「stop everything」：多语言、多说法，而且那是不可判定的意图识别；本仓自己的 `measure-interventions.mjs` 就为同类正则加过 `NUDGE_MAX_LEN` 兜底。`tool_result` 的 `type` 也是 `user`，所以必须看 `origin.kind`，只看 `type` 会把工具结果当成用户发话。
+  - **L3 预算耗尽可见**：上一节已做（`allowed-budget-exhausted`）。
+  - 说清它**不保证**什么：只保证「我们不再增加轮次」。正在跑的子 agent / 后台任务 / 外部命令**停不了** —— 那需要宿主提供 abort 接口。
+- **硬门门禁 `checkStopHookKillSwitch()`**：只要 `modeOf()` 的默认返回变成 `'block'`，就要求 L1/L2/L3 全部在场，否则报红。当前默认是 `off`，所以它是**空转**的 —— 门禁的价值在于「有人想开门时它拦得住」，不在于现在报什么。
+  - 判据经过两轮修正才有效。第一版只查 `src.includes('userIntervenedSince')`，把 `export function` 改名成 `function` 之后门禁照样通过；第二版用 `includes('userIntervenedSince(')`，却被**函数定义那一行本身**命中。现在逐行看、跳过声明行与注释行，并区分「没有导出」与「导出了但没调用点」两种失效形态。
+
 ### Fixed
 
 - **17 个入口的「我是否被直接执行」判断不解析符号链接**（DF-025）。`resolve(argv[1]) === resolve(fileURLToPath(import.meta.url))` 两边一个解析过符号链接、一个没有，所以 `npm link` / `npm install -g .` / pnpm（存储模型就是符号链接）装出来的命令**什么都不做、exit 0**。改成 `realOrResolve()`（`realpathSync` 失败退回 `resolve`）。实测：目录符号链接下 `resolve` 比较 `false`、`realpath` 比较 `true`。**负向验证**：把一个文件改回旧写法 → 新测试红。
