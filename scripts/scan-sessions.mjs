@@ -21,6 +21,11 @@ import { readFileSync, readdirSync, existsSync, statSync, openSync, readSync, cl
 import { join, basename } from 'node:path';import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { resolveJobEventTime } from './job-event-time.mjs';
+// 「尾部有没有未执行的 tool_use」只有一份判据（`endsWithoutToolUse`），
+// 这里复用而不是在 scan 里再写一遍 —— 两份判据必然漂移，本仓库为这件事付过多次账。
+// `stop-signals` 不 import 本文件，所以这条边不构成环（守门测试在 stop-delta.test.mjs）。
+import { endsWithoutToolUse } from './stop-signals.mjs';
+import { computeDelta, lastErrorIndex } from './stop-delta.mjs';
 
 // ── 常量（与 docs/spec/state-model.md 一一对应）────────────────────────
 
@@ -306,9 +311,10 @@ function extractCalls(records) {
   return calls;
 }
 
-/** 解析 jsonl。返回 { records, badLines } —— 坏行数必须随数据一起传递，
- *  不能挂在数组属性上（tailRecords 的 slice 会把它丢掉）。见 DF-005。 */
-/** 解析 jsonl。`maxBytes` 控制只读尾部多少字节。
+/** 解析 jsonl。返回 { records, badLines, truncated } —— 坏行数与截断标志都必须随数据一起
+ *  传递，不能挂在数组属性上（tailRecords 的 slice 会把它丢掉）。见 DF-005。
+ *
+ *  `maxBytes` 控制只读尾部多少字节。
  *
  *  **为什么需要参数而不是写死 4MB**：主 transcript 和子 agent 的需求差一个数量级。
  *  实测本机语料：主 transcript 1.2GB，子 agent 文件 **5.2GB / 3518 个**，
@@ -317,12 +323,19 @@ function extractCalls(records) {
  *  读 4MB 尾部是浪费。给它 512KB 就够，实测覆盖远超 400 条记录。
  */
 export function parseJsonl(path, maxBytes = MAX_READ_BYTES) {
-  const empty = { records: [], badLines: 0 };
+  // `truncated` 必须跟 records 一起传出去，不能由调用方「猜」—— 读的是文件尾巴还是
+  // 整个文件，只有这里知道。它对 delta 的边界判定是决定性的：`computeDelta` 用
+  // `H >= 0 ? 'human' : (windowTruncated ? 'unknown' : 'whole-file')`。实际截断过却传
+  // false，一个本轮起点落在窗口外的会话（H = -1）会被当成整份文件就是本轮，
+  // 于是把窗口里别人的改动全算到它头上，判 UNGROUNDED —— 那不是少报，是误指控。
+  const empty = { records: [], badLines: 0, truncated: false };
   if (!existsSync(path)) return empty;
   let raw;
+  let truncated = false;
   try {
     const size = statSync(path).size;
     if (size > maxBytes) {
+      truncated = true;
       // 真正从尾部按偏移读，而不是先整读再切片：实测单文件可达 59MB
       const buf = Buffer.allocUnsafe(maxBytes);
       const fd = openSync(path, 'r');
@@ -344,12 +357,33 @@ export function parseJsonl(path, maxBytes = MAX_READ_BYTES) {
     if (!line.trim()) continue;
     try { records.push(JSON.parse(line)); } catch { badLines++; }
   }
-  return { records, badLines };
+  return { records, badLines, truncated };
 }
 
 /** 只保留末尾 n 条记录，避免为判定一个窗口而解析整个会话 */
 function tailRecords(records, n) {
   return records.length > n ? records.slice(-n) : records;
+}
+
+/**
+ * 取尾部窗口，**并把「这次是不是只拿到了尾巴」一并交出来**。
+ *
+ * 两条截断来源必须合成一个标志，因为它们对 `computeDelta` 是同一件事：
+ *   1. 文件超 `maxBytes`，`parseJsonl` 只读了尾巴（`parsed.truncated`）；
+ *   2. 文件不大，但我们只要末尾 n 条（这里做的）。
+ * 只报第 1 条会让第 2 条成为静默截断 —— 一个 5000 条记录、本轮起点在第 4000 条的会话，
+ * 拿到的是最后 1200 条，`lastHumanIndex` 返回 -1，若还声称「没截断」，
+ * `boundary` 会落到 `whole-file`，窗口里全部改动被算成「本轮」。
+ *
+ * @returns {{tail: Array, truncated: boolean}}
+ */
+export function tailWindowOf(parsed, n) {
+  const records = Array.isArray(parsed?.records) ? parsed.records : [];
+  const tail = tailRecords(records, n);
+  return {
+    tail,
+    truncated: parsed?.truncated === true || records.length > tail.length,
+  };
 }
 
 /**
@@ -430,8 +464,18 @@ function scanSessionDir(dir) {
   if (!mainPath) return null;
 
   const mainParsed = parseJsonl(mainPath);
-  const mainRecs = tailRecords(mainParsed.records, MAX_CALLS_PER_SESSION * 3);
-  const mainCalls = extractCalls(mainRecs);
+  // 交给 delta 的记录**只有尾部这一份**。两种截断来源任一成立，`computeDelta` 都不能
+  // 把「窗口里没有真人记录」读成「整份文件就是本轮」：
+  //   1. 文件超过 MAX_READ_BYTES，只读了尾巴（parseJsonl 的 truncated）；
+  //   2. 文件本身不大，但我们只取了末尾 MAX_CALLS_PER_SESSION * 3 条（tailRecords）。
+  // 第 2 种以前没有暴露，等于默认没截断——大文件之外还有一条静默的截断路径。
+  // 解构名必须与 `tailWindowOf` 的返回**逐字一致**。此前这里写的是
+  // `{ mainTail, mainTailTruncated }`，而函数返回 `{ tail, truncated }` ——
+  // 于是 `mainTail` 恒为 `undefined`，`extractCalls(undefined)` 抛
+  // `TypeError: records is not iterable`，整条 scan 直接崩。
+  // 注意它**崩得很快**（445ms vs 正常 52s），所以「跑得比以前快」本身就是故障信号。
+  const { tail: mainTail, truncated: mainTailTruncated } = tailWindowOf(mainParsed, MAX_CALLS_PER_SESSION * 3);
+  const mainCalls = extractCalls(mainTail);
   // 会话内部的活动时间：来自 transcript 记录自身的 timestamp，与文件 mtime 无关。
   // 子 agent 的调用也算活动，所以与 allCalls 一起取最大值（见下方 lastActivity）。
   const mainLast = lastActivityOf(mainParsed.records);
@@ -476,6 +520,10 @@ function scanSessionDir(dir) {
   return {
     mainPath,
     mainCalls,
+    // delta 要看的原始记录（不是抽出来的 calls）：边界与接地都判在块级别，
+    // 抽成 calls 之后 assistant 文本已经丢了。
+    mainTail,
+    mainTailTruncated,
     children,
     allCalls,
     gaps: gapsOf(allCalls),
@@ -483,6 +531,63 @@ function scanSessionDir(dir) {
     lastActivity,
     subagentTotal: candidates.length,
     subagentTruncated: truncated,
+  };
+}
+
+/** delta 字段里单个 token 的截断长度与最多条数。
+ *
+ *  为什么截：这个字段要进 JSON 输出与列表页。一个用 Bash 改了三十个文件的会话，
+ *  `considered` 里就是三十条完整命令行；实测最长的单条命令有 12KB。
+ *  截断**必须说出来**（`consideredTruncated`），否则「只列了 40 条」会被读成「只有 40 条」。
+ */
+const DELTA_TOKEN_MAX = 120;
+const DELTA_TOKEN_CAP = 40;
+
+/**
+ * 把 `computeDelta` 的结果压成 JSX 之外可用的行上字段。
+ *
+ * 输入是 `scanSessionDir` 的产物，所以「窗口是否被截断」这件事由它给出，
+ * 这里只负责组装 —— **不要在这里重新推断截断**。
+ *
+ * 还在干活的会话没有「交还」这件事，给它一个 delta 是造数（与 `stop-signals.mjs:396`
+ * 同一条理由）：尾部还有未执行的 tool_use 时返回 null。
+ *
+ * @param {{mainTail?: Array, mainTailTruncated?: boolean}} scanned
+ * @returns {{verdict: string, attribution: string, boundary: string, changed: string,
+ *   hit: number, considered: string[], hits: string[], consideredTruncated: boolean}|null}
+ */
+export function deltaFieldOf({ mainTail, mainTailTruncated } = {}) {
+  const records = Array.isArray(mainTail) ? mainTail : [];
+  if (!records.length) return null;
+  if (!endsWithoutToolUse(records).hit) return null;
+
+  const d = computeDelta({
+    records,
+    windowTruncated: mainTailTruncated === true,
+    errorIndex: lastErrorIndex(records),
+  });
+
+  const clip = (s) => {
+    const t = String(s ?? '');
+    return t.length > DELTA_TOKEN_MAX ? `${t.slice(0, DELTA_TOKEN_MAX)}…` : t;
+  };
+  const cut = (arr) => arr.slice(0, DELTA_TOKEN_CAP).map(clip);
+
+  const considered = d.grounding.considered || [];
+  const hits = d.grounding.hits || [];
+  // 「有没有被截」按**条数**判，不按字符判：字符被截是逐条的显示细节，
+  // 条数被截才是「还有你看不到的改动」。两者混在一起会让这个标志永远为真。
+  const truncated = considered.length > DELTA_TOKEN_CAP || hits.length > DELTA_TOKEN_CAP;
+
+  return {
+    verdict: d.verdict,
+    attribution: d.attribution,
+    boundary: d.grounding.boundary,
+    changed: (d.slots && d.slots.changed) || 'absent',
+    hit: hits.length,
+    considered: cut(considered.map((c) => c.token)),
+    hits: cut(hits.map((h) => h.token)),
+    consideredTruncated: truncated,
   };
 }
 
@@ -952,6 +1057,10 @@ function main(argv) {
       const lastCall = scanned.allCalls.length ? scanned.allCalls[scanned.allCalls.length - 1] : null;
       const threshold = heartbeatThreshold(scanned.gaps);
       const recent = scanned.allCalls.slice(-WINDOW);
+      // 交还 delta：只在停下来的会话上算，规则在 deltaFieldOf 里（尾部还有未执行
+      // tool_use → null）。这是**正交轴**，不参与 state 判定，也不进拦截面——
+      // 接地要求可被「做一次无效编辑再引用那个文件名」满足，用它锁门只会变成仪式。
+      const delta = deltaFieldOf(scanned);
 
       // ── 跨层指纹：与 watch.mjs 的 `probeJobs` 同源 ──
       //
@@ -996,6 +1105,9 @@ function main(argv) {
         lastGapSec: scanned.gaps.length ? Math.round(scanned.gaps[scanned.gaps.length - 1] / 1000) : null,
         state: verdict.state,
         reason: verdict.reason,
+        // 交还 delta。null = 还在干活（没有「交还」这回事），不是「没交还」。
+        // 缺字段与 null 在界面上是两件事：前者是「这版扫描器不会算」，后者是事实。
+        delta,
         // ── 宿主实时字段：**去重键需要它，缺了就必然跨层不同键** ──
         //
         // `candidatesFromScan` 与 `probeWaiting` 对同一次等待必须算出同一个键。

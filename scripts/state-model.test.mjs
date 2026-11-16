@@ -20,6 +20,8 @@ import {
   judgeState,
   parseJsonl,
   SUBAGENT_READ_BYTES,
+  deltaFieldOf,
+  tailWindowOf,
 } from './scan-sessions.mjs';
 const MIN = 60_000;
 const now = Date.now();
@@ -430,4 +432,176 @@ test('parseJsonl 按 maxBytes 只读尾部，512KB 覆盖远超 400 条记录', 
       '小上限应确实少读一些');
     assert.equal(small.badLines, 0, '截断首行必须被丢弃，不能算坏行');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── delta 接到行上（2026-11-16）─────────────────────────────────────
+//
+// 这一节的五条用例都是**负向**用例：每条都对应一个「传错就误指控」的分支，
+// 回退任意一处修复都会让它们变红。逐条理由写在断言旁边。
+//
+// 为什么测 `deltaFieldOf` 而不是跑一遍 CLI：CLI 要把 4MB 临时 transcript 摆到
+// `~/.claude/projects` 下面，测试就变成了依赖本机语料的测试。这里直接喂记录。
+
+const assistantRec = (blocks, extra = {}) => ({
+  type: 'assistant', message: { role: 'assistant', content: blocks }, ...extra,
+});
+const textBlock = (t) => ({ type: 'text', text: t });
+const toolUseBlock = (name, input, id = 'w1') => ({ type: 'tool_use', name, input, id });
+const resultRec = (id, isError = false) => ({
+  type: 'user',
+  message: {
+    role: 'user',
+    content: [{ type: 'tool_result', tool_use_id: id, content: 'ok', ...(isError ? { is_error: true } : {}) }],
+  },
+});
+const humanRec = (t) => ({
+  type: 'user', origin: { kind: 'human' }, message: { role: 'user', content: t },
+});
+
+test('delta 负向 1：窗口截断 + 窗口内无真人记录 → NO_DELTA/unknown，绝不是 UNGROUNDED', async () => {
+  // 这是本次最贵的一个分支。`computeDelta` 的边界判定是
+  //   H >= 0 ? 'human' : (windowTruncated ? 'unknown' : 'whole-file')
+  // 实际截断过却传 windowTruncated=false：一个本轮起点落在窗口外的会话 H = -1，
+  // 会被当成整份文件就是本轮，窗口里别人的改动全算成「本轮」→ UNGROUNDED。
+  // 那不是少报，是**冤枉一个没写错东西的会话**。
+  const fs = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const dir = fs.mkdtempSync(join(tmpdir(), 'ow-delta-'));
+  try {
+    const lines = [JSON.stringify(humanRec('把那个模块的导出修一下'))];
+    // 填充到远超读取上限：把真人消息推出窗口。
+    for (let i = 0; i < 300; i++) {
+      lines.push(JSON.stringify(assistantRec([textBlock(`第 ${i} 步说明，` + 'x'.repeat(120))])));
+    }
+    // 窗口内（靠近尾部）的一次成功写入，末尾文本**不提**这个文件。
+    lines.push(JSON.stringify(assistantRec([toolUseBlock('Write', { file_path: 'D:/proj/some-module.mjs' }, 'w2')])));
+    lines.push(JSON.stringify(resultRec('w2')));
+    lines.push(JSON.stringify(assistantRec([textBlock('都处理好了，没什么要你做的。')])));
+    const f = join(dir, 'big.jsonl');
+    fs.writeFileSync(f, lines.join('\n') + '\n');
+    assert.ok(fs.statSync(f).size > 4096, '构造出的文件必须超过读取上限，否则这条用例测不到截断');
+
+    const parsed = parseJsonl(f, 4096);
+    assert.equal(parsed.truncated, true, '先确认读取层确实标了截断');
+    const { tail, truncated } = tailWindowOf(parsed, 1200);
+    assert.equal(truncated, true);
+
+    const d = deltaFieldOf({ mainTail: tail, mainTailTruncated: truncated });
+    assert.ok(d, '尾部是 assistant 文本、没有未执行 tool_use，应当有 delta');
+    assert.equal(d.verdict, 'NO_DELTA',
+      '边界不可判 + 一条都没引用 → 只能落 NO_DELTA。判 UNGROUNDED 就是拿一个判不了的边界去指控');
+    assert.equal(d.attribution, 'unknown');
+    assert.equal(d.boundary, 'unknown');
+    assert.ok(d.considered.length > 0, '窗口内那次 Write 必须在 considered 里，否则这条用例是空转');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// 截断有**两条**来源，必须分别守。上面那条只覆盖了「文件超过 maxBytes」。
+// 第二条是「文件不大，但我们只要末尾 n 条」—— 它同样是截断，同样会让 boundary 落到
+// whole-file，同样把一个判不了的边界变成一次指控。只测第一条的话，回退
+// `records.length > tail.length` 那一半，测试是绿的。
+test('delta 负向 1b：文件没超上限、但只取末尾 n 条，也必须报截断', async () => {
+  const fs = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const dir = fs.mkdtempSync(join(tmpdir(), 'ow-delta-tail-'));
+  try {
+    // 1500 条记录，文件很小（远不到 4MB），真人消息在第 1 条 —— 切走末尾 1200 条后它就没了。
+    const lines = [JSON.stringify(humanRec('把那个模块的导出修一下'))];
+    for (let i = 0; i < 1498; i++) {
+      lines.push(JSON.stringify(assistantRec([textBlock(`第 ${i} 步。`)])));
+    }
+    lines.push(JSON.stringify(assistantRec([textBlock('都处理好了。')])));
+    const f = join(dir, 'small-but-long.jsonl');
+    fs.writeFileSync(f, lines.join('\n') + '\n');
+
+    const full = parseJsonl(f, 4 * 1024 * 1024);
+    assert.equal(full.truncated, false, '前提：这个文件没有超读取上限');
+    assert.ok(full.records.length > 1200, '前提：记录数要超过尾部窗口，否则这条用例测不到第二类截断');
+
+    const { tail, truncated } = tailWindowOf(full, 1200);
+    assert.ok(tail.length <= 1200);
+    assert.equal(truncated, true,
+      '文件没超上限 ≠ 没截断。丢了 300 条记录也是截断，不报就会让 boundary 落到 whole-file');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('delta 负向 2：parseJsonl 喂超长文件必须报 truncated；小文件不得谎报', async () => {
+  // 若 truncated 恒为 false（或恒为 true），负向 1 那条就变成了对一个常量的断言。
+  const fs = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const dir = fs.mkdtempSync(join(tmpdir(), 'ow-trunc-'));
+  try {
+    const one = JSON.stringify(assistantRec([toolUseBlock('Read', { file_path: '/x' })]));
+    const small = join(dir, 'small.jsonl');
+    fs.writeFileSync(small, one + '\n');
+    assert.equal(parseJsonl(small).truncated, false, '小于上限的文件是整份读的，报截断会让边界永远不可判');
+
+    const big = join(dir, 'big.jsonl');
+    fs.writeFileSync(big, Array(500).fill(one).join('\n') + '\n');
+    const parsed = parseJsonl(big, 1024);
+    assert.equal(parsed.truncated, true, '按偏移读了尾巴就必须说出来');
+    assert.ok(parsed.records.length > 0 && parsed.records.length < 500);
+
+    // 不存在的文件：既没读也没截断，不能报 true。
+    assert.equal(parseJsonl(join(dir, 'nope.jsonl')).truncated, false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('delta 负向 3：成功的 Write + 文本不提它 → UNGROUNDED', () => {
+  // 这条守的是「它到底说了没有」这个判据本身。若它恒为 GROUNDED，
+  // 负向 1 断言 NO_DELTA 就毫无信息量。
+  const records = [
+    humanRec('改一下渲染'),
+    assistantRec([toolUseBlock('Write', { file_path: 'scripts/render.mjs' }, 'w3')]),
+    resultRec('w3'),
+    assistantRec([textBlock('都弄完了。')]),
+  ];
+  const d = deltaFieldOf({ mainTail: records, mainTailTruncated: false });
+  assert.equal(d.verdict, 'UNGROUNDED');
+  assert.equal(d.boundary, 'human', '窗口内有人类消息，边界必须锚在人上');
+  assert.deepEqual(d.considered, ['scripts/render.mjs']);
+  assert.deepEqual(d.hits, []);
+});
+
+test('delta 负向 4：末条是 assistant error 记录 → EXEMPT（没机会写，不是没写）', () => {
+  const records = [
+    humanRec('跑一下测试'),
+    assistantRec([toolUseBlock('Write', { file_path: 'a.mjs' }, 'w4')]),
+    resultRec('w4'),
+    assistantRec([textBlock('好')], { error: 'authentication_failed', isApiErrorMessage: true }),
+  ];
+  const d = deltaFieldOf({ mainTail: records, mainTailTruncated: false });
+  assert.equal(d.verdict, 'EXEMPT', '把「没机会」混进「没写」，比例就变成了假指标');
+  assert.equal(d.attribution, 'harness');
+  assert.equal(d.boundary, 'error-stop');
+});
+
+test('delta 负向 5：还在干活（尾部有未执行 tool_use）→ 不给 delta', () => {
+  // `stop-signals.mjs:396`：「还在干活的会话没有『交还』这件事，给它一个 delta 是造数」。
+  const records = [
+    humanRec('继续'),
+    assistantRec([toolUseBlock('Write', { file_path: 'a.mjs' }, 'w5')]),
+    resultRec('w5'),
+    assistantRec([toolUseBlock('Bash', { command: 'npm test' }, 'b5')]),   // 没有 result
+  ];
+  assert.equal(deltaFieldOf({ mainTail: records, mainTailTruncated: false }), null);
+  assert.equal(deltaFieldOf({}), null, '空输入也必须安全返回 null');
+});
+
+test('delta 的 token 截断要说出来：超过 40 条置 consideredTruncated', () => {
+  const records = [humanRec('批量改')];
+  for (let i = 0; i < 45; i++) {
+    records.push(assistantRec([toolUseBlock('Write', { file_path: `D:/p/f${i}.mjs` }, `w${i}`)]));
+    records.push(resultRec(`w${i}`));
+  }
+  // 末尾文本引用全部 45 个，避免被判 UNGROUNDED（这条只测截断标志）
+  records.push(assistantRec([textBlock(Array.from({ length: 45 }, (_, i) => `D:/p/f${i}.mjs`).join(' '))]));
+  const d = deltaFieldOf({ mainTail: records, mainTailTruncated: false });
+  assert.equal(d.considered.length, 40, '最多 40 条');
+  assert.equal(d.hits.length, 40);
+  assert.equal(d.consideredTruncated, true, '只列了 40 条却不说，会被读成「只有 40 条」');
+  assert.ok(d.considered.every((t) => typeof t === 'string' && t.length <= 121));
 });

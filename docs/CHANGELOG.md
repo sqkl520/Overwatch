@@ -33,8 +33,18 @@
 - **硬门门禁 `checkStopHookKillSwitch()`**：只要 `modeOf()` 的默认返回变成 `'block'`，就要求 L1/L2/L3 全部在场，否则报红。当前默认是 `off`，所以它是**空转**的 —— 门禁的价值在于「有人想开门时它拦得住」，不在于现在报什么。
   - 判据经过两轮修正才有效。第一版只查 `src.includes('userIntervenedSince')`，把 `export function` 改名成 `function` 之后门禁照样通过；第二版用 `includes('userIntervenedSince(')`，却被**函数定义那一行本身**命中。现在逐行看、跳过声明行与注释行，并区分「没有导出」与「导出了但没调用点」两种失效形态。
 
+### Added
+
+- **`scan-sessions --json` 的每个会话行多了 `delta` 字段**（`deltaFieldOf()`）。它是正交轴，与六态并列：`{ verdict, attribution, boundary, changed, hit, considered[], hits[], consideredTruncated }`，`verdict ∈ GROUNDED / UNGROUNDED / NO_DELTA / EXEMPT`。只在**尾部无未执行 `tool_use`** 的会话上算 —— 还在干活的会话没有「交还」这件事，给它一个 delta 是造数。
+- **截断标志有两条来源，必须合成一个**（`tailWindowOf()`）：
+  1. 文件超 `MAX_READ_BYTES`，`parseJsonl` 只读了尾巴（新增 `truncated` 返回）；
+  2. 文件不大，但只取末尾 `MAX_CALLS_PER_SESSION * 3` 条。
+
+  第 2 条以前没有暴露，等于默认没截断。**传错的后果不是少报，是误指控**：`computeDelta` 的边界判定是 `H >= 0 ? 'human' : (windowTruncated ? 'unknown' : 'whole-file')`，实际截断过却传 `false`，一个本轮起点落在窗口外的会话会被当成「整份文件就是本轮」，窗口里别人的改动全算到它头上，判 `UNGROUNDED`。
+
 ### Fixed
 
+- **`scan-sessions` 整条崩溃**（`TypeError: records is not iterable`）：`tailWindowOf()` 返回 `{ tail, truncated }`，调用处却解构成 `{ mainTail, mainTailTruncated }`，于是 `mainTail` 恒为 `undefined`。**这个故障跑得比正常快 100 倍**（445ms vs 52–74s），所以「比以前快」本身就是故障信号 —— 值得记下来，因为第一反应容易是「优化生效了」。
 - **「本轮」边界在 74% 的 transcript 上失效**（`stop-delta.mjs` 的 `isHumanMessage`）。旧判据是 `origin.kind === 'human'`，而 2026-11-16 全库实测（874 个含用户文本的 transcript）：
 
   ```

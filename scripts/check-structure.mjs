@@ -339,6 +339,10 @@ function checkSyntax() {
 const PROBE_ARGS = {
   parseArgs: '[]', parseKeys: '"j"', parseKeysWithRest: '"j"',
   judgeState: '{}', noveltyOf: '[]', signatureOf: '["Read", {}]',
+  // 2026-11-16 delta 接到 scan 行上：两个都是纯函数。
+  // `deltaFieldOf` 空输入返回 null；`tailWindowOf` 空输入返回 { tail: [], truncated: false }。
+  // 探针只喂最小可构造输入，正确性由 state-model.test.mjs 的五条负向用例守。
+  deltaFieldOf: '[{}]', tailWindowOf: '[{}, 1]',
   normalizeBash: '"x"', heartbeatThreshold: '[]', isPersistentChange: '["Bash", {}]',
   displayWidth: '"x"', padDisplay: '["x", 1]', paint: '["x", "red", false]',
   badge: '["PRODUCING", false]', colorEnabled: '[{ isTTY: false }]',
@@ -831,6 +835,7 @@ function checkUnregisteredExports() {
     'isHumanMessage', 'errorOf', 'lastErrorIndex',
     'DELTA_VERDICTS', 'SLOT_STATES',
     'signatureOf', 'normalizeBash', 'heartbeatThreshold', 'isPersistentChange', 'parseJsonl', 'SUBAGENT_READ_BYTES',
+    'deltaFieldOf', 'tailWindowOf',
     'displayWidth', 'padDisplay', 'paint', 'badge', 'colorEnabled', 'stripAnsi',
     'sanitize', 'truncateToWidth', 'wrapToWidth', 'buildDraft', 'detailLines',
     'stripLongStrings', 'collectSubagentFiles', 'stateCounts', 'listRow',
