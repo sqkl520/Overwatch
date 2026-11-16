@@ -15,11 +15,11 @@
 | 能力 | 命令 | 你看什么 |
 |---|---|---|
 | **自检：这台机器能干什么、缺什么**（唯一入口，不加参数即此） | `node scripts/overwatch.mjs` | 8 项前提事实，每行只说读到什么，不出红绿灯；空（exit 2）与坏（exit 3）分开 |
-| **起一个挂了 12 个角色的会话** | `node scripts/overwatch.mjs launch` | 交互式会话，载荷是本仓库的 `.claude/`，工作目录是你的项目 |
+| **起一个挂了载荷的会话** | `node scripts/overwatch.mjs launch` | 交互式会话，载荷是本仓库的 `.claude/`，工作目录是你的项目。**挂几个取决于 `agent.roster`**，随附配置只启用 3 个 |
 | 先看会挂上什么，不执行 | `node scripts/overwatch.mjs launch --dry-run` | 载荷 / roster / 两条 hook / 逐字命令行 |
-| **只验载荷挂对没有**（不需登录、不需推理） | `node scripts/overwatch.mjs launch --verify` | 宿主自己列出 12 个角色，与 `git` 跟踪的清单逐个对；缺一个即非零退出 |
+| **只验载荷挂对没有**（不需登录、不需推理） | `node scripts/overwatch.mjs launch --verify` | 宿主列出的角色与 `git` 跟踪的**源定义**（12 份）逐个对；缺一个即非零退出。**验的是源目录完整，不是实际挂载数** |
 | 在你自己的项目里用（载荷不变，工作目录变） | `node scripts/overwatch.mjs launch --cwd <你的项目>` | 上面同一条，只是 `--cwd` 指过去 |
-| 扫全部会话，压成一张可排序的表 | `node scripts/scan-sessions.mjs --days 3` | 每个会话一行：状态 / calls / novelty / idle / reason |
+| 扫全部会话，压成一张表（顺序固定：先按状态，同状态按闲置时长降序） | `node scripts/scan-sessions.mjs --days 3` | 每个会话一行：状态 / calls / novelty / idle / reason。**没有 `--sort` 参数** |
 | 看某个命令怎么用（不执行） | `node scripts/scan-sessions.mjs --help` | 用法与退出码；0.4 秒返回，**不做任何扫描** |
 | 机器可读的同一份数据 | `node scripts/scan-sessions.mjs --json` | `sessions[]`，TUI 与下游脚本的输入 |
 | 透传宿主的 `needs` / `suggestedReply` | `node scripts/scan-sessions.mjs --days 3` | `[BLOCKED]` 行下面的「等待输入 / 建议回复」两行 |

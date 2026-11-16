@@ -86,13 +86,19 @@ overwatch doctor · 查 8 项前提 · 预算 1000ms（只查前提，不扫语�
 然后：
 
 ```bash
-node scripts/overwatch.mjs launch              # 起一个挂了 12 个角色的会话
+node scripts/overwatch.mjs launch              # 起一个挂了载荷的会话（默认按 roster 筛，见下）
 node scripts/overwatch.mjs launch --dry-run    # 先看它会挂什么，不执行
 node scripts/overwatch.mjs launch --verify     # 只验载荷挂对没有（不需登录）
 ```
 
 **`launch` 最有用的一点：在你自己的项目里用它。** 载荷挂的是本仓库的 `.claude/`，
-工作目录是你的项目，所以你在自己的代码里干活，同时拿到 12 个角色和两条闸：
+工作目录是你的项目，所以你在自己的代码里干活，同时拿到角色定义和两条闸。
+
+> **挂几个角色取决于 `overwatch.config.json` 的 `agent.roster`。** 仓库里随附的配置只启用
+> 3 个（`oversight-planner` / `oversight-executor` / `oversight-acceptor`），所以默认挂的是
+> 3 个而不是 `.claude/agents/` 里的全部 12 个。`--dry-run` 会逐条列出「挂哪些、不挂哪些、
+> 为什么」；`--verify` 验的是**源目录完整**（`git ls-files` 里那 12 份定义都在），不是
+> 「实际挂载了几个」—— 两者不是一回事，此前文档把它们混成了一个「12」。
 
 ```bash
 cd ~/your-project
@@ -141,7 +147,7 @@ Windows 有开机自启和 Toast；macOS / Linux 给出 launchd / systemd 配置
 
 | 能做 | 不能做 |
 |---|---|
-| 扫全部会话，压成一张可排序的表 | 实时干预运行中的会话 |
+| 扫全部会话，压成一张表（固定顺序：先按状态，再按闲置时长） | 实时干预运行中的会话 |
 | 透传宿主的 `needs` / `suggestedReply`（它在等什么、建议回什么） | 自动把回复发进目标会话 |
 | 检出持久化变更（`Write`/`Edit`/写命令），区分「在改东西」和「在读东西」 | 判断改得对不对 |
 | 会话等你时弹桌面通知（宿主 `status: waiting`） | 从「停了很久」推断失败——**实测后已删除该推断** |
