@@ -35,6 +35,27 @@
 
 ### Fixed
 
+- **「本轮」边界在 74% 的 transcript 上失效**（`stop-delta.mjs` 的 `isHumanMessage`）。旧判据是 `origin.kind === 'human'`，而 2026-11-16 全库实测（874 个含用户文本的 transcript）：
+
+  ```
+  两者都有的文件         : 223
+  只有 userType=external : 651   ← 旧判据完全漏掉
+  只有 origin.kind=human : 0     ← 从不单独出现
+  两者都没有             : 3
+  ```
+
+  即 `origin.kind === 'human'` 是 `userType === 'external'` 的**真子集**。漏掉的后果不是少报：`lastHumanIndex` 返回 −1 → `boundary = 'whole-file'` → **整个文件的改动集被当成「本轮」**，于是「本轮」这个守门条件在绝大多数 GROUNDED 上是空转的。**修复前后 boundary 分布：`human` 7 → 555，`whole-file` 96 → 2。**
+
+  **这个仓库早就知道这件事**：`measure-interventions.mjs` 的 `humanTurnText()` 注释里逐字写着「2.1.270 之前的版本不写这个字段，实测 380 条真实人类消息没有 origin」。`stop-delta` 用了更严的判据 —— 同一个判据写两遍，其中一份更差。现在 `stop-delta` 直接复用 `measure-interventions.mjs` 的 `userText` / `SYNTHETIC_PREFIX` / `CONTINUATION` / `INTERRUPT_RE`，不重写第二份。
+
+  顺带排除了**打断标记**：`[Request interrupted by user]`（195 次）与 `[Request interrupted by user for tool use]`（20 次）都是 `userType: external`，**漏进来比漏掉更糟** —— 它会被当成「本轮起点」。两个变体的实测频次在上游注释里记着（只匹配前者已造成 13 次误判）。
+
+  「两个标记都缺」的记录现在**拒绝**而不是放行：全库 159,065 条 user 记录里没有一条如此，所以那不是「老记录」，是「不是人类发言」。
+
+- **失败的写入被算成改动**（`verify-claims.mjs` 的 `edits`）。`changeSetOf` 对 shell 早就按 `ok` 过滤，对 `edits` 一个都没过滤。实测 366 个改动项里 **60 个（16%）** 对应的 tool_result 是报错 / 被拒 / 被 PreToolUse 拦；出现 **54 个**「改动集全部是失败写入」的会话，其中 **14 个被判 `GROUNDED`** —— 文本写的是「write was blocked … so nothing was created」并引用了那个文件名，判据却把它记成一次真实接地。
+  - `edits` 元素新增 `useId` 与 `ok`（初值 `null` = 还没看到 result），在处理 tool_result 的那一圈回填 `b.is_error !== true`。
+  - `ok !== true` 一律不算改动 —— `false` 是磁盘上没多东西，`null` 是我们不知道，**而「不知道」不能当作「有」**。
+  - **只认 `is_error`，不猜文本**：正文里出现「error」不代表这次编辑失败（工具常把被编辑的代码原样回显，那段代码里就有 `throw new Error`）。
 - **`stop-signals` ↔ `stop-delta` 之间的导入环**。此前是 `stop-signals → stop-delta → stop-signals`。它能跑，只因为双方都在**调用时**用对方的**函数声明**（hoisted）；一旦任一侧改成 `const f = ...`、或在模块顶层用到对方的值，就是 TDZ 报错 —— 而且报错点在**启动期**，不是某条路径上，很难归因。
   - 为什么现在必须修：`scan-sessions.mjs` 接下来要 import `stop-delta`（把 delta 接到会话行上），那条环会被拉进 TUI 的数据通路。
   - 修法：把两个纯记录谓词 `isHumanMessage` / `errorOf` **下沉到 `stop-delta.mjs`**，`stop-signals` 侧改为 re-export。导出面一个字没变。顺带新增 `lastErrorIndex(records)`——`scan-sessions` 也要 `errorIndex`，**不在 scan 里再写一份错误识别**（两份判据必然漂移，本仓为这件事付过多次账）。

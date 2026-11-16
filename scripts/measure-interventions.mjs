@@ -43,10 +43,10 @@ const RELEVANT = ['"type":"user"', '"type":"assistant"', '"type":"queue-operatio
  *    - ide_opened_file 67 条、system-reminder 10 条
  *  不排除的话，「介入」会被这些噪声淹没 3 倍以上。
  */
-const SYNTHETIC_PREFIX = /^\s*<(task-notification|command-name|command-message|command-args|local-command-stdout|local-command-caveat|system-reminder|ide_opened_file|ide_selection|system_warning|parameter|create-pr-command|agent-message)\b/;
+export const SYNTHETIC_PREFIX = /^\s*<(task-notification|command-name|command-message|command-args|local-command-stdout|local-command-caveat|system-reminder|ide_opened_file|ide_selection|system_warning|parameter|create-pr-command|agent-message)\b/;
 
 /** 上下文压缩后的续接提示。这是宿主写的，不是用户介入。 */
-const CONTINUATION = 'This session is being continued from a previous conversation';
+export const CONTINUATION = 'This session is being continued from a previous conversation';
 
 /** 打断标记。**有两种变体，实测都出现**：
  *    `[Request interrupted by user]`             195 次

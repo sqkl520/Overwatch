@@ -51,13 +51,69 @@ import { buildEvidenceIndex, isMutatingCommand, lastAssistantText } from './veri
 //
 // 现在 `scan-sessions.mjs` 要 import 本文件（把 delta 接到行上），那条环就会被拉进
 // TUI 的数据通路。所以现在打破，而不是等它炸。
+//
+// 从 `measure-interventions.mjs` 复用「真人发言」的三个判据分量 —— 那边的实现是实测
+// 出来的（380 条真实人类消息没有 origin；中断标记两种变体 195/20 次），重写一份必然
+// 漂移。
+import {
+  userText, SYNTHETIC_PREFIX, CONTINUATION, INTERRUPT_RE,
+} from './measure-interventions.mjs';
 
-/** 真人消息的判据：`origin.kind === 'human'`。
+/** 真人消息的判据。
+ *
+ *  **`origin.kind` 不能作为必要条件。** 这一条本仓早就知道，`measure-interventions.mjs`
+ *  的 `humanTurnText()` 注释里逐字写着：「2.1.270 之前的版本不写这个字段，实测 380 条
+ *  真实人类消息没有 origin」。而这里此前用了 `origin.kind === 'human'` 当**唯一**判据，
+ *  于是在真实语料上「本轮」边界大面积失效。
+ *
+ *  2026-11-16 全库实测（874 个含用户文本的 transcript）：
+ *
+ *      两者都有的文件         : 223
+ *      只有 userType=external : 651   ← 旧判据完全漏掉
+ *      只有 origin.kind=human : 0     ← 从不单独出现
+ *      两者都没有             : 3
+ *
+ *  即 `origin.kind === 'human'` 是 `userType === 'external'` 的**真子集**。漏掉的后果
+ *  不是少报：`lastHumanIndex` 返回 -1 → `boundary = 'whole-file'` → **整个文件的改动集
+ *  被当成「本轮」**，于是「本轮」这个守门条件在 87% 的 GROUNDED 上是空转的。
+ *
+ *  现在的判据与 `measure-interventions.mjs` 同源，三道门：
+ *    1. 有可见文本（tool_result / image-only 不算）
+ *    2. 不是宿主合成的（`SYNTHETIC_PREFIX`）
+ *    3. 不是中断标记 / 压缩续接提示
+ *
+ *  第 1、2 条与第 3 条的中断标记**直接复用**那边的实现，不在这里重写一份——
+ *  两份判据必然漂移，这个仓库为这件事付过多次账。
  *
  *  **不用正则匹配 "user"** —— `tool_result` 也是 `user` 记录，那样会把工具结果
  *  当成用户发话。这个坑在 L2 叫停路径里也踩过一次（会话会自己解锁自己）。 */
 export function isHumanMessage(rec) {
-  return Boolean(rec && rec.type === 'user' && rec.origin && rec.origin.kind === 'human');
+  if (!rec || rec.type !== 'user') return false;
+  // 有 `origin` 且不是 human 的（task-notification / peer / tool）必须排除。
+  // **但不能要求它存在** —— 见上方注释。
+  if (rec.origin && rec.origin.kind !== 'human') return false;
+  // `isMeta` 是宿主写的上下文，不是人打的。
+  if (rec.isMeta) return false;
+  const t = userText(rec);
+  if (t == null) return false;
+  const trimmed = t.trim();
+  if (!trimmed) return false;
+  // 宿主合成的前缀（system-reminder / command-* / local-command-* …）
+  if (SYNTHETIC_PREFIX.test(trimmed)) return false;
+  // 压缩续接提示
+  if (trimmed.startsWith(CONTINUATION)) return false;
+  // 打断标记。**两种变体，实测都出现**（195 次 / 20 次）；只匹配前者会让后者漏进来，
+  // 而漏进来比漏掉更糟 —— 它会被当成「本轮起点」，于是整份文件被当作本轮。
+  if (INTERRUPT_RE.test(trimmed)) return false;
+  // **必须由宿主明确标记为「外部输入」。** 两个标记任取其一：
+  //   `origin.kind === 'human'`（老版本 / 部分启动方式）
+  //   `userType === 'external'`（`promptSource: sdk` 的记录只有这个）
+  // 2026-11-16 全库实测：159,065 条 user 记录里，**没有一条**两个标记都缺。
+  // 所以「两个都没有」不是「老记录」，是「不是人类发言」—— 拒绝，而不是放行。
+  // 这个判据比「三道门全都过就放行」更严，但它有实测支撑，而那个宽松版本只是猜测。
+  if (rec.origin && rec.origin.kind === 'human') return true;
+  if (rec.userType === 'external') return true;
+  return false;
 }
 
 /** 错误记录的形状。`index` 是给 `computeDelta` 用的：它要判「错误记录之后有没有回合
@@ -143,6 +199,11 @@ export function changeSetOf(records, { humanIndex = -1 } = {}) {
   const seen = new Set();
   for (const e of idx.edits) {
     if (e.index <= humanIndex) continue;
+    // **失败的写入不算改动。** `ok === false` 是 tool_result 上的 `is_error`；
+    // `ok === null` 是「发起过但没看到结果」（被中断 / 被 hook 拦 / 会话结束）。
+    // 两种都不算 —— 前者磁盘上没多东西，后者我们不知道，而「不知道」不能当作「有」。
+    // 这与 shell 侧一致：那里早就用 `if (!c.ok ...) continue` 过滤了。
+    if (e.ok !== true) continue;
     if (e.via === 'shell' || !e.path) continue;
     const token = e.path;
     if (seen.has(token)) continue;

@@ -1184,7 +1184,15 @@ export function buildEvidenceIndex(records) {
         pending.set(b.id, { name, cmd, index: i });
         if (EDIT_TOOLS.includes(name)) {
           const p = String(input.file_path || input.path || input.notebook_path || '');
-          edits.push({ index: i, name, path: p, kind: editKindOf(p) });
+          // `ok` 先置 `null`（未知）：tool_use 阶段还没看到 tool_result。
+          // 在处理 tool_result 的那一圈里会回填真值；**没有 result 的**（被中断、
+          // 被 hook 拦、会话结束）保持 `null`，下游自己决定怎么读。
+          //
+          // 为什么必须有这个字段：此前 `edits` 记录的是「发起过一次编辑」，而不是
+          // 「磁盘上真的多了一个文件」。实测 366 个改动项里 60 个（16%）对应的
+          // tool_result 是报错 / 被拒 / 被 PreToolUse 拦 —— 于是「write was blocked,
+          // so nothing was created」这种句子会被判成一次真实接地。
+          edits.push({ index: i, useId: b.id, name, path: p, kind: editKindOf(p), ok: null });
           if (p && !writes.has(p)) writes.set(p, i);
         }
       }
@@ -1196,6 +1204,13 @@ export function buildEvidenceIndex(records) {
         if (!use) continue;
         const text = resultText(b);
         resultTexts.push({ index: use.index, text });
+        // 回填编辑类 tool_use 的成功标志。**只认 tool_result 上的 `is_error`，
+        // 不猜文本**：正文里出现「error」不代表这次编辑失败（很多工具会把被编辑的代码
+        // 原样回显，而那段代码里就有 `throw new Error`）。
+        if (!SHELL_TOOLS.includes(use.name) && !use.cmd) {
+          const e = edits.find((x) => x.useId === b.tool_use_id);
+          if (e) e.ok = b.is_error !== true;
+        }
         if (SHELL_TOOLS.includes(use.name) || use.cmd) {
           const err = b.is_error === true;
           // 「丢到后台去了」不等于成功。实测：`bash ./build.sh -o clean test` 被 Bash 工具

@@ -1038,6 +1038,9 @@ function checkUnregisteredExports() {
     // measure-interventions.mjs：run 会全量扫 1.7GB transcript（实测 24s），不能进结构门；
     // 它的正确性由 measure-interventions.test.mjs 里的小目录用例覆盖。
     'run', 'COUNT_PER_STOP', 'INTERRUPT_MARKER',
+    // 2026-11-16：正则与字符串常量，不是可调用函数 —— checkArgs 调不动它们。
+    // 由 `stop-delta.test.mjs` 的「打断标记两种变体」「宿主合成前缀」两条用例覆盖。
+    'SYNTHETIC_PREFIX', 'CONTINUATION', 'INTERRUPT_RE',
     // defaultClaimsScan 会 spawn verify-claims 子进程（实测 7.2s），不能塞进结构门；
     // 它有独立的 `--plain` 端到端覆盖（见 tui-redesign.test.mjs）。
     'defaultClaimsScan',

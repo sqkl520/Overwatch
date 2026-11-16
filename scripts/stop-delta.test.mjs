@@ -320,3 +320,81 @@ test('stop-delta 不得反向 import stop-signals（导入环会在启动期炸�
     'stop-delta.mjs 不得 import stop-signals.mjs —— 会形成环。'
     + '\n纯谓词（isHumanMessage / errorOf）应下沉到 stop-delta，由 stop-signals 反向 re-export。');
 });
+
+// ── 守门测试：本轮边界（origin 缺失 / 中断标记） ─────────────────────
+//
+// 2026-11-16 全库实测：874 个含用户文本的 transcript 里，`origin.kind === 'human'`
+// 是 `userType === 'external'` 的**真子集**（223 vs 874），651 个只有后者。
+// 旧判据漏掉它们 → `lastHumanIndex` 返回 -1 → `boundary = 'whole-file'` →
+// **整个文件的改动集被当成「本轮」**。修复前后的实测分布：
+//   human     7 → 555
+//   whole-file 96 → 2
+
+test('isHumanMessage：userType=external 且无 origin 的记录必须认出来（实测 651 个文件只有这个）', () => {
+  const sdk = { type: 'user', userType: 'external', promptSource: 'sdk', message: { role: 'user', content: 'Reply' } };
+  assert.equal(isHumanMessage(sdk), true, 'sdk 形态是真实人类消息，漏掉会让「本轮」边界失效');
+});
+
+test('isHumanMessage：origin.kind=human 仍要认出来（兼容老版本）', () => {
+  const old = { type: 'user', origin: { kind: 'human' }, message: { role: 'user', content: '真的' } };
+  assert.equal(isHumanMessage(old), true);
+});
+
+test('isHumanMessage：打断标记不算人类发言（两种变体，实测 195 / 20 次）', () => {
+  const a = { type: 'user', userType: 'external', message: { role: 'user', content: '[Request interrupted by user]' } };
+  const b = { type: 'user', userType: 'external', message: { role: 'user', content: '[Request interrupted by user for tool use]' } };
+  assert.equal(isHumanMessage(a), false);
+  assert.equal(isHumanMessage(b), false, '只匹配前者会让后者漏进来 —— 而漏进来比漏掉更糟，它会被当成「本轮起点」');
+});
+
+test('isHumanMessage：两个标记都缺的记录不算人类发言（实测 159,065 条 user 记录里 0 条如此）', () => {
+  const bare = { type: 'user', message: { role: 'user', content: '系统注入' } };
+  assert.equal(isHumanMessage(bare), false, '真实语料里不存在这种形状，出现即不是人类发言');
+});
+
+test('isHumanMessage：宿主合成的前缀不算（system-reminder / command-*）', () => {
+  const r = { type: 'user', userType: 'external', message: { role: 'user', content: '<system-reminder>注入</system-reminder>' } };
+  assert.equal(isHumanMessage(r), false);
+});
+
+// ── 守门测试：失败的写入不算改动 ─────────────────────────────────────
+//
+// 实测 366 个改动项里 60 个（16%）对应的 tool_result 是报错 / 被拒 / 被 PreToolUse 拦。
+// 不过滤的后果：「write was blocked, so nothing was created」会被判成一次真实接地。
+
+test('changeSetOf：失败的 Write（tool_result is_error）不得算作改动', () => {
+  const recs = [
+    { type: 'user', userType: 'external', timestamp: '2026-11-16T10:00:00Z', message: { role: 'user', content: '写个文件' } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu1', name: 'Write', input: { file_path: 'gated.txt' } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu1', is_error: true, content: 'PreToolUse blocked' }] } },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'write was blocked, so nothing was created: gated.txt' }] } },
+  ];
+  const set = changeSetOf(recs, { humanIndex: lastHumanIndex(recs) });
+  assert.equal(set.length, 0, '磁盘上没多东西，就不该进改动集');
+
+  const d = computeDelta({ records: recs });
+  assert.notEqual(d.verdict, 'GROUNDED',
+    '文本引用了被拒的文件名，但它没有被创建 —— 判成 GROUNDED 就是把一次没发生的写记成接地');
+});
+
+test('changeSetOf：成功的 Write 必须算作改动', () => {
+  const recs = [
+    { type: 'user', userType: 'external', timestamp: '2026-11-16T10:00:00Z', message: { role: 'user', content: '写个文件' } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu1', name: 'Write', input: { file_path: 'made.txt' } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }] } },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'Created made.txt' }] } },
+  ];
+  const set = changeSetOf(recs, { humanIndex: lastHumanIndex(recs) });
+  assert.equal(set.length, 1);
+  assert.equal(set[0].token, 'made.txt');
+  assert.equal(computeDelta({ records: recs }).verdict, 'GROUNDED');
+});
+
+test('changeSetOf：没有 tool_result 的写入（被中断 / 会话结束）不算改动', () => {
+  const recs = [
+    { type: 'user', userType: 'external', timestamp: '2026-11-16T10:00:00Z', message: { role: 'user', content: '写吧' } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu9', name: 'Write', input: { file_path: 'never.txt' } }] } },
+  ];
+  const set = changeSetOf(recs, { humanIndex: lastHumanIndex(recs) });
+  assert.equal(set.length, 0, '「不知道有没有写成」不能当作「有」');
+});
