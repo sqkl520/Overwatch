@@ -41,7 +41,50 @@
  */
 
 import { buildEvidenceIndex, isMutatingCommand, lastAssistantText } from './verify-claims.mjs';
-import { isHumanMessage } from './stop-signals.mjs';
+// **不 import `stop-signals.mjs`。** 那两个纯谓词下沉到本文件（见下方 `isHumanMessage` /
+// `errorOf`），由 `stop-signals` 反过来 re-export。
+//
+// 为什么必须打破这个环：此前是 `stop-signals → stop-delta → stop-signals`。它能跑，
+// 只因为两边都在**调用时**用对方的**函数声明**（hoisted）。一旦任一侧改成
+// `const f = ...`、或在模块顶层用到对方的值，就是 TDZ 报错 —— 而且报错点在启动期，
+// 不是某条路径上。
+//
+// 现在 `scan-sessions.mjs` 要 import 本文件（把 delta 接到行上），那条环就会被拉进
+// TUI 的数据通路。所以现在打破，而不是等它炸。
+
+/** 真人消息的判据：`origin.kind === 'human'`。
+ *
+ *  **不用正则匹配 "user"** —— `tool_result` 也是 `user` 记录，那样会把工具结果
+ *  当成用户发话。这个坑在 L2 叫停路径里也踩过一次（会话会自己解锁自己）。 */
+export function isHumanMessage(rec) {
+  return Boolean(rec && rec.type === 'user' && rec.origin && rec.origin.kind === 'human');
+}
+
+/** 错误记录的形状。`index` 是给 `computeDelta` 用的：它要判「错误记录之后有没有回合
+ *  可写」，只有时间戳不够 —— 同一毫秒内的多条记录无法排序，而下标就是时间。 */
+export function errorOf(rec, index = null) {
+  if (!rec || rec.type !== 'assistant') return null;
+  const err = rec.error ?? (rec.isApiErrorMessage ? rec.message && rec.message.content : null);
+  if (err === null || err === undefined || err === false) return null;
+  const text = typeof err === 'string' ? err : JSON.stringify(err);
+  if (!text || text === 'null' || text === 'false') return null;
+  return { text: text.slice(0, 200), at: rec.timestamp || null, index };
+}
+
+/** 最后一条错误记录的下标。没有就是 -1。
+ *
+ *  `scan-sessions` 自己也需要它（喂 `computeDelta` 的 `errorIndex`）。**不要在 scan 里
+ *  再写一份错误识别** —— 两份判据必然漂移，这个仓库为这件事付过多次账。
+ *
+ *  与 `stop-signals` 的 `hasRecentError` 区别：那个带「只近 20 条」的窗口语义
+ *  （它问的是「最近有没有出错」），这个问的是「错误在哪」—— 口径不同，所以不合并。 */
+export function lastErrorIndex(records) {
+  const arr = Array.isArray(records) ? records : [];
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (errorOf(arr[i], i)) return i;
+  }
+  return -1;
+}
 
 /** delta 判定。四类，`EXEMPT` 与 `NO_DELTA` 必须分开：
  *  - EXEMPT   = 没机会写（错误记录是末条 assistant 记录，模型没有回合可写）

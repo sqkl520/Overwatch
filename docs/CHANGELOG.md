@@ -35,6 +35,11 @@
 
 ### Fixed
 
+- **`stop-signals` ↔ `stop-delta` 之间的导入环**。此前是 `stop-signals → stop-delta → stop-signals`。它能跑，只因为双方都在**调用时**用对方的**函数声明**（hoisted）；一旦任一侧改成 `const f = ...`、或在模块顶层用到对方的值，就是 TDZ 报错 —— 而且报错点在**启动期**，不是某条路径上，很难归因。
+  - 为什么现在必须修：`scan-sessions.mjs` 接下来要 import `stop-delta`（把 delta 接到会话行上），那条环会被拉进 TUI 的数据通路。
+  - 修法：把两个纯记录谓词 `isHumanMessage` / `errorOf` **下沉到 `stop-delta.mjs`**，`stop-signals` 侧改为 re-export。导出面一个字没变。顺带新增 `lastErrorIndex(records)`——`scan-sessions` 也要 `errorIndex`，**不在 scan 里再写一份错误识别**（两份判据必然漂移，本仓为这件事付过多次账）。
+  - **一个 ESM 细节，16 条测试变红才发现**：`export { x } from './m'` 只建立**导出**，**不建立本地绑定**。所以 `stop-signals.mjs` 内部直接写 `errorOf(...)` 会 `ReferenceError: errorOf is not defined`。必须在文件顶部**单独 import 一份**来用。
+  - **守门测试**：`stop-delta.test.mjs` 断言 `stop-delta.mjs` 源码里不含 `from './stop-signals.mjs'`。用**静态断言**而不是运行时探测，因为默认写法（双方都用函数声明）运行时能通过 —— 那样等于没守。负向验证：加一行反向 import → 测试变红。
 - **17 个入口的「我是否被直接执行」判断不解析符号链接**（DF-025）。`resolve(argv[1]) === resolve(fileURLToPath(import.meta.url))` 两边一个解析过符号链接、一个没有，所以 `npm link` / `npm install -g .` / pnpm（存储模型就是符号链接）装出来的命令**什么都不做、exit 0**。改成 `realOrResolve()`（`realpathSync` 失败退回 `resolve`）。实测：目录符号链接下 `resolve` 比较 `false`、`realpath` 比较 `true`。**负向验证**：把一个文件改回旧写法 → 新测试红。
   - 测试 `entry-symlink.test.mjs` 抽三个代表性入口（最重 / 最轻 / hook 三种形态），不逐个跑 17 个：全量版实测 85 秒，而那 17 行改动完全一致，逐个跑增加的只有时间。
   - 判据**只看「有没有输出」，不看「输出是否相等」**：`stop-signals.mjs --help` 单次就 4 秒且输出含耗时（`扫了 3322 ms`），两次独立运行必然不同 —— 第一版用相等判定，于是它恒定报红，那不是符号链接坏了，是判据把「输出含时钟」误当成了「行为改变」。

@@ -30,7 +30,11 @@ import { join, resolve, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { endsWithQuestion } from './asked.mjs';
-import { computeDelta, summarizeDelta } from './stop-delta.mjs';
+// 这两个纯谓词已下沉到 `stop-delta.mjs`（打破导入环，见下方 re-export 处）。
+// **这里必须单独 import 一份**：ESM 的 `export { x } from './m'` 只建立导出，**不建立
+// 本地绑定** —— 本文件内部直接写 `errorOf(...)` 会 `ReferenceError: errorOf is not defined`。
+// 这条规则不直观，实测 16 条测试因此变红才发现。
+import { computeDelta, summarizeDelta, isHumanMessage, errorOf } from './stop-delta.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -125,17 +129,9 @@ export function endsWithoutToolUse(records) {
 
 /** 错误记录的识别。实测语料里的形态见 2026-11-02-deterministic-signals.md 第四节：
  *  `isApiErrorMessage: true` + `error: "authentication_failed"`，
- *  或 `error: { message: "524 {\"error\":{\"type\":\"bad_response_status_code\"...}" }`。 */
-export function errorOf(rec, index = null) {
-  if (!rec || rec.type !== 'assistant') return null;
-  const err = rec.error ?? (rec.isApiErrorMessage ? rec.message && rec.message.content : null);
-  if (err === null || err === undefined || err === false) return null;
-  const text = typeof err === 'string' ? err : JSON.stringify(err);
-  if (!text || text === 'null' || text === 'false') return null;
-  // index 是给 stop-delta 用的：它要判「错误记录之后有没有回合可写」，只有时间戳不够
-  // ——同一毫秒内的多条记录无法排序，而下标就是时间。
-  return { text: text.slice(0, 200), at: rec.timestamp || null, index };
-}
+ *  或 `error: { message: "524 {\"error\":{\"type\":\"bad_response_status_code\"...}" }`。
+ *
+ *  实现已**下沉到 `stop-delta.mjs`**，这里只 re-export（见下方那段）。 */
 
 /**
  * 末尾 N 条记录里是否出现 API/工具错误。只看 assistant 记录上的 error 字段，
@@ -250,11 +246,13 @@ export function contextPressure(records) {
 
 // ── 判据 5：人类原始目标 ────────────────────────────────────────────
 
-/** 真人消息的判据：origin.kind === 'human'。不用正则匹配 "user"，那会把
- *  tool_result（也是 user 记录）算进去。 */
-export function isHumanMessage(rec) {
-  return Boolean(rec && rec.type === 'user' && rec.origin && rec.origin.kind === 'human');
-}
+/** 真人消息的判据与错误记录形状**下沉到 `stop-delta.mjs`**，这里只 re-export。
+ *
+ *  为什么：此前是 `stop-signals → stop-delta → stop-signals` 的环。它能跑，只因为双方
+ *  都在调用时用函数声明（hoisted）；一旦任一侧改成 const 或顶层求值就 TDZ 报错，且报在
+ *  启动期。`scan-sessions` 现在要 import `stop-delta`，那条环会被拉进 TUI 的数据通路。
+ *  导出面一个字没变，调用方不受影响。 */
+export { isHumanMessage, errorOf } from './stop-delta.mjs';
 
 /** 会话里的全部真人消息，按时间顺序。 */
 export function humanMessages(records) {

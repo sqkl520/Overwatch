@@ -14,8 +14,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   computeDelta, summarizeDelta, deltaSlotsOf, changeSetOf, lastHumanIndex,
+  lastErrorIndex, isHumanMessage, errorOf,
   DELTA_VERDICTS, SLOT_STATES,
 } from './stop-delta.mjs';
 
@@ -299,4 +301,22 @@ test('lastHumanIndex：取末条真人记录；无则 -1', () => {
 test('DELTA_VERDICTS 冻结且四类齐全', () => {
   assert.deepEqual([...DELTA_VERDICTS], ['GROUNDED', 'UNGROUNDED', 'NO_DELTA', 'EXEMPT']);
   assert.throws(() => { 'use strict'; DELTA_VERDICTS.push('X'); }, /read only|object is not extensible|Cannot add/);
+});
+
+// ── 导入环：stop-delta 不得反向 import stop-signals ──────────────────
+//
+// 此前是 `stop-signals → stop-delta → stop-signals`。它能跑，只因为双方都在**调用时**
+// 用对方的**函数声明**（hoisted）。一旦任一侧改成 `const f = ...`、或在模块顶层用到
+// 对方的值，就是 TDZ 报错 —— 而且报错点在启动期，不是某条路径上，很难归因。
+//
+// `scan-sessions.mjs` 现在要 import `stop-delta`（把 delta 接到行上），那条环会被拉进
+// TUI 的数据通路。所以这条测试守的不是风格，是**启动期崩溃**。
+//
+// 为什么用「读源码」而不是「运行时探测」：TDZ 只在特定写法下才炸，默认写法（双方都用
+// 函数声明）能跑，所以运行时测试**现在会通过**、等于没守。静态断言才是真的守门。
+test('stop-delta 不得反向 import stop-signals（导入环会在启动期炸）', () => {
+  const src = readFileSync(new URL('./stop-delta.mjs', import.meta.url), 'utf8');
+  assert.ok(!/^import[\s\S]*?from\s+'\.\/stop-signals\.mjs'/m.test(src),
+    'stop-delta.mjs 不得 import stop-signals.mjs —— 会形成环。'
+    + '\n纯谓词（isHumanMessage / errorOf）应下沉到 stop-delta，由 stop-signals 反向 re-export。');
 });
