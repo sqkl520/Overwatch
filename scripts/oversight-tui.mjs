@@ -38,7 +38,14 @@ import {
   partitionRows, resolveLayout, sectionTitle, staleOf, stoppedSummary,
   titleOf, verdictParts, windowOf, shortPath, truncateWithDisclosure, runningRowOf,
 } from './tui-layout.mjs';
-import { createMetaCache, metaFromRecords, projectsRoot, readTailRecords, transcriptPathFor } from './tui-meta.mjs';
+// `askedVerdictOf` 是「问了没答」的唯一判据（转调 `asked.mjs` 的 `assessAsked`，
+// 四道时间门都在那边）。**它必须在这里 import** —— 只在 `tui-meta.mjs` 里导出是不够的，
+// 漏掉这一行会让整个 TUI 在第一次渲染时 `ReferenceError` 崩掉，而单跑任何一条
+// 单元测试都发现不了（它们各自 mock 了 meta）。
+import {
+  createMetaCache, metaFromRecords, projectsRoot, readTailRecords, transcriptPathFor,
+  askedVerdictOf,
+} from './tui-meta.mjs';
 import { buildInbox, defaultStateDir, healthCheck, loadState } from './watch.mjs';
 import { renderSessionBlock, summarizeClaims, flattenResults } from './verify-claims.mjs';
 
@@ -641,7 +648,37 @@ export function viewOf(row, meta = null, { nowMs = Date.now(), host = null } = {
         questionWhy: verdict ? (verdict.why || null) : null,
       }
       : null,
+    // 交还 delta：**必须在这里显式放行**。详情页只从 `view.delta` 取，不从
+    // `row.delta` 取 —— 后者没洗过。`considered` / `hits` 里的 token 是 Bash 命令原文
+    // 与文件路径，直接来自 transcript：本仓 DF-013 记过，只读渲染器被目录名里的
+    // OSC 52 改了系统剪贴板。净化只做在本函数，渲染层不另开一道。
+    delta: deltaViewOf(row?.delta),
     row,
+  };
+}
+
+/** `delta` 字段 → 视图对象。**这是 delta 唯一的净化入口。**
+ *
+ *  字段缺失、为 null、不是对象，一律返回 null：null 在详情页表示「读不到」，
+ *  与「没写」（NO_DELTA）是两件事，不能合并。
+ *  `verdict` / `attribution` / `boundary` 名义上是枚举，但它们来自扫描行，
+ *  同样按不可信字符串处理 —— 枚举表之外的取值必须原样带出来让人看见，
+ *  而不是被渲染层当成已知形态去套模板。
+ */
+function deltaViewOf(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return null;
+  const tokens = (arr) => (Array.isArray(arr)
+    ? arr.map((t) => sanitize(String(t ?? ''))).filter((t) => t.length > 0)
+    : []);
+  return {
+    verdict: sanitize(String(d.verdict ?? '')),
+    attribution: sanitize(String(d.attribution ?? '')),
+    boundary: sanitize(String(d.boundary ?? '')),
+    changed: sanitize(String(d.changed ?? '')),
+    hit: Number.isFinite(d.hit) ? d.hit : null,
+    considered: tokens(d.considered),
+    hits: tokens(d.hits),
+    consideredTruncated: d.consideredTruncated === true,
   };
 }
 
@@ -860,11 +897,76 @@ function statusLine(app, cols) {
 }
 
 /**
+ * 交还 delta 的一句话结论。**五类必须互相可分**，因为它们各自要求不同的动作：
+ *
+ *   GROUNDED   → 没事，可以走
+ *   UNGROUNDED → 去核对它改了什么（它自己没说）
+ *   NO_DELTA   → 它这轮没落盘改动，不等于没干活
+ *   EXEMPT     → 它没机会写（宿主错误停机），不是它没交还
+ *   读不到     → 我们不知道（没有 transcript / 还在干活）
+ *
+ * 把 `EXEMPT` 并进 `NO_DELTA`、或把「读不到」显示成「没写」，都是以另一种方式撒谎 ——
+ * 前者把「没机会」算成「没做」，后者拿缺失当证据。
+ *
+ * @param {object|null} dv  `viewOf` 洗过的 delta 视图
+ */
+function deltaHeadlineOf(dv) {
+  if (!dv) return '判不了 —— 该会话没有 transcript，或还在干活';
+  const n = Array.isArray(dv.considered) ? dv.considered.length : 0;
+  // 条数被字段截断时不能给一个看起来精确的数字：那是「只列了 40 条」被读成「只有 40 条」。
+  const count = dv.consideredTruncated ? `至少 ${n}` : `${n}`;
+  switch (dv.verdict) {
+    case 'GROUNDED':
+      // 只读轮次（considered 为空）也落 GROUNDED：那时「接地」是因为它说了「改动：无」。
+      return n === 0
+        ? '带了 delta —— 本轮没改东西，并明说了这一点'
+        : '带了 delta —— 提到了本轮真实发生过的改动';
+    case 'UNGROUNDED':
+      return `写了但没提 —— 改了 ${count} 项，一项都没提`;
+    case 'NO_DELTA':
+      // 边界不可判时不指控也不断言「没写」：这一轮到底有没有改，我们其实不知道。
+      return dv.attribution === 'unknown'
+        ? '判不了 —— 窗口截断，本轮起点不在窗口里'
+        : '没交还 —— 有机会写，磁盘上没多出可核对的东西';
+    case 'EXEMPT':
+      return '没机会写 —— 错误停机，错误是末条记录，模型没有回合';
+    default:
+      // 枚举表之外的取值原样带出来。猜一个已知形态去套模板，就是替数据撒谎。
+      return `判不了 —— 未知 verdict「${dv.verdict || '空'}」`;
+  }
+}
+
+/** 「本轮」的边界是怎么定的。没有它，「改了 3 项」这句话就没有前提。 */
+function deltaBoundaryOf(dv) {
+  switch (dv && dv.boundary) {
+    case 'human': return '本轮起点 = 末条真人记录';
+    case 'whole-file': return '本轮起点 = 整份文件（窗口内没有真人记录）';
+    case 'unknown': return '不可判 —— 窗口被截断，可能横跨多轮';
+    case 'error-stop': return '错误停机，没有可用的本轮边界';
+    default: return `不可判（boundary「${(dv && dv.boundary) || '空'}」）`;
+  }
+}
+
+/** token 列表 → 一段可折行的文本。token 已由 `viewOf` 洗过，这里不再净化。 */
+function tokenListText(tokens) {
+  return tokens.length ? tokens.join(' · ') : '—';
+}
+
+/** 带标签的多行值：首行对齐标签列，续行缩进到同一栏。 */
+function kvWrapped(label, name, value, cols) {
+  const indent = ' '.repeat(2 + displayWidth(label('')));
+  const width = Math.max(10, cols - displayWidth(indent));
+  return wrapToWidth(String(value ?? '—'), width)
+    .map((l, i) => truncateToWidth(i === 0 ? `  ${label(name)}${l}` : indent + l, cols));
+}
+
+/**
  * 详情页（L5 首屏 + L6 高级区）。
  *
  * **首屏只放能改变动作的四块**：状态 / 身份 / 最近说 / 证据（规划 §2.4-C）。
  * `novelty` / `calls` / `liveness` / `hbThresholdSec` / `lastGapSec` / `tokens` 全部
  * 下沉到 `showInternals=true`（按 `i` 才出现）。理由：它们没有一个能改变用户下一步。
+ * 交还（delta）紧跟证据，不进列表页/折叠行/判决行 —— 那是描述量，不是判据。
  *
  * 51 个子 agent 压成一行计数。**不逐条列出** —— 旧实现列 51 行「◇ 子 agent #N」，
  * 而每行都标注「该节点状态未暴露」，也就是 51 行全是「我不知道」（规划 §1.3）。
@@ -872,8 +974,10 @@ function statusLine(app, cols) {
  * @param {object} session
  * @param {number} cols
  * @param {boolean} useColor
- * @param {{internals?: boolean, claims?: Array, meta?: object, nowMs?: number}} [opts]
+ * @param {{internals?: boolean, claims?: Array, meta?: object, nowMs?: number,
+ *   delta?: object|null}} [opts]
  *   `nowMs` 是老化判断的注入时钟（不传则只看行上的 idleSec）。
+ *   `delta` 必须是 **`viewOf` 洗过的那一份**（`view.delta`），不是扫描行的 `session.delta`。
  */
 export function detailLines(session, cols, useColor, opts = {}) {
   const st = stateOf(session);
@@ -931,6 +1035,31 @@ export function detailLines(session, cols, useColor, opts = {}) {
     out.push(truncateToWidth(`  ${' '.repeat(10)}d 看完整证据链`, cols));
   } else if (opts.claimsKnown) {
     out.push(kv('证据', '没有可核对的完成声明'));
+  }
+
+  // 交还：紧跟在证据后面 —— 两者回答的是同一类问题（它说的东西在记录里站得住吗）。
+  // **只从 `opts.delta` 取**，那是 `viewOf` 洗过的视图对象；不从 `session.delta` 取，
+  // 后者是扫描行原样字段，绕过净化入口，token 里的 OSC 52 会直接上屏。
+  const dv = opts.delta && typeof opts.delta === 'object' ? opts.delta : null;
+  out.push(kv('交还', deltaHeadlineOf(dv)));
+  if (dv) {
+    if (dv.considered.length) {
+      out.push(...kvWrapped(label, '本轮改了', tokenListText(dv.considered), cols));
+      // 「没提」只在真指控时列举：GROUNDED 会话列同一批 token 叫「已提」，
+      // 而不是让人以为漏了什么。
+      if (dv.verdict === 'UNGROUNDED') {
+        const unhit = dv.considered.filter((t) => !dv.hits.includes(t));
+        if (unhit.length) out.push(...kvWrapped(label, '没提', tokenListText(unhit), cols));
+      } else if (dv.verdict === 'GROUNDED' && dv.hits.length) {
+        out.push(...kvWrapped(label, '已提', tokenListText(dv.hits), cols));
+      }
+    }
+    // 字段级截断必须说出来。它与「屏幕放不下」不是一回事：前者是我们没拿到，
+    // 后者是我们拿到了没画完 —— 混在一起会让「只列了 40 条」被读成「只有 40 条」。
+    if (dv.consideredTruncated) {
+      out.push(...kvWrapped(label, '另有', '未收入的改动（字段级截断：每会话最多列 40 条，这不是全部）', cols));
+    }
+    out.push(kv('边界', deltaBoundaryOf(dv)));
   }
 
   // 老化说明：详情页必须说清「为什么它没出现在需动作区」和「为什么按 c 没东西」。
@@ -1788,6 +1917,8 @@ export class App {
       claims,
       claimsKnown: Boolean(this.claims),
       meta: view && view.meta ? { ...view.meta, title: view.title, cwd: view.path } : null,
+      // 从 view 取，不从 session 取：`viewOf` 是唯一的净化入口。
+      delta: view ? view.delta : null,
       nowMs: this.now(),
     });
     const body = [];

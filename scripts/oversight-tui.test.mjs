@@ -620,3 +620,165 @@ test('pendingLines 不超过给定宽度', () => {
     }
   }
 });
+
+// ── 详情页的「交还」块（2026-11-16）────────────────────────────────
+//
+// delta 是**描述量**，不是判据：它不进列表行、不进折叠行、不进判决行，只在用户
+// 按 Enter 为这一个会话显式付费时才出现。所以它的测试全部落在详情页与 `viewOf`。
+//
+// 五类必须互相可分，理由不是措辞洁癖：它们各自要求不同的动作。
+// 把 EXEMPT（没机会写）并进 NO_DELTA（没写）、或把「读不到」画成「没写」，
+// 都是以另一种方式撒谎 —— 本仓在别的地方已经为同类合并付过代价。
+
+const OSC = String.fromCharCode(0x1b) + ']52;c;cHduZWQ=' + String.fromCharCode(0x07);
+
+/** 一条带 delta 的停止会话（形状与 `scan --json` 的行一致）。 */
+function stoppedWithDelta(delta) {
+  return {
+    project: 'p', sessionId: 's', state: 'STOPPED', reason: 'end-turn',
+    needs: null, suggestedReply: null, idleSec: 3600,
+    subagents: 0, subagentsTotal: 0, maxDepth: 0, delta,
+  };
+}
+
+const deltaOf = (over = {}) => ({
+  verdict: 'UNGROUNDED', attribution: 'assistant', boundary: 'human', changed: 'stated',
+  hit: 0, considered: ['scripts/a.mjs', 'scripts/b.mjs'], hits: [],
+  consideredTruncated: false, ...over,
+});
+
+/** 详情页里「交还」那一行。 */
+const deltaLine = (text) => text.split('\n').find((l) => l.trimStart().startsWith('交还')) || '';
+
+test('交还负向 1：viewOf 白名单必须放行 delta，否则详情页拿不到它', () => {
+  // `viewOf` 既是「字段 → 屏幕矩阵」的唯一入口，也是唯一的净化入口。
+  // 没放行 → 渲染层只能去摸 `session.delta`，那等于绕过净化。
+  const v = viewOf(stoppedWithDelta(deltaOf()), null);
+  assert.ok(v.delta, 'viewOf 没有放行 delta —— 详情页会永远显示「判不了」');
+  assert.equal(v.delta.verdict, 'UNGROUNDED');
+  assert.deepEqual(v.delta.considered, ['scripts/a.mjs', 'scripts/b.mjs']);
+  assert.equal(v.delta.consideredTruncated, false);
+});
+
+test('交还负向 2：delta 里的 token 必须净化——它们逐字来自 transcript', () => {
+  // considered 是 Bash 命令原文与文件路径，会原样进详情页。DF-013 记过：
+  // 只读渲染器被目录名里的 OSC 52 改了系统剪贴板。
+  const v = viewOf(stoppedWithDelta(deltaOf({
+    considered: [`scripts/${OSC}a.mjs`, `npm test ${OSC}`],
+    hits: [`scripts/${OSC}a.mjs`],
+    verdict: `UNGROUNDED${OSC}`,
+    boundary: `human${OSC}`,
+  })), null);
+  for (const tok of [...v.delta.considered, ...v.delta.hits]) {
+    assert.ok(!tok.includes('\x1b'), `token 残留 ESC：${JSON.stringify(tok)}`);
+    assert.ok(!tok.includes('\x07'), `token 残留 BEL：${JSON.stringify(tok)}`);
+  }
+  for (const k of ['verdict', 'attribution', 'boundary', 'changed']) {
+    assert.ok(!String(v.delta[k]).includes('\x1b'), `${k} 残留 ESC`);
+  }
+  // 净化不等于丢弃：可见部分必须还在，否则「净化」会退化成「一律清空」。
+  assert.ok(v.delta.considered[0].includes('scripts/'), '净化把整条 token 删了');
+  assert.ok(v.delta.considered[0].includes('a.mjs'), '净化把整条 token 删了');
+
+  const text = detailLines(stoppedWithDelta(null), 100, false, { delta: v.delta }).join('\n');
+  assert.ok(!text.includes('\x1b'), '详情页输出含 ESC');
+  assert.ok(!text.includes('\x07'), '详情页输出含 BEL');
+});
+
+test('交还负向 3：渲染层只能从 opts.delta 取，不得自己摸 session.delta', () => {
+  // 那条路绕过 `viewOf` 的净化入口：session.delta 是扫描行原样字段，没洗过。
+  const src = readFileSync(join(import.meta.dirname, 'oversight-tui.mjs'), 'utf8');
+  // 只看代码行：注释里出现 `session.delta` 正是在说明「不许这么取」。
+  const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+  assert.ok(!/session\.delta/.test(code), 'detailLines 自己取了 session.delta，绕过净化入口');
+  assert.ok(/delta: view \? view\.delta : null/.test(src),
+    'App 没有把 view.delta 传进详情页 —— 交互屏上看不到交还');
+  // session 上有 delta 但 opts 没给 → 必须显示「判不了」，不能偷读。
+  const out = detailLines(stoppedWithDelta(deltaOf()), 100, false).join('\n');
+  assert.ok(deltaLine(out).includes('判不了'), `没经 viewOf 的 delta 不得被渲染：\n${out}`);
+  assert.ok(!out.includes('改了 2 项'), `渲染层偷读了 session.delta：\n${out}`);
+});
+
+test('交还负向 4：EXEMPT 与 NO_DELTA 必须是两种说法（没机会 vs 没写）', () => {
+  // 实测分布：EXEMPT 192 条（24.9%）、NO_DELTA 370 条（47.9%）。合成一句，
+  // 「宿主错误停机导致模型没回合」就会被读成「模型交还时没写」。
+  const render = (over) => {
+    const v = viewOf(stoppedWithDelta(deltaOf(over)), null).delta;
+    return detailLines(stoppedWithDelta(null), 100, false, { delta: v }).join('\n');
+  };
+  const exempt = render({ verdict: 'EXEMPT', attribution: 'harness', boundary: 'error-stop', considered: [] });
+  const noDelta = render({ verdict: 'NO_DELTA', attribution: 'assistant', considered: [] });
+  assert.ok(exempt.includes('没机会写'), `EXEMPT 应说「没机会写」：\n${exempt}`);
+  assert.ok(!exempt.includes('没交还'), `EXEMPT 不得说成「没交还」：\n${exempt}`);
+  assert.ok(noDelta.includes('没交还'), `NO_DELTA 应说「没交还」：\n${noDelta}`);
+  assert.ok(!noDelta.includes('没机会'), `NO_DELTA 不得说成「没机会」：\n${noDelta}`);
+  assert.notEqual(deltaLine(exempt), deltaLine(noDelta), '两条结论行内容相同 —— 五类被合并了');
+});
+
+test('交还负向 5：NO_DELTA + attribution unknown 显示「判不了」，不显示「没交还」', () => {
+  // 边界不可判（窗口截断、本轮起点不在窗口里）时，我们并不知道它有没有改。
+  // 这里落 NO_DELTA 只是为了「不指控」，不等于「已证实没写」。
+  const v = viewOf(stoppedWithDelta(deltaOf({
+    verdict: 'NO_DELTA', attribution: 'unknown', boundary: 'unknown', considered: ['scripts/a.mjs'],
+  })), null).delta;
+  const out = detailLines(stoppedWithDelta(null), 100, false, { delta: v }).join('\n');
+  assert.ok(deltaLine(out).includes('判不了'), `边界不可判时不得下结论：\n${out}`);
+  assert.ok(!out.includes('没交还'), `边界不可判时不得说成「没交还」：\n${out}`);
+  assert.ok(deltaLine(out).includes('窗口截断'), `要说出为什么判不了：\n${out}`);
+});
+
+test('交还负向 6：delta 缺失或为 null 显示「判不了」，且不出现任何数字', () => {
+  // 没有 transcript / 还在干活的会话，`deltaFieldOf` 返回 null。把它画成
+  // 「改了 0 项」就是拿缺失当证据。
+  for (const delta of [null, undefined, {}, 'garbage', []]) {
+    const v = viewOf(stoppedWithDelta(delta), null).delta;
+    const out = detailLines(stoppedWithDelta(null), 100, false, { delta: v }).join('\n');
+    const line = deltaLine(out);
+    assert.ok(line, `缺 delta 时也应有一行说明：\n${out}`);
+    assert.ok(line.includes('判不了'), `delta=${JSON.stringify(delta)} 应显示「判不了」：${line}`);
+    assert.ok(!/\d+\s*项/.test(line), `delta=${JSON.stringify(delta)} 不得出现数字：${line}`);
+  }
+});
+
+test('交还负向 7：本轮改了哪些 / 哪些没提，必须都能对上', () => {
+  const v = viewOf(stoppedWithDelta(deltaOf({
+    considered: ['scripts/stop-delta.mjs', 'scripts/tui-layout.mjs', 'node --test'],
+    hits: [], verdict: 'UNGROUNDED',
+  })), null).delta;
+  const out = detailLines(stoppedWithDelta(null), 100, false, { delta: v }).join('\n');
+  assert.ok(out.includes('本轮改了'), `要列出本轮改动集：\n${out}`);
+  assert.ok(out.includes('scripts/stop-delta.mjs'), `改动集缺项：\n${out}`);
+  assert.ok(out.includes('scripts/tui-layout.mjs'), `改动集缺项：\n${out}`);
+  assert.ok(out.includes('没提'), `UNGROUNDED 要列出没被提到的那些：\n${out}`);
+  assert.ok(out.includes('改了 3 项'), `要说出改了几项：\n${out}`);
+  // GROUNDED 时同一批 token 叫「已提」，不能出现「没提」——那是冤枉。
+  const grounded = viewOf(stoppedWithDelta(deltaOf({
+    verdict: 'GROUNDED', considered: ['scripts/a.mjs'], hits: ['scripts/a.mjs'], hit: 1,
+  })), null).delta;
+  const outG = detailLines(stoppedWithDelta(null), 100, false, { delta: grounded }).join('\n');
+  assert.ok(outG.includes('已提'), `GROUNDED 应说「已提」：\n${outG}`);
+  assert.ok(!outG.includes('没提'), `GROUNDED 不得说「没提」：\n${outG}`);
+});
+
+test('交还负向 8：consideredTruncated 必须写出来，且不说成精确条数', () => {
+  // 字段级截断（每会话最多 40 条）与「屏幕放不下」是两回事：
+  // 前者是我们没拿到，后者是我们拿到了没画完。不说就会被读成「只有 40 条」。
+  const v = viewOf(stoppedWithDelta(deltaOf({
+    considered: Array.from({ length: 40 }, (_, i) => `scripts/f${i}.mjs`),
+    verdict: 'UNGROUNDED', consideredTruncated: true,
+  })), null).delta;
+  const out = detailLines(stoppedWithDelta(null), 100, false, { delta: v }).join('\n');
+  assert.ok(/字段级截断/.test(out), `截断没有说出来：\n${out}`);
+  assert.ok(/至少 40 项/.test(out), `截断时不得给精确条数：\n${deltaLine(out)}`);
+});
+
+test('交还：详情页每一行都不超过给定宽度（含折行后的 token 列表）', () => {
+  const v = viewOf(stoppedWithDelta(deltaOf({
+    considered: Array.from({ length: 12 }, (_, i) => `scripts/some-module-${i}.mjs`),
+  })), null).delta;
+  for (const cols of [40, 60, 76, 100]) {
+    for (const l of detailLines(stoppedWithDelta(null), cols, false, { delta: v })) {
+      assert.ok(displayWidth(l) <= cols, `宽度 ${displayWidth(l)} 超过 ${cols}：${JSON.stringify(l)}`);
+    }
+  }
+});

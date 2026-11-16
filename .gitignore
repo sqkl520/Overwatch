@@ -19,6 +19,11 @@ node_modules/
 tmp/
 .tmp-analysis/
 .tmp-*
+# 临时探针与分析的落点。**没有被忽略过**，所以一次 `git add -A` 就会把它提交进去 ——
+# 而它里面常常有真实 transcript 的切片、会话 id、本机路径。历史上 `.tmp-*` 已经被
+# 误提交过四次（`3a2a883` / `39cc75d` / `b14f6ae` / `7d49543`），内容是干净的，但
+# 那是运气，不是纪律。
+.scratch/
 .DS_Store
 Thumbs.db
 

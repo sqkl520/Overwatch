@@ -1,5 +1,9 @@
 # Overwatch
 
+[![CI](https://github.com/sqkl520/Overwatch/actions/workflows/validate.yml/badge.svg)](https://github.com/sqkl520/Overwatch/actions/workflows/validate.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![No dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#)
+
 **在 AI 想收工时替你把关。**
 
 它会扫描本机所有 Claude Code 会话，但真正的价值只有一个动作：当某个会话说「做完了」，
@@ -11,7 +15,9 @@
 > **把「AI 说它做完了」变成一句可核对的断言。** 其余能力是围绕这件事的观测面。
 > 每一条能力对应的命令见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md)。
 
-零 npm 依赖（仓库里没有 `package.json`），只要 Node ≥ 18。**不安装、不配置。**
+零 npm 依赖（仓库里没有 `package.json`）。**工具本身 Node ≥ 18.20.4**；**跑测试要 20.16+**（用了
+`import.meta.dirname` 与 `process.getBuiltinModule`）。`node scripts/overwatch.mjs` 会把这两条
+分开报——它会告诉你这台机器能跑工具、但跑不了测试。**不安装、不配置。**
 
 「不登录」只对观测类能力成立：`scan` / `verify` / `watch` / `tui` / 两条闸 / `overwatch.mjs`
 自检 / `launch --verify` 都**不需要凭据**。只有 `launch`（真的起会话）要——它得让宿主发起推理。
@@ -49,6 +55,33 @@ overwatch doctor · 查 8 项前提 · 预算 1000ms（只查前提，不扫语�
 [  80ms] plan        <run-id> · 进度 2/5 完成 · 1 失败 · 2 待认领
 合计 795ms / 预算 1000ms —— 前提齐了，可以跑 scan
 ```
+
+**面板长这样**（`node scripts/oversight-tui.mjs`，真实输出，只把项目名换成了占位）：
+
+```
+1 件在等你 · 12 个会话在跑 · 3 个已停
+纯文本快照（交互界面需在终端运行） · 窗口 最近 1 天 · 数据 0s前
+
+ 声明对不上   … 4 条存疑 · d 看证据
+ 后台监视     ✗ 监视未在跑（jobs 2.2d / probe 2.2d 未更新） · 先修这个
+ ✓ 其余 1 项没有发现
+
+需动作 (1)
+ 项目 A                                             1.9d  Enter 看原文
+    它在等：login required — run /login
+
+在跑 (12)
+ 项目 B                                              2s  `SendMessageW` 返回 `LRESULT`，需要先转换成 `HICON`。
+ 项目 C                                             12s  Description 更新成功，但 **Topics 是空的**——API 改 topics 需要…
+ 项目 D                                             28s  守卫实现得很到位（正则覆盖换行/空白，注释讲清了为什么这算残留）。
+```
+
+三处值得看：
+
+- **第一行是判决不是标题**：「1 件在等你」排在最前，而「12 个会话在跑」是背景。
+- **「后台监视 ✗」而不是一个绿勾**：它没在跑，会影响上面那个「1」的可信度，所以直接说。
+  换一台机器上新克隆下来必然出现这一行——那是事实，不是错误。
+- **「其余 1 项没有发现」而不是「全部正常」**：只报查到的，不替你没查的背书。
 
 然后：
 
@@ -200,7 +233,7 @@ Overwatch/
 
 新来的人从 [`docs/README.md`](docs/README.md) 开始——它按「你想知道什么」指路，并说清四类文档的可信度不同。
 
-改动后必跑 `node scripts/check-structure.mjs`（结构硬门）与 `node --test scripts/`（1617 条回归测试；**这个数字由硬门与实跑对账，写错即红**，所以照抄即可、不必手工数）。
+改动后必跑 `node scripts/check-structure.mjs`（结构硬门）与 `node --test scripts/`（1626 条回归测试；**这个数字由硬门与实跑对账，写错即红**，所以照抄即可、不必手工数）。
 
 ## 已知局限
 

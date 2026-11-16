@@ -25,6 +25,18 @@
 
 ### Added
 
+- **社区健康文件与仓库门面**（公开仓库硬约束的落地）。
+  - `SECURITY.md`：给出**私密报告渠道**（GitHub 私密漏洞咨询）、三段响应窗口（7 / 14 / 90 天），以及明确的作用域清单 —— 终端转义注入、路径穿越、hook 被诱导执行、凭据泄漏算；「读 `~/.claude/`」「`tasks/runs/` 累积会话 id」**不算**，因为那是它的用途。同时写清它**不会**做什么：不改别人写的文件、不联网、无依赖可审计。
+  - `CONTRIBUTING.md`：只写**当前实际能跑通**的步骤。前置条件分成两条 —— 跑工具 Node ≥ 18.20.4，跑测试 ≥ 20.16.0（`README.md` 此前只说「Node ≥ 18」，与 `docs/GUIDE.md` 的 20.16 冲突，同一条约束两处不一致，已改）。
+  - `.github/ISSUE_TEMPLATE/`：bug 模板要求版本 / 环境 / 复现 / 期望 vs 实际；feature 模板从**问题**出发，并前置两个会改变答案的追问（这是「驱动动作的状态」还是「描述」、能不能不靠人判定）。
+  - `.github/pull_request_template.md`：要求贴两条检查的尾部输出、声明是否改了测试数、以及一条公开安全确认。
+  - 仓库 About 面板：description 换成一句真实定位，topics 8 个。README 加三个**有据可查**的徽章（CI 连续三次 success / MIT / 0 依赖），并补一段真实面板输出做可视化演示。
+- **详情页多了「交还」块**（`oversight-tui.mjs` 的 `detailLines` + `viewOf` 的 `delta` 白名单）。放在证据块之后、已超龄之前 —— 两者回答的是同一类问题：它说的东西在记录里站得住吗。
+  - **只进详情页**，不进列表行、折叠行、判决行。delta 是描述量而不是判据；四段分区（需动作 / 运行中 / 已停 / 超龄）的组织原理是「能不能驱动动作」，而这个字段一个动作也驱动不了。何况「已停」折叠行已经挤到 45 列，76 列下只剩约 15 个汉字的余地。
+  - **五类必须分开**，因为各自要求不同的动作：`GROUNDED`（提到了真实改动）/ `UNGROUNDED`（改了 N 项一项没提）/ `NO_DELTA`+`assistant`（没交还）/ `NO_DELTA`+`unknown`（**判不了**，窗口截断）/ `EXEMPT`（**没机会写**，错误停机）/ 无 delta（**判不了**，无 transcript 或还在干活）。最后两行是重点：实测 `EXEMPT` 192 条（24.9%）与 `NO_DELTA` 370 条（47.9%），合并就是把「没机会」算成「没做」；而「读不到」显示成「没写」是拿缺失当证据。
+  - **净化只做在 `viewOf`**：`delta.considered` / `hits` 里的 token 是 Bash 命令原文与文件路径，逐字来自 transcript。`viewOf` 新加的 `deltaViewOf()` 把每个 token 过 `sanitize`，渲染层只接 `opts.delta`（`view.delta`），代码里不存在 `session.delta` 取值路径 —— 绕过净化入口的那条路必须不存在，而不是靠自觉不走。
+  - 同时显示「本轮改了哪些 / 哪些没提 / 边界」。`consideredTruncated` 为真时写「字段级截断」并不给精确条数（说「至少 40 项」），因为「只列了 40 条」被读成「只有 40 条」正是本仓反复栽的坑。
+
 - **用户叫停三层路径**（`stop-verify-hook.mjs`）。一个默认开启的强拦如果不给叫停路径，就是把用户锁在自己的会话里 —— 真实事故（issue #108493）：用户说「stop everything, you are done」之后，会话又起了子 agent 和一次外部 run 并截图。
   - **L1 文件闸** `isPaused()` / `pausePathFor()`：闸门文件存在就放行，**在所有判定之前**。路径放仓库外（`%LOCALAPPDATA%/Overwatch/stop-hook.PAUSE`），两条理由：被 hook 的项目通常不是本仓库；`DF-020` 记录过状态目录被整个清空且无告警。「不可被 hook 覆盖」= hook 任何分支都越不过它；它**可以**被模型用 Bash 删掉，但那会留痕、可审计 —— 这里不假装它是安全的。
   - **L2 用户发话** `userIntervenedSince()`：最后一条**真人**消息（`origin.kind === 'human'`）晚于上次拦截 → 放行并记 `allowed-user-intervened`。**不用文本匹配**「stop everything」：多语言、多说法，而且那是不可判定的意图识别；本仓自己的 `measure-interventions.mjs` 就为同类正则加过 `NUDGE_MAX_LEN` 兜底。`tool_result` 的 `type` 也是 `user`，所以必须看 `origin.kind`，只看 `type` 会把工具结果当成用户发话。
