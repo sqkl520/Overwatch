@@ -198,10 +198,25 @@ test('Bug2：truncateDisplay 是线性的，不是 O(n²)', () => {
     return Number(t1 - t0) / 1e6 / 5;
   };
   time(200);                                  // 预热，排除首次 JIT
-  const small = time(1600);
-  const large = time(6400);                   // 4 倍输入
-  const ratio = large / Math.max(small, 0.001);
-  assert.ok(ratio < 8, `4 倍输入耗时涨了 ${ratio.toFixed(1)} 倍，疑似仍是 O(n²)`);
+  // **取中位数，不要单次测量。** 2026-11-17 实测：同一台空闲机器上连续做 8 次单独测量，
+  // 比值分别是 1.42 / 3.48 / 5.13 / 5.30 / 2.09 / 7.70 / 4.23 / 4.96 —— **相差 5.4 倍**。
+  // 而判据是 `< 8`，最大那次距门槛只差 0.3。所以全量跑（并发负载）时会偶发变红，
+  // 而单跑总是绿的 —— 那不是回归，是测量噪声。
+  //
+  // 单次测量在这里是错的：`small` 碰巧快、`large` 撞上一次 GC，比值就翻倍。
+  // 取 5 次的中位数能把这类一次性的抖动滤掉，同时**仍然抓得住真的 O(n²)** ——
+  // 回退成 O(n²) 时比值是 10+，中位数也压不下去（已做手工回退验证）。
+  const ratios = [];
+  for (let k = 0; k < 5; k++) {
+    const small = time(1600);
+    const large = time(6400);                 // 4 倍输入
+    ratios.push(large / Math.max(small, 0.001));
+  }
+  ratios.sort((a, b) => a - b);
+  const ratio = ratios[Math.floor(ratios.length / 2)];
+  assert.ok(ratio < 8,
+    `4 倍输入耗时涨了 ${ratio.toFixed(1)} 倍（5 次中位数），疑似仍是 O(n²）。`
+    + `全部样本：${ratios.map((r) => r.toFixed(2)).join(', ')}`);
 });
 
 test('Bug2：宽度表由生成器与原始数据保持一致', () => {

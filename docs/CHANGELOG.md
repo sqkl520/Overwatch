@@ -56,6 +56,9 @@
 
 ### Fixed
 
+- **复杂度测试在并发负载下偶发假红**（`tui-bugfixes.test.mjs` 的「truncateDisplay 是线性的」）。它用**单次测量**算比值，而 2026-11-17 在空闲机器上实测同一操作连续 8 次，比值是 **1.42 / 3.48 / 5.13 / 5.30 / 2.09 / 7.70 / 4.23 / 4.96** —— 相差 **5.4 倍**，而判据是 `< 8`，最大那次距门槛只差 0.3。所以全量跑（并发）会偶发变红、单跑总是绿的，那不是回归，是测量噪声。
+  - 改成 **5 次取中位数**。单次测量在这里是错的：`small` 碰巧快、`large` 撞上一次 GC，比值就翻倍。中位数滤掉一次性抖动，同时仍抓得住真的 O(n²)。
+  - **负向验证**：把 `truncateDisplay` 回退成「每追加一个字符重算前缀」，中位数升到 **13.8 倍**（样本 13.28 / 13.46 / 13.75 / 14.35 / 17.27），测试变红。
 - **`scan-sessions` 整条崩溃**（`TypeError: records is not iterable`）：`tailWindowOf()` 返回 `{ tail, truncated }`，调用处却解构成 `{ mainTail, mainTailTruncated }`，于是 `mainTail` 恒为 `undefined`。**这个故障跑得比正常快 100 倍**（445ms vs 52–74s），所以「比以前快」本身就是故障信号 —— 值得记下来，因为第一反应容易是「优化生效了」。
 - **「本轮」边界在 74% 的 transcript 上失效**（`stop-delta.mjs` 的 `isHumanMessage`）。旧判据是 `origin.kind === 'human'`，而 2026-11-16 全库实测（874 个含用户文本的 transcript）：
 
