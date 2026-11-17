@@ -187,36 +187,39 @@ test('Bug2：truncateDisplay 与旧 truncateToWidth 语义一致（不切开宽�
 });
 
 test('Bug2：truncateDisplay 是线性的，不是 O(n²)', () => {
-  // 修复前实测 6400 字 321ms/call（每追加一字符重算整个前缀）。
-  // 这里用**比值**而不是绝对毫秒：CI 机器快慢不同，但 n 翻倍时 O(n²) 会涨 4 倍、
-  // O(n) 只涨 2 倍。用 process.hrtime 在进程内计时，扣掉冷启动。
-  const time = (n) => {
+  // **这个判据不看绝对耗时，也不看耗时的比值。它看「每字符成本随 n 的变化方向」。**
+  //
+  // 为什么不能用耗时比值（前两版的错）：
+  //   第一版单次测量 —— 同一台空闲机器连续 8 次，比值 1.42 到 7.70，差 5.4 倍。
+  //   第二版取 5 次中位数 —— 本机（Node 26）绿了，但 **CI（Node 20）照样红**。
+  //   两次错在同一件事：耗时是环境的函数，不是复杂度的函数。CI 的核数、GC 策略、
+  //   JIT 阈值都不同，把一个「本机调好的阈值」推给 CI 就是在赌运气。
+  //
+  // 换个判据：**O(n) 的每字符成本随 n 增大而下降（固定开销被摊薄）后趋于常数；
+  // O(n²) 的每字符成本随 n 线性上升。** 这个方向性差异与机器快慢无关 ——
+  // 快机器只是把两边都缩小，方向不变。
+  const perChar = (n) => {
     const s = '中'.repeat(n);
     const t0 = process.hrtime.bigint();
-    for (let i = 0; i < 5; i++) truncateDisplay(s, n >> 1);
+    for (let i = 0; i < 3; i++) truncateDisplay(s, n >> 1);
     const t1 = process.hrtime.bigint();
-    return Number(t1 - t0) / 1e6 / 5;
+    return (Number(t1 - t0) / 1e6 / 3) / n;    // ms per char
   };
-  time(200);                                  // 预热，排除首次 JIT
-  // **取中位数，不要单次测量。** 2026-11-17 实测：同一台空闲机器上连续做 8 次单独测量，
-  // 比值分别是 1.42 / 3.48 / 5.13 / 5.30 / 2.09 / 7.70 / 4.23 / 4.96 —— **相差 5.4 倍**。
-  // 而判据是 `< 8`，最大那次距门槛只差 0.3。所以全量跑（并发负载）时会偶发变红，
-  // 而单跑总是绿的 —— 那不是回归，是测量噪声。
-  //
-  // 单次测量在这里是错的：`small` 碰巧快、`large` 撞上一次 GC，比值就翻倍。
-  // 取 5 次的中位数能把这类一次性的抖动滤掉，同时**仍然抓得住真的 O(n²)** ——
-  // 回退成 O(n²) 时比值是 10+，中位数也压不下去（已做手工回退验证）。
-  const ratios = [];
-  for (let k = 0; k < 5; k++) {
-    const small = time(1600);
-    const large = time(6400);                 // 4 倍输入
-    ratios.push(large / Math.max(small, 0.001));
-  }
-  ratios.sort((a, b) => a - b);
-  const ratio = ratios[Math.floor(ratios.length / 2)];
-  assert.ok(ratio < 8,
-    `4 倍输入耗时涨了 ${ratio.toFixed(1)} 倍（5 次中位数），疑似仍是 O(n²）。`
-    + `全部样本：${ratios.map((r) => r.toFixed(2)).join(', ')}`);
+  perChar(200);                                 // 预热，排除首次 JIT
+
+  // 取多个 n，看每字符成本是不是**没有随规模上升**。
+  // 用最大与最小的比，而不是相邻比 —— 相邻比受噪声影响大。
+  const sizes = [1600, 6400, 25600];
+  const samples = sizes.map((n) => ({ n, pc: perChar(n) }));
+  const first = samples[0].pc;
+  const last = samples[samples.length - 1].pc;
+  const growth = last / Math.max(first, 1e-9);
+
+  // O(n) 时 growth ≤ 1（固定开销摊薄后每字符更便宜）；O(n²) 时 25600/1600 = 16 倍输入
+  // 会让每字符成本涨约 16 倍。给 4 倍的宽容度，足以吸收噪声且远低于 16。
+  assert.ok(growth < 4,
+    `每字符成本随规模涨了 ${growth.toFixed(2)} 倍（${samples.map((s) => `n=${s.n}:${s.pc.toExponential(2)}ms`).join(' ')}）。`
+    + ' O(n) 应该持平或下降，涨这么多说明还是 O(n²)。');
 });
 
 test('Bug2：宽度表由生成器与原始数据保持一致', () => {
