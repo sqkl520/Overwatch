@@ -40,6 +40,7 @@ import { fileURLToPath } from 'node:url';
 import { classifyStop, openWaitingToolUseIds } from './classify-stop.mjs';
 import { sessionIdOf } from './asked.mjs';
 import { resolveJobEventTime } from './job-event-time.mjs';
+import { resolveStateDir } from './state-dir.mjs';
 
 // ── 常量 ──────────────────────────────────────────────────────────────
 
@@ -229,14 +230,12 @@ export function claimOwnership(stateDir, repoPath, { nowMs = Date.now() } = {}) 
   return { owner: record, previous: prev, conflict };
 }
 
+/** 默认状态目录。**解析逻辑在 `state-dir.mjs`** —— 这里只是一个转调，
+ *  因为此前 `watch` / `asked` / `notify` / `install-watcher` 各写了一份，
+ *  每份都注释着「与另一份保持一致」。靠注释一致的东西必然漂移。
+ *  改名迁移（`Overwatch` → `UntilDone`）与「旧目录沿用」的规则都在那边，只写一遍。 */
 export function defaultStateDir(env = process.env) {
-  if (env.OVERWATCH_STATE_DIR) return env.OVERWATCH_STATE_DIR;
-  if (process.platform === 'win32') {
-    const base = env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local');
-    return join(base, 'Overwatch');
-  }
-  const xdg = env.XDG_STATE_HOME || join(homedir(), '.local', 'state');
-  return join(xdg, 'overwatch');
+  return resolveStateDir(env);
 }
 
 const statePath = (dir) => join(dir, 'state.json');

@@ -29,6 +29,7 @@ import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, realpa
 import { join, basename, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { resolveStateDir } from './state-dir.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -711,13 +712,8 @@ export function historyStats(hist, { nowMs = Date.now() } = {}) {
 /** 历史文件位置。与 watch.mjs 同源规则：**绝不写仓库**。
  *  和 watch 的状态目录放一起，这样备份/清理时是一份东西。 */
 export function historyPath(env = process.env) {
-  if (env.OVERWATCH_STATE_DIR) return join(env.OVERWATCH_STATE_DIR, 'asked-history.json');
-  if (process.platform === 'win32') {
-    const base = env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local');
-    return join(base, 'Overwatch', 'asked-history.json');
-  }
-  const xdg = env.XDG_STATE_HOME || join(homedir(), '.local', 'state');
-  return join(xdg, 'overwatch', 'asked-history.json');
+  // 目录解析统一在 `state-dir.mjs`（含 `Overwatch` → `UntilDone` 的迁移规则）。
+  return resolveStateDir(env, { sub: 'asked-history.json' });
 }
 
 export function formatHistory(st) {

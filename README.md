@@ -2,12 +2,12 @@
 
 <div align="center">
 
-# Overwatch
+# UntilDone
 
-**把「AI 说它做完了」变成一句可核对的断言。**
+**一次给到需求，便一次做完。**
 
-扫描本机所有 Claude Code 会话；当某个会话说「做完了」，去 transcript 里找支持这句话的
-工具调用。找不到，就把这句话标出来。
+它约束 AI 在动手前把需求问清楚，然后一次做到底 —— 不给你「一轮一个骨架、二轮一层皮毛」。
+跨会话监控只是让它能看见「这一轮到底做到哪了」的附属能力。
 
 ![CI](https://github.com/sqkl520/Overwatch/actions/workflows/validate.yml/badge.svg)
 ![Node](https://img.shields.io/badge/node-%E2%89%A518.20.4-blue?style=flat-square)
@@ -40,7 +40,7 @@
 - 另一个说「修好了」，其实只是把报错吞了
 - 其余几个在跑，但你不知道它们是在推进还是在原地打转
 
-Overwatch 给这三件事可见性：扫全部 transcript → 判状态 → 只在真的需要你时通知。
+UntilDone 给这三件事可见性：扫全部 transcript → 判状态 → 只在真的需要你时通知。
 **它不替你决策，也不往运行中的会话里写东西。**
 
 ### 和官方 `claude agents` 是什么关系
@@ -222,7 +222,7 @@ UNCHECKABLE   159   70.4%   ← 七成判不了
 ## 📁 目录
 
 ```
-Overwatch/
+UntilDone/
 ├─ .claude/agents/       12 个角色定义（宿主直接加载）
 ├─ .claude/skills/       调度流程
 ├─ docs/                 入口 docs/README.md · CAPABILITIES 能力清单 · GUIDE 手册

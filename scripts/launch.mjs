@@ -370,7 +370,7 @@ function askProtocol(config, mode) {
   const auto = ask.mode === 'auto';
 
   const lines = [
-    '【提问协议 · 由 Overwatch 追加】',
+    '【提问协议 · 由 UntilDone 追加】',
     '',
     auto
       ? '本项目的约定是：动手前先把需求问清楚。若你判断这次任务没有需要澄清的地方，直接做。'
@@ -450,7 +450,7 @@ function applyRoster({ root, payload, roster }) {
     writeFileSync(join(out, '.claude-plugin', 'plugin.json'), JSON.stringify({
       name: 'overwatch-roster',
       version: '0.0.0',
-      description: `Overwatch 运行时分身：只含 roster 启用的 ${enabled.length} 个角色（每次启动重建，不是第二份真源）`,
+      description: `UntilDone 运行时分身：只含 roster 启用的 ${enabled.length} 个角色（每次启动重建，不是第二份真源）`,
     }, null, 2) + '\n');
     for (const a of enabled) {
       copyFileSync(join(payload.dir, 'agents', `${a}.md`), join(out, 'agents', `${a}.md`));

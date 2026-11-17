@@ -445,6 +445,10 @@ const PROBE_ARGS = {
   contextPressure: '[[]]', isHumanMessage: '[{}]', humanMessages: '[[]]',
   originalGoalFrom: '[[]]', questionAnswered: '[[]]', lastTextIsQuestion: '[[]]',
   classifySession: '[{}]', summarize: '[[]]', listTranscripts: '["/nonexistent"]',
+  // state-dir.mjs（2026-11-17 改名迁移）：状态目录的唯一解析处。
+  // `resolveStateDir` 只做路径判断 + 一次 `existsSync`，不写盘；空 env 必须安全返回。
+  resolveStateDir: '[{}, {}]', stateRoot: '[{}]',
+  // 两个目录名常量是字符串，不是函数 —— 见 INTENTIONALLY_PROBED_FREE。
   // stop-delta.mjs（2026-11-16 交还 delta）：判据层全是纯函数，探针取最小可构造输入。
   // 空记录 / 空文本 / 空数组都必须安全返回 —— 一个没有内容的会话不该让报告崩掉。
   computeDelta: '[{}]', summarizeDelta: '[[]]', deltaSlotsOf: '""',
@@ -832,6 +836,7 @@ function checkUnregisteredExports() {
     // stop-delta.mjs（2026-11-16）：交还 delta 的正交轴。四个函数已进 PROBE_ARGS 实际调用；
     // 两个冻结表是数据，不是函数。
     'computeDelta', 'summarizeDelta', 'deltaSlotsOf', 'changeSetOf', 'lastHumanIndex',
+    'resolveStateDir', 'stateRoot',
     'isHumanMessage', 'errorOf', 'lastErrorIndex',
     'DELTA_VERDICTS', 'SLOT_STATES',
     'signatureOf', 'normalizeBash', 'heartbeatThreshold', 'isPersistentChange', 'parseJsonl', 'SUBAGENT_READ_BYTES',
@@ -1053,6 +1058,9 @@ function checkUnregisteredExports() {
     // 同样不能塞进结构门；判据本身已逐条登记在 PROBE_ARGS 里。
     'TAIL_BYTES', 'HEAD_BYTES', 'LOOP_WINDOW', 'LOOP_REPEAT', 'CONTEXT_NEAR_FULL_RATIO',
     'scanAll', 'KINDS',
+    // 2026-11-17 改名迁移：两个常量是**字符串映射**，不是可调用函数 —— checkArgs 调不动。
+    // `resolveStateDir` 的行为由 watch/asked/notify/install-watcher 四份测试共同覆盖。
+    'STATE_DIR_NAME', 'LEGACY_DIR_NAME',
     // measure-execution-phase.mjs：run 会全量扫 1.8GB transcript（实测 37s），
     // 不能进结构门；它的正确性由 measure-execution-phase.test.mjs 的小目录端到端用例覆盖。
     // 三个常量是数据（工具白名单 / 文本截断长度 / 空闲切分参数），不是函数。

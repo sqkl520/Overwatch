@@ -2,13 +2,13 @@
 
 <div align="center">
 
-# Overwatch
+# UntilDone
 
-**Turn "the AI says it's done" into a claim you can check.**
+**Give it the requirement once, and it gets finished in one pass.**
 
-It scans every Claude Code session on this machine, and when a session says it
-finished something, it goes into the transcript to find the tool call that
-backs that up. No call, no evidence — the sentence gets flagged.
+It makes the AI clarify the requirement before touching anything, then carries the
+work through to the end — no "skeleton in round one, veneer in round two".
+Cross-session monitoring exists only so you can see how far this pass actually got.
 
 ![CI](https://github.com/sqkl520/Overwatch/actions/workflows/validate.yml/badge.svg)
 ![Node](https://img.shields.io/badge/node-%E2%89%A518.20.4-blue?style=flat-square)
@@ -46,7 +46,7 @@ you**:
 - Another said "fixed it" when all it did was swallow the error
 - The rest are running, but you can't tell progress from spinning
 
-Overwatch gives you visibility on all three: scan every transcript → judge the
+UntilDone gives you visibility on all three: scan every transcript → judge the
 state → notify only when it actually concerns you.
 **It does not make decisions for you, and it never writes into a running session.**
 
@@ -250,7 +250,7 @@ This boundary is spelled out because it is easily mistaken for "not built yet":
 ## 📁 Layout
 
 ```
-Overwatch/
+UntilDone/
 ├─ .claude/agents/       12 role definitions (loaded directly by the host)
 ├─ .claude/skills/       dispatch workflow
 ├─ docs/                 entry point docs/README.md · CAPABILITIES · GUIDE

@@ -27,6 +27,7 @@ import { join, dirname, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { resolveStateDir } from './state-dir.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO = resolve(HERE, '..');
@@ -40,16 +41,11 @@ export function templatePath(repo = DEFAULT_REPO) {
   return join(repo, 'scripts', 'install', 'start-watch.vbs.template');
 }
 
-/** 数据目录。与 watch.mjs 的 defaultStateDir 保持一致，但不 import——
- *  安装脚本独立于运行时脚本，避免为了 20 行路径逻辑拖进整个 watch.mjs。 */
+/** 数据目录。解析逻辑在 `state-dir.mjs` —— 一个零依赖、无副作用的小文件，
+ *  安装脚本 import 它是便宜的，不需要为了「不拖进 watch.mjs」而抄一份。
+ *  抄的那份此前注释着「与 watch.mjs 的 defaultStateDir 保持一致」—— 靠注释一致必然漂移。 */
 export function stateDirFor(env = process.env) {
-  if (env.OVERWATCH_STATE_DIR) return env.OVERWATCH_STATE_DIR;
-  if (process.platform === 'win32') {
-    const base = env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local');
-    return join(base, 'Overwatch');
-  }
-  const xdg = env.XDG_STATE_HOME || join(homedir(), '.local', 'state');
-  return join(xdg, 'overwatch');
+  return resolveStateDir(env);
 }
 
 /** 开机自启目录。

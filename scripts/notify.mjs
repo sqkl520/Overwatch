@@ -29,9 +29,10 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { resolveStateDir } from './state-dir.mjs';
 
-const APP_ID = 'Overwatch.Notifier';
-const APP_NAME = 'Overwatch';
+const APP_ID = 'UntilDone.Notifier';
+const APP_NAME = 'UntilDone';
 const TAG_MAX = 16;
 /** PowerShell 冷启动 3.3–4.2s，留足余量 */
 const TIMEOUT_MS = 25_000;
@@ -41,14 +42,8 @@ const POLL_MS = 50;
 
 /** 通知工作目录。与 watch.mjs 同源规则：绝不写仓库。 */
 export function defaultNotifyDir(env = process.env) {
-  const explicit = env.OVERWATCH_STATE_DIR;
-  if (explicit) return join(explicit, 'notify');
-  if (process.platform === 'win32') {
-    const base = env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local');
-    return join(base, 'Overwatch', 'notify');
-  }
-  const xdg = env.XDG_STATE_HOME || join(homedir(), '.local', 'state');
-  return join(xdg, 'overwatch', 'notify');
+  // 目录解析统一在 `state-dir.mjs`（含 `Overwatch` → `UntilDone` 的迁移规则）。
+  return resolveStateDir(env, { sub: 'notify' });
 }
 
 const winDir = () => process.env.SystemRoot || 'C:\\Windows';
@@ -98,7 +93,7 @@ try {
 `;
 
 /** 启动器。路径一律走参数，不嵌进 VBS 字符串——省掉转义地狱，也不会僵死。 */
-const VBS_TEMPLATE = `' Overwatch toast launcher — 由 notify.mjs 生成。
+const VBS_TEMPLATE = `' UntilDone toast launcher — 由 notify.mjs 生成。
 ' 关键在第三个参数 0：子进程窗口隐藏；wscript 自身无控制台，所以全程不闪窗。
 Dim sh, cmd, i
 Set sh = CreateObject("WScript.Shell")
@@ -232,7 +227,7 @@ function main(argv) {
     }
     const dir = defaultNotifyDir();
     sendNotification({
-      title: 'Overwatch P0 自检',
+      title: 'UntilDone P0 自检',
       body: 'wscript 隐藏启动 · 这条通知代表通道可用',
       tag: 'selftest',
       dir,
