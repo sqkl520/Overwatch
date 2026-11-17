@@ -1,38 +1,64 @@
+[English](README-EN.md) | 简体中文
+
+<div align="center">
+
 # Overwatch
 
-[![CI](https://github.com/sqkl520/Overwatch/actions/workflows/validate.yml/badge.svg)](https://github.com/sqkl520/Overwatch/actions/workflows/validate.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![No dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#)
+**把「AI 说它做完了」变成一句可核对的断言。**
 
-**在 AI 想收工时替你把关。**
+扫描本机所有 Claude Code 会话；当某个会话说「做完了」，去 transcript 里找支持这句话的
+工具调用。找不到，就把这句话标出来。
 
-它会扫描本机所有 Claude Code 会话，但真正的价值只有一个动作：当某个会话说「做完了」，
-去 transcript 里找支持这句话的工具调用——找不到，就把这句话标出来。附带把会话压成一张表，
-在真的需要你时通知你。
+![CI](https://github.com/sqkl520/Overwatch/actions/workflows/validate.yml/badge.svg)
+![Node](https://img.shields.io/badge/node-%E2%89%A518.20.4-blue?style=flat-square)
+![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/regression%20tests-1627%20passing-brightgreen?style=flat-square)
+![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
-> 这一版刻意**收窄了定位**。它不做「管理你所有的会话」——官方 `claude agents` 已经把
-> 「看清有哪些会话」做完了（见下）。它做的是官方没有的那一件事：
-> **把「AI 说它做完了」变成一句可核对的断言。** 其余能力是围绕这件事的观测面。
-> 每一条能力对应的命令见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md)。
+**零依赖** · **不安装** · **不登录也能用** —— `git clone` 之后 `node scripts/overwatch.mjs` 就行
 
-零 npm 依赖（仓库里没有 `package.json`）。**工具本身 Node ≥ 18.20.4**；**跑测试要 20.16+**（用了
-`import.meta.dirname` 与 `process.getBuiltinModule`）。`node scripts/overwatch.mjs` 会把这两条
-分开报——它会告诉你这台机器能跑工具、但跑不了测试。**不安装、不配置。**
+**[⬇️ 下载最新版](https://github.com/sqkl520/Overwatch/releases)** ·
+[能力清单](docs/CAPABILITIES.md) ·
+[使用手册](docs/GUIDE.md) ·
+[问题反馈](https://github.com/sqkl520/Overwatch/issues)
 
-「不登录」只对观测类能力成立：`scan` / `verify` / `watch` / `tui` / 两条闸 / `overwatch.mjs`
-自检 / `launch --verify` 都**不需要凭据**。只有 `launch`（真的起会话）要——它得让宿主发起推理。
-没登录时 `launch` 自己判认证失败并 **exit 6**，不会假装跑过了。详见
-[GUIDE 第 2 节](docs/GUIDE.md) 那张表。
+</div>
+
+> ⚠️ **早期项目。** 没有 tag、没有 npm 包，仓库就是发布物。
+> 有任何问题欢迎 [提交 Issue](https://github.com/sqkl520/Overwatch/issues)；觉得有用就 Star 一下 ⭐
+>
+> **本 README 不维护版本号** —— 版本以 [Releases 页](https://github.com/sqkl520/Overwatch/releases) 为准。
 
 ---
 
-## 它解决什么问题
+## ✨ 它解决什么问题
 
-同时开五六个会话已经很常见。真正的摩擦不是切窗口，而是几小时后回来时记不清**哪个在干什么、哪个卡住了、哪个一直在等你**：一个会话三小时前抛了个二选一的问题，你没看见；另一个说「修好了」，其实只是把报错吞了；其余几个在跑，但你不知道它们是在推进还是在原地打转。
+同时开五六个 Claude Code 会话已经很常见。真正的摩擦不是切窗口，而是几小时后回来时记不清
+**哪个在干什么、哪个卡住了、哪个一直在等你**：
 
-Overwatch 给这三件事可见性：扫全部 transcript → 判状态 → 只在真的需要你时通知。它不替你决策，也不往运行中的会话里写东西。
+- 一个会话三小时前抛了个二选一的问题，你没看见
+- 另一个说「修好了」，其实只是把报错吞了
+- 其余几个在跑，但你不知道它们是在推进还是在原地打转
 
-## 30 秒上手
+Overwatch 给这三件事可见性：扫全部 transcript → 判状态 → 只在真的需要你时通知。
+**它不替你决策，也不往运行中的会话里写东西。**
+
+### 和官方 `claude agents` 是什么关系
+
+`claude agents --json` 已经能列出所有会话、按状态分组、可派发可回复 ——
+**它把「看清有哪些会话」这件事原生做完了**，这一点直说。两者回答不同的问题：
+
+```
+claude agents --json  →  宿主注册了哪些会话，此刻 busy / idle / blocked
+scan-sessions.mjs     →  这些会话在干什么、有没有卡住、卡在哪儿
+verify-claims.mjs     →  它说的「做完了」，在 transcript 里找得到证据吗
+```
+
+**只有第三行是官方没有的。** 其余能力都是围绕它的观测面。
+
+---
+
+## 🚀 30 秒上手
 
 ```bash
 git clone https://github.com/sqkl520/Overwatch.git
@@ -40,8 +66,8 @@ cd Overwatch
 node scripts/overwatch.mjs
 ```
 
-`overwatch.mjs` 是**唯一入口**。不加参数跑的是自检：它在一秒内告诉你这台机器能干什么、缺什么、
-现在有没有任务在跑——只报**读到的事实**，不替你判通过。
+`overwatch.mjs` 是自检：一秒钟内告诉你这台机器能干什么、缺什么、现在有没有任务在跑 ——
+**只报读到的事实，不替你判通过。**
 
 ```
 overwatch doctor · 查 8 项前提 · 预算 1000ms（只查前提，不扫语料）
@@ -56,7 +82,7 @@ overwatch doctor · 查 8 项前提 · 预算 1000ms（只查前提，不扫语�
 合计 795ms / 预算 1000ms —— 前提齐了，可以跑 scan
 ```
 
-**面板长这样**（`node scripts/oversight-tui.mjs`，真实输出，只把项目名换成了占位）：
+**面板长这样**（`node scripts/oversight-tui.mjs`，真实输出，项目名换成占位）：
 
 ```
 1 件在等你 · 12 个会话在跑 · 3 个已停
@@ -72,93 +98,76 @@ overwatch doctor · 查 8 项前提 · 预算 1000ms（只查前提，不扫语�
 
 在跑 (12)
  项目 B                                              2s  `SendMessageW` 返回 `LRESULT`，需要先转换成 `HICON`。
- 项目 C                                             12s  Description 更新成功，但 **Topics 是空的**——API 改 topics 需要…
- 项目 D                                             28s  守卫实现得很到位（正则覆盖换行/空白，注释讲清了为什么这算残留）。
+ 项目 C                                             12s  Description 更新成功，但 **Topics 是空的**。
+ 项目 D                                             28s  守卫实现得很到位（正则覆盖换行/空白）。
 ```
 
 三处值得看：
 
-- **第一行是判决不是标题**：「1 件在等你」排在最前，而「12 个会话在跑」是背景。
-- **「后台监视 ✗」而不是一个绿勾**：它没在跑，会影响上面那个「1」的可信度，所以直接说。
-  换一台机器上新克隆下来必然出现这一行——那是事实，不是错误。
-- **「其余 1 项没有发现」而不是「全部正常」**：只报查到的，不替你没查的背书。
+- **第一行是判决不是标题**：「1 件在等你」排在最前，「12 个会话在跑」是背景
+- **「后台监视 ✗」而不是一个绿勾**：它没在跑，会影响上面那个「1」的可信度，所以直接说
+- **「其余 1 项没有发现」而不是「全部正常」**：只报查到的，不替你没查的背书
 
-然后：
-
-```bash
-node scripts/overwatch.mjs launch              # 起一个挂了载荷的会话（默认按 roster 筛，见下）
-node scripts/overwatch.mjs launch --dry-run    # 先看它会挂什么，不执行
-node scripts/overwatch.mjs launch --verify     # 只验载荷挂对没有（不需登录）
-```
-
-**`launch` 最有用的一点：在你自己的项目里用它。** 载荷挂的是本仓库的 `.claude/`，
-工作目录是你的项目，所以你在自己的代码里干活，同时拿到角色定义和两条闸。
-
-> **挂几个角色取决于 `overwatch.config.json` 的 `agent.roster`。** 仓库里随附的配置只启用
-> 3 个（`oversight-planner` / `oversight-executor` / `oversight-acceptor`），所以默认挂的是
-> 3 个而不是 `.claude/agents/` 里的全部 12 个。`--dry-run` 会逐条列出「挂哪些、不挂哪些、
-> 为什么」；`--verify` 验的是**源目录完整**（`git ls-files` 里那 12 份定义都在），不是
-> 「实际挂载了几个」—— 两者不是一回事，此前文档把它们混成了一个「12」。
+### 核心命令
 
 ```bash
-cd ~/your-project
-node /path/to/Overwatch/scripts/overwatch.mjs launch --cwd . --dry-run
-```
-
-不想用入口也行，四条原生命令等价（`overwatch.mjs` 只是路由到它们，不代跑）：
-
-```bash
-node scripts/scan-sessions.mjs --days 3        # 扫描：每个会话一行
+node scripts/scan-sessions.mjs --days 3        # 每个会话一行：状态 / 调用数 / 闲置时长
+node scripts/verify-claims.mjs --days 3        # 「AI 说它做完了」有没有证据
 node scripts/oversight-tui.mjs                 # 面板：列表 → Enter 详情 → c 复制接力草稿
 node scripts/watch.mjs --inbox                 # 谁在等你
-node scripts/verify-claims.mjs --days 3        # 「AI 说它做完了」有没有证据
+node scripts/check-structure.mjs               # 结构硬门
 ```
 
-真实输出格式（项目名已替换，行数与耗时随语料变化）：
+每一条能力对应的命令见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) —— 硬门会检查那里的脚本与参数真实存在。
+
+---
+
+## 🎯 唯一站得住的差异：断言 vs 证据
+
+这是整个项目的理由。看一条真实输出：
 
 ```
-OmniSight 会话扫描 · 最近 3 天 · 138 个会话
-transcript 436 个：窗口内 136 · 窗口外 299 · 时间未知 1 · job 10 个（补入 2）
-liveness: reconstructed（事后重建，非实时上报）
-
-[PRODUCING] Projects/<repo>     calls=  988 sub=    13 depth=1 novelty=0.97 hb=0s/120s    idle=5s   persistent-change-in-window
-[EXPLORING] Projects/<repo-2>   calls= 5840 sub=100/272~ depth=1 novelty=1.00 hb=0s/120s  idle=67.5h dormant
+AI 说：「## 交付完成：**BUILD SUCCESS — 1341 例全绿**」
+证据：构建调用 5 次（成功 2 次）；最近一次成功在 11-16 19:58；之后 11-16 20:56 又改了源码
+判定：STALE_ONLY（构建/编译成功）
+建议：成功结果在源码改动之后就失效了。重跑 `mvn -q -DskipTests package`，
+      补上最后一次编辑之后的证据
 ```
 
-`--days N` **默认是 7**（不写就是一周），写错（`--days abc`、负数）会报错而不是静默回落。
-耗时按你的 transcript 总量线性增长：本机 436 份约 40–60 秒，干净环境 1 秒内。
-`dormant` 不告警——会话只是结束了，不是坏了。
+**注意第三行。** 它不是说「找到了构建成功的记录」，而是说**那个成功已经失效了** ——
+因为构建之后你又改了源码。这是证据的时效性推理，不是「找关键词」。
 
-**跑完不知道下一步做什么？读 [GUIDE](docs/GUIDE.md)。** 那里每条命令都有「什么时候用」，
-还有一个完整的 before/after 叙事（一个会话停了 22 天，按提示回了一句话之后继续干活）。
-README 只讲「它是什么、能做什么」；GUIDE 讲「我该敲什么、会看到什么、看到之后做什么」。
+四档判定：
 
-```bash
-node scripts/oversight-tui.mjs            # 面板：列表 → Enter 详情 → c 复制接力草稿
-node scripts/watch.mjs --inbox            # 一次性看谁在等你
-node scripts/install-watcher.mjs install  # 开机自启 + 桌面通知
-```
-
-Windows 有开机自启和 Toast；macOS / Linux 给出 launchd / systemd 配置但没有通知通道，退回写 `runner.log`。**没有通知通道时不会静默丢弃**，`--inbox` 随时能看。
-
-## 核心能力
-
-下表每一行都对应 `docs/CAPABILITIES.md` 里一条**能跑的命令**——硬门会检查那些命令的脚本与参数真实存在。
-
-| 能做 | 不能做 |
+| 档位 | 含义 |
 |---|---|
-| 扫全部会话，压成一张表（固定顺序：先按状态，再按闲置时长） | 实时干预运行中的会话 |
-| 透传宿主的 `needs` / `suggestedReply`（它在等什么、建议回什么） | 自动把回复发进目标会话 |
-| 检出持久化变更（`Write`/`Edit`/写命令），区分「在改东西」和「在读东西」 | 判断改得对不对 |
-| 会话等你时弹桌面通知（宿主 `status: waiting`） | 从「停了很久」推断失败——**实测后已删除该推断** |
-| 把完成声明与支持它的工具调用配对，判四档（见下） | 保证 AI 没在别处撒谎 |
-| 在收工点值守：AI 想结束回合时拦住没有证据的完成声明（Stop hook，默认关闭） | 替用户点「结束」或「允许」 |
-| 生成带具体下一步的接力草稿，由你复制发送 | 自动接力（见下） |
-| 产出对账：派活前登记「该产出哪些文件」，收活时对磁盘与 transcript 四方核对 | 保证子 agent 说的就是它做的（只核对文件痕迹，不核对语义） |
+| `SUPPORTED` | 断言有对应调用，且调用在最后一次相关改动之后 |
+| `STALE_ONLY` | 有对应调用，但之后又改了相关代码 —— **成功已失效** |
+| `NO_EVIDENCE` | 说了做完了，找不到任何对应调用 |
+| `UNCHECKABLE` | 断言类型不在可核对范围内 —— **判不了，明说判不了** |
 
-### 关于「六种状态，只有两个能驱动动作」
+### 诚实的数字
 
-代码里有 `EXPLORING` / `PRODUCING` / `STALLED` / `FAILED` / `BLOCKED` / `WAITING`，但在真实数据里极不均衡。2026-10-31 实测 129 个会话的末态：
+7 天窗口，226 条完成声明：
+
+```
+SUPPORTED      15    6.6%
+STALE_ONLY      3    1.3%
+NO_EVIDENCE    46   20.4%
+UNKNOWN         3    1.3%
+UNCHECKABLE   159   70.4%   ← 七成判不了
+```
+
+**70.4% 判不了。** 这不是缺陷，是边界：它只在少数**有明确工具调用可对**的断言上有效
+（构建成功、测试通过、推送完成、文件数）。其余一律归 `UNCHECKABLE` 而不是猜。
+把「判不了」说成「没问题」是本项目最不想犯的错。
+
+---
+
+## 📋 六种状态，只有三个能驱动动作
+
+代码里有 `EXPLORING` / `PRODUCING` / `STALLED` / `FAILED` / `BLOCKED` / `WAITING`，
+但真实数据里极不均衡。2026-10-31 实测 129 个会话的末态：
 
 | 状态 | 命中 | 说明 |
 |---|---|---|
@@ -168,80 +177,13 @@ Windows 有开机自启和 Toast；macOS / Linux 给出 launchd / systemd 配置
 | `WAITING` | 0–1 | 宿主实时状态，你一说话就消失，抓不到末态 |
 | `STALLED` | **0** | 全语料 56,809 个滑窗里命中 10 次（0.018%），末态从未命中 |
 
-**不要把它当状态机用。** 真正能驱动动作的只有宿主上报的那几个。会发通知的是 `WAITING` / `BLOCKED` / `FAILED` / `ASKED`；前三个的判据来自宿主文件、不来自推断，`ASKED` 是从 transcript 文本推的，走另一套更严的门。
+**不要把它当状态机用。** 真正能驱动动作的只有宿主上报的那几个。
+会发通知的是 `WAITING` / `BLOCKED` / `FAILED` / `ASKED`；前三个的判据来自宿主文件、
+不来自推断，`ASKED` 是从 transcript 文本推的，走另一套更严的门。
 
-## 和官方 `claude agents` 是什么关系
+---
 
-`claude agents --json` 已经能列出所有会话、按状态分组、可派发可回复。**它把「看清有哪些会话」这件事原生做完了**，这一点直说。两者回答不同的问题：
-
-```
-claude agents --json  →  宿主注册了哪些会话，此刻 busy / idle / blocked
-scan-sessions.mjs     →  这些会话在干什么、有没有卡住、卡在哪儿
-```
-
-同一次运行实测：前者给 10 条（blocked=2 busy=4 idle=4），`scan --days 3` 给 19 条（PRODUCING=3 EXPLORING=16）。`claude agents` 看不到 `failed`，也没有 novelty、idle 时长、派生树、token 用量；`scan` 则要从 transcript 重建，天生有延迟。**两个都用**：`scan` 判断「该不该管」，`claude agents` 确认「这个会话是否真的注册着、能不能投递」。
-
-本仓库超出这一层的地方只有一处：**断言与证据的核对**。其余能力官方在覆盖，开源侧也有几千个同类项目——不假装这是蓝海。
-
-## 为什么不能自动接力
-
-**这不是本库的缺陷，是平台的安全边界。**
-
-官方文档写明：来自另一个会话的消息**永远不算你的同意**——不能替你回答权限提示、不能改配置、消息里的斜杠命令不会被执行。`claude --help` 对 `--bg --resume <session-id>` 的原文也是「或者在会话已在运行时启动一个副本并说明这一点」：你以为接上了，实际另一个副本在跑。
-
-所以 `relay.deliver` 只有一个合法值：`manual`。草稿由 TUI 按 `c` 复制，或由 Relay Agent 写好经 Safety Agent 过红线，**粘贴和回车这两步永远是你的**。往这个方向加自动化，等于和平台的安全模型对打。
-
-## 通知系统：三个修掉的真 bug
-
-2026-11-04 的修复，每一个都有真实日志与负向测试（把 bug 装回去测试必然变红）。
-
-| 缺陷 | 实测 | 修复后 |
-|---|---|---|
-| `permission prompt` 是噪声桶 | **66/66 = 0% 真阳性**（`input needed` 是 9/9 = 100%） | 不再通知，但照常写观察记录 |
-| 去重键恒等 | 会话 `<session-S>` 的 **8 次真实等待挤成 1 个键**，一次都收不到 | 8 次等待 → 8 个键 |
-| `lastSeenAt` 从不刷新 | 现场 **73/73 条**记录 `lastSeenAt === firstSeenAt`，超过 24h 的等待在第 25 小时被重新通知 | TTL 改按 `lastSeenAt` 计时 |
-
-真实日志里 `already=1` 出现 **5413 次**，其中连续 **2213 个 tick（585 分钟）**在同一个键上空转——这就是键恒等的形状。
-
-更早一次删代码同样值得记：初版会推断「末次调用间隔超自适应 p95 且停够 60 秒 → `FAILED`」。全语料实测后删掉——真实运行发了 5 条通知，**5 条全是它发明的 `FAILED`**，对应会话分别在 13 / 151 / 411 秒后继续干活，最离谱的一条在报「失败」时正在跑 `sleep 240`。删掉之后脚本从「猜 5 次全错」变成「不猜」。
-
-## 唯一站得住的差异：断言 vs 证据
-
-Agent 报「修好了」而实际只是把报错吞了——HN 长贴上反复出现的词是 **「sanitised optimism」**，有用户的说法是「现在我总让它先证明真的生效了再往下走」。Cognition 2026 的实测方向一致：独立的干净上下文 review agent 平均每个 PR 抓 2 个 bug，约 58% 是严重的。
-
-`scripts/verify-claims.mjs` 把这件事做成可运行的判据：从最后一条 assistant 文本认出可核对的完成性断言（测试通过 / 构建成功 / 已提交 / 已推送 / 文件数 / hash），在 transcript 的 tool_use / tool_result 里找支持它的调用，再按「最后一次源码编辑」这条时间线判四档：
-
-```
-SUPPORTED / STALE_ONLY / FAILED_ONLY / NO_EVIDENCE   （另有 UNKNOWN = 读不全，不当「没有」）
-```
-
-全量实测（228 个主 transcript、31 条断言）：`SUPPORTED 26 / STALE_ONLY 1 / FAILED_ONLY 0 / NO_EVIDENCE 1 / UNKNOWN 3`。人工抽检 13 条：11 条判对、2 条判错，**精度约 84.6%**（样本小，只能当量级看）。全量耗时 2.9–5.6 秒。
-
-2026-11-13 起多认一族 **`vague-completion`**：「修好了」「搞定了」这类**没有任何指标**的完成声明——它们恰恰最需要证据，而改造前被判为「没认出断言」直接放行。范围与已知漏报见 `docs/CAPABILITIES.md` §4。
-
-同仓库还有两个确定性判据：`stop-signals.mjs`（停机原因的结构判定：错误停机、死循环、上下文压力、原始目标提取，全部不读语义）和 `asked.mjs`（从文本判断「问了没答」，不依赖宿主）。都能直接跑，例如 `node scripts/verify-claims.mjs --days 3`、`node scripts/stop-signals.mjs`。
-
-**收工值守（可选）**：`scripts/stop-verify-hook.mjs` 把上面的判定挂到宿主的 `Stop` 事件上——
-AI 想结束回合时，宿主先问它一句「你的完成声明有证据吗」，没有就把理由喂回去让它补。
-**默认关闭，只记账不拦**；开启方式、上限与 fail-open 设计见 `docs/CAPABILITIES.md` §3。
-
-## 目录
-
-```
-Overwatch/
-├─ .claude/agents/       12 个角色定义（宿主直接加载）
-├─ docs/                 入口 docs/README.md · CAPABILITIES 能力清单 · GUIDE 手册
-│                        spec/ 规格 · adr/ 决策 · research/ 实测报告（含状态索引）
-│                        design/ 全是未实现的设计推演，状态见 docs/design/README.md
-├─ scripts/              scan / watch / verify-claims / stop-verify-hook / TUI / 硬门
-└─ tasks/                两本台账：范围外发现、已知偏差
-```
-
-新来的人从 [`docs/README.md`](docs/README.md) 开始——它按「你想知道什么」指路，并说清四类文档的可信度不同。
-
-改动后必跑 `node scripts/check-structure.mjs`（结构硬门）与 `node --test scripts/`（1626 条回归测试；**这个数字由硬门与实跑对账，写错即红**，所以照抄即可、不必手工数）。
-
-## 已知局限
+## ⚠️ 已知局限
 
 这些不是待办，是知道但选择不做的：
 
@@ -254,11 +196,53 @@ Overwatch/
 
 两条和本库无关但影响你怎么用它：
 
-- **多 agent 不是免费的。** Anthropic 自述多 agent 系统比 chat 多烧约 **15×** token，且 token 用量单独解释 **80%** 的性能方差——收益主要来自花更多 token，不是架构更聪明。MAST 论文（1600+ 轨迹）实测「改进角色规格」和「增强协调」两种干预效果不充分；本仓库 `.claude/agents/` 的方法论属于后一类，别指望它能单独把结果变好。
-- **扫描是事后重建，不是实时。** 每个文件只读末尾 4 MB，主 transcript 取末尾 1200 条记录。要确认某个会话此刻的真实状态，最可靠的办法是打开它看一眼。
+- **多 agent 不是免费的。** Anthropic 自述多 agent 系统比 chat 多烧约 **15×** token，
+  且 token 用量单独解释 **80%** 的性能方差 —— 收益主要来自花更多 token，不是架构更聪明。
+  MAST 论文（1600+ 轨迹）实测「改进角色规格」和「增强协调」两种干预效果不充分；
+  本仓库 `.claude/agents/` 的方法论属于后一类，别指望它能单独把结果变好。
+- **扫描是事后重建，不是实时。** 每个文件只读末尾 4 MB，主 transcript 取末尾 1200 条记录。
+  要确认某个会话此刻的真实状态，最可靠的办法是打开它看一眼。
 
-**够用与否**：要「这几个会话里哪个在等我、哪个在报假完成」，够用；要「自动接力、自动决策」，**不够用**，而原因是平台的墙，不是缺一个 feature。
+**够用与否**：要「这几个会话里哪个在等我、哪个在报假完成」，够用；要「自动接力、自动决策」，
+**不够用**，而原因是平台的墙，不是缺一个 feature。
 
-## License
+---
 
-MIT
+## 🔧 为什么不能自动接力
+
+能力边界写在这里，是因为它最容易被误解成「还没做」：
+
+- 宿主的会话是**独立进程**，没有受支持的注入接口。往运行中的会话写东西需要模拟输入，
+  而那是平台明确封的路径（实测过 UIA、IPC 管道、CDP 调试端口，全部不可用）。
+- 所以本库只能**生成草稿**（`c` 键复制），由你粘贴发送。
+- 这不叫「降级」，这叫「如实说平台的边界在哪」。
+
+---
+
+## 📁 目录
+
+```
+Overwatch/
+├─ .claude/agents/       12 个角色定义（宿主直接加载）
+├─ .claude/skills/       调度流程
+├─ docs/                 入口 docs/README.md · CAPABILITIES 能力清单 · GUIDE 手册
+│                        spec/ 规格 · adr/ 决策 · research/ 实测报告（含状态索引）
+│                        design/ 全是未实现的设计推演，状态见 docs/design/README.md
+├─ scripts/              scan / watch / verify-claims / stop-verify-hook / TUI / 硬门
+└─ tasks/                两本台账：范围外发现、已知偏差
+```
+
+新来的人从 [`docs/README.md`](docs/README.md) 开始 —— 它按「你想知道什么」指路，
+并说清四类文档的可信度不同（`spec/` 是现行事实、`design/` 全部未实现、`research/` 会过期）。
+
+## 🤝 参与
+
+- 跑测试：`node --test scripts/`（1626 条回归测试；**这个数字由硬门与实跑对账，写错即红**，
+  所以照抄即可、不必手工数。要 Node ≥ 20.16，因为用了 `import.meta.dirname`）。
+- 结构硬门：`node scripts/check-structure.mjs`
+- 两条都必须绿才能提交，细节见 [CONTRIBUTING.md](CONTRIBUTING.md)
+- 安全报告：**不要开公开 issue**，见 [SECURITY.md](SECURITY.md)
+
+## 📄 License
+
+MIT —— 见 [LICENSE](LICENSE)
