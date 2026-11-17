@@ -359,7 +359,17 @@ test('--json 与人类输出出自同一份数据（字段全在、且逐项对�
     // 而它在两次运行之间会变（Agent 正在往里写），于是「两次渲染必须一致」随机红。
     // 指到一个不存在的目录 → plan 报「还没有 run」，是个稳定的空状态。
     // 参考时刻定在「文件写入之后 + 5 分钟」，两次运行看到的年龄必然一致。
-    const pinned = ['--now', new Date(Date.now() + 5 * 60_000).toISOString()];
+    // **预算必须给足。** `doctor` 的默认预算是 1000ms，而每一项都有 `deadline`——
+    // 到点就停并如实标注「预算内没数全」。全量跑时这台机器同时有十几个测试文件在抢
+    // CPU，两次运行的耗时不同，于是**同一项可能在一次跑完、另一次被预算截断**，
+    // `text` 就不同了。那不是两套渲染，是两次不同的截断。
+    //
+    // 实测：不加 `--budget` 时 `node --test scripts/` 连续 3 次全红（fail 2/3/2），
+    // 单独跑却恒绿——并发负载是唯一变量。给它 30 秒，任何合理负载下都跑得完。
+    const pinned = [
+      '--now', new Date(Date.now() + 5 * 60_000).toISOString(),
+      '--budget', '30000',
+    ];
 
     const human = run(['doctor', ...pinned], { env });
     const json = run(['doctor', ...pinned, '--json'], { env });
@@ -434,7 +444,10 @@ test('doctor 遇到损坏的 state.json 不说「没在工作」，也不改名�
     // watch.mjs 的 loadState() 在解析失败时会把文件改名成 *.corrupt-<ts>。
     // doctor 若 import 它并调 loadState，就会**改动现场**。这里钉住不改。
     writeFileSync(join(stateDir, 'state.json'), '{ this is not json');
-    const r = run(['doctor', '--json'], { env: { OVERWATCH_STATE_DIR: stateDir, CLAUDE_PROJECTS_DIR: fakeRoot(dir) } });
+    // **预算必须给足**（理由同「--json 与人类输出同源」那条）：默认 1000ms 下
+    // `watcher` 那一项可能被 deadline 截断，于是 `stateNote` 根本没算出来，
+    // 断言 `/读不出|不是合法 JSON/` 就红。单跑绿、全量红，并发负载是唯一变量。
+    const r = run(['doctor', '--json', '--budget', '30000'], { env: { OVERWATCH_STATE_DIR: stateDir, CLAUDE_PROJECTS_DIR: fakeRoot(dir) } });
     assert.equal(r.code, 0, `损坏的 state.json 不该让 doctor 失败：${r.code}`);
     const data = JSON.parse(r.out);
     const w = data.steps.find((s) => s.id === 'watcher');
