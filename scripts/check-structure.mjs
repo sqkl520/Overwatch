@@ -382,9 +382,11 @@ const PROBE_ARGS = {
   userIntervenedSince: '["s", { records: [], env: {} }]',
   readTotalBlocks: '["s", { env: {} }]',
   resetBlockCount: '["s", { env: {} }]',
-  appendLog: '[{}, { OVERWATCH_STOP_VERIFY_LOG: "/nonexistent-dir-ow/x.jsonl" }]',
-  bumpBlockCount: '["s", { env: { OVERWATCH_STOP_VERIFY_STATE: "/nonexistent-dir-ow/x.json" } }]',
-  runHook: '[{ input: { session_id: "probe", last_assistant_message: "" }, env: {} }]',
+  appendLog: '[{}, { OVERWATCH_STOP_VERIFY_LOG: _sandbox + "/x.jsonl" }]',
+  bumpBlockCount: '["s", { env: { OVERWATCH_STOP_VERIFY_STATE: _sandbox + "/x.json" } }]',
+  // `env: {}` 会**覆盖**探针进程里已设好的 `OVERWATCH_STATE_DIR`，于是 `runHook`
+  // 真的往生产台账写一行 `unparsable-input`。不传 env 才走 process.env（已含沙箱路径）。
+  runHook: '[{ input: { session_id: "probe", last_assistant_message: "" } }]',
   // readStdin 要一个 stream。给一个「已 EOF」的最小替身：setEncoding/on 是空操作，
   // readableEnded 为 true 让它在第一拍就 resolve 空串 —— 不会挂住结构门，也不需要
   // 在 ESM 探针脚本里 import('node:stream')。
@@ -396,7 +398,7 @@ const PROBE_ARGS = {
   // 给空 argv 走默认「开」。
   SAMPLE_TEXT_LIMIT: '[]', samplePathFor: '[{}]', sampleLogEnabled: '[{}, []]',
   toolSummaryOf: '[[]]', rawFamilyHits: '""',
-  buildSample: '[{}]', appendSample: '[{}, { OVERWATCH_STOP_VERIFY_SAMPLES: "/nonexistent-dir-ow/s.jsonl" }]',
+  buildSample: '[{}]', appendSample: '[{}, { OVERWATCH_STOP_VERIFY_SAMPLES: _sandbox + "/s.jsonl" }]',
   // analyze-hook-samples.mjs（2026-11-13）：放行样本的分布分析。全部只读，探针取最小输入。
   // 读盘的两个用不存在的路径 —— 返回空样本是它的正常路径，正好验「空文件不报错」。
   COLON_COMPLETION_RE: '[]', COMPLETION_ANY_RE: '[]',
@@ -647,7 +649,7 @@ const PROBE_ARGS = {
   secretPathFor: '["/nonexistent-ow-probe"]',
   readGateSecret: '["/nonexistent-ow-probe/.claude/.ow-gate-secret"]',
   reasonFor: '[{ cwd: "/x", markerPath: "/x/m", gateCommand: "g", minReads: 3, halt: false }]',
-  bumpDenials: '["/nonexistent-dir-ow/pwg.json", "probe", { readOnly: true }]',
+  bumpDenials: '[_sandbox + "/pwg.json", "probe", { readOnly: true }]',
   cli: '[["status", "--cwd", "/nonexistent-ow-probe"], {}]',
 
   // observe-reality-check.mjs（2026-11-14 写前闸的真实语料重放）：
@@ -725,6 +727,26 @@ const SANDBOX_ARGS = {
   // SANDBOX_ARGS —— 探针把它指到结构门自己的临时目录，不碰任何真实项目。
   ensureGateSecret: '[_join(_sandbox, "pwg-secret")]',
 };
+
+/** 同名但**签名不同**的导出：不参加强制调用。
+ *
+ *  `PROBE_ARGS` 是一张**扁平**表，按名字命中所有模块。而 `stop-verify-hook.mjs` 与
+ *  `pre-write-gate.mjs` 里这几个名字一样、签名不一样：
+ *
+ *    stop-verify-hook : runHook({ input, env })          —— 一个对象
+ *    pre-write-gate   : runHook(input, { env, nowMs })   —— 两个位置参数
+ *
+ *  拿 stop hook 那份参数去打 `pre-write-gate.runHook`，它读不到 `cwd`，
+ *  回落到 `process.cwd()`（= 仓库根），然后**真的往生产台账写一行**。
+ *  2026-11-18 实测：这正是每次跑结构门 `pre-write-gate/<日期>.jsonl` +2 行的原因，
+ *  而且只在 `DF-031` 把 66 条静默跳过的探针打开之后才暴露 ——
+ *  这个泄漏一直被「根本没验证」掩盖着。
+ *
+ *  宁可少覆盖几个，也不要用 A 的形状去调 B：那样得到的「通过」是假的。 */
+const CROSS_MODULE_SKIP = Object.freeze([
+  'runHook', 'decide', 'logPathFor', 'appendLog', 'readStdin', 'parseHookInput',
+]);
+
 /** `node --check` 只查语法，查不到「调用了一个不存在的函数」。
  *  曾把 wrapToWidth 的循环变量改了一半，语法全绿、结构门全绿，
  *  但按 ? 打开帮助就抛 ReferenceError。
@@ -751,6 +773,8 @@ function checkImportable() {
     `const SANDBOX_ARGS = ${JSON.stringify(SANDBOX_ARGS)};`,
     `const FILES = ${JSON.stringify(files)};`,
     `const DIR = ${JSON.stringify(base)};`,
+    `const CROSS_MODULE_SKIP = ${JSON.stringify([...CROSS_MODULE_SKIP])};`,
+    'const SKIP = new Set(CROSS_MODULE_SKIP);',
     'const failures = [];',
     '// 并行 import：串行时每个 import 只花几十毫秒，但整轮仍受进程启动主导；',
     '// 并行后 6 个模块合计 78ms，而不是 6 × 1.5s。',
@@ -761,10 +785,52 @@ function checkImportable() {
     '  let m2 = m;',
     '  for (const [k, v] of Object.entries(m2)) {',
     '    if (typeof v !== "function") continue;',
+    '    if (SKIP.has(k)) continue;',
     '    const src = PROBE_ARGS[k] !== undefined ? PROBE_ARGS[k] : SANDBOX_ARGS[k];',
     '    if (src === undefined) continue;',
     '    let a;',
-    '    try { a = JSON.parse("[" + src + "]"); } catch { continue; }',
+    // 探针参数按 **JS 表达式**求值，而不是要求写成 JSON。
+    //
+    // 2026-11-18 实测（`DF-031`）：这里原本是 `JSON.parse("[" + src + "]")`，
+    // 而 `PROBE_ARGS` 里大量条目的值是 JS 对象字面量（`{ env: {} }`、
+    // `[{ isTTY: false }]`、`[{ summary: {...} }]`）—— 它们不是合法 JSON，
+    // 于是 **458 条里 66 条被静默跳过**。被跳过的恰好是 `appendLog` / `runHook` /
+    // `decide` / `resetBlockCount` / `bumpBlockCount` / `reconcile` 这些
+    // **有副作用、最该被验**的导出：结构门对它们一个字都没验证，
+    // 却在别处声称「导出了但调用即炸会在这里暴露」。
+    //
+    // 静默跳过在这里格外危险：它的表现和「这条探针通过了」完全一样。
+    //
+    // 为什么是求值而不是把这 66 条改写成 JSON：
+    //   · 逐条改是**改数据**，下一个加探针的人还会写成 JS 字面量，同一个坑再踩一次；
+    //   · 求值是**改机制**，`{ env: {} }` 这种写法从此就是对的。
+    //   安全前提：探针在子进程里跑，且 `OVERWATCH_STATE_DIR` 已在本脚本开头指到临时目录
+    //   （见 `process.env.OVERWATCH_STATE_DIR = _sandbox`），两个 hook 都认它 ——
+    //   所以「真的调用一次 `runHook`」不会写进生产台账。
+    // 注意必须是**直接** eval（`eval(...)`）而不是间接的 `(0, eval)(...)`：
+    // 间接求值在 ESM 里跑在全局作用域，看不到本模块的 `_sandbox` / `_join`，
+    // 而 `SANDBOX_ARGS` 里正是用这两个变量拼路径。实测：写成 `(0, eval)` 时
+    // `ensureGateSecret` / `createLogger` 等 5 条会报 `_join is not defined` ——
+    // 报错比静默跳过好，但它们本来能过。
+    '    try { a = eval("[" + src + "]"); } catch (e) {',
+    '      failures.push([f, k + ": 探针参数求值失败（" + e.message + "）：" + src.slice(0, 80)]);',
+    '      continue;',
+    '    }',
+    // 把每个对象实参上的 `env` 强制指进沙箱。
+    //
+    // 探针表里有 `{ env: {} }`、`{ env: { OVERWATCH_STOP_VERIFY_LOG: ... } }` 这类写法，
+    // 它们**覆盖**了进程级 `OVERWATCH_STATE_DIR`，于是「调一次 appendLog 看它炸不炸」
+    // 会真的往生产台账写一行。实测：`pre-write-gate.appendLog` 与 `stop-verify-hook.appendLog`
+    // 同名，探针按名字命中两个模块，前者不认 `OVERWATCH_STOP_VERIFY_LOG`，
+    // 于是回落到仓库默认路径 —— 每跑一次结构门就多一行 `sid=undefined`。
+    //
+    // 修在**机制层**而不是逐条改数据：新增探针不需要记得这件事，
+    // 想往沙箱外写也写不出去。
+    '    for (const arg of a) {',
+    '      if (!arg || typeof arg !== "object" || Array.isArray(arg)) continue;',
+    '      if (!("env" in arg)) continue;',
+    '      arg.env = { ...(arg.env || {}), OVERWATCH_STATE_DIR: _sandbox };',
+    '    }',
     '    try {',
     '      const r = v(...a);',
     '      if (r && typeof r.then === "function") await r.catch(() => {});',
@@ -1133,6 +1199,28 @@ function checkUnregisteredExports() {
     'WRITE_TOOLS', 'SHELL_TOOLS', 'READ_TOOLS',
   ];
   for (const k of PRE_WRITE_GATE_FNS) REGISTERED.add(k);
+
+  // ── 同名但签名不同的导出：必须按模块分开探针 ─────────────────────────
+  //
+  // `PROBE_ARGS` 是一张**扁平**表，按名字命中所有模块。而这两个文件里
+  // `runHook` / `decide` / `logPathFor` / `appendLog` / `readStdin` /
+  // `parseHookInput` 同名但**签名不同**：
+  //
+  //   stop-verify-hook : runHook({ input, env })          —— 一个对象
+  //   pre-write-gate   : runHook(input, { env, nowMs })   —— 两个位置参数
+  //
+  // 于是 stop hook 那份参数 `[{ input: {session_id:"probe",...} }]` 打到
+  // `pre-write-gate.runHook` 上时，`input` 变成了 `{input:{...}}` ——
+  // 它读不到 `cwd`，回落到 `process.cwd()`（= 仓库根），然后**真的往
+  // 生产台账写一行** `sid=undefined / unparsable-input`。
+  //
+  // 2026-11-18 实测：这就是每次跑结构门 `pre-write-gate/<日期>.jsonl` +2 行的原因。
+  // 只在探针全开时才出现（`DF-031` 把 66 条静默跳过的探针打开之后才暴露）——
+  // 也就是说这个泄漏**一直被「不验证」掩盖着**。
+  //
+  // 修法：这几个名字**跳过强制调用**，由各自的专属探针验（见 `SANDBOX_ARGS`）。
+  // 宁可少覆盖几个，也不要用 A 的形状去调 B —— 那产生的结论是假的。
+  for (const k of CROSS_MODULE_SKIP) REGISTERED.add(k);
 
   // 2026-11-14 审计期间新加的三个探针脚本。它们是**一次性测量工具**，
   // 导出的是测量装置本身（读真实语料、算统计），不是被生产代码调用的纯函数。

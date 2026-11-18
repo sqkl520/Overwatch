@@ -436,11 +436,23 @@ export function buildReason({ blocking = [], project = null, blockCount = 0, mod
   return out.length > 4000 ? out.slice(0, 3980) + '\n…（已截断）' : out;
 }
 
-/** 观测记录路径。默认 `tasks/runs/stop-hook/YYYY-MM-DD.jsonl`（gitignored）。 */
+/** 观测记录路径。默认 `tasks/runs/stop-hook/YYYY-MM-DD.jsonl`（gitignored）。
+ *
+ *  优先级与 `pre-write-gate.mjs` 的 `logPathFor` **刻意保持一致**：
+ *  `OVERWATCH_STOP_VERIFY_LOG`（显式覆盖）→ `OVERWATCH_STATE_DIR`（本仓脚本统一的
+ *  临时区变量）→ 仓库默认路径。
+ *
+ *  中间那一层是 2026-11-18 补的（`DF-031`）。此前只有 `pre-write-gate` 认
+ *  `OVERWATCH_STATE_DIR`，本文件不认 —— 于是任何沿用「设 `OVERWATCH_STATE_DIR` 隔离」
+ *  这个既有约定的测试/探针，在这个 hook 上都会**静默失效并写进生产台账**。
+ *  同一个仓库里两个 hook 对同一个环境变量给出不同答案，比两个都不认更糟：
+ *  它让「我已经隔离了」这句话变成有时真、有时假。 */
 export function logPathFor(env = process.env, nowMs = Date.now()) {
   if (env.OVERWATCH_STOP_VERIFY_LOG) return env.OVERWATCH_STOP_VERIFY_LOG;
   const d = new Date(nowMs);
   const day = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  const stateDir = String(env.OVERWATCH_STATE_DIR || '').trim();
+  if (stateDir) return join(stateDir, 'stop-hook', day + '.jsonl');
   return join(REPO_ROOT, 'tasks', 'runs', 'stop-hook', day + '.jsonl');
 }
 
@@ -490,6 +502,8 @@ export const RESET_AFTER_MS = 10 * 60 * 1000;
 
 export function statePathFor(env = process.env) {
   if (env.OVERWATCH_STOP_VERIFY_STATE) return env.OVERWATCH_STOP_VERIFY_STATE;
+  const stateDir = String(env.OVERWATCH_STATE_DIR || '').trim();
+  if (stateDir) return join(stateDir, 'stop-hook', 'state.json');
   return join(REPO_ROOT, 'tasks', 'runs', 'stop-hook', 'state.json');
 }
 
@@ -586,6 +600,8 @@ export const SAMPLE_TEXT_LIMIT = 500;
  *  可用 `OVERWATCH_STOP_VERIFY_SAMPLES` 覆盖（测试用）。 */
 export function samplePathFor(env = process.env) {
   if (env.OVERWATCH_STOP_VERIFY_SAMPLES) return env.OVERWATCH_STOP_VERIFY_SAMPLES;
+  const stateDir = String(env.OVERWATCH_STATE_DIR || '').trim();
+  if (stateDir) return join(stateDir, 'stop-hook-samples.jsonl');
   return join(REPO_ROOT, 'tasks', 'runs', 'stop-hook-samples.jsonl');
 }
 

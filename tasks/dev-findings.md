@@ -537,4 +537,41 @@
 - **建议归属**：不修，但**要在 `analyze-hook-samples.mjs` 或文档里加一句切分口径**。
   这件事本身还没做，作为本条的遗留项。
 
+### DF-031 [fixed] 结构硬门里 66 条探针是非法 JSON，被静默跳过——包括所有有副作用的导出
+
+- **发现于**：2026-11-18 审计 Agent 逐条核查台账污染路径时发现
+- **位置**：`scripts/check-structure.mjs` 的子进程探针生成器（原 `JSON.parse("[" + src + "]")`
+  + `catch { continue; }`）
+- **证据**（可复算）：`PROBE_ARGS` 共 458 条，其中 **66 条**的值是 JS 对象字面量
+  （`{ env: {} }`、`[{ isTTY: false }]`、`[{ summary: {...} }]`），**不是合法 JSON**，
+  于是解析失败被 `continue` 掉。被跳过的恰好是：
+  `appendLog` / `runHook` / `decide` / `resetBlockCount` / `bumpBlockCount` /
+  `appendSample` / `writeMarker` / `reconcile` / `bumpDenials` —— **所有有副作用的导出**。
+  结构门因此在别处声称「导出了但调用即炸会在这里暴露」，对这 66 个其实一个字都没验证。
+- **为什么这条最严重**：静默跳过的表现与「探针通过」**完全一样**。没有人能从输出里看出区别。
+- **修法**（改机制而非改数据）：探针参数改成按 **JS 表达式直接求值**（`eval(...)`，
+  注意必须是直接 eval —— `(0, eval)` 在 ESM 里看不到 `_sandbox` / `_join`），
+  于是 `{ env: {} }` 这种写法从此是对的，下一个加探针的人不会重踩同一个坑。
+- **修完之后立刻暴露了第二个缺陷**（这条是本条真正的价值）：
+  `runHook` / `decide` / `logPathFor` / `appendLog` / `readStdin` / `parseHookInput`
+  在两个文件里**同名但签名不同** ——
+  `stop-verify-hook.runHook({ input, env })` vs `pre-write-gate.runHook(input, { env })`。
+  扁平表按名字命中，拿 stop hook 的参数去打 pre-write-gate 的 `runHook`，
+  它读不到 `cwd` 就回落到 `process.cwd()`（= 仓库根），**真的往生产台账写一行**。
+  实测：每次跑结构门 `pre-write-gate/<日期>.jsonl` +2 行。
+  现在这几个名字进 `CROSS_MODULE_SKIP`，不参加跨模块强制调用 ——
+  **宁可少覆盖几个，也不要用 A 的形状去调 B，那样得到的「通过」是假的。**
+- **顺带修掉的第三处**：`PROBE_ARGS` 里四条 `"/nonexistent-dir-ow/..."` 路径。
+  审计指出这个论证在 Windows 上是错的 —— 它解析成 `D:\nonexistent-dir-ow\`，
+  **不是不存在的目录，是盘符根下可创建的位置**（`mkdirSync(recursive)` 会建出来）。
+  已改成显式注入 `_sandbox`。
+- **负向验证**：把探针调用整个禁掉 → 台账增量 0（确认泄漏来自探针）；
+  逐模块二分 → 定位到 `pre-write-gate.runHook`。修复后实测三个台账增量全为 0，
+  全量 1633 测试通过。
+- **也补了 `DF-029` 同类的一处**：`stop-verify-hook.mjs` 的三个路径解析器
+  （`logPathFor` / `statePathFor` / `samplePathFor`）原本**不认 `OVERWATCH_STATE_DIR`**，
+  而 `pre-write-gate.mjs` 认。同一仓库里两个 hook 对同一环境变量给出不同答案，
+  比两个都不认更糟：它让「我已经隔离了」有时真、有时假。已补齐并加测试
+  （负向验证：摘掉兜底 → 该测试变红）。
+
 _（新增条目追加在此行上方）_

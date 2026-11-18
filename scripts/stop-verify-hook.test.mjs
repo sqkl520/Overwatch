@@ -71,6 +71,24 @@ const inputOf = (extra = {}) => ({
   ...extra,
 });
 
+/** 隔离用的 env：**三个落盘路径一起指到临时目录**。
+ *
+ *  为什么不各条手写：`appendLog` / `bumpBlockCount` / `appendSample` 各认一个变量，
+ *  漏掉任意一个，那条用例就会往**生产台账**写一行。实测这么漏过一次
+ *  （`OVERWATCH_STOP_VERIFY_SAMPLES` 在 `:417` 那条用例里缺席，于是每次跑测试
+ *  `tasks/runs/stop-hook-samples.jsonl` 多一行 `sid=sess-test`）。
+ *
+ *  逐条补齐能修好当下，但下一个写用例的人还会漏。所以做成**只能整体给**的函数：
+ *  想隔离就一次给全，想不隔离就得显式写 `{}` —— 让「漏一个」在代码里无从发生。
+ *  `OVERWATCH_STATE_DIR` 也一起给：它是本仓的统一约定，两个 hook 都认它。 */
+const envIn = (dir, extra = {}) => ({
+  OVERWATCH_STATE_DIR: dir,
+  OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'),
+  OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json'),
+  OVERWATCH_STOP_VERIFY_SAMPLES: join(dir, 'samples.jsonl'),
+  ...extra,
+});
+
 // ── 1. 默认不拦：装上之后会话必须还能结束 ────────────────────────────
 
 test('默认模式（未设环境变量）是 off，且 decide 的结论不会变成 block', () => {
@@ -89,7 +107,7 @@ test('默认模式（未设环境变量）是 off，且 decide 的结论不会�
 test('runHook 在默认模式下只记账、不拦（这是最重要的一条负向测试）', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-stophook-'));
   try {
-    const env = { OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'), OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+    const env = envIn(dir);
     const out = runHook({ input: inputOf({ cwd: dir }), env });
     assert.equal(out, null, '默认模式必须放行');
     const rows = readFileSync(env.OVERWATCH_STOP_VERIFY_LOG, 'utf8').trim().split('\n').map(JSON.parse);
@@ -335,7 +353,7 @@ test('last_assistant_message 为空时退回 transcript 尾部；两路都空 �
 test('判定抛异常 → runHook 返回 null 并记 hook-internal-error', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-stophook-'));
   try {
-    const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'), OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY: 'block' });
     // 传一个会让 detectClaims 炸的输入：last_assistant_message 是不可转字符串的对象。
     const evil = { session_id: 's', hook_event_name: 'Stop', transcript_path: join(dir, 'none.jsonl') };
     evil.last_assistant_message = { toString() { throw new Error('boom'); } };
@@ -364,7 +382,7 @@ test('appendLog 写不进去也不抛（记账失败不能影响判定）', () =
 test('bumpBlockCount 递增，readBlockCount 读回同一个数', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-stophook-'));
   try {
-    const env = { OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+    const env = envIn(dir);
     assert.equal(readBlockCount('s1', { env }), 0);
     assert.equal(bumpBlockCount('s1', { env }), 0, '第一次返回「之前是 0」');
     assert.equal(readBlockCount('s1', { env }), 1);
@@ -378,7 +396,7 @@ test('bumpBlockCount 递增，readBlockCount 读回同一个数', () => {
 test('超过 RESET_AFTER_MS 没有新拦截 → 计数归零（泡杯咖啡回来不该看到「第 5 次」）', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-stophook-'));
   try {
-    const env = { OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+    const env = envIn(dir);
     const t0 = 1_000_000;
     bumpBlockCount('s1', { env, nowMs: t0 });
     assert.equal(readBlockCount('s1', { env, nowMs: t0 + 1000 }), 1);
@@ -391,7 +409,7 @@ test('超过 RESET_AFTER_MS 没有新拦截 → 计数归零（泡杯咖啡回�
 test('到自己的 MAX_BLOCKS 后主动放行，不依赖宿主的强制放行', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-stophook-'));
   try {
-    const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'), OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY: 'block' });
     const input = inputOf({ cwd: dir });
 
     // 前面 MAX_BLOCKS 次都拦
@@ -414,7 +432,7 @@ test('到自己的 MAX_BLOCKS 后主动放行，不依赖宿主的强制放行',
 test('放行一次后**连续**计数清零，但**累计**计数保留 —— 预算不因一次放行而重置', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-stophook-'));
   try {
-    const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'), OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY: 'block' });
     const bad = inputOf({ cwd: dir });
     const good = inputOf({ cwd: dir, last_assistant_message: '我改了文件，准备跑测试。' });
     runHook({ input: bad, env });
@@ -434,7 +452,7 @@ test('放行一次后**连续**计数清零，但**累计**计数保留 —— �
 test('每次判定都记一行，含断言原文 / 判定档位 / reason / 第几次 / 放行原因', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-stophook-'));
   try {
-    const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'), OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY: 'block' });
     runHook({ input: inputOf({ cwd: dir }), env });
     const r = JSON.parse(readFileSync(env.OVERWATCH_STOP_VERIFY_LOG, 'utf8').trim());
     for (const k of ['at', 'sessionId', 'mode', 'action', 'blockCount', 'blocking', 'reason', 'outcome']) {
@@ -453,6 +471,34 @@ test('默认日志路径在 tasks/runs/stop-hook/ 下（gitignored），不污�
   assert.ok(p.includes(join('tasks', 'runs', 'stop-hook')), p);
   assert.ok(p.endsWith('2026-11-12.jsonl'), p);
   assert.ok(statePathFor({}).includes(join('tasks', 'runs', 'stop-hook')));
+});
+
+test('OVERWATCH_STATE_DIR 必须能隔离三个落盘路径 —— 与 pre-write-gate 行为一致', () => {
+  // 2026-11-18（DF-031）：此前本文件三个路径解析器都不认 `OVERWATCH_STATE_DIR`，
+  // 而 `pre-write-gate.mjs` 认。同一个仓库里两个 hook 对同一个环境变量给出不同答案，
+  // 后果是**任何沿用这个既有约定的测试/探针都会静默写进生产台账** ——
+  // 「我已经隔离了」这句话从此有时真、有时假。
+  const dir = join(tmpdir(), 'ow-statedir-probe');
+  const env = { OVERWATCH_STATE_DIR: dir };
+  const at = Date.UTC(2026, 10, 18, 0, 0, 0);
+
+  assert.equal(logPathFor(env, at), join(dir, 'stop-hook', '2026-11-18.jsonl'));
+  assert.equal(statePathFor(env), join(dir, 'stop-hook', 'state.json'));
+  assert.equal(samplePathFor(env), join(dir, 'stop-hook-samples.jsonl'));
+
+  // 显式变量优先于 STATE_DIR —— 两者都有时必须听更具体的那个，
+  // 否则想单独覆盖日志路径的调用方会被 STATE_DIR 悄悄改掉。
+  assert.equal(
+    logPathFor({ ...env, OVERWATCH_STOP_VERIFY_LOG: '/explicit/x.jsonl' }, at),
+    '/explicit/x.jsonl',
+  );
+  assert.equal(
+    samplePathFor({ ...env, OVERWATCH_STOP_VERIFY_SAMPLES: '/explicit/s.jsonl' }),
+    '/explicit/s.jsonl',
+  );
+
+  // 都没设时必须回到仓库默认路径，不能被上一行探针污染成「到处都写临时目录」。
+  assert.ok(logPathFor({}, at).includes(join('tasks', 'runs', 'stop-hook')));
 });
 
 // ── 8. 项目命令探测 ─────────────────────────────────────────────────
@@ -607,13 +653,9 @@ test('拦 P2 时的 reason 必须说清「要跑一次任何形式的检查」�
 
 const P4_TEXT = '项目里的 4 个 bug 都在 lib.js...已全部修好：';
 
-/** 样本用一套独立环境变量，避免和判定日志互相覆盖。 */
-const sampleEnvOf = (dir, extra = {}) => ({
-  OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'),
-  OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json'),
-  OVERWATCH_STOP_VERIFY_SAMPLES: join(dir, 'samples.jsonl'),
-  ...extra,
-});
+/** 样本用一套独立环境变量，避免和判定日志互相覆盖。
+ *  `envIn` 出现之前这里是手写的一份；两者内容相同，合并成一个以免再次漂移。 */
+const sampleEnvOf = (dir, extra = {}) => envIn(dir, extra);
 
 const readSamples = (p) => readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
 
@@ -800,7 +842,7 @@ test('L1：闸门文件存在 → 无论判定说该不该拦，都放行', () =
   try {
     const pause = join(dir, 'stop-hook.PAUSE');
     const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_PAUSE: pause,
-      OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'), OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+      ...envIn(dir) };
 
     // 前提：没有闸门文件时，这个输入**会**被拦。
     const blocked = runHook({ input: inputOf({ cwd: dir }), env });
@@ -822,7 +864,7 @@ test('L1：闸门文件的判定在 decide() 之前 —— 任何判定分支都
     const pause = join(dir, 'stop-hook.PAUSE');
     writeFileSync(pause, '');
     const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_PAUSE: pause,
-      OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'), OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+      ...envIn(dir) };
     // 连带 `transcript_path` 都指错（读不到记录）也必须先被闸门放行，
     // 而不是落到「读不到 → 按没有可核对断言放行」那条路上去。
     const out = runHook({ input: inputOf({ cwd: dir, transcript_path: join(dir, 'nope.jsonl') }), env });
@@ -836,8 +878,7 @@ test('L1：闸门文件的判定在 decide() 之前 —— 任何判定分支都
 test('L2：最后一条真人消息晚于上次拦截 → 放行，且理由与预算耗尽分开', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-interv-'));
   try {
-    const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'),
-      OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY: 'block' });
     const t0 = Date.parse('2026-11-16T10:00:00Z');
     // 先制造一次拦截（lastAt = t0）
     const first = runHook({ input: inputOf({ cwd: dir }), env, nowMs: t0 });
@@ -857,7 +898,7 @@ test('L2：最后一条真人消息晚于上次拦截 → 放行，且理由与�
 test('L2：工具结果类 user 记录不算「用户发话」（origin.kind !== human）', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-interv-'));
   try {
-    const env = { OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json'), OVERWATCH_STOP_VERIFY_LOG: join(dir, 'l.jsonl') };
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY_LOG: join(dir, 'l.jsonl') });
     const t0 = Date.parse('2026-11-16T10:00:00Z');
     runHook({ input: inputOf({ cwd: dir }), env, nowMs: t0 });
     // 一条 tool_result：`type` 是 user，但 `origin.kind` 不是 human。
@@ -873,7 +914,7 @@ test('L2：工具结果类 user 记录不算「用户发话」（origin.kind !==
 test('L2：真人消息早于上次拦截 → 不算介入（时间顺序要判对）', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-interv-'));
   try {
-    const env = { OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json'), OVERWATCH_STOP_VERIFY_LOG: join(dir, 'l.jsonl') };
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY_LOG: join(dir, 'l.jsonl') });
     const t0 = Date.parse('2026-11-16T10:00:00Z');
     runHook({ input: inputOf({ cwd: dir }), env, nowMs: t0 });
     const records = [
@@ -888,8 +929,7 @@ test('L2：真人消息早于上次拦截 → 不算介入（时间顺序要判�
 test('L2 接线：runHook 真的在拦截前查了「用户是否已发话」（不只是纯函数对）', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-interv-wire-'));
   try {
-    const env = { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'),
-      OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json') };
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY: 'block' });
     const t0 = Date.parse('2026-11-16T10:00:00Z');
     // 一次拦，建立 lastAt
     assert.ok(runHook({ input: inputOf({ cwd: dir }), env, nowMs: t0 }));

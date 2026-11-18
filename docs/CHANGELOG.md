@@ -81,6 +81,26 @@
   最小修法是让 hook 按 `tool_use_id` 幂等，而不是去检测「我是否被重复注册」——
   后者本身就是个不可靠的判断。
 
+- **`DF-031`：结构硬门里 66 条探针被静默跳过，包括所有有副作用的导出**。
+  `PROBE_ARGS` 共 458 条，其中 66 条的值是 JS 对象字面量而非合法 JSON，
+  `JSON.parse` 失败后被 `catch { continue; }` 吞掉 —— 被跳过的恰好是
+  `appendLog` / `runHook` / `decide` / `reconcile` / `writeMarker` 这些**最该被验的**。
+  硬门因此在别处声称「导出了但调用即炸会在这里暴露」，对它们一个字都没验证，
+  而**静默跳过的输出和「通过」完全一样**。
+  改成按 JS 表达式求值（直接 `eval`，间接求值看不到 `_sandbox`）。
+
+  **修完立刻暴露第二个缺陷，这才是本条真正的价值**：`runHook` / `decide` /
+  `logPathFor` / `appendLog` / `readStdin` / `parseHookInput` 在两个文件里同名但签名不同
+  （`stop-verify-hook.runHook({input,env})` vs `pre-write-gate.runHook(input,{env})`），
+  扁平表按名字命中，于是拿 A 的参数去调 B、B 读不到 `cwd` 回落到仓库根、
+  **真的往生产台账写一行**（实测每次跑结构门 +2 行）。这几个名字现在不参加跨模块强制调用。
+
+  同类问题还有两处一并修掉：四条 `"/nonexistent-dir-ow/..."` 探针路径在 Windows 上
+  会解析成盘符根下的**可创建**位置（`mkdirSync(recursive)` 会建出来），已改注入 `_sandbox`；
+  `stop-verify-hook.mjs` 的三个路径解析器原本不认 `OVERWATCH_STATE_DIR`
+  （`pre-write-gate.mjs` 认），补齐并加测试。
+  **修复后实测：全量 1633 测试通过，三个台账增量全部为 0。**
+
 - **`DF-030`：已被污染的台账存量数据决定不清理，改为按时间切分**。修复之后连跑全量测试，
   两个台账增量都是 0；但存量里 `stop-hook/2026-11-18.jsonl` 仍有 78/133 行是
   `unparsable-input`，整个目录 232 行里有 160 行。**清不干净**：那些行的 `sessionId`/`cwd`
