@@ -184,6 +184,37 @@ PID 启动时刻对不上 → 「已被别的进程复用」+ 重启；PID 吻�
   **负向验证**：关掉沙箱过滤 → 「沙箱目录必须被排除」这条测试变红；恢复后 5/5 绿。
   测试用**构造语料**而不是本机真实数据（测试不该读用户的 500 份 transcript）。
 
+## [Unreleased] - 2026-11-18（Stop 闸真的打开了；并更正「怎么开」的错误建议）
+
+### Changed
+
+- **`OVERWATCH_STOP_VERIFY=block` 已启用**（`.claude/settings.local.json`，gitignored）。
+  依据是 `replay-stop-gate.mjs` 的实测：真实项目 + 主会话 315 份里拦 15 份（**4.8%**），
+  抽查那 15 个多数是该拦的（典型形态「有 34 次测试成功，但都发生在最后一次编辑之前」）。
+
+  开闸前实测了三条保护路径（同一份无证据的完成声明，47MB transcript）：
+
+  | 条件 | 结果 |
+  |---|---|
+  | 无 | 输出 `{"decision":"block", reason:…}`，exit 0 |
+  | `%LOCALAPPDATA%/Overwatch/stop-hook.PAUSE` 存在 | 无输出（不拦） |
+  | `stop_hook_active:true` | 无输出（不拦，防循环） |
+
+  每次判定耗时 **374–445ms**。
+
+### Fixed
+
+- **「在 shell 里设环境变量」这条启用建议是错的**（`CAPABILITIES.md` §3、
+  `templates/stop-verify-hook.settings.json` 同改）。
+
+  hook 的环境变量继承自**宿主进程**，而桌面版从快捷方式启动，读不到你终端里 export 的东西。
+  照原文档做，结果是「设了变量、重启会话」之后台账里 `mode` 仍是 `off` ——
+  **而且没有任何东西会提示你开闸失败**。你以为闸开了，其实一直在观测模式。
+
+  原建议的顾虑是「写进 settings 太容易忘，改了不记得改回来」。那个顾虑是真的，
+  但它换来的是「根本开不起来」，代价更大。现在改成写进 `settings.local.json` 的
+  `env` 块，临时关掉走叫停路径（建一个空的 `stop-hook.PAUSE` 文件，立刻生效）。
+
 ## [Unreleased] - 2026-11-18（先量「开 Stop 闸会拦多少」，再谈开不开）
 
 ### Added

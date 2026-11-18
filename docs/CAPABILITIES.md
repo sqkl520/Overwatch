@@ -71,8 +71,38 @@
 |---|---|
 | 1. 注册 hook | 把 `templates/stop-verify-hook.settings.json` 合并进 `.claude/settings.local.json`（本机私有），把 `command` 换成你机器上本仓库的绝对路径 |
 | 2. 观测模式（默认） | 不设环境变量。跑几次后看 `tasks/runs/stop-hook/<日期>.jsonl`，确认它对你的用法没误判 |
-| 3. 开启拦截 | shell 里设 `OVERWATCH_STOP_VERIFY=block`（**不写进 settings 的 env**，见模板里的说明），重启会话 |
+| 3. 开启拦截 | 见下方「怎么开才对」——**桌面版必须写进 `settings.local.json` 的 `env` 块**，shell 环境变量传不到 |
 | 4. 看效果 | `node scripts/analyze-hook-samples.mjs` 看放行样本；`jsonl` 里 `outcome=blocked` 是拦住的那几次 |
+
+### 怎么开才对（2026-11-18 更正）
+
+模板和上面这行此前都写「在 shell 里设 `OVERWATCH_STOP_VERIFY=block`，**不要**写进 settings 的 env」。
+**那个建议在桌面版上不成立。**
+
+hook 进程的环境变量继承自**宿主进程**，不是你的终端。桌面版从 Start Menu / 快捷方式启动，
+它的环境里没有你 shell 里 `export` 的东西 —— 于是「设了变量、重启会话」之后
+`jsonl` 里 `mode` 仍然是 `off`，而**没有任何东西会提示你开闸失败了**。
+这个失效方向最坏：你以为闸开了，其实一直是观测模式。
+
+正确做法（本机已验证）：
+
+```json
+// .claude/settings.local.json（gitignored）
+{
+  "env": { "OVERWATCH_STOP_VERIFY": "block" },
+  "hooks": { ... }
+}
+```
+
+原建议的顾虑是「写进 settings 太容易忘，改了不记得改回来」——那个顾虑是真的，
+但它换来的是「根本开不起来」，代价更大。想临时关掉用**叫停路径**（下面三条），
+不要靠删 `env` 那一行。
+
+**实测（2026-11-18，47MB transcript，真实主会话）**：
+- 无证据的完成声明 → 输出 `{"decision":"block", reason:...}`，exit 0
+- 同一输入 + `%LOCALAPPDATA%/Overwatch/stop-hook.PAUSE` 存在 → 无输出（不拦）
+- 同一输入 + `stop_hook_active:true` → 无输出（不拦，防循环）
+- 每次判定耗时 **374–445ms**
 
 设计取向（按对用户的伤害排序，详见脚本头注释）：
 
