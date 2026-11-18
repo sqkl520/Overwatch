@@ -413,4 +413,42 @@
      （`OVERWATCH_STATE_DIR` 之类的环境变量是否漏传）。
 - **影响**：CI 会偶发红，让「全绿」这个信号不可靠。这是**真的**代价，不是洁癖。
 
+### DF-027 [open] 写前闸认不出 `sed`，且 `head` 抽出的相对路径与 Edit 的绝对路径永远不匹配
+
+- **发现于**：2026-11-18 把两道闸注册进 `.claude/settings.local.json` 后，本会话
+  （`ea4ef562`）observe 模式跑出 339 条记录，其中**唯一一条** `would-deny` 是误判
+- **位置**：`scripts/pre-write-gate.mjs:152`（`SHELL_READ_VERBS`）、
+  `scripts/pre-write-gate.mjs:413`（`readPathsOfToolUse`）、
+  `scripts/pre-write-gate.mjs:852-856`（Edit 侧目标匹配）
+- **证据**（本会话实测，可复算）：
+
+  那次被判 `would-deny` 的调用是 `Edit D:\Projects\Overwatch\docs\CHANGELOG.md`，
+  日志里 `reads:4`、`allowReason:"observe-mode"`、`target:(none)`。
+  同一会话另外 8 次 Edit 全部 `allow / target-read`，唯一区别是**我读 CHANGELOG 用的不是 `Read`**：
+
+  ```
+  sed -n '1,30p' docs/CHANGELOG.md   -> []                       ← 完全不算读过
+  head -30 docs/CHANGELOG.md         -> ["docs/CHANGELOG.md"]    ← 相对路径
+  Read docs/CHANGELOG.md             -> 绝对路径                  ← 唯一能匹配上的形态
+  ```
+
+  两个独立缺陷叠在一起：
+  1. `sed` 不在 `SHELL_READ_VERBS`（`['cat','head','tail','type','get-content','gc','more']`），
+     而 `sed -n '1,30p' <file>` 是读文件的常见写法 —— 它数都不数。
+  2. `head`/`tail`/`cat` 抽出来的是命令里的**原样字符串**（相对路径），而 `intent.paths`
+     来自 `tool_input.file_path`（绝对路径）。`pathKeyOf()` 只做分隔符归一，**不做绝对化**，
+     于是 `docs/changelog.md` ≠ `d:/projects/overwatch/docs/changelog.md`，Edit 侧恒不命中。
+
+- **为什么这次没拦住我**：observe 模式。真开了 `deny` 会把这个会话的这一次合法编辑挡下来，
+  并按 `brake:"halt"` 结束整个回合 —— 用户会看到「我明明读过它，闸说我读过」。
+- **影响**：`target-read` 这条判据（本仓实测 18/18 真实 Edit-first 会话都靠它放行）
+  对**任何用 shell 读文件的会话**失效，退化成「没读过目标」。而用 `sed`/`awk`/`grep` 读文件
+  在长会话里是常态 —— 也就是说这条判据的真实覆盖率被高估了。
+- **建议归属**：独立任务。修法要分两步，**不能一步到位**：
+  1. 给 `readPathsOfToolUse` 的抽取结果做绝对化（`resolve(cwd, p)`），这步无争议；
+  2. `sed` 要不要进动词表是个**判据问题不是实现问题** —— `sed -n '1,30p' f` 是读，
+     `sed -i 's/x/y/' f` 是写，同一个动词两种语义。加之前必须先有负向测试区分这两者，
+     否则会把 `sed -i` 也记成「读过」（那是写入，记成读就是假的证据）。
+- **优先级**：P2。observe 模式下不害人，但它让「自动放行率」这个指标偏乐观。
+
 _（新增条目追加在此行上方）_

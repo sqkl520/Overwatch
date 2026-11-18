@@ -21,6 +21,52 @@
 
 ---
 
+## [Unreleased] - 2026-11-18（第一屏承诺与正文对齐；两道闸开始真跑）
+
+### Changed
+
+- **README 第一屏承诺「一次做完」，正文却在卖「监控会话」**（commit `a6c54e1`）——
+  这正是改名要纠正的那个错，改完名字却没改正文。陌生人读完会以为这是个 dashboard。
+  现在开头直接写它存在要防的失败（提前收工：骨架 → 皮毛 → 看起来做完了），
+  以及对应的三道闸；并且**明说中间那道还没实现、收工闸默认只记账**，
+  不把路线图当现状读。监控退到「为什么需要它」那一节，作为让「做完没做完」可观测的仪器。
+
+### Fixed
+
+- **改名只改了一半：GitHub 仓库还叫 `Overwatch`**（commit `480d0b9`，`gh repo rename`）。
+  代码在 `efd9541` 就改了名，但远端仓库、`origin`、描述、topics 都还是旧的。
+  后果具体：README 的克隆命令写成 `git clone .../UntilDone.git` 之后**会失败**，因为那个路径不存在。
+  现在仓库名、`origin` URL、description、topics 四处一致；旧名由 GitHub 重定向。
+  topics 一并从「监控」口径改成「闭环」口径（去 `session-monitoring`/`observability`，
+  加 `task-checklist`/`ai-agent-orchestration`/`multi-agent`）。
+
+- **克隆后的目录名与下一步命令对不上**（`README.md` / `README-EN.md` / `docs/FOR-USERS.md`）。
+  `git clone .../UntilDone.git` 建出的是 `UntilDone/`，而正文三处都写着 `cd Overwatch` ——
+  陌生人执行的**第一条命令**就会失败。这是 README 里最贵的一类错：它不报错在自己身上，
+  报在读者身上。
+
+- **「下载最新版」指向一个空页面**。仓库零 tag、零 Release，那一行链接到一个什么都没有的页面，
+  而它正下方那句写着「没有 tag、没有 npm 包，仓库就是发布物」——同屏自相矛盾。
+  改指 README 自己的「30 秒上手」锚点（英文版是 `#-quick-start`，锚点按各自标题，不是直译）。
+
+- **测试跑一次就往生产台账写 3 行**（`scripts/entry-symlink.test.mjs`，commit `a8ec14e` 系列）。
+  这个测试用 `spawnSync` 起两个 hook 却**没传隔离环境变量**，于是 hook 把观测记录追加进了
+  `tasks/runs/stop-hook/<日期>.jsonl` —— 那是给真机记账用的。
+  实测后果：该台账 232 条里 **160 条**是 `unparsable-input`，全是 `input: ''` 的 spawn 写的，
+  而它看起来像真实会话的分布。更贵的是**它污染了诊断**：我据此先以为「这两道闸零次运行」，
+  实际是「真实运行 0 次、测试运行 160 次」——同一个桶里装两件事。
+  修法：`spawnSync` 的 `env` 是**整体替换不是合并**，必须 `{ ...process.env, ...隔离项 }`，
+  否则 Windows 上连 Node 都起不来。**负向验证**：修复后单跑该文件，两个台账增量都是 0；
+  回退后重新变成 3。
+
+### Added
+
+- **两道闸注册进 `.claude/settings.local.json`**（本机私有，gitignored）。此前它们写得完整、
+  测试齐全、`templates/` 里有注册模板，但**没有任何会话真的挂过**。
+  现在默认 observe（只记账、永不放拦），实测开销：写前闸 ~190ms/次、Stop 闸 ~330ms/次。
+  注册后本会话立刻生效，339 次调用里 22 次 `allow`（有证据放行）、316 次 `passthrough`、
+  **1 次 `would-deny`** —— 那 1 次是误判，已登记 `DF-027`。
+
 ## [Unreleased] - 2026-11-18（文档指向真实名字；实测数字与文档对齐）
 
 ### Fixed

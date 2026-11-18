@@ -23,11 +23,11 @@
  * 一个在 CI 里静默变绿的测试等于没有测试。
  */
 
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const HERE = import.meta.dirname;
@@ -45,14 +45,41 @@ function makeTmp() {
   throw new Error('没有可写的临时目录');
 }
 
+// ── 不许往生产台账里写字 ─────────────────────────────────────────────
+//
+// 本文件 spawn 的入口里有两个 **hook**（`stop-verify-hook.mjs`、`pre-write-gate.mjs`）。
+// 它们被宿主调起来时会把观测记录追加到**生产台账**：
+//   · stop hook → `tasks/runs/stop-hook/<日期>.jsonl`、`tasks/runs/stop-hook/state.json`，
+//     外加默认开启的 `tasks/runs/stop-hook-samples.jsonl`
+//   · 写前闸    → `tasks/runs/pre-write-gate/<日期>.jsonl`
+// 这三处都是**给真机记账用的**。测试每跑一次就掺几条进去，后果不是「文件变大」而是
+// **统计结论被污染**：修复前实测该台账 232 条里 160 条是 `unparsable-input`，
+// 那全是这里 `input: ''` / `'{}'` 的 spawn 写的，而它看起来像真实用户会话的分布。
+//
+// 三个 hook 各自留了覆盖路径的环境变量，所以把子进程指到本测试自己的临时目录。
+// **`spawnSync` 的 `env` 是整体替换而不是合并**，因此必须 `{ ...process.env, ...隔离项 }`
+// —— 只传隔离项会把 `PATH` / `SystemRoot` 一起抹掉（Windows 上 Node 起不来）。
+const LEDGER_DIR = join(makeTmp(), 'ledgers');
+const ISOLATED_ENV = {
+  ...process.env,
+  OVERWATCH_STOP_VERIFY_LOG: join(LEDGER_DIR, 'stop-hook.jsonl'),
+  OVERWATCH_STOP_VERIFY_STATE: join(LEDGER_DIR, 'stop-hook-state.json'),
+  OVERWATCH_STOP_VERIFY_SAMPLES: join(LEDGER_DIR, 'stop-hook-samples.jsonl'),
+  OW_PRE_WRITE_GATE_LOG: join(LEDGER_DIR, 'pre-write-gate.jsonl'),
+};
+// 非 hook 的入口（`render-plan` / `stop-signals` / `overwatch`）不看这几个变量，
+// 多传无害 —— 与其逐个入口判断「它会不会写台账」（那种判断迟早漏一个），
+// 不如让所有 spawn 走同一份 env。
+after(() => { rmSync(dirname(LEDGER_DIR), { recursive: true, force: true }); });
+
 const run = (script, args = ['--help']) => spawnSync(process.execPath, [script, ...args], {
-  encoding: 'utf8', timeout: 30000, cwd: ROOT, input: '',
+  encoding: 'utf8', timeout: 30000, cwd: ROOT, input: '', env: ISOLATED_ENV,
 });
 /** 给 hook 类入口喂一份 stdin —— 那是它们的真实调用形态（宿主从 `settings.json`
  *  按路径调起来，input 走 stdin）。`--help` 对它们没有意义，所以不能拿空输出去判定。
  *  超时压到 10 秒：这些入口本该立刻返回，等 30 秒只是在为「它挂住了」浪费时间。 */
 const runWithStdin = (script, stdin) => spawnSync(process.execPath, [script], {
-  encoding: 'utf8', timeout: 10000, cwd: ROOT, input: stdin,
+  encoding: 'utf8', timeout: 10000, cwd: ROOT, input: stdin, env: ISOLATED_ENV,
 });
 const text = (r) => String(r.stdout || '') + String(r.stderr || '');
 
@@ -192,7 +219,7 @@ test('argv[1] 指向不存在的路径时，import 入口不抛（realpath 失�
     "console.log('IMPORTED');",
   ].join('\n');
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe], {
-    encoding: 'utf8', timeout: 30000, cwd: ROOT,
+    encoding: 'utf8', timeout: 30000, cwd: ROOT, env: ISOLATED_ENV,
   });
   assert.equal(r.status, 0,
     `argv[1] 不存在时 import 入口抛了 —— realpathSync 的异常没有被吞掉。stderr: ${String(r.stderr || '')}`);
@@ -211,7 +238,7 @@ test('被 import 时入口不执行 main（修复不能把「不执行」也修�
     "console.log(Object.keys(m).length > 0 ? 'imported-quietly' : 'no-exports');",
   ].join('\n');
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', probe], {
-    encoding: 'utf8', timeout: 30000, cwd: ROOT,
+    encoding: 'utf8', timeout: 30000, cwd: ROOT, env: ISOLATED_ENV,
   });
   assert.equal(r.status, 0, `import 入口失败：${String(r.stderr || '')}`);
   assert.equal(String(r.stdout || '').trim(), 'imported-quietly',
