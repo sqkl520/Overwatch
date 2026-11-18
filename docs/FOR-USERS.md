@@ -21,8 +21,8 @@
 ## 1. 三十秒跑起来
 
 ```bash
-git clone https://github.com/sqkl520/Overwatch.git
-cd Overwatch
+git clone https://github.com/sqkl520/UntilDone.git
+cd UntilDone
 node scripts/overwatch.mjs
 ```
 

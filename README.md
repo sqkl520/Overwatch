@@ -9,7 +9,7 @@
 它约束 AI 在动手前把需求问清楚，然后一次做到底 —— 不给你「一轮一个骨架、二轮一层皮毛」。
 跨会话监控只是让它能看见「这一轮到底做到哪了」的附属能力。
 
-![CI](https://github.com/sqkl520/Overwatch/actions/workflows/validate.yml/badge.svg)
+![CI](https://github.com/sqkl520/UntilDone/actions/workflows/validate.yml/badge.svg)
 ![Node](https://img.shields.io/badge/node-%E2%89%A518.20.4-blue?style=flat-square)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square)
 ![Tests](https://img.shields.io/badge/regression%20tests-1627%20passing-brightgreen?style=flat-square)
@@ -17,17 +17,17 @@
 
 **零依赖** · **不安装** · **不登录也能用** —— `git clone` 之后 `node scripts/overwatch.mjs` 就行
 
-**[⬇️ 下载最新版](https://github.com/sqkl520/Overwatch/releases)** ·
+**[⚡ 30 秒上手](#-30-秒上手)** ·
 [能力清单](docs/CAPABILITIES.md) ·
 [使用手册](docs/GUIDE.md) ·
-[问题反馈](https://github.com/sqkl520/Overwatch/issues)
+[问题反馈](https://github.com/sqkl520/UntilDone/issues)
 
 </div>
 
 > ⚠️ **早期项目。** 没有 tag、没有 npm 包，仓库就是发布物。
-> 有任何问题欢迎 [提交 Issue](https://github.com/sqkl520/Overwatch/issues)；觉得有用就 Star 一下 ⭐
+> 有任何问题欢迎 [提交 Issue](https://github.com/sqkl520/UntilDone/issues)；觉得有用就 Star 一下 ⭐
 >
-> **本 README 不维护版本号** —— 版本以 [Releases 页](https://github.com/sqkl520/Overwatch/releases) 为准。
+> **本 README 不维护版本号** —— 版本以 [Releases 页](https://github.com/sqkl520/UntilDone/releases) 为准。
 
 ---
 
@@ -61,8 +61,8 @@ verify-claims.mjs     →  它说的「做完了」，在 transcript 里找得�
 ## 🚀 30 秒上手
 
 ```bash
-git clone https://github.com/sqkl520/Overwatch.git
-cd Overwatch
+git clone https://github.com/sqkl520/UntilDone.git
+cd UntilDone
 node scripts/overwatch.mjs
 ```
 
@@ -237,8 +237,8 @@ UntilDone/
 
 ## 🤝 参与
 
-- 跑测试：`node --test scripts/`（1626 条回归测试；**这个数字由硬门与实跑对账，写错即红**，
-  所以照抄即可、不必手工数。要 Node ≥ 20.16，因为用了 `import.meta.dirname`）。
+- 跑测试：`node --test scripts/`（1626 条回归测试；**这个数字由硬门数源码 `test(` 调用对账，写错即红**，
+  所以照抄即可、不必手工数。实跑报告会比它多几条 —— 子测试会被单独计数。要 Node ≥ 20.16，因为用了 `import.meta.dirname`）。
 - 结构硬门：`node scripts/check-structure.mjs`
 - 两条都必须绿才能提交，细节见 [CONTRIBUTING.md](CONTRIBUTING.md)
 - 安全报告：**不要开公开 issue**，见 [SECURITY.md](SECURITY.md)

@@ -3,11 +3,11 @@
 ## Reporting a vulnerability
 
 **Use GitHub's private vulnerability reporting** —
-[open a draft advisory](https://github.com/sqkl520/Overwatch/security/advisories/new).
+[open a draft advisory](https://github.com/sqkl520/UntilDone/security/advisories/new).
 It stays private between you and the maintainer until a fix ships.
 
 If that link does not work on your account, open a
-[regular issue](https://github.com/sqkl520/Overwatch/issues/new) that says only
+[regular issue](https://github.com/sqkl520/UntilDone/issues/new) that says only
 "security report, please enable a private channel" and **nothing else** — no
 details, no reproduction steps, no affected paths. The maintainer will open a
 private channel and reply there.

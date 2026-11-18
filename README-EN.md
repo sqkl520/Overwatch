@@ -10,7 +10,7 @@ It makes the AI clarify the requirement before touching anything, then carries t
 work through to the end — no "skeleton in round one, veneer in round two".
 Cross-session monitoring exists only so you can see how far this pass actually got.
 
-![CI](https://github.com/sqkl520/Overwatch/actions/workflows/validate.yml/badge.svg)
+![CI](https://github.com/sqkl520/UntilDone/actions/workflows/validate.yml/badge.svg)
 ![Node](https://img.shields.io/badge/node-%E2%89%A518.20.4-blue?style=flat-square)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square)
 ![Tests](https://img.shields.io/badge/regression%20tests-1627%20passing-brightgreen?style=flat-square)
@@ -19,19 +19,19 @@ Cross-session monitoring exists only so you can see how far this pass actually g
 **Zero dependencies** · **Nothing to install** · **Works without logging in** —
 `git clone` then `node scripts/overwatch.mjs`
 
-**[⬇️ Latest release](https://github.com/sqkl520/Overwatch/releases)** ·
+**[⚡ Quickstart](#-quick-start)** ·
 [Capabilities](docs/CAPABILITIES.md) ·
 [Guide](docs/GUIDE.md) ·
-[Report an issue](https://github.com/sqkl520/Overwatch/issues)
+[Report an issue](https://github.com/sqkl520/UntilDone/issues)
 
 </div>
 
 > ⚠️ **Early-stage project.** No tags, no npm package; the repository is the release.
-> Issues and suggestions are welcome — please [open an Issue](https://github.com/sqkl520/Overwatch/issues).
+> Issues and suggestions are welcome — please [open an Issue](https://github.com/sqkl520/UntilDone/issues).
 > If you find it useful, a star means a lot ⭐
 >
 > **This README does not track a version number.** The
-> [Releases page](https://github.com/sqkl520/Overwatch/releases) is the source of truth.
+> [Releases page](https://github.com/sqkl520/UntilDone/releases) is the source of truth.
 
 ---
 
@@ -70,8 +70,8 @@ Everything else is instrumentation around it.
 ## 🚀 Quick start
 
 ```bash
-git clone https://github.com/sqkl520/Overwatch.git
-cd Overwatch
+git clone https://github.com/sqkl520/UntilDone.git
+cd UntilDone
 node scripts/overwatch.mjs
 ```
 
