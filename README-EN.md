@@ -37,24 +37,44 @@ Cross-session monitoring exists only so you can see how far this pass actually g
 
 ## ✨ What problem it solves
 
-Running five or six Claude Code sessions at once is normal by now. The friction
-isn't switching windows — it's coming back hours later unable to tell **which
-session is doing what, which one is stuck, and which one has been waiting on
-you**:
+Most coding-agent failures aren't wrong answers — they're **early exits**. One
+round lays down a skeleton, you push back, the next round pastes on a veneer,
+and three rounds in the code looks finished while every part of it stopped at
+"it runs".
 
-- One threw a two-way question at you three hours ago and you never saw it
-- Another said "fixed it" when all it did was swallow the error
-- The rest are running, but you can't tell progress from spinning
+The cause isn't model capability, it's **the requirement decaying in transit**.
+Five things in your head become three in the prompt, the model reads two and a
+half, and it declares done after one — with nothing standing in the way of that
+declaration.
 
-UntilDone gives you visibility on all three: scan every transcript → judge the
-state → notify only when it actually concerns you.
-**It does not make decisions for you, and it never writes into a running session.**
+UntilDone puts a gate at each of three points:
 
-### How this relates to the official `claude agents`
+| Point | Gate | What it stops |
+|---|---|---|
+| Before work | Clarify the requirement | "I assumed you meant X" — surface ambiguity before the first line of code |
+| During | Decompose into a checklist you approve | The list is one you signed off on, not one invented afterwards |
+| Before the turn ends | Check each item landed on disk | "It's done" needs a tool call behind it in the transcript |
 
-`claude agents --json` already lists every session, groups them by state, and
-lets you dispatch and reply. **It has natively solved "see which sessions
-exist"** — no point pretending otherwise. The two answer different questions:
+**What it guarantees isn't "you can see whether it finished" — it's "it finishes
+in one pass."** The first leaves the judgment cost with you; only the second
+gives you your time back. That distinction is the whole product.
+
+> Where it actually stands: **the middle gate is not built**, and the closing
+> gate defaults to observe-only (it writes a record, it blocks nothing). The
+> measurements below show it does catch real cases, but only over the roughly
+> one fifth of assertions that can be checked at all. Don't read the roadmap as
+> current behaviour.
+
+### How this relates to session monitoring
+
+Monitoring is an **ancillary capability**, not the product. It earns its place
+for one reason: a single round now runs long, and you need to know whether it's
+advancing or spinning — otherwise "finishes in one pass" is unobservable.
+
+Which is also why the point about the official tool stands. `claude agents
+--json` already lists every session, groups them by state, and lets you dispatch
+and reply. **It has natively solved "see which sessions exist"** — no point
+pretending otherwise. The questions differ:
 
 ```
 claude agents --json  →  which sessions the host registered, busy / idle / blocked
@@ -62,8 +82,8 @@ scan-sessions.mjs     →  what those sessions are doing, stuck where
 verify-claims.mjs     →  does "it's done" have a tool call behind it
 ```
 
-**Only the third line is something the official tool does not do.**
-Everything else is instrumentation around it.
+**Only the third line is something the official tool does not do** — and it is
+there to serve the closing gate above.
 
 ---
 
