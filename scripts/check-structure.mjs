@@ -381,6 +381,9 @@ const PROBE_ARGS = {
   pausePathFor: '[{}]', isPaused: '[{}]', lastBlockAt: '["s", { env: {} }]',
   userIntervenedSince: '["s", { records: [], env: {} }]',
   readTotalBlocks: '["s", { env: {} }]',
+  // 2026-11-18 `DF-029`：Stop 的去重键构造。纯函数，空输入必须返回 null 而不是抛
+  // （`claimKeyOf` 缺段即放弃去重，见 hook-dedupe.mjs 文件头 §失效方向）。
+  stopTurnKeyOf: '[{}]',
   resetBlockCount: '["s", { env: {} }]',
   appendLog: '[{}, { OVERWATCH_STOP_VERIFY_LOG: _sandbox + "/x.jsonl" }]',
   bumpBlockCount: '["s", { env: { OVERWATCH_STOP_VERIFY_STATE: _sandbox + "/x.json" } }]',
@@ -721,11 +724,38 @@ const SANDBOX_ARGS = {
   probeJobs: '[_sandbox]', probeMtime: '[_sandbox]',
   createLogger: '[_sandbox]', defaultStateDir: '{}', defaultNotifyDir: '{}',
   readLogHealth: '[_sandbox]', logHealthPath: '["/nonexistent"]',
+  // DF-028：`procWitnessPath` 是纯路径拼接；`readProcWitness` 读不存在的目录 → null。
+  // `judgeProcess(null)` 走 unverified 分支，**刻意不 spawn powershell**：
+  // 结构门要一秒内跑完，不该为一条冷路径付 360ms，更不该对真实 PID 发信号。
+  // `writeProcWitness` 写到沙箱（`_sandbox` 由探针注入），不碰真实数据目录。
+  procWitnessPath: '["/nonexistent"]', readProcWitness: '["/nonexistent"]',
+  processStartedAt: '[]', judgeProcess: '[null]',
+  writeProcWitness: '[_sandbox]',
   createObservationLog: '[_sandbox]', observationStats: '[_sandbox]',
   classifyCandidate: '[{}]', readTranscriptTail: '["/nonexistent"]',
   // pre-write-gate.mjs 的签名密钥生成（2026-11-14）。它会 real 写盘，所以只能进
   // SANDBOX_ARGS —— 探针把它指到结构门自己的临时目录，不碰任何真实项目。
   ensureGateSecret: '[_join(_sandbox, "pwg-secret")]',
+
+  // hook-dedupe.mjs（2026-11-18，`DF-029` 的幂等层）。三条都会写盘，所以一律进
+  // SANDBOX_ARGS 并且路径由 `_sandbox` 拼 —— 它们**本身就是「写一个文件」这件事**，
+  // 不给路径就没法验「调用即炸」。
+  //   · claimOnce     认领一次事件（O_EXCL 创建）；空键走「放弃去重」分支，不写盘
+  //   · recordSkipped 追加一行跳过记录
+  //   · sweepIfCrowded 清理过期认领文件；目录不存在时安全返回
+  // 另外两个纯路径拼接（claimPathFor / claimDirFor）与一个纯解析（claimKeyOf）也在这里，
+  // 它们只需要最小可构造输入。
+  claimDirFor: '[_sandbox, "probe"]',
+  claimPathFor: '[_sandbox, "probe", "k"]',
+  claimKeyOf: '["probe", ["a"]]',
+  dedupeRoot: '[{}]',
+  claimOnce: '[{ hookId: "probe", key: "k", env: { OVERWATCH_HOOK_DEDUPE_DIR: _sandbox } }]',
+  recordSkipped: '[{ hookId: "probe", key: "k", env: { OVERWATCH_HOOK_DEDUPE_DIR: _sandbox } }]',
+  sweepIfCrowded: '[_sandbox]',
+
+  // make-social-preview.mjs 的渲染层（2026-11-18）：把顶层副作用收进 main() 之后
+  // 才可被调用。`renderPng` 只产字节、不写盘 —— 正好用来验「点了就炸」。
+  renderPng: '[]',
 };
 
 /** 同名但**签名不同**的导出：不参加强制调用。
@@ -927,6 +957,12 @@ function checkUnregisteredExports() {
   // （用 `_sandbox` 真的调一次）；logHealthPath 是纯路径拼接，也进 PROBE_ARGS；
   // LOG_HEALTH_FILE 是数据（文件名常量），不是函数。
   'readLogHealth', 'logHealthPath', 'LOG_HEALTH_FILE',
+  // watch.mjs 的进程见证（DF-028，2026-11-18）：「进程死了」与「进程卡住了」可区分。
+  // `judgeProcess` 进 PROBE_ARGS 但不传见证 → 走 unverified 分支，**不 spawn powershell**
+  // （否则每跑一次结构门多 360ms，且这条冷路径的代价不该由硬门承担）。
+  // `PROC_TOLERANCE_MS` 是数字，不是函数 —— checkArgs 调不动它。
+  'procWitnessPath', 'writeProcWitness', 'readProcWitness', 'processStartedAt',
+  'judgeProcess', 'PROC_TOLERANCE_MS',
     'statusToState', 'liveToRow', 'mergeLiveSessions', 'listRow', 'detailLines', 'pendingLines',
     'claimOwnership', 'readOwner', 'ownerPath', 'askedCandidates',
     'requestIdTime', 'lastTimelineStateTime', 'resolveJobEventTime', 'BLOCKED_MAX_AGE',
@@ -1062,6 +1098,8 @@ function checkUnregisteredExports() {
     'resolveAssistantText', 'decide', 'buildReason', 'logPathFor', 'appendLog',
     'statePathFor', 'bumpBlockCount', 'resetBlockCount', 'readBlockCount', 'readTotalBlocks', 'runHook',
     'pausePathFor', 'isPaused', 'lastBlockAt', 'userIntervenedSince',
+    // 2026-11-18 `DF-029`：Stop 的去重键构造（纯函数，输入进、字符串出）。
+    'stopTurnKeyOf',
     'loadRecords', 'loadSubagentRecords', 'SUBAGENT_TAIL_BYTES',
     // stop-verify-hook.mjs 的放行样本记录（2026-11-13）。纯记账层：写入失败一律
     // 吞掉，所以探针只需要证明「给了最小输入也不抛」。分析命令的导出同批登记。
@@ -1200,6 +1238,22 @@ function checkUnregisteredExports() {
   ];
   for (const k of PRE_WRITE_GATE_FNS) REGISTERED.add(k);
 
+  // hook-dedupe.mjs（2026-11-18，`DF-029` 的幂等层）：三条会写盘的进 SANDBOX_ARGS
+  // 真实调用一次（路径由 `_sandbox` 拼），其余是纯函数/常量。
+  // 这一节必须存在：2026-11-18 之前 `checkUnregisteredExports` 自己因为
+  // 「某个脚本 import 即打印 → JSON.parse 失败 → 静默 return」而**从来没跑过**，
+  // 所以「未登记」这件事谁都看不见（见 `checkUnregisteredExports` 上方注释）。
+  const HOOK_DEDUPE_FNS = [
+    'claimKeyOf', 'claimPathFor', 'claimDirFor', 'dedupeRoot',
+    'claimOnce', 'recordSkipped', 'sweepIfCrowded',
+    'CLAIM_TTL_MS', 'SWEEP_AT', 'SKIPPED_FILE', 'DEDUPE_DIR_NAME',
+  ];
+  for (const k of HOOK_DEDUPE_FNS) REGISTERED.add(k);
+
+  // make-social-preview.mjs（2026-11-18）：`renderPng` 已进 PROBE_ARGS 实际调用；
+  // `main` 是 CLI 入口（写盘），由 make-social-preview.test.mjs 覆盖。
+  for (const k of ['renderPng', 'main']) REGISTERED.add(k);
+
   // ── 同名但签名不同的导出：必须按模块分开探针 ─────────────────────────
   //
   // `PROBE_ARGS` 是一张**扁平**表，按名字命中所有模块。而这两个文件里
@@ -1334,9 +1388,32 @@ function checkUnregisteredExports() {
     'Promise.all([' + mods.join(',') + '].map((u) => import(u).then((m) => Object.keys(m)).catch(() => [])))' +
     '.then((all) => console.log(JSON.stringify(all)))';
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 20000 });
-  if (r.status !== 0) return;
+  if (r.status !== 0) {
+    // **不许静默 return。** 2026-11-18 实测：`import()` 一个「模块顶层就执行并打印」的脚本
+    // （当时是 `make-social-preview.mjs`，后来是 `measure-checklist-coverage.mjs`）会把
+    // 中文打到这个子进程的 stdout 上，于是下面那句 `JSON.parse` 必然失败，
+    // 原来的 `catch { return; }` 就把**整项检查**放弃了 —— 而它的输出与
+    // 「全部导出都登记过」逐字相同。这正是 `DF-031` 那个缺陷的同一种形态：
+    // 静默跳过看起来和通过一样。
+    //
+    // 现在的处置分两层：
+    //   · 子进程非 0 退出 → **fail**（import 都炸了，这一项根本没有结论）；
+    //   · 解析不出 JSON   → **fail** 并指名是哪个文件污染了 stdout（可修的那种）。
+    fail('scripts/', `导出清单扫描的子进程以 ${r.status} 退出：${String(r.stderr || '').trim().split('\n')[0] || '无输出'}`);
+    return;
+  }
   let all;
-  try { all = JSON.parse(String(r.stdout || '[]')); } catch { return; }
+  try {
+    all = JSON.parse(String(r.stdout || '[]'));
+  } catch {
+    // 指名道姓：拿不到导出清单时，最可能的原因是某个模块 import 即执行。
+    // 逐个 import 太慢（那是 40 个进程），所以只报现象 + 定位办法。
+    fail('scripts/', '导出清单不是合法 JSON —— 说明某个非测试脚本在**模块顶层**就往 stdout 打印了'
+      + '（import 即执行）。这类脚本必须加「我是不是被直接执行」的入口守卫，'
+      + '否则每次跑本门都会把它们真的执行一遍（副作用 + 输出污染）。'
+      + ` 实测 stdout 前 80 字：${JSON.stringify(String(r.stdout || '').slice(0, 80))}`);
+    return;
+  }
   all.forEach((exportsList, i) => {
     for (const k of exportsList) {
       if (REGISTERED.has(k) || INTENTIONALLY_PROBED_FREE.has(k) || k === 'default') continue;

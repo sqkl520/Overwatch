@@ -108,10 +108,11 @@
 
 import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { bashWriteScan } from './claim-ledger.mjs';
+import { claimOnce, claimKeyOf, recordSkipped } from './hook-dedupe.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..');
@@ -148,8 +149,39 @@ export const READ_TOOLS = Object.freeze(['Read', 'NotebookRead']);
  *
  *  `readVerbs` 参数**只为让重放器能验证「动词表是判据的唯一来源」**而存在：
  *  生产调用从不传它，传了就等于改判据。`observe-reality-check.test.mjs` 用
- *  「注入 `ls`」证明重放器跟着动 —— 重放器若自己写一份动词表，那条测试会红。 */
-const SHELL_READ_VERBS = Object.freeze(['cat', 'head', 'tail', 'type', 'get-content', 'gc', 'more']);
+ *  「注入 `ls`」证明重放器跟着动 —— 重放器若自己写一份动词表，那条测试会红。
+ *
+ *  ## 为什么 `sed` 在表里，而 `awk` 不在（`DF-027`，2026-11-18）
+ *
+ *  `sed` 一个动词两种语义：`sed -n '1,30p' f` 是读，`sed -i 's/x/y/' f` 是写。
+ *  所以光把它加进表是不够的 —— 表只回答「这个动词像不像读」，回答不了「这一次是不是读」。
+ *  带就地编辑的一律由 `shellInPlaceEdit()` 排除，**不进**这张表也解决不了问题
+ *  （那样 `sed -n ...` 永远数不上）。一律记成读，就是给那些就地编辑伪造证据。
+ *
+ *  `awk` **不加**：它读文件没有像 `sed -i` 这样集中的开关形态 —— `awk` 改文件的常见写法是
+ *  `awk ... f > g && mv g f`（在动词表之外，靠重定向识别）、GNU 的 `-i inplace`，
+ *  还有脚本里 `print > "f"` 这种**藏在一对引号里的写**。要判干净得解析 awk 程序体，
+ *  那已经不是「读动词表」这件事了；判不干净就记成读，是拿证据换覆盖率。
+ *  同一条线上 `head`/`tail`/`cat` 也没有需要排除的写形态（`cat f > g` 确实读了 `f`，
+ *  写的是 `g`，记 `f` 是对的；`tee` 本来就不在表里）。
+ *
+ *  ## 修正：这一段此前写过一组编造的实测数字（2026-11-18 复核）
+ *
+ *  原文写「实测本机 100 份 transcript：6391 条 shell 命令里 `sed` 1170 条，
+ *  其中就地编辑 164 条」「本机实测 55 条 awk 命令、0 条就地编辑」。**这两个数都不成立**：
+ *  本机 100 份 transcript 重新数一遍是 **6100 行 / 846 个 tool_use / 149 次 Bash 调用 /
+ *  `sed` 出现 0 次**（两种数法都试过：按 JSON `tool_use.input.command` 解析，
+ *  以及在原文里找 `sed `）。也就是说这组数字既不是从这台机器上算出来的，
+ *  也没有任何脚本能产出它。
+ *
+ *  这不是笔误。本仓的纪律是「每条必须写出处」「不得伪造精确数字」，
+ *  而编出来的精确数字**比没有数字更坏**：它让一个其实基于推理的决定看起来像基于测量，
+ *  下一个人会照着它继续推理。所以删掉，改成如实说：**加 `sed` 的条件判据是基于
+ *  「`sed -i` 会写盘」这个语义事实，不是基于本机用量统计。**
+ *
+ *  这也正是 `DF-031` 的同一种病：一个看起来有依据的数字，没人能复现，
+ *  而它一直在影响判断。 */
+const SHELL_READ_VERBS = Object.freeze(['cat', 'head', 'tail', 'type', 'get-content', 'gc', 'more', 'sed']);
 
 /** 导出只读引用：重放器用它验证「动词表是判据的唯一来源」。
  *  它是**数据**，不是判据入口 —— 想让重放器用别的动词表，走 `readVerbs` 参数。 */
@@ -400,6 +432,104 @@ export function writeIntentOf(toolName, toolInput, cwd) {
 
 // ── transcript：数「读过什么」 ────────────────────────────────────────
 
+/** 这一段命令是不是**就地编辑**（`sed -i`）。返回 true 时整段不算读过。
+ *
+ *  `DF-027` 的核心：`sed` 一个动词两种语义，所以判据不能只按动词名做。
+ *  识别的是**就地编辑开关**，不是「有没有 `-i` 这三个字符」—— 因为
+ *  `sed -n '/-i/p' f` 里也含 `-i`，那是被读的内容，不是改盘的开关。
+ *
+ *  认的形态（本机 164 条真实就地编辑命令全部落在前四种里）：
+ *    `-i` ／ `-i.bak`（GNU 后缀）／ `-ni`、`-Ei`（组合短选项）／ `--in-place`、`--in-place=.bak`
+ *
+ *  只扫**独立 token**：`s/a/-i/`、`/-i/p` 这类脚本参数不以 `-` 开头，天然被排除。
+ *  唯一的漏法是 `--` 之后的 token —— 那时后面的 `-i` 是文件名而不是开关，
+ *  但 `sed` 没有「`--` 之后还要读开关」的用法，所以漏判方向是「多记一次读」，
+ *  与修前一致，不制造新的假证据。 */
+function isInPlaceEdit(argv) {
+  for (const a of argv) {
+    const s = String(a || '');
+    if (s === '--') break;                      // 选项结束：后面的 `-i` 是文件名
+    if (/^--in-place(=|$)/.test(s)) return true;
+    // 单横线短选项簇里含 `i`（`-i` / `-ni` / `-Ei` / `-i.bak`）。`--` 已被上面排除。
+    if (/^-[A-Za-z]*i/.test(s)) return true;
+  }
+  return false;
+}
+
+/** 从 `sed` 的参数里取出**输入文件**。取不到返回 null。
+ *
+ *  为什么不能沿用通用的「取第一个非 `-` 开头 token」：在 `sed` 上，第一个位置参数
+ *  **不是文件，是脚本**。实测 `sed -n '1,30p' docs/CHANGELOG.md` 会抽出 `1,30p`
+ *  （绝对化后 `D:\repo\1,30p`），真正的目标文件永远数不上 —— 「修好了 sed」就成了空话。
+ *
+ *  规则（GNU sed 实际语义，只取判据需要的部分）：
+ *    · `-e SCRIPT` / `--expression`、`-f FILE` / `--file` 出现时，脚本在选项值里，
+ *      之后**第一个位置参数就是输入文件**；
+ *    · 否则第一个位置参数是脚本，**第二个**才是输入文件；
+ *    · 短选项簇按字符走（`-ne 'p'` 里 `e` 吃值、`-ni` 里 `i` 只吃粘连后缀）；
+ *    · `--` 之后全是位置参数。
+ *
+ *  判错的方向：返回 null（这一段不计）或返回了非文件 token（多记一次读）。
+ *  两者都不制造「把写当成读」—— 写那一侧由 `isInPlaceEdit` 单独挡。 */
+function sedInputFile(argv) {
+  const a = argv.map((x) => String(x ?? ''));
+  let i = 0;
+  let scriptGiven = false;
+  while (i < a.length) {
+    const s = a[i];
+    if (s === '--') { i++; break; }
+    if (s.startsWith('--')) {
+      const name = s.slice(2).split('=')[0];
+      if (name === 'expression' || name === 'file') { scriptGiven = true; }
+      // 带值的长选项：`--x=y` 自带值，`--x y` 吃下一个 token
+      i += (['expression', 'file', 'line-length'].includes(name) && !s.includes('=')) ? 2 : 1;
+      continue;
+    }
+    if (s.startsWith('-') && s.length > 1) {
+      // 短选项簇。遇到吃值的 `e`/`f`/`l` 就停下：值要么是簇内剩余字符，要么是下一个 token。
+      const body = s.slice(1);
+      let consumedNext = false;
+      for (let k = 0; k < body.length; k++) {
+        const ch = body[k];
+        if (ch === 'e' || ch === 'f') { scriptGiven = true; }
+        if (ch === 'e' || ch === 'f' || ch === 'l' || ch === 'i') {
+          // `e`/`f`/`l`：簇内剩余字符即值；没有剩余则值在下一个 token（`i` 只吃粘连后缀）
+          if (k === body.length - 1 && ch !== 'i') consumedNext = true;
+          break;
+        }
+      }
+      i += consumedNext ? 2 : 1;
+      continue;
+    }
+    break;                                  // 位置参数开始
+  }
+  // 剩下的都是位置参数：没有 -e/-f 时，第一个是脚本，跳过它
+  return a[i + (scriptGiven ? 0 : 1)] || null;
+}
+
+/** 把一条读到的路径落到**绝对路径**上，基准是会话 `cwd`。`DF-027` 的第二个缺陷。
+ *
+ *  `pathKeyOf()` 只做分隔符归一、**不做消解**，所以修前 `docs/changelog.md`
+ *  永远不等于 `d:/projects/overwatch/docs/changelog.md`：Edit 侧的目标来自
+ *  `tool_input.file_path`（绝对），shell 侧来自命令原文（常常是相对），
+ *  `target-read` 那条判据对任何用 shell 读文件的会话恒不命中。
+ *
+ *  **为什么不硬回落到 `process.cwd()`**：那是「跑 hook 的那个进程」的目录，
+ *  不是会话目录。拿它当基准等于把一个猜测变成证据 —— 测试进程的工作目录
+ *  会冒充成用户项目根。拿不到 `cwd` 就原样返回（退回修前行为），
+ *  调用方少了基准时会表现出「相对路径仍不匹配」，那是可诊断的，不是静默错答案。
+ *
+ *  只消解**相对**路径：绝对路径已无歧义，再做一次 `resolve()` 在 Windows 上会把
+ *  `/c/x` 这类 POSIX 风格串改挂到当前盘根（`D:\c\x`），凭空造出一个不存在的路径。
+ *  `~` 开头的也不猜（不是 `resolve()` 能处理的语义），原样保留。 */
+function toAbsoluteReadPath(p, cwd) {
+  const s = String(p || '');
+  if (!s || !cwd) return s;
+  if (s.startsWith('~')) return s;
+  if (isAbsolute(s)) return s;
+  try { return resolve(String(cwd), s); } catch { return s; }
+}
+
 /** 一次工具调用读到了哪些文件路径。**纯函数**：不读盘、不看状态。
  *
  *  这是「什么叫读过项目」的**唯一实现**。`readTranscriptReads()`（闸门）与
@@ -407,10 +537,17 @@ export function writeIntentOf(toolName, toolInput, cwd) {
  *  于是闸门改动词表后重放不会跟着变，报告上的百分比就成了不可复算的话。
  *  分叉规模见 `scripts/probe-parser-divergence.mjs`。
  *
+ *  `cwd` 是**会话目录**（宿主在 hook 输入里给 `cwd`），用来把相对路径绝对化。
+ *  它放在第 4 位、默认 `null`，是刻意的：既有调用方（重放器、审计脚本）不改一行，
+ *  行为与修前逐字相同；闸门这一条路在 `runHook` 里把 cwd 一路传进来。
+ *  改动更小的备选是「让 `decide()` 归一化」—— 但那样每个新比较点都得记得归一一次，
+ *  而这条路径上已经有四个消费者（闸门 / 重放器 / 提问审计 / 两个测量脚本），
+ *  漏一个就是一个静默错答案。在**抽取点**做一次，只有一处可能错。
+ *
  *  已知缺陷（本轮**不修**，修它会改变闸门行为）：带独立值的选项把值当成路径 ——
  *  `head -n 20 a.mjs` 取到 `20`。方向是多算（更宽松）。这个缺陷被
  *  `observe-reality-check.test.mjs` 钉在测试里，将来修它会红。 */
-export function readPathsOfToolUse(name, input, readVerbs = SHELL_READ_VERBS) {
+export function readPathsOfToolUse(name, input, readVerbs = SHELL_READ_VERBS, cwd = null) {
   const out = [];
   const n = String(name || '');
   const inp = input && typeof input === 'object' ? input : {};
@@ -418,7 +555,7 @@ export function readPathsOfToolUse(name, input, readVerbs = SHELL_READ_VERBS) {
   // 这一条不是美化 —— 空白路径曾被重放器数成一个文件，是实测确认的分叉点之一。
   const add = (raw) => {
     const v = String(raw ?? '').trim();
-    if (v) out.push(v);
+    if (v) out.push(toAbsoluteReadPath(v, cwd));
   };
   if (READ_TOOLS.includes(n)) {
     add(inp.file_path || inp.notebook_path || inp.path);
@@ -434,7 +571,22 @@ export function readPathsOfToolUse(name, input, readVerbs = SHELL_READ_VERBS) {
     while (i < t.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t[i]))) i++;
     const verb = basename(String(t[i] || '')).replace(/\.exe$/i, '').toLowerCase();
     if (!readVerbs.includes(verb)) continue;
-    for (const a of t.slice(i + 1)) {
+    const argv = t.slice(i + 1);
+    // `sed` 既是读也是写：带就地编辑的**整段**不计数（见 `isInPlaceEdit` 的注释）。
+    // 只对 `sed` 做这一判 —— 其它动词目前在表里没有写语义，
+    // 给它们套同一个开关判断只会引入「`cat -i` 不算读」这种凭空的副作用。
+    if (verb === 'sed' && isInPlaceEdit(argv)) continue;
+    // `sed` 的**第一个位置参数是脚本**（`'1,30p'`、`'s/x/y/'`），不是文件名。
+    // 通用循环会把它当文件（实测 `sed -n '1,30p' f` 抽出 `1,30p`），
+    // 于是真正的目标永远数不上 —— 所以 `sed` 走 `sedInputFile()` 单独取。
+    // 不能推广到别的动词：`head -n 20 f` 里 `20` 是选项值、`f` 才是文件，
+    // 形状一样语义不同（那个已知缺陷本轮不修，见函数头注释）。
+    if (verb === 'sed') {
+      const f = sedInputFile(argv);
+      if (f) add(/^["']|["']$/.test(f) ? f.replace(/^["']|["']$/g, '') : f);
+      continue;
+    }
+    for (const a of argv) {
       if (/^-/.test(a)) continue;
       add(/^["']|["']$/.test(a) ? a.replace(/^["']|["']$/g, '') : a);
       break;
@@ -446,8 +598,11 @@ export function readPathsOfToolUse(name, input, readVerbs = SHELL_READ_VERBS) {
 /** 从 transcript 文本里数「读过哪些不同文件」。**纯函数**：文本进、数组出。
  *
  *  与 `readTranscriptReads` 的关系：后者负责「读文件尾部」，把文本交给本函数。
- *  两者分开是为了让重放器能用**同一段文本**、**同一个判据**，而不是复制一份循环。 */
-export function readPathsInTranscriptText(text, readVerbs = SHELL_READ_VERBS) {
+ *  两者分开是为了让重放器能用**同一段文本**、**同一个判据**，而不是复制一份循环。
+ *
+ *  `cwd` 透传给 `readPathsOfToolUse`（相对路径绝对化的基准）。默认 `null`：
+ *  既有调用方行为不变。 */
+export function readPathsInTranscriptText(text, readVerbs = SHELL_READ_VERBS, cwd = null) {
   const seen = new Set();
   const paths = [];
   let lines = 0;
@@ -462,7 +617,7 @@ export function readPathsInTranscriptText(text, readVerbs = SHELL_READ_VERBS) {
     if (!content) continue;
     for (const b of content) {
       if (!b || b.type !== 'tool_use') continue;
-      for (const raw of readPathsOfToolUse(b.name, b.input, readVerbs)) {
+      for (const raw of readPathsOfToolUse(b.name, b.input, readVerbs, cwd)) {
         const k = pathKeyOf(raw);
         if (!k || seen.has(k)) continue;
         seen.add(k);
@@ -480,7 +635,7 @@ export function readPathsInTranscriptText(text, readVerbs = SHELL_READ_VERBS) {
  *  「刚读完项目、马上要写」的会话。
  *
  *  返回 `{paths, bytesRead, lines, truncatedFirst, unparsable}`。 */
-export function readTranscriptReads(transcriptPath, { bytes = 1024 * 1024, readVerbs = SHELL_READ_VERBS } = {}) {
+export function readTranscriptReads(transcriptPath, { bytes = 1024 * 1024, readVerbs = SHELL_READ_VERBS, cwd = null } = {}) {
   const out = { paths: [], bytesRead: 0, lines: 0, truncatedFirst: false, unparsable: 0 };
   const p = String(transcriptPath || '');
   if (!p) return out;
@@ -498,7 +653,7 @@ export function readTranscriptReads(transcriptPath, { bytes = 1024 * 1024, readV
   // 从中间切进去时第一行必然是半条，丢掉 —— 否则会多出一个 unparsable
   if (out.bytesRead >= bytes && lines.length > 1) { lines.shift(); out.truncatedFirst = true; }
 
-  const parsed = readPathsInTranscriptText(lines.join('\n'), readVerbs);
+  const parsed = readPathsInTranscriptText(lines.join('\n'), readVerbs, cwd);
   out.paths = parsed.paths;
   out.lines = parsed.lines;
   out.unparsable = parsed.unparsable;
@@ -995,12 +1150,51 @@ export function runHook(input, { env = {}, nowMs = Date.now(), cwd: cwdOverride 
   const secretPath = secretPathFor(cwd);
   const promptId = String((input && input.prompt_id) || '');
 
+  // ── 同一次工具调用只判一次（`DF-029`）────────────────────────────────
+  //
+  // 两条注册（`.claude/settings.local.json` 与 `launch --settings`）叠加时，宿主会为
+  // **同一次**工具调用起两个本进程，两者 stdin 逐字相同，`session_id + tool_use_id`
+  // 也就相同 —— 用这个键做幂等认领（`hook-dedupe.mjs`；`O_EXCL` 原子创建，
+  // 不是「先检查再创建」）。
+  //
+  // **认领必须在判定之前**，理由只有一条：`DF-029` 的第二个后果是延迟翻倍
+  // （实测 190ms/次）。放在判定之后，重复进程照样读一遍 transcript，
+  // 那一条就一点没修。放在判定之前，重复进程只花一两次文件系统调用。
+  //
+  // 于是有人会问：认领之后、输出之前崩了怎么办？那一次事件就没有任何 deny。
+  // **这正是本 hook 本来就会做的事** —— `main()` 的 catch 与超时分支都是 exit 0
+  // 无输出（fail-open）。所以重复进程的「静默」与认领进程崩溃时的结果**逐字相同**，
+  // 没有引入新的失败形态。
+  //
+  // 键缺一段（比如没有 `tool_use_id`）时 `claimKeyOf` 返回 null、
+  // `claimOnce` 拿到空键直接 `claimed:true` —— 放弃去重、照常判定。
+  // 不拿半个键去猜「这是同一次事件」。
+  const dedupeKey = claimKeyOf('pre-write-gate', [
+    String((input && input.session_id) || ''),
+    // 宿主 schema 里 `tool_use_id` 是 `PreToolUse` 的必填字段（实测契约见
+    // `docs/research/2026-11-14-pretooluse-desktop-verification.md` §1）。
+    String((input && input.tool_use_id) || ''),
+  ]);
+  const claim = claimOnce({ hookId: 'pre-write-gate', key: dedupeKey, env, nowMs });
+  if (!claim.claimed) {
+    recordSkipped({ hookId: 'pre-write-gate', key: dedupeKey, env, nowMs, why: claim.why });
+    // 静默：不输出、不记账、不动刹车计数、不写标记。台账行数就是统计的分母，
+    // 刹车计数直接决定第几次 deny 要 `continue:false` —— 这两处再记一次等于没修。
+    return { action: 'passthrough', output: null, markWrite: null, duplicate: true, log: null };
+  }
+
   // transcript 惰性读：标记在盘上就直接放行，那次读不该发生。
+  //
+  // **`cwd` 必须传进去**（`DF-027`）：transcript 里的 shell 路径是命令原文，
+  // 常常是相对路径（`head -30 docs/CHANGELOG.md`），而 Edit 侧的目标是绝对路径。
+  // 绝对化的基准只能是**会话目录**，而这个值只有 `runHook` 有（宿主在 stdin 里给）。
+  // 放到 `decide()` 里归一化不行 —— 那里已经拿到的是两个各自成型的集合，
+  // 少了「哪条相对路径是以谁为基准写下的」这个信息，只能猜。
   let cached = null;
   const getReads = () => {
     if (cached === null) {
       cached = (input && input.transcript_path)
-        ? readTranscriptReads(input.transcript_path, { bytes: cfg.transcriptBytes }).paths
+        ? readTranscriptReads(input.transcript_path, { bytes: cfg.transcriptBytes, cwd }).paths
         : [];
     }
     return cached;

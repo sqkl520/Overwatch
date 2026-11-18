@@ -26,7 +26,7 @@ import {
   isPaused, pausePathFor, userIntervenedSince, lastBlockAt,
   runHook, loadSubagentRecords, BLOCKING_STATUS, MAX_BLOCKS, ESCALATE_AT, RESET_AFTER_MS,
   samplePathFor, sampleLogEnabled, toolSummaryOf, buildSample, appendSample,
-  rawFamilyHits, SAMPLE_TEXT_LIMIT,
+  rawFamilyHits, SAMPLE_TEXT_LIMIT, stopTurnKeyOf,
 } from '../scripts/stop-verify-hook.mjs';
 
 import {
@@ -71,7 +71,7 @@ const inputOf = (extra = {}) => ({
   ...extra,
 });
 
-/** 隔离用的 env：**三个落盘路径一起指到临时目录**。
+/** 隔离用的 env：**四个落盘路径一起指到临时目录**。
  *
  *  为什么不各条手写：`appendLog` / `bumpBlockCount` / `appendSample` 各认一个变量，
  *  漏掉任意一个，那条用例就会往**生产台账**写一行。实测这么漏过一次
@@ -80,12 +80,17 @@ const inputOf = (extra = {}) => ({
  *
  *  逐条补齐能修好当下，但下一个写用例的人还会漏。所以做成**只能整体给**的函数：
  *  想隔离就一次给全，想不隔离就得显式写 `{}` —— 让「漏一个」在代码里无从发生。
- *  `OVERWATCH_STATE_DIR` 也一起给：它是本仓的统一约定，两个 hook 都认它。 */
+ *  `OVERWATCH_STATE_DIR` 也一起给：它是本仓的统一约定，两个 hook 都认它。
+ *
+ *  **第四个是去重目录**（`DF-029` 的修复引入的）。漏了它的后果与上面同类，而且
+ *  更隐蔽：认领文件会落到 `tasks/runs/hook-dedupe/`（污染仓库），同时同一份输入
+ *  被跑第二次的用例会拿到 `null` / `passthrough`（假红）。实测就是这么红的。 */
 const envIn = (dir, extra = {}) => ({
   OVERWATCH_STATE_DIR: dir,
   OVERWATCH_STOP_VERIFY_LOG: join(dir, 'log.jsonl'),
   OVERWATCH_STOP_VERIFY_STATE: join(dir, 'state.json'),
   OVERWATCH_STOP_VERIFY_SAMPLES: join(dir, 'samples.jsonl'),
+  OVERWATCH_HOOK_DEDUPE_DIR: join(dir, 'dedupe'),
   ...extra,
 });
 
@@ -946,5 +951,110 @@ test('L2 接线：runHook 真的在拦截前查了「用户是否已发话」（
     assert.equal(out, null, '用户在上次拦截之后发话了，这一回合必须放行');
     const rows = readFileSync(env.OVERWATCH_STOP_VERIFY_LOG, 'utf8').trim().split('\n').map(JSON.parse);
     assert.equal(rows[rows.length - 1].outcome, 'allowed-user-intervened');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── 15. `DF-029`：同一个回合结束点被触发两次时，只判一次、只记一行 ────────
+//
+// 场景：`.claude/settings.local.json` 注册了本 hook，`overwatch launch` 又用
+// `--settings` 注入同名一条，宿主的实测行为是**叠加** —— 同一次 Stop 起两个进程。
+//
+// 实测（修前）：台账 2 行，`state.json` 里 `count`/`total` **各跳 2**，
+// 于是 MAX_BLOCKS=6 的预算实际只够 3 个回合。这是本条最贵的一处。
+
+test('DF-029：同一回合被触发两次 → 台账 1 行、blockCount/total 只跳 1', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-dedupe-stop-'));
+  try {
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY: 'block' });
+    const input = inputOf({ cwd: dir, prompt_id: 'p-1' });
+
+    const first = runHook({ input, env, sampleLog: false });
+    assert.ok(first && first.decision === 'block', '第一次必须真的拦');
+
+    const second = runHook({ input, env, sampleLog: false });
+    assert.equal(second, null, '第二次必须静默放行（重复触发不该产出第二条 block）');
+
+    // 台账 1 行（修复前 2 行）
+    const rows = readFileSync(env.OVERWATCH_STOP_VERIFY_LOG, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 1, '台账行数就是统计的分母');
+
+    // state.json 只跳 1（修复前 count=2 / total=2）
+    const state = JSON.parse(readFileSync(env.OVERWATCH_STOP_VERIFY_STATE, 'utf8'));
+    assert.equal(state['sess-test'].count, 1, '连续计数不许双跳');
+    assert.equal(state['sess-test'].total, 1, '累计计数不许双跳 —— 它是预算的唯一依据');
+
+    // 跳过记录单独一个文件，不进台账
+    const skipped = join(dir, 'dedupe', 'stop-verify-hook', 'skipped.jsonl');
+    assert.equal(existsSync(skipped), true, '跳过必须留痕');
+    assert.equal(readFileSync(skipped, 'utf8').trim().split('\n').length, 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-029 负向：真序列「拦一次 → 模型补证据 → 再 Stop」不许被去重压掉', () => {
+  // 这是本修复最容易做坏的地方：过度去重会把「hook 拦下后宿主继续一轮」的第二次
+  // Stop 当成重复，于是**第二次判定整个消失** —— 模型说「我补了」也没人核。
+  // 宿主把 `stop_hook_active` 从 false 翻成 true，键里带了它，所以两次必然不同。
+  const dir = mkdtempSync(join(tmpdir(), 'ow-dedupe-stop2-'));
+  try {
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY: 'block' });
+
+    const k1 = stopTurnKeyOf(inputOf({ cwd: dir, prompt_id: 'p-1', stop_hook_active: false }));
+    const k2 = stopTurnKeyOf(inputOf({ cwd: dir, prompt_id: 'p-1', stop_hook_active: true }));
+    assert.notEqual(k1, k2, 'stop_hook_active 变了，键必须跟着变');
+
+    // 回复改了但 prompt 相同、stop_hook_active 相同：键也必须变
+    const k3 = stopTurnKeyOf(inputOf({ cwd: dir, prompt_id: 'p-1', stop_hook_active: true, last_assistant_message: '换了句话' }));
+    assert.notEqual(k2, k3, '回复变了，键必须跟着变');
+
+    // 端到端：两次都真的判定（第 1 次拦、第 2 次因 active 放行），台账 2 行
+    const a = runHook({ input: inputOf({ cwd: dir, prompt_id: 'p-1', stop_hook_active: false }), env, sampleLog: false });
+    const b = runHook({ input: inputOf({ cwd: dir, prompt_id: 'p-1', stop_hook_active: true }), env, sampleLog: false });
+    assert.ok(a && a.decision === 'block');
+    assert.equal(b, null, 'stop_hook_active 时本来就放行（decide 的第一条判据）');
+    const rows = readFileSync(env.OVERWATCH_STOP_VERIFY_LOG, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 2, '两次**不同的** Stop 必须两行台账');
+    assert.equal(rows[1].allowReason, 'stop-hook-active', '第二次的理由要如实记成 active，不是 duplicate');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-029：不同会话的同一回合文本互不影响（session_id 在键里）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-dedupe-stop3-'));
+  try {
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY: 'block' });
+    const t = '全部测试通过，336/336，可以结束了。';
+    const a = runHook({ input: inputOf({ cwd: dir, session_id: 'sid-A', prompt_id: 'p', last_assistant_message: t }), env, sampleLog: false });
+    const b = runHook({ input: inputOf({ cwd: dir, session_id: 'sid-B', prompt_id: 'p', last_assistant_message: t }), env, sampleLog: false });
+    assert.ok(a && a.decision === 'block');
+    assert.ok(b && b.decision === 'block', '不同会话的同形回合不许互相去重');
+    assert.equal(readFileSync(env.OVERWATCH_STOP_VERIFY_LOG, 'utf8').trim().split('\n').length, 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-029：放行样本同样不重复记（样本文件也是「一次事件一行」）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-dedupe-stop4-'));
+  try {
+    const env = envIn(dir);
+    const input = inputOf({ cwd: dir, prompt_id: 'p-sample', last_assistant_message: '我准备开始了。' });
+    runHook({ input, env });
+    runHook({ input, env });
+    const rows = readFileSync(env.OVERWATCH_STOP_VERIFY_SAMPLES, 'utf8').trim().split('\n');
+    assert.equal(rows.length, 1, '同一回合两次触发只留一条样本 —— 否则样本分布也翻倍');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-029：认领写不进去时照常判定并记账（失效方向是「多记」不是「漏判」）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-dedupe-stop5-'));
+  try {
+    // 让去重目录的父路径是个文件 → mkdir 必失败
+    const blocker = join(dir, 'blocker');
+    writeFileSync(blocker, 'x');
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY: 'block', OVERWATCH_HOOK_DEDUPE_DIR: join(blocker, 'sub') });
+    const input = inputOf({ cwd: dir, prompt_id: 'p-fail' });
+    const a = runHook({ input, env, sampleLog: false });
+    const b = runHook({ input, env, sampleLog: false });
+    assert.ok(a && a.decision === 'block', '去重不可用时闸门必须照常拦');
+    assert.ok(b && b.decision === 'block', '也不许把它当成重复');
+    assert.equal(readFileSync(env.OVERWATCH_STOP_VERIFY_LOG, 'utf8').trim().split('\n').length, 2,
+      '失效方向是「多记一次」，不是「漏判一次」');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

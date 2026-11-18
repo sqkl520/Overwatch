@@ -27,6 +27,7 @@ import {
   observationStats, formatStats, readObservationRows, NOTIFY_KINDS, unclassifiableMinIdleSec, tooRecentToNotify,
   traceability, readJobStates, probeWaiting, readLiveSessionStates, buildInbox, formatInbox, healthCheck, formatHealth, HEALTH_PERIODS,
   claimOwnership, readOwner, ownerPath, askedCandidates, witnessPath, writeWitness, readWitness, checkStateIntegrity, HOST_FACT_STATES,
+  procWitnessPath, writeProcWitness, readProcWitness, judgeProcess, PROC_TOLERANCE_MS,
   requestIdTime, lastTimelineStateTime, resolveJobEventTime, BLOCKED_MAX_AGE,
   readLogHealth, logHealthPath, LOG_HEALTH_FILE,
 } from './watch.mjs';
@@ -2897,7 +2898,8 @@ test('缺陷3：pruneNotified 按 lastSeenAt 计时，老但仍在被看到的�
 test('空收件箱 + 守护进程没在跑 → 文案要说明「这个空不可信」并给替代命令', () => {
   const src = readFileSync(join(import.meta.dirname, 'watch.mjs'), 'utf8');
   // 判据必须复用 healthCheck，不许另写一份「守护进程在不在工作」
-  assert.match(src, /healthCheck\(state, \{ nowMs: Date\.now\(\), logHealth: readLogHealth\(dir\) \}\)/,
+  // （DF-028 之后这次调用还多了 procWitness —— 但那是同一个判据的输入，不是第二份判据）
+  assert.match(src, /healthCheck\(state, \{ nowMs: Date\.now\(\), logHealth: readLogHealth\(dir\), procWitness: readProcWitness\(dir\) \}\)/,
     '「在不在工作」只能有一个答案来源 —— 复用 --health 的判据');
   assert.match(src, /这个「空」不可信/, '必须直说这个空不可信，而不是并列提一句「也可能是」');
   assert.match(src, /node scripts\/scan-sessions\.mjs --days 1/,
@@ -2912,4 +2914,171 @@ test('空收件箱但守护进程没跑 → 退出码不为 0（调用方必须�
     '必须把 exitCode 传出去；写死 exit(0) 会覆盖上面的判断');
   assert.doesNotMatch(src, /空收件箱不是错误[^\n]*\n\s*process\.exit\(0\)/,
     '不能再用写死的 exit(0)');
+});
+
+// ── DF-028：进程死了 vs 进程卡住了（2026-11-18）────────────────────────
+//
+// 背景：守护进程死了 4 天没人知道，而 `--health` 只能说「未在运行」。
+// 「未在运行」把两件处置完全相反的事说成同一句：
+//   进程死了（被外部杀掉 / 重启后 Startup 没生效）→ 该重启
+//   进程还在但卡住了（某个 tick 挂死）            → 重启前先看日志，重启会丢掉现场
+//
+// **判据是这个任务的核心难点，不是附属细节。** 只用 `process.kill(pid, 0)` 判存活
+// 在 Windows 上会假阳性：PID 会被复用，一个死掉的 PID 可能已经被别的进程占用。
+// 所以见证文件里除了 pid 还要写 `startedAt`（进程启动时刻），health 时双向核对。
+//
+// 判据与它的误判边界写在 `judgeProcess()` 的注释里；下面这组用例逐条钉住。
+
+test('DF-028 负向①：PID 不存在 → 必须报「已退出」，而不是「卡住」', () => {
+  const now = Date.now();
+  // 999999 在 Windows 上不存在（实测 process.kill(999999, 0) 抛 ESRCH）
+  const v = judgeProcess({ pid: 999999, startedAt: new Date(now - 3 * 86400e3).toISOString() },
+    { nowMs: now });
+  assert.equal(v.alive, false);
+  assert.equal(v.verdict, 'gone', '「不在」与「卡住」必须分开报');
+  assert.match(v.reason, /已退出/);
+  assert.match(v.reason, new RegExp('999999'));
+});
+
+test('DF-028 负向②：PID 存在（用自己的 PID 模拟）→ 必须报「还在但卡住了」', () => {
+  const now = Date.now();
+  // startedAt 取当前进程推导出来的启动时刻，与真实值同源 → 应判 alive
+  const startedAt = new Date(now - process.uptime() * 1000).toISOString();
+  const v = judgeProcess({ pid: process.pid, startedAt }, { nowMs: now });
+  assert.equal(v.alive, true, '自己一定活着');
+  assert.equal(v.verdict, 'stuck', '活着但心跳停了 = 卡住，不是退出');
+  assert.match(v.reason, /卡住/);
+  assert.match(v.reason, /先看日志/, '必须提示重启前先看现场');
+});
+
+test('DF-028 负向③：PID 被复用（同 PID、启动时间对不上）→ 不得判成「还活着」', () => {
+  // 这是 PID 复用假阳性的核心用例。真实现场形如：
+  //   守护进程 11-14 死掉，PID 31396 被别的进程拿走，health 却说「进程还在」。
+  const now = Date.now();
+  const witnessStartedAt = new Date(now - 4 * 86400e3).toISOString();  // 4 天前启动
+  // pid 用真实存在的 pid（自己），但启动时间写 4 天前 —— 自己显然不是 4 天前启动的
+  const v = judgeProcess({ pid: process.pid, startedAt: witnessStartedAt }, { nowMs: now });
+  assert.notEqual(v.alive, true, '启动时间对不上就不能判「活着」—— 那正是 PID 复用的形态');
+  assert.equal(v.verdict, 'reused', '必须单独报「PID 被别的进程占用了」');
+  assert.match(v.reason, /复用|被别的进程/);
+});
+
+test('DF-028：没有进程见证（老版本写的 owner.json）→ unverified，不得编造死活', () => {
+  const v = judgeProcess(null, { nowMs: Date.now() });
+  assert.equal(v.verdict, 'unverified');
+  assert.equal(v.alive, null, 'null 而不是 false —— 「不知道」不等于「死了」');
+});
+
+test('DF-028：心跳正常时不误报 —— 进程层只在心跳停了的时候才说话', () => {
+  const now = Date.now();
+  const fresh = {
+    lastJobsScanAt: new Date(now - 30_000).toISOString(),
+    lastProbeAt: new Date(now - 60_000).toISOString(),
+  };
+  // 故意给一个必然判「gone」的见证：心跳健康时它不该出现在结论里
+  const r = healthCheck(fresh, {
+    nowMs: now,
+    procWitness: { pid: 999999, startedAt: new Date(now - 86400e3).toISOString() },
+  });
+  assert.equal(r.healthy, true, '心跳正常就是健康，进程见证不得把它拉红');
+  assert.ok(!r.reasons.some((x) => /已退出|卡住/.test(x)), '心跳正常时不许报进程死活');
+  assert.equal(r.process, undefined, '健康时不产出 process 结论，免得调用方误读');
+});
+
+test('DF-028：心跳停了 + 进程已退出 → 结论里说「该重启」', () => {
+  const now = Date.now();
+  const stale = new Date(now - 4 * 86400e3).toISOString();
+  const r = healthCheck({ lastJobsScanAt: stale, lastProbeAt: stale }, {
+    nowMs: now,
+    procWitness: { pid: 999999, startedAt: stale },
+  });
+  assert.equal(r.healthy, false);
+  assert.equal(r.process.verdict, 'gone');
+  const out = formatHealth(r);
+  assert.match(out, /已退出/, '输出必须直说进程不在了');
+  assert.match(out, /重启/, '进程不在了处置是重启');
+});
+
+test('DF-028：心跳停了 + 进程还在 → 结论里说「卡住了，先看日志」', () => {
+  const now = Date.now();
+  const startedAt = new Date(now - process.uptime() * 1000).toISOString();
+  const stale = new Date(now - 4 * 86400e3).toISOString();
+  const r = healthCheck({ lastJobsScanAt: stale, lastProbeAt: stale }, {
+    nowMs: now,
+    procWitness: { pid: process.pid, startedAt },
+  });
+  assert.equal(r.healthy, false);
+  assert.equal(r.process.verdict, 'stuck');
+  const out = formatHealth(r);
+  assert.match(out, /卡住/);
+  assert.match(out, /先看日志/, '卡住的处置是先看现场，不能直接重启');
+});
+
+test('DF-028：proc 层不得印出 NaN —— 它没有周期，套通用格式会印「上限 NaN 天」', () => {
+  const now = Date.now();
+  const stale = new Date(now - 4 * 86400e3).toISOString();
+  const out = formatHealth(healthCheck({ lastJobsScanAt: stale, lastProbeAt: stale }, {
+    nowMs: now,
+    procWitness: { pid: 999999, startedAt: stale },
+  }));
+  assert.doesNotMatch(out, /NaN/, 'proc 层没有 interval / ageMs，不能被通用格式渲染');
+  assert.doesNotMatch(out, /undefined/, '缺字段必须以没有那一行为准，不许印 undefined');
+  // 而且 proc 只应出现一次（通用循环里应被跳过）
+  assert.equal((out.match(/proc/g) || []).length, 1, 'proc 层只能渲染一次');
+});
+
+test('DF-028 写见证：claimOwnership 会带上 pid 与 startedAt，且跨调用稳定', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    const a = claimOwnership(dir, '/repo/a', { nowMs: now });
+    assert.equal(a.owner.pid, process.pid, '见证必须记 pid');
+    assert.ok(a.owner.startedAt, '见证必须记进程启动时刻');
+    // 第二个 tick 不该改 startedAt —— 它描述的是**这个进程**，不是每次 tick
+    const b = claimOwnership(dir, '/repo/a', { nowMs: now + 15_000 });
+    assert.equal(b.owner.startedAt, a.owner.startedAt, 'startedAt 是进程属性，不随 tick 变');
+    assert.equal(b.owner.pid, a.owner.pid);
+    // 且它必须能被 judgeProcess 直接判成 alive
+    assert.equal(judgeProcess(readOwner(dir), { nowMs: now }).alive, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-028 写节流：同一进程第二次 claim 不重写 owner.json（每 tick 写盘是纯浪费）', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    claimOwnership(dir, '/repo/a', { nowMs: now });
+    const mtime1 = statSync(ownerPath(dir)).mtimeMs;
+    // 等一小会儿让 mtime 有机会变化（Windows 文件时间精度约 1ms，但不可依赖）
+    const t = Date.now(); while (Date.now() - t < 30) { /* spin */ }
+    const r = claimOwnership(dir, '/repo/a', { nowMs: now + 15_000 });
+    const mtime2 = statSync(ownerPath(dir)).mtimeMs;
+    assert.equal(mtime2, mtime1, '同一进程重复声明不该写盘 —— 15 秒一次的 IO 没有新信息');
+    assert.equal(r.written, false, '要能告诉调用方这次没写');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-028 写节流不得吞掉冲突：换了仓库必须照样落盘', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    claimOwnership(dir, '/repo/a', { nowMs: now });
+    const r = claimOwnership(dir, '/repo/b', { nowMs: now + 1000 });
+    assert.equal(r.conflict, true, '冲突判定不受节流影响');
+    assert.equal(readOwner(dir).repo, '/repo/b', '冲突时仍要写盘 —— 覆盖是这次的结论');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-028 进程见证独立于 owner.json：owner.json 是元数据，被别的仓库覆盖后仍能判死活', () => {
+  const dir = tmp();
+  try {
+    const now = Date.now();
+    writeProcWitness(dir, { pid: process.pid, nowMs: now });
+    const w = readProcWitness(dir);
+    assert.equal(w.pid, process.pid);
+    // owner.json 被别人改写成别的仓库（同一台机器上的第二份克隆）
+    claimOwnership(dir, '/other/repo', { nowMs: now });
+    assert.equal(readProcWitness(dir).pid, process.pid, '进程见证不能被归属信息覆盖');
+    assert.equal(judgeProcess(readProcWitness(dir), { nowMs: now }).alive, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

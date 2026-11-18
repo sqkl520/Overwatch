@@ -39,9 +39,10 @@
  * 退出码：0 = 正常；2 = 找不到 transcript 根。
  */
 
-import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { readdirSync, readFileSync, statSync, existsSync, realpathSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 
 /** 沙箱目录名特征。**只匹配目录名，不看内容** —— 依据是这些目录全由测试脚本
  *  在系统临时目录下创建，名字里带 Temp 或本仓测试前缀。 */
@@ -115,61 +116,78 @@ function summarize(list) {
   };
 }
 
-const argv = process.argv.slice(2);
-const opt = parseArgs(argv);
+/** CLI 入口。**必须走入口守卫**（见文件末）：本脚本此前在模块顶层执行并打印，
+ * 而 check-structure.mjs 的「导出是否登记」那一项会 import 每个脚本 ——
+ * 于是每次跑硬门都真的把这份测量跑一遍，并把中文打到那个子进程的 stdout 上，
+ * 导致它的 JSON.parse 失败后**静默放弃整项检查**（与 DF-031 同一种失效：
+ * 静默跳过与通过的表现一模一样）。收进函数 + 入口守卫之后，import 不再有行为。 */
+export function main(argv = process.argv.slice(2), log = console.log) {
+  const opt = parseArgs(argv);
 
-if (opt.help) {
-  console.log('用法：node scripts/measure-checklist-coverage.mjs [--days 7] [--json] [--root <dir>]');
-  console.log('只读。报「派发率」与「清单率」，并分开报含沙箱 / 不含沙箱两个口径。');
-  process.exit(0);
+  if (opt.help) {
+    console.log('用法：node scripts/measure-checklist-coverage.mjs [--days 7] [--json] [--root <dir>]');
+    console.log('只读。报「派发率」与「清单率」，并分开报含沙箱 / 不含沙箱两个口径。');
+    return 0;
+  }
+
+  const root = opt.root || defaultRoot();
+  if (!existsSync(root)) {
+    console.error(`找不到 transcript 根：${root}`);
+    return 2;
+  }
+
+  const cutoff = Date.now() - opt.days * 864e5;
+  const all = collect(root, cutoff);
+  if (!all) {
+    console.error(`目录不可读：${root}`);
+    return 2;
+  }
+
+  const real = all.filter((p) => !p.sandbox);
+  const sandbox = all.filter((p) => p.sandbox);
+
+  const result = {
+    root,
+    days: opt.days,
+    all: summarize(all),
+    real: summarize(real),
+    sandbox: summarize(sandbox),
+    topReal: real.sort((a, b) => b.n - a.n).slice(0, 8)
+      .map((p) => ({ project: p.project, transcripts: p.n, withAgentCall: p.withAgent, withTaskGraph: p.withGraph })),
+  };
+
+  if (opt.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return 0;
+  }
+
+  const row = (label, s) => `  ${label.padEnd(12)} ${String(s.transcripts).padStart(5)} 份`
+    + ` | 派发 ${String(s.withAgentCall).padStart(4)} (${s.agentRatePct ?? '-'}%)`
+    + ` | 清单 ${String(s.withTaskGraph).padStart(3)} (${s.graphRatePct ?? '-'}%)`;
+
+  console.log(`清单机制覆盖率 · 窗口 ${opt.days} 天 · 根 ${root}`);
+  console.log('');
+  console.log('口径（两个都报，差距本身就是结论）：');
+  console.log(row('含沙箱', result.all));
+  console.log(row('不含沙箱', result.real));
+  console.log(row('  其中沙箱', result.sandbox));
+  console.log('');
+  console.log('怎么读这组数：');
+  console.log('  · 派发率高、清单率低 → 大家在派发，但不走清单流程。清单机制做得再严也只覆盖那一小撮。');
+  console.log('  · 两个都低           → 这个机制在解决一个没人遇到的问题。');
+  console.log('  · 两个都高           → 加闸是有意义的，覆盖面撑得住成本。');
+  console.log('');
+  console.log('沙箱目录由本仓库自己的测试脚本创建，里面有大量 Agent 调用。');
+  console.log('不排除会把派发率算成 90%+ —— 那是工具在数自己，不是用户行为。');
+
+  return 0;
 }
 
-const root = opt.root || defaultRoot();
-if (!existsSync(root)) {
-  console.error(`找不到 transcript 根：${root}`);
-  process.exit(2);
-}
-
-const cutoff = Date.now() - opt.days * 864e5;
-const all = collect(root, cutoff);
-if (!all) {
-  console.error(`目录不可读：${root}`);
-  process.exit(2);
-}
-
-const real = all.filter((p) => !p.sandbox);
-const sandbox = all.filter((p) => p.sandbox);
-
-const result = {
-  root,
-  days: opt.days,
-  all: summarize(all),
-  real: summarize(real),
-  sandbox: summarize(sandbox),
-  topReal: real.sort((a, b) => b.n - a.n).slice(0, 8)
-    .map((p) => ({ project: p.project, transcripts: p.n, withAgentCall: p.withAgent, withTaskGraph: p.withGraph })),
+/** 「我是不是被直接执行」——比的是**真实路径**（理由见 stop-verify-hook.mjs 的同名逻辑）：
+ *  resolve() 不解析符号链接，经 npm link / pnpm 执行时两边必然不等，程序会静默 exit 0。 */
+const realOrResolve = (p) => {
+  try { return realpathSync(p); } catch { return resolve(p); }
 };
-
-if (opt.json) {
-  console.log(JSON.stringify(result, null, 2));
-  process.exit(0);
+if (process.argv[1] && realOrResolve(process.argv[1]) === realOrResolve(fileURLToPath(import.meta.url))) {
+  process.exit(main());
 }
-
-const row = (label, s) => `  ${label.padEnd(12)} ${String(s.transcripts).padStart(5)} 份`
-  + ` | 派发 ${String(s.withAgentCall).padStart(4)} (${s.agentRatePct ?? '-'}%)`
-  + ` | 清单 ${String(s.withTaskGraph).padStart(3)} (${s.graphRatePct ?? '-'}%)`;
-
-console.log(`清单机制覆盖率 · 窗口 ${opt.days} 天 · 根 ${root}`);
-console.log('');
-console.log('口径（两个都报，差距本身就是结论）：');
-console.log(row('含沙箱', result.all));
-console.log(row('不含沙箱', result.real));
-console.log(row('  其中沙箱', result.sandbox));
-console.log('');
-console.log('怎么读这组数：');
-console.log('  · 派发率高、清单率低 → 大家在派发，但不走清单流程。清单机制做得再严也只覆盖那一小撮。');
-console.log('  · 两个都低           → 这个机制在解决一个没人遇到的问题。');
-console.log('  · 两个都高           → 加闸是有意义的，覆盖面撑得住成本。');
-console.log('');
-console.log('沙箱目录由本仓库自己的测试脚本创建，里面有大量 Agent 调用。');
-console.log('不排除会把派发率算成 90%+ —— 那是工具在数自己，不是用户行为。');

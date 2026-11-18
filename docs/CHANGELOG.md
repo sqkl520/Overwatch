@@ -21,6 +21,138 @@
 
 ---
 
+## [Unreleased] - 2026-11-18（让 `--health` 分得出「进程死了」和「进程卡住了」）
+
+### Added
+
+- **`DF-028`：进程见证 `proc.json`，让守护进程的两种失效可区分。**
+  修前 `--health` 只说「没有在工作」，而这句话把处置完全相反的两件事说成同一句：
+  进程**死了**该重启；进程**还在但卡住了**得先看日志（重启会丢掉现场）。
+
+  新文件 `<stateDir>/proc.json` 记 `{ version, pid, startedAt, writtenAt }`。
+  `--health` 在心跳已停时读它，结论分四档：
+
+  | verdict | 含义 | 处置 |
+  |---|---|---|
+  | `gone` | `process.kill(pid, 0)` 抛 `ESRCH` | 重启 |
+  | `reused` | PID 存在但启动时刻对不上 → 被别的进程占了 | 重启 |
+  | `stuck` | PID 存在且启动时刻吻合 | 先看日志再重启 |
+  | `unverified` | 没有 `proc.json`（老版本写的目录） | 判不了，别猜 |
+
+  **判据不能用 `kill(pid, 0)` 单独下结论** —— PID 会被复用。所以见证里多记一个
+  `startedAt`，health 时拿 `Get-Process .StartTime`（Windows）/ `ps -o etimes=`
+  （POSIX）反查当前持有者的启动时刻，差超过 `PROC_TOLERANCE_MS`（2 秒）即判 `reused`。
+  **已知误判边界**：新持有者与原进程启动时刻相差不到 2 秒时会判成 `stuck`。
+
+  Windows 上 `process.kill(pid, 0)` 的实测行为（Node 26 / Windows 10 19045，2026-11-18）：
+
+  ```
+  kill(自己的 pid, 0)          → 成功
+  kill(999999, 0)              → 抛 ESRCH   （不存在）
+  kill(4, 0)                   → 抛 EPERM   （存在但无权限，System 进程）
+  kill(刚退出的子进程, 0)       → 抛 ESRCH
+  kill(0, 0)                   → 成功       （POSIX「当前进程组」，不是「不存在」）
+  kill(null|1.5, 0)            → 抛 ERR_INVALID_ARG_TYPE
+  ```
+
+  即 **`ESRCH` = 不存在，`EPERM` = 存在但没权限**；把 `EPERM` 当「不存在」会把活进程报成已退出。
+
+- **写频率（约束 2）**：`proc.json` 每进程写一次；`owner.json` 从「每 tick 写」改成
+  **同一 `(repo, pid, startedAt)` 第二次起不写**（`claimOwnership` 返回值新增 `written`）。
+  冲突时仍照写 —— 那是本次调用的结论，不能被节流吞掉。
+  顺带修掉一个测量陷阱：`owner.json` 的 `lastSeenAt` 原本会被**任何**调用者（包括人手敲的
+  `install-watcher status`）刷新，`DF-028` 现场正是靠它误判成「18:02 刚跑过」的假活。
+  节流后它只描述「哪个进程什么时候接手」。
+
+- **不引入新依赖（约束 3）**：存活判定只用 `process.kill(pid, 0)`；启动时刻在 Windows /
+  POSIX 上分别调 `powershell` / `ps`（都是系统自带）。且**只在心跳已停时才走这条路**
+  （实测 355–390ms），正常 `--health` 零成本。
+
+### 变更的判据入口
+
+- `healthCheck(state, { …, procWitness, judge })` 新增进程层，返回 `process` 字段。
+  **心跳正常时不产出 `process`** —— 一个永远存在、永远说 alive 的字段迟早会被当成
+  「进程检查通过」。`judge` 参数只为了可测。
+- `formatHealth` 的处置建议按 verdict 分开写，替换掉原来那句
+  「这**不代表进程死了**。进程可能还活着但卡住了」（它对「进程已经不在了」的现场什么也没说）。
+- 新导出：`procWitnessPath` / `writeProcWitness` / `readProcWitness` / `processStartedAt` /
+  `judgeProcess` / `PROC_TOLERANCE_MS`。前四个已登记进结构门的 PROBE_ARGS；
+  `PROC_TOLERANCE_MS` 是数字，不是函数。
+
+### 验证
+
+负向四条，每条都是「把 bug 放回去 → 变红」：
+
+```
+去掉启动时刻核对（退回只看 kill(pid,0)）  → ✖ 负向③ PID 复用判成还行  fail 1
+把任何 kill 异常都当「存在」            → ✖ 负向① + 场景「该重启」    fail 2
+健康时也产出进程层                      → ✖ 负向① + 「不误报」+ …    fail 3
+去掉 owner.json 写节流                  → ✖ 三条（含写节流）          fail 3
+让 proc 层走通用渲染格式                → ✖ 「不得印 NaN」            fail 1
+```
+
+端到端（真 `--health`，五个现场）：心跳正常不报进程层；PID 不存在 → 「进程已退出（PID 999999 已不在）」+ 重启；
+PID 启动时刻对不上 → 「已被别的进程复用」+ 重启；PID 吻合 → 「它卡住了，重启前先看日志」；
+无 `proc.json` → 「判不了」。
+
+---
+
+## [Unreleased] - 2026-11-18（两条闸改成幂等的；顺手让一道从未跑过的门禁开口说话）
+
+### Fixed
+
+- **`DF-029`：`overwatch launch` 起的会话把同一条判据跑两次**。
+  项目 `.claude/settings.local.json` 已注册两条 hook，`launch --settings` 又注入同名两条，
+  宿主的行为是**叠加**。修前实测（直接调 `runHook` 两次，同一 `tool_use_id`）：
+
+  ```
+  PreToolUse  台账 2 行 · decision ["deny","deny"] · 刹车计数 n:2（1 次真实拒绝记成 2 次）
+  Stop        台账 2 行 · state.json {"count":2,"total":2}
+  ```
+
+  `DF-029` 最初把第三条后果写成「没有验证」，这次测出来了：**`count` / `total` 各跳 2**，
+  而 `MAX_BLOCKS = 6` 的预算按 `total` 算 —— **6 次预算实际只够 3 个回合**。
+
+  修法新增 `scripts/hook-dedupe.mjs`：两条 hook 在判定前各做一次**幂等认领**。
+  认领用 `openSync(path, 'wx')`（`O_CREAT|O_EXCL`）原子创建，**不是先读后写**；
+  实测 6 个并发进程抢同一个键恰好 1 个成功。键：`PreToolUse` 用
+  `session_id + tool_use_id`；`Stop` 用 `session_id + prompt_id + stop_hook_active
+  + sha256(last_assistant_message)`（空文本时再掺 transcript 字节数）。
+
+  **为什么 Stop 不能只用 `prompt_id`**：读宿主 2.1.308 的 schema，`prompt_id` 是
+  **回合**级的（「until the next prompt」），只用它会把「hook 拦一次 → 模型补证据 →
+  再 Stop」也压成一次，第二次判定整个消失 —— 比原来的重复更坏。
+  残留缺陷如实写在文件头：空文本 + 同 prompt + 同 transcript 字节数才会误合并，
+  后果是少一行观测记录，不是判断错。
+  **没有采用「launch 不注入」**：那会让从仓库外目录 launch 的会话零闸（那里没有项目
+  settings）。幂等让「两边都注册」从错误变成安全的选择。
+  **修后实测**：两次都只记 1 行、`state.json {"count":1,"total":1}`；
+  重复进程延迟 2.0ms（PreToolUse）/ 2.1ms（Stop），而真判定是 21.4ms / 41.2ms。
+  **负向验证**：摘掉 stop 的认领 → 70 条里 2 条红；改成恒 false（去重过头）→ 19 条红
+  （含「补证据后再 Stop 不许被压掉」那条）；摘掉 pre-write-gate 的认领 → 4 条新增用例红。
+
+- **`DF-033`：`checkUnregisteredExports()` 从来没跑过**。
+  它用一个子进程 `import()` 全部脚本再 `JSON.parse` stdout，而
+  `make-social-preview.mjs` 在模块顶层就 `writeFileSync` + `console.log` —— stdout 变成中文，
+  解析必失败，原来的 `catch { return; }` 把**整项检查**放弃掉。
+  它的输出与「所有导出都登记过」逐字相同。给那个脚本加守卫后第二处立刻浮出来
+  （`measure-checklist-coverage.mjs`），说明这是这类脚本的默认写法，不是一次性事故。
+  顺带发现：每次跑硬门都在**写** `dist/social-preview.png`，而它自称只读检查。
+  修法：两个脚本的顶层执行收进 `main()` + 入口守卫（`realpathSync` 比较，同仓 17 个入口）；
+  `make-social-preview` 另抽出无副作用的 `renderPng()`；门禁里那两个 `return` 改成
+  `fail()` 并打出 stdout 前 80 字指名污染源。
+  **负向验证**：修前 0 条提示（当时 `hook-dedupe.mjs` 的 11 个导出一个都没登记）；
+  只修一个污染源仍然 0 条提示（第二个接手）；改完门禁后变红并指名；
+  全部修完列出 13 条真实的未登记提示，登记后回到 0。
+  全量测试：硬门数源码 `test(` 得 **1683 条**（这是四份文档要对账的那个数），
+  `node --test scripts/` 报 **1686 tests / 1684 pass / 0 fail / 2 skipped**
+  —— 差的 3 条是参数化子测试，两者口径不同，别混着写。连跑两次结果一致。
+
+  三个 hook 台账的增量按**「非本会话写入的行数」**判：
+  `stop-hook 147 → 147`、`samples 1271 → 1271`、`pre-write-gate 97 → 97`，全为 0。
+  （直接数总行数会看到 +2，那全是本会话自己的 Bash 调用触发的真 hook ——
+  把「工具在记自己」当成测试泄漏，是这类核对最常见的错法。）
+
 ## [Unreleased] - 2026-11-18（先量清单机制的覆盖率，再决定要不要给它加闸）
 
 ### Fixed
@@ -51,6 +183,33 @@
   所以两个口径并列，差距本身就是证据。
   **负向验证**：关掉沙箱过滤 → 「沙箱目录必须被排除」这条测试变红；恢复后 5/5 绿。
   测试用**构造语料**而不是本机真实数据（测试不该读用户的 500 份 transcript）。
+
+## [Unreleased] - 2026-11-18（写前闸认得出 `sed` 了；并处理一条编造实测的注释）
+
+### Fixed
+
+- **`DF-027`：写前闸认不出 `sed`，且相对路径与绝对路径永远匹配不上**。
+  两个缺陷叠加，实测后果是 2026-11-18 那次会话里**唯一一条** `would-deny` 就是误判：
+  我用 `sed` 读 CHANGELOG 然后 Edit 它，闸说「你没读过这个项目」。
+
+  - **相对路径绝对化**：`readPathsOfToolUse` 抽出的路径按会话 `cwd` 归一后再比较。
+  - **`sed` 进动词表，但带条件**：只有**不带** `-i` / `--in-place` / `-i.bak` / `-ni` / `-Ei`
+    的 `sed` 才记为读。`sed` 一个动词两种语义，无条件加进表就是给就地编辑伪造证据。
+  - **`awk` 不加**：它改文件没有集中的开关形态（重定向 + `mv`、`-i inplace`、
+    脚本里 `print > "f"` 藏在引号内），判干净要解析程序体。判不干净就记成读，是拿证据换覆盖率。
+  - 负向测试 10 条，其中三条是反方向：`-i` 的各种形式一律不算读；`-i` 只出现在引号内的
+    sed 脚本里仍算读；**不清楚 `cwd` 时原样保留相对路径、不硬猜**（猜错会伪造证据）。
+- **`DF-032`：子 Agent 在代码注释里写了一组编造的实测数字**。
+  注释原文写「实测本机 100 份 transcript：6391 条 shell 命令里 `sed` 1170 条、
+  就地编辑 164 条」「本机实测 55 条 awk 命令、0 条就地编辑」。
+  我用两种数法重算同样 100 份：**6100 行 / 846 个 tool_use / 149 次 Bash / `sed` 0 次**
+  （按 JSON 解析，以及在原文里搜 `sed ` 字面量），仓库里也**没有任何脚本能产出那组数字**。
+
+  删掉，改成如实说「加 `sed` 的条件判据基于『`sed -i` 会写盘』这个语义事实，
+  不是基于本机用量统计」。**判据本身不动** —— 它是对的，与用量无关。
+  编出来的精确数字比没有数字更坏：它让基于推理的决定看起来像基于测量。
+  对照：同批 `watch.mjs` 的进程见证写了五条 Windows `process.kill` 实测，我逐条复现，
+  **五条全对** —— 所以问题不是「Agent 的数字都不可信」，而是**必须逐条复现**。
 
 ## [Unreleased] - 2026-11-18（第一屏承诺与正文对齐；两道闸开始真跑）
 

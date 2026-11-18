@@ -48,7 +48,7 @@
  * 它只是语料，**不参与判定** —— 现在是采集阶段，不是规则阶段。
  */
 
-import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
+import { appendFileSync, mkdirSync, existsSync, readFileSync, statSync, writeFileSync, realpathSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -59,6 +59,8 @@ import {
   familyName,
 } from './verify-claims.mjs';
 import { detectProjectCommands, commandHint } from './project-commands.mjs';
+import { createHash } from 'node:crypto';
+import { claimOnce, claimKeyOf, recordSkipped } from './hook-dedupe.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..');
@@ -754,6 +756,52 @@ export function appendSample(record, env = process.env) {
   }
 }
 
+/** Stop 的去重键（`DF-029`）。
+ *
+ *  **Stop 的输入里没有「第几次调用」这类字段** —— 宿主 schema 实测（2.1.308 二进制里的
+ *  `hook_event_name:"Stop"` 分支）只有 `stop_hook_active` / `last_assistant_message` /
+ *  `background_tasks` / `session_crons`，外加公共的 `session_id` / `prompt_id` /
+ *  `transcript_path` / `cwd`。没有 `tool_use_id` 那种天然唯一 id。
+ *
+ *  所以只能退而求其次，用「同一次 Stop 被触发两次时必然逐字相同」的那几项拼：
+ *    · `session_id`      会话身份
+ *    · `prompt_id`       本回合（宿主文档：同一个 prompt 下的后续事件共用它）
+ *    · `stop_hook_active` 第 2 轮起翻成 true —— 它同时也是「这次 Stop 是某次 hook
+ *                        拦下来的」的标记，所以「拦一次 → 模型补证据 → 再 Stop」
+ *                        两次的键**必然不同**，不会被误去重
+ *    · `last_assistant_message` 的哈希 同一回合里两次触发逐字相同；而模型改过回复
+ *                        之后再结束，哈希就变了
+ *
+ *  **已知边界，如实写在这里**：`last_assistant_message` 为空（纯工具轮）时这一项
+ *  对任何回合都相同，于是「同一 prompt 内连续两次空文本 Stop」会被当成同一次而合并。
+ *  为此额外掺入 transcript 的文件大小 —— 它只在空文本时才加（有文本时**不能**加：
+ *  transcript 可能在两次触发之间被 flush，键一变去重就失效，而那是最常见的情形）。
+ *  代价：两个真的不同的空文本回合，恰好在同一字节数上结束，会被合并成一次 ——
+ *  后果是少一行观测记录与一条放行样本，不是一个判断错。方向选得与全文件一致：
+ *  宁可少记，不可错拦。 */
+export function stopTurnKeyOf(input, { transcriptSize = null } = {}) {
+  const i = input && typeof input === 'object' ? input : {};
+  // **每一段都走 `safeString`**：`String(x)` 在 `toString` 会抛的对象上直接抛。
+  // 有测试专门喂一个 `{ toString() { throw } }` 的 `last_assistant_message`，
+  // 第一版就是在这里红的 —— 去重层的崩溃不该让判定跟着崩（本 hook 的 fail-open
+  // 是有测试守的，别在去重这一层把它破掉）。
+  const text = safeString(i.last_assistant_message);
+  const digest = createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 24);
+  const parts = [
+    safeString(i.session_id),
+    safeString(i.prompt_id),
+    i.stop_hook_active ? 'active' : 'idle',
+    digest,
+  ];
+  if (!text) parts.push(transcriptSize === null ? 'na' : String(transcriptSize));
+  return claimKeyOf('stop-verify-hook', parts);
+}
+
+/** transcript 大小。拿不到返回 null（这只会让空文本那条键更粗，不影响判定）。 */
+function transcriptSizeOf(p) {
+  try { return statSync(String(p || '')).size; } catch { return null; }
+}
+
 /** 主流程。返回宿主该看到的东西：`{ decision, reason }` 或 null（放行）。
  *
  *  **这个函数自己就是 fail-open 的**：内部的 try/catch 包住整段判定。理由是不能
@@ -770,6 +818,34 @@ export function runHook({ input, env = process.env, nowMs = Date.now(), sampleLo
   const sessionId = (() => {
     try { return String(i.session_id || 'unknown'); } catch { return 'unknown'; }
   })();
+
+  // ── 同一个回合结束点只判一次（`DF-029`）──────────────────────────────
+  //
+  // 两条注册叠加时，宿主为**同一次** Stop 起两个本进程，两者的 stdin 逐字相同。
+  // 判定与记账之前先认领（`hook-dedupe.mjs` 用 `O_EXCL` 原子创建，不是先读后写）。
+  //
+  // **位置必须在任何写盘之前**，`bumpBlockCount` 是最要命的一处：实测同一回合被调
+  // 两次时 `state.json` 里的 `count`/`total` 各跳 2，于是 6 次预算只够 3 个回合。
+  // 放在判定之前还顺带省掉重复进程那次 transcript 读（实测 330ms/次）。
+  //
+  // 认领失败一律照常判定（`claimOnce` 永不抛，拿不到键就返回 `claimed:true`）；
+  // 失效方向永远是「多记一次」，不是「漏判一次」。
+  //
+  // 「认领成功之后、输出之前崩了」这个窗口的后果是：这一次 Stop 没有任何输出 ——
+  // 那**就是**本 hook 的 fail-open 结果（`main()` 的 catch 与超时分支都是 exit 0
+  // 无输出），所以没有引入新的失败形态。
+  const dedupeKey = stopTurnKeyOf(i, {
+    nowMs,
+    transcriptSize: transcriptSizeOf(safeString(i.transcript_path)),
+  });
+  const claim = claimOnce({ hookId: 'stop-verify-hook', key: dedupeKey, env, nowMs });
+  if (!claim.claimed) {
+    recordSkipped({ hookId: 'stop-verify-hook', key: dedupeKey, env, nowMs, why: claim.why });
+    // **不写台账、不动 state.json、不写样本**：那三处都是「一次事件一行 / 一跳」，
+    // 重复触发写进去就是本次要修的那个缺陷。跳过记录单独一个文件，
+    // 它证明机制在跑，但不参与任何比例统计。
+    return null;
+  }
 
   let loaded;
   let project;

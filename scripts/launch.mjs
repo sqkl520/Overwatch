@@ -820,7 +820,18 @@ function renderPlan(p) {
     // 这也是本文件只写 `hooks` 这一个键的原因：`--settings` 的标量键会**覆盖**
     // 项目设置（实测 `permissions.defaultMode` 与 `model` 都会被顶掉），
     // 只写 hooks 就不会碰到用户的权限与模型。
+    //
+    // 叠加的后果（`DF-029`）：项目 settings 已经注册过这两条时，同一次事件会跑两遍。
+    // 修在 hook 自己身上 —— 两条 hook 都按输入里的 id 幂等
+    // （`scripts/hook-dedupe.mjs`，`PreToolUse` 用 `tool_use_id`，
+    // `Stop` 用 `prompt_id` + `stop_hook_active` + 回复哈希），
+    // 第二次触发直接放行且**不记账**。所以这里的叠加现在只是「多起一个几乎不花时间的
+    // 进程」，不再有台账翻倍、延迟翻倍、计数双跳。
+    //
+    // 为什么不反过来「launch 不注入」：从**仓库外目录**起的会话没有项目 settings，
+    // 不注入就等于零闸。幂等让两边都注册变成安全的选择，而不是二选一。
     lines.push('             这两条是**额外**挂上的：项目自己的 hooks 照旧生效（实测两边都会触发）。');
+    lines.push('             重复触发已由 hook 自己按 id 幂等处理（第二次放行且不记账），见 scripts/hook-dedupe.mjs。');
     lines.push('             settings 里只写了 hooks 这一个键 —— 别的键（权限、模型）会覆盖你的项目设置。');
   }
 

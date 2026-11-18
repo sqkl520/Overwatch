@@ -17,8 +17,9 @@
  */
 
 import { deflateSync } from 'node:zlib';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const WIDTH = 1280;
 const HEIGHT = 640;
@@ -244,15 +245,41 @@ function drawTitle(px) {
   return 176 + 7 * scale;
 }
 
-const outPath = (() => {
-  const i = process.argv.indexOf('--out');
-  const rel = i > 0 && process.argv[i + 1] ? process.argv[i + 1] : join('dist', 'social-preview.png');
-  return resolve(rel);
-})();
+/** 画出整张图并编码成 PNG 字节。**唯一副作用是内存**，可直接被测试与结构门调用。
+ *
+ *  抽出来的理由不是美观，是 `checkUnregisteredExports()` 的一条实测教训：
+ *  结构门会 `import()` 每个非测试脚本，而这个文件此前**在模块顶层直接写盘 + 打印**。
+ *  后果是每次跑 `check-structure.mjs` 都会：
+ *    ① 往 `dist/social-preview.png` 写一张图（一次「只读检查」的副作用）；
+ *    ② 往 stdout 打两行中文 —— 而结构门那个子进程的 stdout 是要被
+ *       `JSON.parse` 的。解析失败后它 `catch { return; }` **静默放弃整项检查**，
+ *       于是「导出未登记」这道门从来没跑过。与 `DF-031` 完全同一种失效：
+ *       **静默跳过与通过的表现一模一样**。
+ *  现在副作用全部收进 `main()`，import 它不再有任何 observable 行为。 */
+export function renderPng() {
+  assertGlyphsCovered();
+  return encodePng(render());
+}
 
-mkdirSync(dirname(outPath), { recursive: true });
-assertGlyphsCovered();
-const png = encodePng(render());
-writeFileSync(outPath, png);
-console.log(`已生成 ${WIDTH}×${HEIGHT} · ${png.length} 字节`);
-console.log(outPath);
+/** CLI 入口：生成并写盘。`--out <path>` 指定落点，默认 `dist/social-preview.png`。 */
+export function main(argv = process.argv, log = console.log) {
+  const i = argv.indexOf('--out');
+  const rel = i > 0 && argv[i + 1] ? argv[i + 1] : join('dist', 'social-preview.png');
+  const outPath = resolve(rel);
+  const png = renderPng();
+  mkdirSync(dirname(outPath), { recursive: true });
+  writeFileSync(outPath, png);
+  log(`已生成 ${WIDTH}×${HEIGHT} · ${png.length} 字节`);
+  log(outPath);
+  return outPath;
+}
+
+/** 「我是不是被直接执行」——比的是**真实路径**（理由见 `stop-verify-hook.mjs` 同名逻辑：
+ *  `resolve()` 不解析符号链接，而 `fileURLToPath(import.meta.url)` 已是真实路径，
+ *  经 `npm link` / pnpm 执行时两者必然不等，程序会静默 exit 0）。 */
+const realOrResolve = (p) => {
+  try { return realpathSync(p); } catch { return resolve(p); }
+};
+if (process.argv[1] && realOrResolve(process.argv[1]) === realOrResolve(fileURLToPath(import.meta.url))) {
+  main();
+}

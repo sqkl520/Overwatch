@@ -30,6 +30,7 @@ import {
   readTranscriptReads, runHook, parseHookInput, appendLog, logPathFor, bumpDenials, cli,
   markerSigOf, readGateSecret, ensureGateSecret, secretPathFor,
   MARKER_REL, SECRET_REL, MODES, BRAKES, WRITE_TOOLS, SHELL_TOOLS, READ_TOOLS, EDIT_SIDE_TOOLS,
+  readPathsOfToolUse, pathKeyOf,
 } from '../scripts/pre-write-gate.mjs';
 
 // ── 装置 ──────────────────────────────────────────────────────────────
@@ -40,6 +41,24 @@ const TEST_SECRET = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'.repeat(2);
 function sandbox() {
   return mkdtempSync(join(tmpdir(), 'ow-pwg-'));
 }
+
+/** 隔离用的 env：**四个落盘路径一起指到临时目录**。
+ *
+ *  为什么做成「只能整体给」的函数，而不是各处手写 `{ OW_PRE_WRITE_GATE_LOG: ... }`：
+ *  这个 hook 有四个落点 —— 台账（`OW_PRE_WRITE_GATE_LOG`）、标记与密钥（跟着
+ *  cwd 走，由 sandbox 目录兜住）、刹车计数（同上）、以及**去重认领文件**
+ *  （`OVERWATCH_HOOK_DEDUPE_DIR` / `OVERWATCH_STATE_DIR`）。
+ *  漏掉最后一个的后果是实测过的：`DF-029` 的修复刚接上时，全量测试把
+ *  `tasks/runs/hook-dedupe/` 写进了仓库 —— 而同一个测试文件里断言的 `deny` 变成
+ *  `passthrough`（第二次同 id 调用被当成重复）。一个常量漏写同时制造了
+ *  「污染仓库」与「假红」两种症状。
+ *
+ *  同 `stop-verify-hook.test.mjs` 的 `envIn`：想隔离就一次给全。 */
+const envIn = (dir, extra = {}) => ({
+  OVERWATCH_HOOK_DEDUPE_DIR: join(dir, 'dedupe'),
+  OW_PRE_WRITE_GATE_LOG: join(dir, 'log.jsonl'),
+  ...extra,
+});
 
 /** 造一个 cwd + marker 的状态对象。`decide` 是纯函数，所以状态全由参数给。 */
 function stateFor({ cwd = '/repo', marker = { exists: false, data: null }, reads = [], denials = 0, config = {}, secret = TEST_SECRET } = {}) {
@@ -487,6 +506,111 @@ test('pathKeyOf 在非 win32 上不折叠大小写：读过 a.mjs 不得放行 E
   assert.equal(r.action, 'deny', '大小写不同的另一个文件，不能算「读过目标」');
 });
 
+// ── 6b-2. `DF-027`：sed 读、相对路径绝对化 ──────────────────────────
+//
+// 两个叠加的缺陷，实测在 2026-11-18 的会话（`ea4ef562`）里造出唯一一条误判。
+// 修法分两半，**判据含义不同**，所以测试也分两半：
+//   · 绝对化是纯实现问题（`readPathsOfToolUse` 抽出的是命令里的原样字符串，
+//     Edit 侧是 `tool_input.file_path` 绝对路径，`pathKeyOf` 只归一不消解）；
+//   · `sed` 是判据问题 —— 同一个动词既能读也能写，所以**先有负向测试再动源码**。
+
+test('DF-027a：`sed -n 1,30p f` 必须被记成读过（当前完全不记账）', () => {
+  // 实测（修前）：`readPathsOfToolUse('Bash', {command:"sed -n '1,30p' docs/CHANGELOG.md"})`
+  // 返回 `[]` —— 而这是长会话里读文件最常见的写法。
+  // 断言按 `pathKeyOf` 比（win32 上绝对化会给 `/repo/x` 补盘符，字面量比会假红）。
+  // 期望值走 `resolve` 而不是 `join`：那正是 `toAbsoluteReadPath` 用的函数，
+  // 两边同口径，断言才是在测「有没有绝对化」而不是在测两个不同的拼路径函数。
+  assert.deepEqual(
+    readPathsOfToolUse('Bash', { command: "sed -n '1,30p' docs/CHANGELOG.md" }, undefined, '/repo').map(pathKeyOf),
+    [pathKeyOf(resolve('/repo', 'docs', 'CHANGELOG.md'))],
+  );
+  // 裸 `sed 1,30p f`（不带 -n）同样是读：没人这样写，但它也不写盘。
+  assert.deepEqual(
+    readPathsOfToolUse('Bash', { command: 'sed 1,30p docs/a.md' }, undefined, '/repo').map(pathKeyOf),
+    [pathKeyOf(resolve('/repo', 'docs', 'a.md'))],
+  );
+});
+
+test('DF-027a 负向：`sed -i` / `--in-place` / `-i.bak` / `-ni` / `-Ei` 一律不算读过', () => {
+  // **这一条是本轮的核心**：把 `sed` 直接塞进动词表会让下面每条都变成「读过的证据」，
+  // 而它们都在改盘上的文件 —— 那是伪造证据，比现在的漏判更坏。
+  const writes = [
+    "sed -i 's/x/y/' f.md",
+    "sed -i.bak 's/x/y/' f.md",
+    "sed --in-place 's/x/y/' f.md",
+    "sed --in-place=.bak 's/x/y/' f.md",
+    "sed -ni '1,5p' f.md",            // 组合短选项：-n 是读、-i 才是写，但混在一起就是写
+    "sed -Ei 's/x/y/' f.md",          // 带扩展正则的就地编辑
+    "sed -e 's/a/b/' -i f.md",        // -i 出现在后面
+    "sed 's/x/y/' f.md -i",           // -i 在路径之后（GNU 也认）
+  ];
+  for (const cmd of writes) {
+    assert.deepEqual(
+      readPathsOfToolUse('Bash', { command: cmd }, undefined, '/repo'), [],
+      `就地编辑不得记成读过：${cmd}`,
+    );
+  }
+});
+
+test('DF-027a 负向：`-i` 只出现在引号里的脚本中（不是在改盘）仍算读', () => {
+  // 反方向也要钉住，否则「见到 -i 就整条不算」会把 `sed -n '/-i/p' f` 误判成写。
+  assert.deepEqual(
+    readPathsOfToolUse('Bash', { command: "sed -n '/-i/p' docs/a.md" }, undefined, '/repo').map(pathKeyOf),
+    [pathKeyOf(resolve('/repo', 'docs', 'a.md'))],
+  );
+});
+
+test('DF-027a：脚本在选项值里（-e / -f / --expression）时，文件仍然取得对', () => {
+  // 「第一个位置参数是脚本」不是永远成立的：有 `-e`/`-f` 时脚本在选项值里，
+  // 第一个位置参数**就是**文件。只按「跳过第一个位置参数」写会在这里把文件漏掉。
+  const cases = [
+    "sed -e 's/a/b/' docs/a.md",
+    'sed -f script.sed docs/a.md',
+    "sed -ne '1,3p' docs/a.md",           // 组合短选项里的 e
+    "sed -n -e 'p' docs/a.md",
+    "sed --expression='s/a/b/' docs/a.md",
+    "sed --expression 's/a/b/' docs/a.md",
+  ];
+  for (const cmd of cases) {
+    assert.deepEqual(
+      readPathsOfToolUse('Bash', { command: cmd }, undefined, '/repo').map(pathKeyOf),
+      [pathKeyOf(resolve('/repo', 'docs', 'a.md'))],
+      `脚本在选项值里时文件必须取对：${cmd}`,
+    );
+  }
+});
+
+test('DF-027b：相对路径读 + 绝对路径 Edit 必须匹配上（修前恒不命中）', () => {
+  // 修前：`head -30 docs/CHANGELOG.md` 抽出 `docs/CHANGELOG.md`，
+  // Edit 侧拿到 `D:\Projects\Overwatch\docs\CHANGELOG.md`，`pathKeyOf` 不消解 → 恒不等。
+  const cwd = process.platform === 'win32' ? 'D:\\Projects\\Overwatch' : '/repo';
+  const reads = readPathsOfToolUse('Bash', { command: 'head -30 docs/CHANGELOG.md' }, undefined, cwd);
+  assert.equal(reads.length, 1);
+  assert.ok(
+    pathKeyOf(reads[0]) === pathKeyOf(join(cwd, 'docs', 'CHANGELOG.md')),
+    `相对路径必须绝对化到会话 cwd：${reads[0]} vs ${join(cwd, 'docs', 'CHANGELOG.md')}`,
+  );
+  // 端到端：同一条 cwd 下，shell 读 → Edit 该文件必须放行，理由是 target-read。
+  const r = decide(EDIT_INPUT(join(cwd, 'docs', 'CHANGELOG.md')),
+    stateFor({ cwd, config: { mode: 'deny', minReads: 3 }, reads }));
+  assert.equal(r.action, 'allow', '用 head/sed 读过目标文件，Edit 它不该被判「没读过」');
+  assert.equal(r.log.allowReason, 'target-read');
+});
+
+test('DF-027b 负向：绝对化不会把「读过别的目录下同名文件」也算成读过目标', () => {
+  const cwd = process.platform === 'win32' ? 'D:\\Projects\\Overwatch' : '/repo';
+  const reads = readPathsOfToolUse('Bash', { command: 'cat lib/a.mjs' }, undefined, cwd);
+  const r = decide(EDIT_INPUT(join(cwd, 'src', 'a.mjs')),
+    stateFor({ cwd, config: { mode: 'deny', minReads: 3 }, reads }));
+  assert.equal(r.action, 'deny', '绝对化只能对齐同一路径，不能把不同目录折到一起');
+});
+
+test('DF-027b 边界：不清楚 cwd 时不硬猜 —— 原样保留相对路径', () => {
+  // 没有基准就没法绝对化，硬用 `process.cwd()` 会把「测试进程的工作目录」
+  // 冒充成「会话目录」，那是把一个猜测变成证据。宁可退回修前的行为。
+  assert.deepEqual(readPathsOfToolUse('Bash', { command: 'cat docs/a.md' }), ['docs/a.md']);
+});
+
 // ── 6c. 改动二：`satisfied_by:"auto"` 不可外部伪造 ──────────────────
 
 test('伪造 {"satisfied_by":"auto"} 无签名字段 → 不放行', () => {
@@ -620,14 +744,17 @@ test('e2e：伪造标记文件（shell 一条命令）不再放行，闸门自�
   const dir = sandbox();
   try {
     const log = join(dir, 'log.jsonl');
-    const env = { OW_PRE_WRITE_GATE: 'deny', OW_PRE_WRITE_GATE_LOG: log };
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny' });
     // 第 1 步：一条 shell 重定向写一个「验出来的」标记
     mkdirSync(join(dir, '.claude'), { recursive: true });
     writeFileSync(markerPathFor(dir), JSON.stringify({
       version: 1, session_id: 'sess-1', satisfied_by: 'auto', reads: 99, at: '2026-11-14T00:00:00.000Z',
     }));
-    // 第 2 步：写入 → 必须被拦（这就是红队 §5-B 的完整路径）
-    const forged = runHook(INPUT({ cwd: dir }), { env });
+    // 第 2 步：写入 → 必须被拦（这就是红队 §5-B 的完整路径）。
+    // 下面两次 runHook 是**两次不同的工具调用**（真序列：先被拦、再重试），
+    // 所以必须给不同 `tool_use_id` —— 同一个 id 会被去重层当成本次调用的第二次触发
+    // （`DF-029`），那测的就不是「伪造标记放不放行」了。
+    const forged = runHook(INPUT({ cwd: dir, tool_use_id: 'toolu_forged' }), { env });
     assert.equal(forged.action, 'deny', '伪造的 auto 标记不该放行');
     // why 是 auto-no-secret：此时还没有密钥文件，闸门连验签的密钥都没有。
     // 关键是**它没有放行** —— 「验不了」在本闸里永远不等于「验过了」。
@@ -635,7 +762,7 @@ test('e2e：伪造标记文件（shell 一条命令）不再放行，闸门自�
     // 第 3 步：换成闸门自己写的标记 → 放行
     const w = writeMarker(markerPathFor(dir), { sessionId: 'sess-1', satisfiedBy: 'auto', reads: 3 });
     assert.ok(w && w.sig);
-    const real = runHook(INPUT({ cwd: dir }), { env });
+    const real = runHook(INPUT({ cwd: dir, tool_use_id: 'toolu_retry' }), { env });
     assert.equal(real.action, 'allow');
     assert.equal(real.log.allowReason, 'marker-present');
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -773,7 +900,7 @@ test('runHook 在 observe 模式下什么都不写、不输出', () => {
   const dir = sandbox();
   try {
     const log = join(dir, 'log.jsonl');
-    const out = runHook(INPUT({ cwd: dir }), { env: { OW_PRE_WRITE_GATE_LOG: log } });
+    const out = runHook(INPUT({ cwd: dir }), { env: envIn(dir) });
     assert.equal(out.action, 'passthrough');
     assert.equal(out.output, null);
     assert.equal(existsSync(markerPathFor(dir)), false, '观测模式不得写标记');
@@ -788,7 +915,7 @@ test('runHook 在 deny 模式下拦 + 记账 + 推计数器', () => {
   const dir = sandbox();
   try {
     const log = join(dir, 'log.jsonl');
-    const env = { OW_PRE_WRITE_GATE: 'deny', OW_PRE_WRITE_GATE_LOG: log };
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny' });
     const out = runHook(INPUT({ cwd: dir }), { env });
     assert.equal(out.action, 'deny');
     assert.equal(out.output.continue, false);
@@ -807,7 +934,7 @@ test('runHook 读到足够 transcript 时自己写标记（satisfied_by=auto）'
       toolUseLine('Read', { file_path: join(dir, 'src/b.mjs') }),
     ].join('\n') + '\n');
     const out = runHook(INPUT({ cwd: dir, transcript_path: tp }), {
-      env: { OW_PRE_WRITE_GATE: 'deny', OW_PRE_WRITE_GATE_LOG: join(dir, 'log.jsonl') },
+      env: envIn(dir, { OW_PRE_WRITE_GATE: 'deny' }),
     });
     assert.equal(out.action, 'allow');
     const m = readMarker(markerPathFor(dir));
@@ -820,11 +947,13 @@ test('runHook 的计数器只在 budget 档参与刹车，不参与判定', () =
   const dir = sandbox();
   try {
     const log = join(dir, 'log.jsonl');
-    const env = { OW_PRE_WRITE_GATE: 'deny', OW_PRE_WRITE_GATE_BRAKE: 'budget', OW_PRE_WRITE_GATE_DENY_BUDGET: '1', OW_PRE_WRITE_GATE_LOG: log };
-    const a = runHook(INPUT({ cwd: dir }), { env });
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_PRE_WRITE_GATE_BRAKE: 'budget', OW_PRE_WRITE_GATE_DENY_BUDGET: '1' });
+    // 两次不同的工具调用（同一回合内连写两个文件）—— `tool_use_id` 必须不同，
+    // 否则去重层会把它当成「同一次调用的第二次触发」而直接放行（`DF-029`）。
+    const a = runHook(INPUT({ cwd: dir, tool_use_id: 'toolu_a' }), { env });
     assert.equal(a.action, 'deny');
     assert.equal(a.output.continue, undefined);
-    const b = runHook(INPUT({ cwd: dir }), { env });
+    const b = runHook(INPUT({ cwd: dir, tool_use_id: 'toolu_b' }), { env });
     assert.equal(b.action, 'deny');
     assert.equal(b.output.continue, false, '第二次触到预算，刹车');
     // 两次都拒绝：计数只影响刹车，不影响「拦不拦」
@@ -838,7 +967,7 @@ test('runHook 的失败面：transcript 读不到也只是「没读到」，不�
   const dir = sandbox();
   try {
     const out = runHook(INPUT({ cwd: dir, transcript_path: dir }), {
-      env: { OW_PRE_WRITE_GATE_LOG: join(dir, 'log.jsonl') },
+      env: envIn(dir),
     });
     assert.equal(out.action, 'passthrough');
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -901,7 +1030,7 @@ function runHookProcess(input, env = {}, extraArgs = []) {
 test('e2e：hook 在默认模式下退出 0 且不输出', () => {
   const dir = sandbox();
   try {
-    const r = runHookProcess(INPUT({ cwd: dir }), { OW_PRE_WRITE_GATE_LOG: join(dir, 'log.jsonl') });
+    const r = runHookProcess(INPUT({ cwd: dir }), envIn(dir));
     assert.equal(r.status, 0, `hook 崩溃了：${r.stderr}`);
     assert.equal(r.stdout, '', 'passthrough 时 stdout 必须为空 —— 输出 allow 会参与多 hook 合并');
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -910,9 +1039,7 @@ test('e2e：hook 在默认模式下退出 0 且不输出', () => {
 test('e2e：hook 在 deny 模式下输出合法 JSON 且带 continue:false', () => {
   const dir = sandbox();
   try {
-    const r = runHookProcess(INPUT({ cwd: dir }), {
-      OW_PRE_WRITE_GATE: 'deny', OW_PRE_WRITE_GATE_LOG: join(dir, 'log.jsonl'),
-    });
+    const r = runHookProcess(INPUT({ cwd: dir }), envIn(dir, { OW_PRE_WRITE_GATE: 'deny' }));
     assert.equal(r.status, 0, `hook 必须永远 exit 0（exit 2 不拦截，实测 D3）：${r.stderr}`);
     const o = JSON.parse(r.stdout);
     assert.equal(o.hookSpecificOutput.hookEventName, 'PreToolUse');
@@ -925,7 +1052,7 @@ test('e2e：hook 在 deny 模式下输出合法 JSON 且带 continue:false', () 
 test('e2e：垃圾输入 → exit 0、无输出（fail-open）', () => {
   const dir = sandbox();
   try {
-    const r = runHookProcess('not json at all', { OW_PRE_WRITE_GATE: 'deny', OW_PRE_WRITE_GATE_LOG: join(dir, 'log.jsonl') });
+    const r = runHookProcess('not json at all', envIn(dir, { OW_PRE_WRITE_GATE: 'deny' }));
     assert.equal(r.status, 0);
     assert.equal(r.stdout, '');
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -935,9 +1062,7 @@ test('e2e：标记存在时 hook 完全静默', () => {
   const dir = sandbox();
   try {
     writeMarker(markerPathFor(dir), { sessionId: 'sess-1', satisfiedBy: 'auto', reads: 3 });
-    const r = runHookProcess(INPUT({ cwd: dir }), {
-      OW_PRE_WRITE_GATE: 'deny', OW_PRE_WRITE_GATE_LOG: join(dir, 'log.jsonl'),
-    });
+    const r = runHookProcess(INPUT({ cwd: dir }), envIn(dir, { OW_PRE_WRITE_GATE: 'deny' }));
     assert.equal(r.status, 0);
     assert.equal(r.stdout, '');
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -948,15 +1073,15 @@ test('e2e：mark 子命令写出标记，之后 hook 放行（完整闭环）', 
   try {
     const log = join(dir, 'log.jsonl');
     // 1) 先拦
-    const before = runHookProcess(INPUT({ cwd: dir }), { OW_PRE_WRITE_GATE: 'deny', OW_PRE_WRITE_GATE_LOG: log });
+    const before = runHookProcess(INPUT({ cwd: dir }), envIn(dir, { OW_PRE_WRITE_GATE: 'deny' }));
     assert.equal(JSON.parse(before.stdout).hookSpecificOutput.permissionDecision, 'deny');
     // 2) 照 reason 跑 mark
-    const marked = runHookProcess('', { OW_PRE_WRITE_GATE_LOG: log }, ['mark', '--session', 'sess-1', '--cwd', dir]);
+    const marked = runHookProcess('', envIn(dir), ['mark', '--session', 'sess-1', '--cwd', dir]);
     assert.equal(marked.status, 0, marked.stderr);
     assert.equal(existsSync(markerPathFor(dir)), true);
     assert.match(marked.stdout, /标记已写入/);
     // 3) 再写，放行
-    const after = runHookProcess(INPUT({ cwd: dir }), { OW_PRE_WRITE_GATE: 'deny', OW_PRE_WRITE_GATE_LOG: log });
+    const after = runHookProcess(INPUT({ cwd: dir }), envIn(dir, { OW_PRE_WRITE_GATE: 'deny' }));
     assert.equal(after.stdout, '', '标记存在后必须静默放行');
     // 4) 标记里记的是「自己说的」，不是「验出来的」
     assert.equal(readMarker(markerPathFor(dir)).data.satisfied_by, 'claim');
@@ -1009,4 +1134,127 @@ test('模板默认不带 OW_PRE_WRITE_GATE=deny（默认必须是最保守的）
   const tpl = JSON.parse(readFileSync(join(dirname(SCRIPT), '..', 'templates', 'pre-write-gate.settings.json'), 'utf8'));
   const env = JSON.stringify(tpl.env || {});
   assert.doesNotMatch(env, /OW_PRE_WRITE_GATE"\s*:\s*"deny"/, '模板里预置 deny 等于默认就拦');
+});
+
+// ── 13. `DF-029`：同一次工具调用被触发两次时，只判一次、只记一行 ──────────
+//
+// 场景是真实存在的：`.claude/settings.local.json` 注册了本 hook，`overwatch launch`
+// 又用 `--settings` 注入同名一条，宿主的实测行为是**叠加**。于是同一次工具调用
+// 会起两个本进程，两者 stdin 逐字相同（实测见 `docs/research/` 的 PreToolUse 契约）。
+//
+// 这几条测试的判据是**可观测的量**：台账行数、刹车计数、标记文件的 mtime。
+// 不看代码里有没有 `if`。
+
+test('DF-029：同一 tool_use_id 被触发两次 → 台账 1 行、刹车计数 1、第二次静默', () => {
+  const dir = sandbox();
+  try {
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny' });
+    const input = INPUT({ cwd: dir, tool_use_id: 'toolu_once' });
+
+    const first = runHook(input, { env });
+    assert.equal(first.action, 'deny', '第一次必须真的判定并拦');
+    assert.equal(first.duplicate, undefined, '第一次不是重复');
+
+    const second = runHook(input, { env });
+    assert.equal(second.action, 'passthrough', '第二次必须静默放行');
+    assert.equal(second.output, null, '第二次不许往 stdout 写任何东西（会参与多 hook 合并）');
+    assert.equal(second.duplicate, true, '必须能被识别为重复');
+    assert.equal(second.log, null, '第二次不许记账');
+
+    // 台账：1 行（修复前是 2 行）
+    const rows = readFileSync(join(dir, 'log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 1, '台账行数就是统计的分母，翻倍会让比例全错');
+
+    // 刹车计数：1（修复前是 2 —— 一次真实拒绝被记成两次，denyBudget 提前用光）
+    assert.equal(bumpDenials(denialPathFor(dir), 'prompt-1', { readOnly: true }), 1,
+      '刹车计数翻倍会让 denyBudget 提前用完');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-029 的负向：不同的 tool_use_id 必须各自判定（去重不许吞掉真调用）', () => {
+  const dir = sandbox();
+  try {
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny' });
+    // 同一回合内连写两个文件 = 两次真调用，tool_use_id 不同
+    const a = runHook(INPUT({ cwd: dir, tool_use_id: 'toolu_1', tool_input: { file_path: join(dir, 'a.txt'), content: 'x' } }), { env });
+    const b = runHook(INPUT({ cwd: dir, tool_use_id: 'toolu_2', tool_input: { file_path: join(dir, 'b.txt'), content: 'x' } }), { env });
+    assert.equal(a.action, 'deny');
+    assert.equal(b.action, 'deny', '第二次真调用不许被当成重复而放行');
+    const rows = readFileSync(join(dir, 'log.jsonl'), 'utf8').trim().split('\n');
+    assert.equal(rows.length, 2, '两次真调用必须两行台账');
+    assert.equal(bumpDenials(denialPathFor(dir), 'prompt-1', { readOnly: true }), 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-029：重复触发不会重写标记文件（否则 mtime 会跳，Auto 标记的 at 也会变）', () => {
+  const dir = sandbox();
+  try {
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny' });
+    const tp = join(dir, 'transcript.jsonl');
+    writeFileSync(tp, [
+      toolUseLine('Read', { file_path: join(dir, 'README.md') }),
+      toolUseLine('Read', { file_path: join(dir, 'src/a.mjs') }),
+      toolUseLine('Read', { file_path: join(dir, 'src/b.mjs') }),
+    ].join('\n') + '\n');
+    const input = INPUT({ cwd: dir, transcript_path: tp, tool_use_id: 'toolu_mark' });
+
+    const t0 = 1_700_000_000_000;
+    assert.equal(runHook(input, { env, nowMs: t0 }).action, 'allow');
+    const m1 = readFileSync(markerPathFor(dir), 'utf8');
+
+    // 第二次（同 id，晚 500ms）：必须完全不碰盘
+    const second = runHook(input, { env, nowMs: t0 + 500 });
+    assert.equal(second.action, 'passthrough');
+    assert.equal(second.markWrite, null, '重复触发不许再写一次标记');
+    assert.equal(readFileSync(markerPathFor(dir), 'utf8'), m1, '标记内容逐字不变');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-029：缺 tool_use_id 时放弃去重、照常判定（不拿半个键去猜）', () => {
+  const dir = sandbox();
+  try {
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny' });
+    const input = INPUT({ cwd: dir, tool_use_id: undefined });
+    const a = runHook(input, { env });
+    const b = runHook(input, { env });
+    assert.equal(a.action, 'deny');
+    assert.equal(b.action, 'deny', '没有 tool_use_id 就不许去重');
+    assert.equal(readFileSync(join(dir, 'log.jsonl'), 'utf8').trim().split('\n').length, 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-029：重复触发真的省掉了判定（transcript 只被读一次）', () => {
+  // 判据不是计时（那在 CI 上不稳），而是**可观测的副作用次数**：
+  // 让 transcript 指向一个目录（读必失败），两次调用后检查只有一份认领文件、
+  // 且第二次返回的是 passthrough 而不是「按读不到处理」的 passthrough。
+  const dir = sandbox();
+  try {
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny' });
+    const input = INPUT({ cwd: dir, transcript_path: dir, tool_use_id: 'toolu_two_pass' });
+    const a = runHook(input, { env });
+    const b = runHook(input, { env });
+    assert.equal(a.log.decision, 'deny', '第一次走完整判定');
+    assert.equal(b.duplicate, true);
+    assert.equal(b.log, null);
+    // 跳过记录单独一个文件，不进台账
+    const skipped = join(dir, 'dedupe', 'pre-write-gate', 'skipped.jsonl');
+    assert.equal(existsSync(skipped), true, '跳过必须留痕，否则无法判断去重有没有真的触发');
+    assert.equal(readFileSync(skipped, 'utf8').trim().split('\n').length, 1);
+    assert.equal(readFileSync(join(dir, 'log.jsonl'), 'utf8').trim().split('\n').length, 1,
+      '跳过记录**不许**混进台账');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-029：端到端 —— 同一个 stdin 喂两个进程，只有一行台账', () => {
+  const dir = sandbox();
+  try {
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny' });
+    const input = INPUT({ cwd: dir, tool_use_id: 'toolu_e2e' });
+    const a = runHookProcess(input, env);
+    const b = runHookProcess(input, env);
+    assert.equal(JSON.parse(a.stdout).hookSpecificOutput.permissionDecision, 'deny');
+    assert.equal(b.stdout, '', '第二个进程必须完全静默（否则宿主会看到两条 deny）');
+    const rows = readFileSync(join(dir, 'log.jsonl'), 'utf8').trim().split('\n');
+    assert.equal(rows.length, 1, `两个进程必须只记一行，实测 ${rows.length}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

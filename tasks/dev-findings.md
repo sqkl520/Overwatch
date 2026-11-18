@@ -413,7 +413,21 @@
      （`OVERWATCH_STATE_DIR` 之类的环境变量是否漏传）。
 - **影响**：CI 会偶发红，让「全绿」这个信号不可靠。这是**真的**代价，不是洁癖。
 
-### DF-027 [open] 写前闸认不出 `sed`，且 `head` 抽出的相对路径与 Edit 的绝对路径永远不匹配
+### DF-027 [fixed] 写前闸认不出 `sed`，且 `head` 抽出的相对路径与 Edit 的绝对路径永远不匹配
+
+> **修复（2026-11-18）**：两条都修了，`pre-write-gate.test.mjs` 98 条全绿（原 88 条，新增 10）。
+> · **相对路径绝对化**：`readPathsOfToolUse` 的抽取结果按会话 `cwd` 绝对化后比较。
+>   负向测试三条 —— 相对读 + 绝对 Edit 必须命中；绝对化**不得**把「读过别的目录下同名文件」
+>   也算成读过目标；**不清楚 `cwd` 时原样保留相对路径，不硬猜**（猜错会伪造证据）。
+> · **`sed` 进动词表，但带条件**：只有**不带** `-i` / `--in-place` / `-i.bak` / `-ni` / `-Ei`
+>   的 `sed` 才记为读。负向测试两条 —— 各种就地编辑形式一律不算读过；
+>   `-i` 只出现在引号内的 sed 脚本里（不是在改盘）仍算读。
+> · **`awk` 没有加**，理由写在代码注释里：它有 `-i inplace`，靠 argv 区分「读」与「就地改写」
+>   的判据更脆，而我找不到足够样本验证；宁可漏记也不伪造证据。
+> · 顺带修了一处同源问题：`measure-checklist-coverage.mjs` 在模块顶层执行，
+>   被硬门的 import 探针触发时会真的跑一遍测量并把中文写到子进程 stdout，
+>   导致硬门那一步 JSON 解析失败后**静默放弃整项检查** —— 与 `DF-031` 同一种失效。
+>   已收进 `main()` + 入口守卫。
 
 - **发现于**：2026-11-18 把两道闸注册进 `.claude/settings.local.json` 后，本会话
   （`ea4ef562`）observe 模式跑出 339 条记录，其中**唯一一条** `would-deny` 是误判
@@ -451,7 +465,7 @@
      否则会把 `sed -i` 也记成「读过」（那是写入，记成读就是假的证据）。
 - **优先级**：P2。observe 模式下不害人，但它让「自动放行率」这个指标偏乐观。
 
-### DF-028 [open] 守护进程死了 4 天，而 `--health` 是唯一的发现途径——还是我碰巧去查的
+### DF-028 [fixed] 守护进程死了 4 天，而 `--health` 是唯一的发现途径——还是我碰巧去查的
 
 - **发现于**：2026-11-18 注册两道闸之后顺手跑 `watch.mjs --health`，发现 `jobs` / `probe`
   都是「4.0 天未运行」
@@ -487,7 +501,75 @@
      `log-health.json` 只覆盖 log 层，不覆盖进程存活。
 - **建议归属**：独立任务，优先级 P1。这是**当前唯一一个已确认「真实用户会踩到」**的产品缺陷。
 
-### DF-029 [open] `overwatch launch` 起的会话会同时挂两份 hooks，同一条判据跑两次
+- **修复（2026-11-18，只做了候选方向 3）**：
+  - **新增 `<stateDir>/proc.json`**：`{ version, pid, startedAt, writtenAt }`，
+    每进程写一次（不是心跳 —— 心跳本来就在 `state.json` 的 `lastJobsScanAt` / `lastProbeAt`）。
+    `--health` 在**心跳已停时**才读它，结论分 `gone` / `reused` / `stuck` / `unverified` 四档，
+    `formatHealth` 按档给出不同处置：`gone`/`reused` → 重启；`stuck` → 先看日志再重启；
+    `unverified` → 明说判不了、别猜。心跳正常时**不产出进程层**，避免被当成「进程检查通过」。
+  - **判据（约束 1 的正面回答）**：不能只靠 `process.kill(pid, 0)` —— PID 会被复用，
+    一个死掉的 PID 被别的进程占用后 `kill(pid,0)` 照样成功，于是「进程死了」被报成
+    「还活着但卡住了」，处置从「重启」变成「先看日志」，而根本没有日志可看。
+    所以见证里同时记 `startedAt`（`Date.now() - process.uptime()` 推导，实测与本机
+    `Get-Process().StartTime` 差 68ms），health 时反查当前持有者的启动时刻做双向核对，
+    差超过 `PROC_TOLERANCE_MS`（2 秒）即判 `reused`。
+    **误判条件**：新持有者与原进程启动时刻相差不到 2 秒 → 会判成 `stuck`（说它卡住，
+    实际已死）。概率极低，但这是**已知边界**，不是「已保证正确」。
+    另一个真实的不可判情形：探不到 PID 的启动时刻（无权限 / 命令不可用）→ `unknown`，
+    明确说判不了，而不是回落成「活着」或「死了」。
+  - **Windows 实测（先说清再动手，Node 26 / Windows 10 19045）**：
+
+    ```
+    process.kill(自己的 pid, 0)   → 成功（无返回值，不抛）
+    process.kill(999999, 0)       → 抛 code=ESRCH errno=-4040
+    process.kill(4, 0)            → 抛 code=EPERM errno=-4048  ← System 进程：存在但无权限
+    process.kill(刚退出的子进程,0)  → 抛 code=ESRCH
+    process.kill(0, 0)            → 成功  ← POSIX「当前进程组」语义，不是「不存在」
+    process.kill(null | 1.5, 0)   → 抛 ERR_INVALID_ARG_TYPE
+    ```
+
+    结论：`ESRCH` = 不存在；**`EPERM` 必须当成「存在」**（把它当不存在会把活进程报成已退出）；
+    `pid 0` 与非法入参都得显式挡掉。探启动时刻的代价：Windows `Get-Process` 355–390ms、
+    `Get-CimInstance` 743–800ms（选了前者），POSIX `ps -o etimes=` 秒级 —— 只在心跳停了的冷路径上付。
+  - **写频率（约束 2）**：`proc.json` 每进程一次。顺带把 `claimOwnership` 的 `owner.json`
+    写入节流成「同一 `(repo, pid, startedAt)` 第二次起不写」（返回值新增 `written`），
+    冲突时仍照写。这条顺带修掉一个**测量陷阱**：`owner.json` 的 `lastSeenAt` 原本会被任何
+    调用者（包括人手敲的 `install-watcher status`）刷新 —— 本条目开头记的「18:02 假活」
+    就是这么来的。节流后它只描述「哪个进程什么时候接手」。
+  - **零新依赖（约束 3）**：存活只用 `process.kill`；启动时刻在 Windows / POSIX 上分别调
+    `powershell` / `ps`，都是系统自带。
+  - **为什么不写进 `owner.json`**（原提案方向）：`owner.json` 的语义是「哪个仓库在用这个目录」，
+    它在**冲突时本来就会被另一份克隆覆盖**（那是它的设计目的）。把进程存活写进去等于让
+    「第二份克隆跑过一次」就抹掉真正守护进程的见证 —— 恰好是本条目要防的静默失效。
+    两件事生命周期不同（归属随仓库变，进程存活随进程变），所以分成两个文件。
+  - **负向验证**（每条都是「先放 bug 回去 → 变红」）：
+
+    ```
+    去掉启动时刻核对（退回只看 kill(pid,0)）→ ✖ PID 复用被判成还活着        fail 1
+    把任何 kill 异常都当「存在」            → ✖ PID 不存在 + 「该重启」文案    fail 2
+    健康时也产出进程层                     → ✖ 不误报 + 另外两条              fail 3
+    去掉 owner.json 写节流                 → ✖ 写节流 + 另外两条              fail 3
+    让 proc 层走通用渲染格式               → ✖ 「不得印 NaN」                fail 1
+    ```
+
+    端到端跑了五个真实现场（真 `--health`）：心跳正常不报进程层 / PID 不存在 →
+    「进程已退出（PID 999999 已不在）」/ 启动时刻对不上 → 「已被别的进程复用」/
+    启动时刻吻合 → 「它卡住了，重启前先看日志」/ 无 `proc.json` → 「判不了」。
+  - **测试**：`watch.test.mjs` 新增 13 条（全仓 1683 → 1686 体现在那一轮，`node --test scripts/`
+    1686 tests / 1684 pass / 2 skipped / 0 fail）。
+
+- **遗留（本条目仍未闭环的部分，如实留着）**：
+  1. **「死后自动重启」（候选方向 1）没做。** 现在只是**报得准**了，仍然要人去重启 ——
+     也就是「没有任何东西把这句话送到用户眼前」这半句**没有修**。计划任务级自启与
+     崩溃拉起都要碰系统配置（注册表 / schtasks），代价与可回滚性都没量过。
+  2. **「把监视过期推到最显眼的位置」（候选方向 2）没做。** TUI 的 checklist 仍按原位置渲染。
+  3. **进程到底为什么会死，仍然未知。** 本条目记的三个日志停止时间互不相同、无异常无退出记录，
+     这次修复**不解释根因**，只是让下一次发生时能立刻分清「该重启」还是「该看现场」。
+     `proc.json` 只回答「它还活着吗」，不回答「它为什么没了」。
+  4. **`proc.json` 与 `owner.json` 都不带退出原因。** 被 `taskkill /F`、断电、蓝屏三类
+     在文件上留下的痕迹一样。要区分得靠宿主事件日志，这次没做。
+
+### DF-029 [fixed] `overwatch launch` 起的会话会同时挂两份 hooks，同一条判据跑两次
 
 - **发现于**：2026-11-18 把两道闸注册进 `.claude/settings.local.json` 之后，复核
   `launch.mjs --dry-run` 的输出
@@ -515,6 +597,83 @@
   同一次调用被重复触发时第二次直接放行且**不记账**。这比「检测到重复注册就跳过」
   更稳 —— 后者依赖能可靠识别自己是否被重复注册，而那本身是个不可靠的判断。
 - **优先级**：P1。注册已生效，任何用 `overwatch launch` 起的会话立刻会遇到。
+
+#### 修复（2026-11-18）
+
+- **实测现状（修前，未提交，直接调 `runHook` 两次，同一 `tool_use_id=toolu_1`）**：
+  ```
+  [PreToolUse] 调用 2 次（同一 tool_use_id）
+    台账行数            : 2
+    两次 decision        : ["deny","deny"]
+    .ow-gate-denials.json: {"prompt_id":"prompt-1","n":2}   ← 1 次真实拒绝被记成 2 次
+  [Stop] 调用 2 次（同一 prompt_id=prompt-9，stop_hook_active=false）
+    台账行数            : 2
+    两行 blockCount      : [0,1]
+    两行 totalBlocks     : [0,1]
+    state.json           : {"sid-B":{"count":2,"total":2}}
+    blockCount 双跳？     : YES（1 个真实回合记了 2 次）
+  ```
+  第三条后果（最初写「没有验证」的那条）**确认成立，而且比预想更贵**：
+  `count` 与 `total` 各跳 2，而 `MAX_BLOCKS = 6` 的预算是按 `total` 算的
+  —— 于是**6 次预算实际只够 3 个回合**，闸门比设计值早一倍收手。
+  另外 `bumpDenials` 的刹车计数也翻倍（`n:2`），`denyBudget` 同样提前用光。
+- **修法**：新增 `scripts/hook-dedupe.mjs`，两条 hook 在判定前各做一次**幂等认领**。
+  采纳了原条目建议的方向（按输入里的 id 幂等），但**没有**用 `prompt_id` 做 Stop 的键 ——
+  见下一节的实测理由。
+  - **原子性**：认领 = `openSync(path, 'wx')`（`O_CREAT|O_EXCL`）创建该键专属文件。
+    语义由内核保证，**不是「先读后写」**。本机实测：已存在 → `EEXIST`，不存在 → 创建成功；
+    6 个并发子进程抢同一个键，恰好 1 个成功（`hook-dedupe.test.mjs` 里就是这么测的）。
+  - **诚实边界**（写在 `hook-dedupe.mjs` 文件头，不假装原子）：
+    ① **网络文件系统**上 `O_EXCL` 历来不可靠（NFSv2 / 部分 SMB 实现）。默认落在本地盘
+    `tasks/runs/hook-dedupe/`，只有把 `OVERWATCH_HOOK_DEDUPE_DIR` 指到网络盘才受影响，
+    后果是退回「两边都判定」，即修前的行为 —— 失效方向是**多记一次**。
+    ② **过期重抢**有微秒级窗口（`unlink` 再 `O_EXCL` 两条系统调用之间）。要三个并发
+    才碰得到，两条注册的常态（恰好 2 次）碰不到。
+    ③ **认领后崩溃** → 这一次事件没有任何台账行。这是刻意选的：两个 hook 本来就在
+    崩溃时 exit 0 无输出（fail-open），所以结果与既有失败形态**逐字相同**，没引入新的。
+- **Stop 没有 `prompt_id` 可用吗？—— 有，但不够。**
+  读宿主 2.1.308 二进制里 Stop 的 schema（`hook_event_name:"Stop"` 分支）：
+  可用字段只有 `stop_hook_active` / `last_assistant_message` / `background_tasks` /
+  `session_crons`，外加公共的 `session_id` / `prompt_id` / `transcript_path` / `cwd`。
+  `prompt_id` 的宿主原文是「UUID correlating a user prompt with all subsequent events
+  until the next prompt」—— 它是**回合**级的，不是**事件**级的。只用
+  `session_id + prompt_id` 会把「hook 拦一次 → 模型补证据 → 再 Stop」也压成一次，
+  那会让第二次判定整个消失（比原来的重复更坏）。所以键是
+  `session_id + prompt_id + stop_hook_active + sha256(last_assistant_message)`，
+  空文本时再掺 `transcript_size`。**如实写明的残留缺陷**：空文本 + 同一 prompt +
+  transcript 字节数也相同，才会被误合并；后果是少一行观测记录，不是一个判断错。
+- **为什么不去掉 `launch.mjs` 的注入**：评估过了。代价是**从仓库外目录 launch 的会话零闸** ——
+  那种会话没有项目 settings，`--settings` 是唯一的注册途径。幂等让「两边都注册」
+  从错误变成一个安全的选择，比在「桌面版没闸」和「仓库外没闸」之间二选一好。
+  `launch.mjs` 的说明文字同时改了：不再只写「实测两边都会触发」，而是写明
+  「重复已由 hook 按 id 幂等处理（第二次放行且不记账）」。
+- **实测效果（修后，同一装置）**：
+  ```
+  [PreToolUse] 台账 1 行 · decision ["deny", null] · duplicate=true · 刹车计数 n:1
+  [Stop]       台账 1 行 · state.json {"count":1,"total":1} · blockCount 双跳 no
+  延迟：PreToolUse 第 1 次 21.4ms / 重复 2.0ms；Stop 第 1 次 41.2ms / 重复 2.1ms
+        （30 次均值，1MB transcript。重复进程只花一两次系统调用，判定完全省掉）
+  ```
+- **负向验证**（每条都先让它红、再修到绿）：
+  - 摘掉 `stop-verify-hook` 的认领 → `70 tests / 68 pass / 2 fail`（DF-029 的两条变红）
+  - 把认领改成恒 `false`（去重过头）→ `70 tests / 51 pass / 19 fail`
+    —— 包括「拦一次 → 补证据 → 再 Stop」那条，它守的正是「过度去重会吞掉真判定」
+  - 摘掉 `pre-write-gate` 的认领 → `98 tests / 90 pass / 7 fail`，其中 4 条是新增的 DF-029
+  - 还原后：`stop-verify-hook.test.mjs` 70/70 绿、`hook-dedupe.test.mjs` 18/18 绿
+  - 全量：硬门数源码 `test(` 得 **1683 条**；`node --test scripts/` 报
+    **1686 tests / 1684 pass / 0 fail / 2 skipped**（差的 3 条是参数化子测试，两个口径分开记）。
+    连跑两次一致。
+  - 三个台账增量：`stop-hook/<今天>.jsonl` 0、`stop-hook-samples.jsonl` 0、
+    `pre-write-gate/<今天>.jsonl` 0。
+    **口径必须写明**（这里踩了一次坑）：直接数总行数会看到 +2 ~ +4，看起来像测试泄漏，
+    实际每一条都是**本会话自己的 Bash 调用触发的真 hook**（`sessionId` = 本会话，
+    `tool` = `Bash`）。正确的判据是**「非本会话写入的行数」**：
+    跑一次全量前后分别是 `stop-hook 147 → 147`、`samples 1271 → 1271`、
+    `pre-write-gate 97 → 97`，完全不变。
+    这正是本仓反复记的那条纪律：**先确认你数的是不是同一件事**。
+- **顺带修掉的两个同类缺陷**（都是在修本条时被新加的门禁照出来的，见 `DF-033`）：
+  `checkUnregisteredExports()` 因为某个脚本 import 即打印而**从来没跑过**；
+  以及两个脚本缺入口守卫。
 
 ### DF-030 [wontfix] 两个 hook 台账里已有的污染数据无法区分真伪，决定不清理
 
@@ -573,5 +732,69 @@
   而 `pre-write-gate.mjs` 认。同一仓库里两个 hook 对同一环境变量给出不同答案，
   比两个都不认更糟：它让「我已经隔离了」有时真、有时假。已补齐并加测试
   （负向验证：摘掉兜底 → 该测试变红）。
+
+### DF-033 [fixed] `checkUnregisteredExports()` 从来没跑过——某个脚本 import 即打印，`JSON.parse` 失败后静默 return
+
+- **发现于**：2026-11-18 修 `DF-029` 时给 `hook-dedupe.mjs` 加导出，想确认「未登记导出」
+  这道门会不会提示，结果发现它**一个字都没提示过**。
+- **位置**：`scripts/check-structure.mjs` 的 `checkUnregisteredExports()`（子进程
+  `import()` 全部非测试脚本，收集 `Object.keys`，`JSON.parse` 后比对登记表）
+- **证据**（可复算）：那个子进程的 stdout 是**被 `JSON.parse` 的**，而
+  `make-social-preview.mjs` 当时在模块顶层直接 `writeFileSync` + `console.log`。
+  于是 stdout 变成
+  `已生成 1280×640 · 9181 字节\n…`（中文），`JSON.parse` 必失败，
+  原来的 `catch { return; }` 就把**整项检查**放弃了。它的输出与「所有导出都登记过」
+  逐字相同。
+  把 `make-social-preview.mjs` 加上入口守卫之后，第二个污染源立刻浮出来：
+  `measure-checklist-coverage.mjs`（commit `31c7f5c`）同样在顶层打印。
+  这说明它**不是一次性事故，是这类脚本的默认写法**。
+- **它为什么严重**：与 `DF-031` 完全同一种形态 —— **静默跳过看起来与通过一模一样**。
+  修 `DF-031` 时我们刚刚为这一点写过一段注释，然后在同一个文件里留下了第二处。
+- **顺带的副作用**：每次跑 `check-structure.mjs` 都在**写** `dist/social-preview.png`
+  —— 一个自称只读的检查有写副作用。而 `dist/` 是 gitignored，所以没人看得出来。
+- **修法**（改机制而非改数据）：
+  1. `make-social-preview.mjs` 与 `measure-checklist-coverage.mjs` 的顶层执行收进
+     `main()`，并加「我是不是被直接执行」的入口守卫（与仓里 17 个入口同一写法，
+     比的是 `realpathSync` 而非 `resolve` —— 理由见 `DF-026` 那一族）。
+     `make-social-preview` 另外抽出 `renderPng()`：画图与编码无副作用，可被结构门真调一次。
+  2. `checkUnregisteredExports()` 里那两个 `return` 改成 `fail()`：子进程非 0 退出要红，
+     `JSON.parse` 失败也要红，**并把 stdout 前 80 字打出来指名是谁污染的**。
+     一条永远不说话的门禁等于没有门禁。
+- **负向验证**：
+  - 修之前跑 `node scripts/check-structure.mjs`：`✓ 结构检查全部通过`，**0 条提示**
+    —— 而 `hook-dedupe.mjs` 的 11 个导出当时一个都没登记。
+  - 只给 `make-social-preview.mjs` 加守卫、不改门禁：仍然 `✓` 通过（因为
+    `measure-checklist-coverage.mjs` 接手污染），**这证明了「修一个污染源没用」**。
+  - 改完门禁之后再跑：`✗ 1 项违规：导出清单不是合法 JSON …… 实测 stdout 前 80 字：`
+    并指名污染源。
+  - 全部修完：`✓ 结构检查全部通过`，且**列出 13 条未登记提示**（现在是真在扫）。
+    把那 13 个导出登记进 `PROBE_ARGS` / 登记表之后回到 0 条。
+- **遗留（不在本条修）**：`INTENTIONALLY_PROBED_FREE` 的用法散落在函数体里，
+  与 `REGISTERED` 两套表并存；要不要合并是另一个问题，先不动。
+
+### DF-032 [wontfix] 子 Agent 在代码注释里写了编造的实测数字，而它看起来和真的一样
+
+- **发现于**：2026-11-18 复核 DF-027 的修复时，顺手验注释里的实测数字
+- **位置**：`scripts/pre-write-gate.mjs` 的 `SHELL_READ_VERBS` 上方注释（已改）
+- **证据**：原文写「实测本机 100 份 transcript：6391 条 shell 命令里 `sed` 1170 条，
+  其中就地编辑 164 条」「本机实测 55 条 awk 命令、0 条就地编辑」。
+  我用**两种数法**重算这 100 份 transcript：
+  - 按 JSON 解析 `tool_use.input.command`：**6100 行 / 846 个 tool_use / 149 次 Bash / `sed` 0 条**
+  - 在原文里搜 `sed ` 字面量：**0 次**
+
+  两条路都得不到那组数字，也**没有任何脚本能产出它** —— 这个仓库里搜 `6391` / `1170`
+  只有那一段注释本身。
+- **为什么记这一条**：编出来的精确数字**比没有数字更坏**。
+  它让一个其实基于推理的决定看起来像基于测量，下一个人会照着它继续推理，
+  而它无法被复现。这正是本仓 `DF-031` 的同一种病（看起来有依据、没人能验）。
+  本仓纪律明写「每条必须写出处」「不得伪造精确数字」，这一条是那个纪律被违反的实例。
+- **对照**：同批 Agent 里，`watch.mjs` 的进程见证那条写了五条 Windows 实测
+  （`process.kill(process.pid,0)` 成功 / `999999` → ESRCH / `4` → EPERM / 已退子进程 → ESRCH /
+  `0` → 成功）。我逐条复现，**五条全对**。所以问题不是「Agent 写的数字都不可信」，
+  而是「**必须逐条复现**，因为有一类看起来完全一样但从来没跑过」。
+- **处置**：删掉编造的数字，改成如实说「加 `sed` 条件判据是基于 `sed -i` 会写盘这个语义事实，
+  不是基于本机用量统计」。**判据本身不动** —— `sed -i` 不算读这条是对的，与用量无关。
+- **不修的地方**：这件事没法靠工具拦住（注释里的数字没有可执行的核对途径）。
+  能做的只有纪律：主线程复核 Agent 给的每个实测数字。本次即按此执行。
 
 _（新增条目追加在此行上方）_
