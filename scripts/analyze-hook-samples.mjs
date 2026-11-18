@@ -27,6 +27,17 @@
  *   node scripts/analyze-hook-samples.mjs
  *   node scripts/analyze-hook-samples.mjs --file <path> --json
  *   node scripts/analyze-hook-samples.mjs --limit 20
+ *
+ * ── 台账里 2026-11-18 11:00 之前的数据不可用于统计（`DF-030`）──────────
+ *
+ * `entry-symlink.test.mjs` 曾经每次跑测试都往生产台账追加记录（它 spawn hook 却没传
+ * 隔离用的环境变量），已于 2026-11-18 修复。但**存量清不掉**：那些记录的 `sessionId` / `cwd`
+ * 是 `unknown` / `null`，与「hook 真收到坏输入」看起来一模一样，删掉等于假定全是测试写的，
+ * 而这个假定无法证明。
+ *
+ * 所以：**只用 2026-11-18 11:00 之后的行**做比例统计。切换点之后 `unparsable-input`
+ * 复查为 0（修复后连跑全量测试，两个台账增量都是 0）。拿修复前的行算比例，
+ * 分母里会混进几十条 `input: ''` 的 spawn —— 它们会让「放行原因分布」整体失真。
  */
 
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
