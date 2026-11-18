@@ -46,6 +46,7 @@
 | 文档相对链接不悬空 | `node scripts/check-links.mjs` | 断链数，非 0 即失败 |
 | 生成仓库社交预览图（1280×640） | `node scripts/make-social-preview.mjs --out docs/assets/social-preview.png` | 一张 PNG；GitHub 的 social preview 没有 API，要人工上传 |
 | 清单机制在真实使用中覆盖多少 | `node scripts/measure-checklist-coverage.mjs --days 7` | 派发率 / 清单率两个口径（含沙箱、不含沙箱）。**数字低不是缺陷，是「加闸值不值得」的依据** |
+| 把 Stop 闸改成 block 会拦多少个真实会话 | `node scripts/replay-stop-gate.mjs --days 30` | 三档：全部 / 非沙箱 / **★ 会真的跑闸（真实项目 + 主会话）**。**只看 ★ 那一行** —— 子 agent transcript 不产生 Stop 事件，混进去会把拦截率虚高数倍 |
 
 > 想确认某个数字：跑对应命令，**不要相信任何文档里写死的秒数/占比**。
 > 扫描耗时、命中率、token 用量都随语料增长而变，见 `docs/research/README.md`「互相矛盾的地方」。
