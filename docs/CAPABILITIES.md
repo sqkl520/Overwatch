@@ -44,6 +44,7 @@
 | 从 transcript 抽子 agent 的写入痕迹（不需要它配合） | `node scripts/claim-ledger.mjs observe --run <run-id> --session <会话目录>` | 每条写文件的调用（`Write`/`Edit` + 路径可确定解析的 Bash 写入），含失败的调用，并打印「判不出」的逐类计数 |
 | 全量回归测试 | `node --test scripts/` | 全绿；条数以命令输出为准 |
 | 文档相对链接不悬空 | `node scripts/check-links.mjs` | 断链数，非 0 即失败 |
+| 生成仓库社交预览图（1280×640） | `node scripts/make-social-preview.mjs --out docs/assets/social-preview.png` | 一张 PNG；GitHub 的 social preview 没有 API，要人工上传 |
 
 > 想确认某个数字：跑对应命令，**不要相信任何文档里写死的秒数/占比**。
 > 扫描耗时、命中率、token 用量都随语料增长而变，见 `docs/research/README.md`「互相矛盾的地方」。
