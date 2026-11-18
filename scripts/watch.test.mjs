@@ -30,6 +30,7 @@ import {
   procWitnessPath, writeProcWitness, readProcWitness, judgeProcess, PROC_TOLERANCE_MS,
   requestIdTime, lastTimelineStateTime, resolveJobEventTime, BLOCKED_MAX_AGE,
   readLogHealth, logHealthPath, LOG_HEALTH_FILE,
+  convergeBySession,
 } from './watch.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-watch-test-'));
@@ -77,6 +78,56 @@ test('AC2 去重：reason 变化视为新事件', async () => {
 
     assert.equal(calls.length, 2, 'reason 变化必须再发一条');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-024：同一会话的 WAITING 与 ASKED 必须只留一条，且宿主事实优先', () => {
+  // 这是 `dedupeKey` 收敛不了的那一类：state 被编进哈希，所以两条件不同键。
+  // 实测两个键确实不同（见下面的断言），所以在 `convergeBySession` 之前，
+  // 它们会各自通过 `seen` 检查 —— 用户收到两条说同一件事的通知。
+  const waiting = { sessionId: 'sess-A', state: 'WAITING', reason: 'permission-prompt', project: 'p' };
+  const asked = { sessionId: 'sess-A', state: 'ASKED', reason: 'permission-prompt', project: 'p' };
+
+  assert.notEqual(
+    dedupeKey(waiting.sessionId, waiting.state, waiting.reason),
+    dedupeKey(asked.sessionId, asked.state, asked.reason),
+    '前提：两条件确实是不同键，否则本条缺陷不存在',
+  );
+
+  // 顺序无关：无论谁先到，留下的都必须是宿主事实那条。
+  for (const order of [[waiting, asked], [asked, waiting]]) {
+    const r = convergeBySession(order);
+    assert.equal(r.kept.length, 1, '同一会话只留一条');
+    assert.equal(r.kept[0].state, 'WAITING', '宿主事实优先于推断');
+    assert.equal(r.dropped.length, 1);
+    assert.equal(r.dropped[0].state, 'ASKED');
+  }
+});
+
+test('DF-024：不同会话各不相同，不能被误收敛', () => {
+  const r = convergeBySession([
+    { sessionId: 'a', state: 'WAITING', reason: 'x' },
+    { sessionId: 'b', state: 'WAITING', reason: 'x' },
+    { sessionId: 'c', state: 'ASKED', reason: 'x' },
+  ]);
+  assert.equal(r.kept.length, 3, '会话不同就是不同的事，一条都不能丢');
+  assert.equal(r.dropped.length, 0);
+});
+
+test('DF-024：同级之间保留先到的，不做隐含严重度排序', () => {
+  // 两个都是宿主事实（WAITING / BLOCKED）时，没有可信的严重度序 ——
+  // 保留先到的，行为可预测。编一个排序会让判定看起来比实际更聪明。
+  const r = convergeBySession([
+    { sessionId: 's', state: 'WAITING', reason: 'first' },
+    { sessionId: 's', state: 'BLOCKED', reason: 'second' },
+  ]);
+  assert.equal(r.kept.length, 1);
+  assert.equal(r.kept[0].reason, 'first', '同级保留先到的');
+});
+
+test('DF-024：空输入与垃圾输入不抛', () => {
+  assert.deepEqual(convergeBySession([]), { kept: [], dropped: [] });
+  assert.deepEqual(convergeBySession(null), { kept: [], dropped: [] });
+  assert.deepEqual(convergeBySession(undefined), { kept: [], dropped: [] });
 });
 
 test('AC2 去重键：sessionId | state | reasonClass | evidenceFingerprint 的 sha256 前 16 位', () => {

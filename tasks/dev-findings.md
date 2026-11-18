@@ -320,7 +320,20 @@
   超过 N 个周期就标红。`state.lastJobsScanAt` 已经存在，只是没人拿它跟现在比。
 - **处置（2026-10-31 已修）**：`watch.mjs --health`，按各层周期 ×3 判 stale。
   接进 `install-watcher.mjs status` 与 `SKILL.md` §0；结构门守住引用不被删。
-### DF-024 [open] 同一 tick 内 WAITING 与 ASKED 可能对同一会话各发一条（跨路径收敛未做）
+### DF-024 [fixed] 同一 tick 内 WAITING 与 ASKED 会对同一会话各发一条（跨路径收敛未做）
+
+> **修复（2026-11-18）**：新增 `convergeBySession(candidates)`（`watch.mjs:886`，纯函数、已导出），
+> 在 `runTick` 的 `seen` 收敛之后再做一次**会话级**收敛。同一 `sessionId` 一个 tick 只留一条；
+> 宿主事实（`WAITING`/`BLOCKED`/`FAILED`）优先于推断（`ASKED`），推断那条**丢弃不延迟**
+> （延迟就是 10 分钟后那条重复通知）。同级之间保留先到的，不做隐含严重度排序。
+>
+> **为什么不改 `dedupeKey`**：把 `state` 从键里拿掉会让「同一会话换了状态」这类真实变化被吞掉 ——
+> 漏报比多报更糟。收敛必须在会话维度做，不是在键的构造上做。
+>
+> **负向验证**：把 `convergeBySession` 退化成「不收敛」→ 两条测试变红
+> （「只留一条」「同级保留先到的」）；恢复后 `watch.test.mjs` 170 条全绿。
+> 测试先断言「WAITING 与 ASKED 确实是不同键」，把这个前提也钉住 —— 否则将来
+> `dedupeKey` 改了，这个测试会变成一个测不到东西的空壳。
 
 - **发现于**：2026-11-04-notify-fix / 修复 Agent F3（修去重键时顺带发现，**不在本次任务范围内**）
 - **位置**：`watch.mjs` 的 `runTick` 去重收敛块（`seen` 集合），与 `askedCandidates`

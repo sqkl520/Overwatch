@@ -354,6 +354,8 @@ const PROBE_ARGS = {
   usage: '[]', fmtDur: '[1]', fmtNovelty: '[0.5]', projectLabel: '["a-b"]',
   glyphOf: '[{}]', stateOf: '[{}]',
   reasonClass: '["novelty=0.1"]', dedupeKey: '["a", "STALLED", "novelty=0.1", "x"]',
+  // DF-024：跨 state 的会话级收敛。纯函数，给两条同会话不同 state 的候选即可。
+  convergeBySession: '[[{ sessionId: "s", state: "ASKED", reason: "x" }, { sessionId: "s", state: "WAITING", reason: "y" }]]',
   // measure-interventions.mjs（2026-11-11 人工介入基线）：全部纯函数，参数取最小可构造输入。
   // eachLine / analyzeTranscript / formatReport 读盘，用不存在的路径——空文件返回 0 行，
   // 不存在的路径在 analyzeTranscript 里会抛，外面 checkImportable 会吞掉（它只关心 ReferenceError）。
@@ -941,7 +943,7 @@ function checkUnregisteredExports() {
     'sanitize', 'truncateToWidth', 'wrapToWidth', 'buildDraft', 'detailLines',
     'stripLongStrings', 'collectSubagentFiles', 'stateCounts', 'listRow',
     'columnHeaderLine', 'listHeaderLine', 'usage', 'fmtDur', 'fmtNovelty',
-    'projectLabel', 'glyphOf', 'stateOf', 'reasonClass', 'dedupeKey',
+    'projectLabel', 'glyphOf', 'stateOf', 'reasonClass', 'dedupeKey', 'convergeBySession',
     'emptyState', 'loadState', 'saveState', 'recordSent', 'probeJobs', 'pruneNotified', 'NOTIFIED_TTL_HOURS',
     'probeMtime', 'diffProbe', 'foldProbe', 'canNotify', 'candidatesFromScan',
     'createLogger', 'defaultStateDir', 'escapeXml', 'sanitizeTag', 'textOf',

@@ -857,6 +857,52 @@ export function dedupeKey(sessionId, state, reason, evidenceFingerprint = '') {
     .slice(0, 16);
 }
 
+/** **同一会话一个 tick 只留一条候选**（`DF-024`）。纯函数：候选进、保留/丢弃出。
+ *
+ *  ── 为什么需要它 ──────────────────────────────────────────────────
+ *
+ *  `dedupeKey` **把 state 编进了哈希**（`sessionId|state|reason|fingerprint`），
+ *  所以同一会话的 `WAITING` 与 `ASKED` 天然是不同键，去重集合收敛不了它们。
+ *  一个停在 `AskUserQuestion` 上的会话会在同一 tick 各产一条候选 ——
+ *  用户先后收到两条说同一件事的通知。
+ *
+ *  `GLOBAL_MIN_GAP`（10 分钟）只**推迟**第二发、不取消它：下一个 tick 照发。
+ *
+ *  ── 为什么不在 `dedupeKey` 上改 ───────────────────────────────────
+ *
+ *  把 `state` 从键里拿掉，会让「同一会话换了状态」这类**真实变化**被吞掉。
+ *  漏报比多报更糟：多一条你能忽略，少一条你不知道它发生过。
+ *  收敛必须在**会话维度**做，而不是在键的构造上做。
+ *
+ *  ── 优先级 ────────────────────────────────────────────────────────
+ *
+ *  宿主事实（`WAITING`/`BLOCKED`/`FAILED`）优先于推断（`ASKED`）。
+ *  宿主说的是「它此刻确实停在这个状态」，`asked.mjs` 是从文本推的。
+ *
+ *  **丢弃推断那条，不延迟它。** 延迟就是 10 分钟后那条重复通知 —— 那正是本条要消掉的东西。
+ *
+ *  同级之间保留**先到的**（到达顺序稳定，可预测；不做「严重度更大者胜」那类隐含排序，
+ *  因为本仓没有可信的严重度序，编一个会让判定看起来比实际更聪明）。 */
+export function convergeBySession(candidates) {
+  const arr = Array.isArray(candidates) ? candidates : [];
+  const winner = new Map();
+  for (const c of arr) {
+    const prev = winner.get(c.sessionId);
+    if (!prev) { winner.set(c.sessionId, c); continue; }
+    const prevHost = HOST_FACT_STATES.includes(prev.state);
+    const curHost = HOST_FACT_STATES.includes(c.state);
+    // 宿主事实覆盖推断；其余一律保留先到的。
+    if (curHost && !prevHost) winner.set(c.sessionId, c);
+  }
+  const kept = [];
+  const dropped = [];
+  for (const c of arr) {
+    if (winner.get(c.sessionId) === c) kept.push(c);
+    else dropped.push({ sessionId: c.sessionId, state: c.state, reason: c.reason });
+  }
+  return { kept, dropped };
+}
+
 /** 等待锚点：**这次**等待的唯一标识，用作 `dedupeKey` 的第四个参数。
  *
  *  取 transcript 里最后一个未闭合的 `AskUserQuestion` / `ExitPlanMode` 的 `tool_use_id`。
@@ -2449,6 +2495,17 @@ export async function runTick({
     seen.add(k);
     eligible.push(c);
   }
+
+  // 跨 state 的会话级收敛（`DF-024`）。判据在 `convergeBySession()` 里，
+  // 抽成纯函数是为了能被直接测 —— 内联在这里的话，测它得先构造整条 runTick 链路。
+  const conv = convergeBySession(eligible);
+  if (conv.dropped.length && log) {
+    for (const d of conv.dropped) {
+      log.info(`suppressed ${d.state} cross-state-duplicate session=${d.sessionId} (reason=${d.reason})`);
+    }
+  }
+  eligible.length = 0;
+  eligible.push(...conv.kept);
 
   const dispatched = await dispatchCandidates(eligible, {
     state, logger: log, notifier: notify, nowMs, dryRun,
