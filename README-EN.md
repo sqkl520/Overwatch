@@ -164,21 +164,24 @@ Four verdicts:
 
 ### The honest numbers
 
-Seven-day window, 226 completion claims:
+Seven-day window, measured 2026-11-18: 192 checkable assertions.
 
 ```
-SUPPORTED      15    6.6%
-STALE_ONLY      3    1.3%
-NO_EVIDENCE    46   20.4%
-UNKNOWN         3    1.3%
-UNCHECKABLE   159   70.4%   ← seven in ten cannot be judged
+SUPPORTED      20   10.4%
+STALE_ONLY      3    1.6%
+NO_EVIDENCE    11    5.7%
+UNKNOWN         3    1.6%
+UNCHECKABLE   155   80.7%   ← eight in ten cannot be judged
 ```
 
-**70.4% cannot be judged.** That is not a defect, it's the boundary: it only
+**80.7% cannot be judged.** That is not a defect, it's the boundary: it only
 works on assertions that have a specific tool call to compare against (build
 succeeded, tests passed, push completed, file count). Everything else is filed
 under `UNCHECKABLE` rather than guessed at. Calling "cannot judge" a "looks
 fine" is the one mistake this project least wants to make.
+
+These numbers drift as the corpus grows — run `node scripts/verify-claims.mjs
+--days 7` to see yours. Do not quote the denominator here as a constant.
 
 ---
 

@@ -1,8 +1,8 @@
 # Changelog
 
-本项目：**Overwatch · OmniSight** —— 跨会话 AI 任务监控与接力调度，以**纯 Claude Code 配置库**形态交付（markdown 角色定义 + 零依赖 Node 脚本），它看见的不是一个会话，而是所有对话的全景。
+本项目：**UntilDone** —— 目标是**用户一次给到需求便一次做完，不会中途停止**，以**纯 Claude Code 配置库**形态交付（markdown 角色定义 + 零依赖 Node 脚本）。跨会话监控与接力调度是这个框架的**附属功能**，不是产品定义。
 
-> **仓库**：<https://github.com/sqcola/Overwatch> ｜ **版本**：`0.2.0` + `[Unreleased]`（无 tag、无 Release）
+> **仓库**：<https://github.com/sqkl520/UntilDone> ｜ **版本**：`0.2.0` + `[Unreleased]`（无 tag、无 Release）
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/)。项目尚未正式发版，各段以**工作阶段/里程碑**划分，并标注对应的 git commit。所有日期取自 `git log --format=%ad --date=short`；规格与 ADR 的落款日期是 2026-10-29，首次提交发生在 2026-10-30 凌晨——两者不一致是事实，不是笔误。
 
@@ -20,6 +20,43 @@
 > 3. 数字冲突时以最新实测为准，并在条目里说明旧数字为什么错。
 
 ---
+
+## [Unreleased] - 2026-11-18（文档指向真实名字；实测数字与文档对齐）
+
+### Fixed
+
+- **改名只改了一半：GitHub 仓库还叫 `Overwatch`**（commit `480d0b9`，`gh repo rename`）。
+  代码在 `efd9541` 就改了名，但远端仓库、`origin`、描述、topics 都还是旧的。
+  后果具体：README 的克隆命令写成 `git clone .../UntilDone.git` 之后**会失败**，因为那个路径不存在。
+  现在仓库名、`origin` URL、description、topics 四处一致；旧名由 GitHub 重定向。
+  topics 一并从「监控」口径改成「闭环」口径（去 `session-monitoring`/`observability`，
+  加 `task-checklist`/`ai-agent-orchestration`/`multi-agent`）。
+
+- **克隆后的目录名与下一步命令对不上**（`README.md` / `README-EN.md` / `docs/FOR-USERS.md`）。
+  `git clone .../UntilDone.git` 建出的是 `UntilDone/`，而正文三处都写着 `cd Overwatch` ——
+  陌生人执行的**第一条命令**就会失败。这是 README 里最贵的一类错：它不报错在自己身上，
+  报在读者身上。
+
+- **「下载最新版」指向一个空页面**。仓库零 tag、零 Release，那一行链接到一个什么都没有的页面，
+  而它正下方那句写着「没有 tag、没有 npm 包，仓库就是发布物」——同屏自相矛盾。
+  改指 README 自己的「30 秒上手」锚点（英文版是 `#-quick-start`，锚点按各自标题，不是直译）。
+
+### Changed
+
+- **测试数一句话里混了两个口径**（`README.md:240`）。徽章写 1627、正文写 1626，两个都是实测值：
+  1626 是 `check-structure.mjs` 数源码 `test(` 的个数，1627 是 `node --test` 的 pass 数
+  （子测试被单独计数）。现在正文明说是哪个口径，并说明实跑会多几条 —— 免得下一个人
+  以为其中一个写错了，把它「修正」成另一个。
+
+- **README 里 7 天窗口的四档数字已漂移，改成实测值**（`README.md` / `README-EN.md`）。
+  旧值 226 条 / `UNCHECKABLE` 70.4%，2026-11-18 实测 192 条 / **80.7%**：
+  `20 SUPPORTED / 3 STALE_ONLY / 11 NO_EVIDENCE / 3 UNKNOWN / 155 UNCHECKABLE`，
+  覆盖 591 个 transcript，读盘 0.77 GB，2996 ms。补了一句「这些数字随语料增长而变，
+  不要引用分母当常量」——旧值漂移的原因正是没人知道它会漂。
+
+- **CHANGELOG 头部两处失实**：项目名还写着 `Overwatch · OmniSight`，仓库地址写着
+  `sqcola/Overwatch`（账号与仓库都错）。本文件自己规定「每条必须写出处」，
+  头部却一直是错的，而它是读者第一眼看到的东西。
 
 ## [Unreleased] - 2026-11-17（改名 UntilDone；README 变成漏斗 + 中英双语）
 
