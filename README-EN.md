@@ -26,12 +26,11 @@ Cross-session monitoring exists only so you can see how far this pass actually g
 
 </div>
 
-> ⚠️ **Early-stage project.** No tags, no npm package; the repository is the release.
+> ⚠️ **Early-stage project.** No tags, no releases, no npm package — **`main` is the
+> release**; clone it and it works, no version to wait for. Changes are recorded in the
+> [CHANGELOG](docs/CHANGELOG.md).
 > Issues and suggestions are welcome — please [open an Issue](https://github.com/sqkl520/UntilDone/issues).
 > If you find it useful, a star means a lot ⭐
->
-> **This README does not track a version number.** The
-> [Releases page](https://github.com/sqkl520/UntilDone/releases) is the source of truth.
 
 ---
 

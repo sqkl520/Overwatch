@@ -24,10 +24,9 @@
 
 </div>
 
-> ⚠️ **早期项目。** 没有 tag、没有 npm 包，仓库就是发布物。
+> ⚠️ **早期项目。** 没有 tag、没有 Release、没有 npm 包 —— **仓库的 `main` 分支就是发布物**，
+> 克隆下来就能用，不需要等版本。改动记录在 [CHANGELOG](docs/CHANGELOG.md)。
 > 有任何问题欢迎 [提交 Issue](https://github.com/sqkl520/UntilDone/issues)；觉得有用就 Star 一下 ⭐
->
-> **本 README 不维护版本号** —— 版本以 [Releases 页](https://github.com/sqkl520/UntilDone/releases) 为准。
 
 ---
 
