@@ -487,4 +487,33 @@
      `log-health.json` 只覆盖 log 层，不覆盖进程存活。
 - **建议归属**：独立任务，优先级 P1。这是**当前唯一一个已确认「真实用户会踩到」**的产品缺陷。
 
+### DF-029 [open] `overwatch launch` 起的会话会同时挂两份 hooks，同一条判据跑两次
+
+- **发现于**：2026-11-18 把两道闸注册进 `.claude/settings.local.json` 之后，复核
+  `launch.mjs --dry-run` 的输出
+- **位置**：`scripts/launch.mjs:676-695`（`--settings` 注入）、
+  `.claude/settings.local.json`（项目级注册）、`scripts/launch.mjs:818-823`（自己的注释）
+- **证据**：`launch.mjs --dry-run` 的输出里明写着这两句 ——
+  「hooks 2 条，默认都是 observe」「这两条是**额外**挂上的：项目自己的 hooks 照旧生效
+  （实测两边都会触发）」。也就是说注释本身承认了叠加，但**没有说叠加的后果**。
+  在这个仓库里（`.claude/settings.local.json` 已注册）用 `overwatch launch` 起会话，
+  `PreToolUse` 每次工具调用会跑 **2 次** pre-write-gate，`Stop` 每个回合结束跑 **2 次** stop-verify-hook。
+- **后果**（按严重度）：
+  1. **台账翻倍**：`tasks/runs/stop-hook/<日期>.jsonl` 里每个回合两条记录，
+     而统计脚本（`analyze-hook-samples.mjs`）按行数算比例 —— 分母凭空翻倍。
+     这不是「多一份冗余」：两条记录同一时刻、同一 session，会被当成两件事统计。
+  2. **延迟翻倍**：实测单次 190ms（写前闸）/ 330ms（Stop）。Bash 密集的会话里
+     200 次调用 = 多花 38 秒，全部花在重复的同一件事上。
+  3. **计数器可能双跳**：`stop-verify-hook` 的 `blockCount` / `totalBlocks` 写在
+     `state.json` 里。同一回合被调两次会不会各 bump 一次，取决于它是否按 `prompt_id` 去重 ——
+     这一点**我没有验证**，需要真跑一次 `launch` 才能确认。
+- **为什么不是「关掉一边」这么简单**：两种会话是不同的入口。
+  桌面版起会话**只**看项目 settings（没有 `--settings`），`launch` 起的会话两边都有。
+  关掉项目 settings 会让桌面版重新变成零闸；关掉 `launch` 的注入会让从仓库外目录
+  起的会话没有闸（`--plugin-dir` 的 cwd 不在仓库里）。
+- **建议归属**：独立任务。最小修法是让 hook 自己**按 `tool_use_id` / `prompt_id` 幂等**：
+  同一次调用被重复触发时第二次直接放行且**不记账**。这比「检测到重复注册就跳过」
+  更稳 —— 后者依赖能可靠识别自己是否被重复注册，而那本身是个不可靠的判断。
+- **优先级**：P1。注册已生效，任何用 `overwatch launch` 起的会话立刻会遇到。
+
 _（新增条目追加在此行上方）_
