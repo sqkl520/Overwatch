@@ -5,7 +5,8 @@
     "mode": "always",
     "maxQuestions": 5,
     "requireReadFirst": true,
-    "minReads": 3
+    "minReads": 3,
+    "minQuestionsBeforeWrite": 0
   },
   "agent": {
     "roster": [

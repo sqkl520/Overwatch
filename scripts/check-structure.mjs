@@ -656,6 +656,15 @@ const PROBE_ARGS = {
   reasonFor: '[{ cwd: "/x", markerPath: "/x/m", gateCommand: "g", minReads: 3, halt: false }]',
   bumpDenials: '[_sandbox + "/pwg.json", "probe", { readOnly: true }]',
   cli: '[["status", "--cwd", "/nonexistent-ow-probe"], {}]',
+  // 2026-11-19 `ask.minQuestionsBeforeWrite`（第一次写之前先问够 N 个问题）：
+  // 判定层是纯函数，探针取最小可构造输入。`readTranscriptActivity` 给不存在的路径
+  // —— 那是「读不到」的正常分支（`unreadable:true`），正好把 fail-open 那条也验一遍。
+  // `minQuestionsBeforeWriteOf` 给一个不存在的配置文件：回落 0 是它的正常路径，
+  // 而且**不能**让它去读仓库根的 `overwatch.config.json`（那是真配置）。
+  readTranscriptActivity: '["/nonexistent-ow-probe"]',
+  minQuestionsBeforeWriteOf: '[{}, { configFile: "/nonexistent-ow-probe.json" }]',
+  reasonForQuestions: '[{ cwd: "/x", need: 3, have: 1, halt: false }]',
+  MAX_MIN_QUESTIONS: '[]',
 
   // observe-reality-check.mjs（2026-11-14 写前闸的真实语料重放）：
   // 判定函数全是纯的，探针取最小可构造输入。读盘的几个用不存在的路径 ——
@@ -1237,6 +1246,9 @@ function checkUnregisteredExports() {
     'decide', 'runHook', 'parseHookInput', 'readStdin', 'logPathFor', 'appendLog',
     'MARKER_REL', 'DENIAL_REL', 'MODES', 'BRAKES', 'DEFAULT_BUDGET_MS',
     'WRITE_TOOLS', 'SHELL_TOOLS', 'READ_TOOLS',
+    // 2026-11-19 `ask.minQuestionsBeforeWrite`。三个函数已进 PROBE_ARGS 实际调用，
+    // 这里显式登记免得被「未登记导出」刷屏。
+    'readTranscriptActivity', 'minQuestionsBeforeWriteOf', 'reasonForQuestions', 'MAX_MIN_QUESTIONS',
   ];
   for (const k of PRE_WRITE_GATE_FNS) REGISTERED.add(k);
 
@@ -1371,6 +1383,13 @@ function checkUnregisteredExports() {
     'scanCorpus', 'cli',
   ];
   for (const k of QUESTION_AUDIT_FNS) REGISTERED.add(k);
+
+  // question-form.mjs（2026-11-19 从 question-audit 搬出的两个判据）：两个纯函数，
+  // 参数已进 PROBE_ARGS（`questionsOfAsk` / `normalizeText` 本来就是那张表里的名字，
+  // 探针按名字命中所有模块，所以搬过来之后它们的探针自动生效）。
+  // 搬家的原因（避免 `pre-write-gate → question-audit → observe-reality-check → pre-write-gate`
+  // 的 TDZ 环）见该文件头。这里显式登记，免得被「未登记导出」刷屏。
+  for (const k of ['questionsOfAsk', 'normalizeText']) REGISTERED.add(k);
 
   // probe-parser-divergence.mjs（2026-11-14 量化重放器与闸门的分叉）：纯函数进 PROBE_ARGS，
   // `probe` 要扫全量语料，与 measure-* 系列同处置 —— 由 probe-parser-divergence.test.mjs

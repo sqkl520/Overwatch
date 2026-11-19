@@ -60,6 +60,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { readPathsOfToolUse, pathKeyOf } from './pre-write-gate.mjs';
+import { questionsOfAsk, normalizeText } from './question-form.mjs';
 // 复用既有的去重判据与宽口径读取判据，不另写一份。
 // `dedupeForks()` 判的是「前 N 条调用序列是否逐字相同」；
 // `broadReadsOf()` 是「结构性探索（ls/find/grep/Glob）也算了解项目」那一档。
@@ -119,6 +120,17 @@ export function defaultConfig() {
       maxQuestions: 5,
       requireReadFirst: true,
       minReads: 3,
+      /** 第一次写文件之前必须已经问过几个问题。**0 = 不启用**（默认）。
+       *
+       *  这一项的**执行侧不是本脚本**，是写前闸的 `pre-write-gate.mjs`
+       *  （`decide()` 里那段「判据零」）。本文件只负责让它能通过校验、
+       *  不被判成 `unknown-key` —— 键白名单与执行侧分离是本仓库的既有结构：
+       *  `ask.mode` 的执行侧也在 `launch.mjs`，不在这里。
+       *
+       *  取值范围与执行侧的 `MAX_MIN_QUESTIONS` 一致（0..20）。
+       *  为什么默认 0、为什么不是本脚本执行，见 `pre-write-gate.mjs` 的
+       *  `minQuestionsBeforeWriteOf()`。 */
+      minQuestionsBeforeWrite: 0,
     },
     agent: {
       roster: ['oversight-planner', 'oversight-executor', 'oversight-acceptor'],
@@ -165,7 +177,7 @@ export function validateConfig(raw) {
   } else if (ask === null || typeof ask !== 'object' || Array.isArray(ask)) {
     err('bad-type', 'ask', 'ask 必须是对象');
   } else {
-    const ASK_KEYS = new Set(['mode', 'maxQuestions', 'requireReadFirst', 'minReads']);
+    const ASK_KEYS = new Set(['mode', 'maxQuestions', 'requireReadFirst', 'minReads', 'minQuestionsBeforeWrite']);
     for (const k of Object.keys(ask)) {
       if (!ASK_KEYS.has(k)) err('unknown-key', `ask.${k}`, `未知键 "ask.${k}"（允许：${[...ASK_KEYS].join(' / ')}）`);
     }
@@ -197,6 +209,22 @@ export function validateConfig(raw) {
       err('bad-range', 'ask.minReads', `ask.minReads 必须是 0..50 的整数（当前：${JSON.stringify(ask.minReads)}）`);
     } else {
       cfg.ask.minReads = ask.minReads;
+    }
+    // `ask.minQuestionsBeforeWrite`：写前闸的执行侧。**校验与执行分两处，但口径必须一致**
+    // —— 这里拒绝的范围与 `pre-write-gate.mjs` 的 `MAX_MIN_QUESTIONS`（20）逐字相同，
+    // 否则会出现「配置校验通过、闸门当非法回落到 0」的静默失效。
+    // 由于两处都写死了 20，`question-audit.test.mjs` 里那条断言把它钉住了。
+    if (ask.minQuestionsBeforeWrite === undefined) {
+      // 缺省 = 0（不启用）。**不报 missing**：这是老配置的既有形态，凭空要求新键
+      // 会让所有已有用户的配置文件突然变非法。
+      cfg.ask.minQuestionsBeforeWrite = 0;
+    } else if (!Number.isInteger(ask.minQuestionsBeforeWrite)
+      || ask.minQuestionsBeforeWrite < 0 || ask.minQuestionsBeforeWrite > 20) {
+      err('bad-range', 'ask.minQuestionsBeforeWrite',
+        `ask.minQuestionsBeforeWrite 必须是 0..20 的整数（当前：${JSON.stringify(ask.minQuestionsBeforeWrite)}）。`
+        + '0 = 不启用这条判据；字符串 "3" 也拒绝，理由同 maxQuestions');
+    } else {
+      cfg.ask.minQuestionsBeforeWrite = ask.minQuestionsBeforeWrite;
     }
     // 语义矛盾：mode=never 时「问之前必须读过项目」没有主语可约束。
     // 不静默忽略——让用户显式写 false，是这个配置项存在的意义。
@@ -270,62 +298,18 @@ export function loadConfig(file = join(ROOT, CONFIG_FILE)) {
 
 // ── transcript 解析 ───────────────────────────────────────────────────
 
-/** 一次 `AskUserQuestion` 的 `questions` 字段有三种实测形态：数组、JSON 字符串、
- *  坏掉的 JSON 字符串。**返回形态，不猜内容**。
+/** 判据本身住在 `question-form.mjs`（2026-11-19 搬出），这里**只转出**。
  *
- *  实测（257 个有工具调用的会话 / 197 次去重调用）：
- *    array 191、unparsable-string 6、absent 0
- *  6 条坏 JSON 全部来自「选项里带 `preview` 多行文本」的调用，模型把引号写坏了。
- *  它们的问题数是**不知道**，不是 0。 */
-export function questionsOfAsk(input) {
-  const qs = input && typeof input === 'object' ? input.questions : undefined;
-  if (Array.isArray(qs)) {
-    const out = qs
-      .filter((q) => q && typeof q === 'object')
-      .map((q) => ({
-        question: typeof q.question === 'string' ? q.question : '',
-        header: typeof q.header === 'string' ? q.header : '',
-        multiSelect: q.multiSelect === true,
-        options: Array.isArray(q.options)
-          ? q.options.map((o) => (o && typeof o.label === 'string' ? o.label : '')).filter(Boolean)
-          : [],
-      }))
-      .filter((q) => q.question);
-    return { questions: out, form: 'array', unknown: false };
-  }
-  if (typeof qs === 'string') {
-    try {
-      const parsed = JSON.parse(qs);
-      if (Array.isArray(parsed)) {
-        // 字符串形态但能解析：等价于数组形态，只是宿主/模型多绕了一层编码。
-        const out = parsed
-          .filter((q) => q && typeof q === 'object')
-          .map((q) => ({
-            question: typeof q.question === 'string' ? q.question : '',
-            header: typeof q.header === 'string' ? q.header : '',
-            multiSelect: q.multiSelect === true,
-            options: Array.isArray(q.options)
-              ? q.options.map((o) => (o && typeof o.label === 'string' ? o.label : '')).filter(Boolean)
-              : [],
-          }))
-          .filter((q) => q.question);
-        return { questions: out, form: 'json-string', unknown: false };
-      }
-    } catch { /* 落到 unknown */ }
-    return { questions: [], form: 'unparsable-string', unknown: true };
-  }
-  if (qs === undefined || qs === null) return { questions: [], form: 'absent', unknown: true };
-  return { questions: [], form: 'other', form_raw: typeof qs, unknown: true };
-}
-
-/** 归一化问题文本：去空白、去标点、小写。
- *  与 `classify-stop.mjs` 的 bigram 归一化同一口径（去标点后再比），
- *  但不复用它的 `bigrams()`——那会多导出一个只在这里用的函数。 */
-export function normalizeText(s) {
-  return String(s || '')
-    .toLowerCase()
-    .replace(/[\s，。、；：！？,.;:!?"'“”‘’（）()[\]{}<>《》〈〉—\-_/\\|~`·…]+/g, '');
-}
+ *  搬家的理由只有一个：写前闸（`pre-write-gate.mjs`）要数「问过几个问题」，
+ *  而它直接 import 本文件会形成环 —— 本文件 import 了 `observe-reality-check.mjs`，
+ *  后者在模块顶层求值 `GATE_SHELL_READ_VERBS`，环会让那一行在常量初始化之前执行，
+ *  直接 TDZ ReferenceError。环的成因见 `question-form.mjs` 文件头。
+ *
+ *  判据仍然只有一份：本文件不再有这两个函数的实现。既有的调用方（本文件的
+ *  `scanSession`、`nearDuplicateQuestions`、`question-audit.test.mjs`、
+ *  以及一切 `import { questionsOfAsk } from './question-audit.mjs'` 的地方）
+ *  **一行都不用改**。 */
+export { questionsOfAsk, normalizeText };
 
 /** 会话里「读过项目」的四种口径。**都要，因为它们的结论不同**，而且差异实测存在：
  *

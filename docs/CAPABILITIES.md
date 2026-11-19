@@ -113,6 +113,56 @@ hook 进程的环境变量继承自**宿主进程**，不是你的终端。桌�
 
 依据：`docs/research/2026-11-12-stop-hook-prototype.md`（拦得住）、`2026-11-12-stop-hook-e2e-validation.md`（真模型上很少有机会拦）、`2026-11-13-hook-sample-logging.md`（先攒样本，不急着加规则）。
 
+## 3.5 写前闸的 `ask.minQuestionsBeforeWrite`：第一次写之前先问够 N 个问题
+
+**默认 `0` = 这条判据完全不存在。** 装上写前闸的现有项目升级后行为**逐字节不变**
+（测试用「0 时连 transcript 都不读」钉住了这一点，不是看代码里有没有 `if`）。
+
+`N > 0` 时：第一次写文件之前，transcript 里必须已经有 ≥N 个**去重后**的问题
+（`AskUserQuestion` + `ExitPlanMode`，与 `measure-ask-vs-tell.mjs` 同一口径）。
+只判**第一次写** —— 写过就不再判，写到一半才拦会打断正在进行的活。
+
+| 步骤 | 做什么 |
+|---|---|
+| 1 | 先把写前闸按 `templates/pre-write-gate.settings.json` 装上（见该文件的 `_how_to_enable`） |
+| 2 | 在**你的项目根**的 `overwatch.config.json` 的 `ask` 段写 `"minQuestionsBeforeWrite": 3` |
+| 3 | 临时试跑不改文件：环境变量 `OW_ASK_MIN_QUESTIONS=3`（**优先于**配置文件） |
+| 4 | 确认它真的生效：`node scripts/pre-write-gate.mjs status --cwd <你的项目>` |
+
+```json
+// <你的项目根>/overwatch.config.json —— 只写这一段也能生效，其余键走默认
+{ "ask": { "minQuestionsBeforeWrite": 3 } }
+```
+
+```powershell
+# 临时试跑（不改任何文件）。桌面版的 hook 继承宿主进程的环境，
+# 所以这个变量要设在「启动 claude 的那个环境」里，不是设在你的终端里。
+$env:OW_ASK_MIN_QUESTIONS = "3"
+node scripts/pre-write-gate.mjs status --cwd D:\你的项目    # 看 minQuestions 一行
+```
+
+**它和另外两条判据的关系**（三条独立、各自 deny、各自给 reason）：
+
+| 顺序 | 判据 | 什么时候放行 |
+|---|---|---|
+| 0 | `minQuestionsBeforeWrite` | 问够了 N 个不同问题，或**这个会话已经写过文件** |
+| 1 | Edit 侧：`target-read` | 读过**这个文件本身** |
+| 2 | Write 侧：`minReads` | 读过 ≥N 个**不同**文件 |
+
+叫停路径与另一条闸**共用同一个文件**：`%LOCALAPPDATA%/Overwatch/stop-hook.PAUSE`
+存在即放行（`pre-write-gate.mjs` 调的是 `stop-verify-hook.mjs` 的 `isPaused()`）。
+刹车也共用同一份 `brake` / `denyBudget`，没有第二个预算。
+
+**它为什么默认关、以及这条判据的诚实边界**：
+
+- 判的是**数得清的次数**，不是「问得准不准」。问三个敷衍的问题照样能过闸 ——
+  这一条本仓库判不了（需要语义理解），见 `docs/spec/2026-11-14-question-audit.md` §8。
+- 只判**第一次写**。前半场没问、写到一半才想清楚方向 → 这条闸不会再出现。
+- 形态不可读的提问（`questions` 是坏 JSON，实测 6/197 次）**不参与判定**：
+  解析失败 ≠ 没问，把它当 0 会拦一个按规矩做了的会话。
+- transcript 读不到、配置是垃圾、键值超范围 → 一律回落到 `0`（不拦）。
+- 走 `mark` 逃生口（或标记已存在）的会话不受这条约束 —— 逃生口的意义就是「我知道我在干什么」。
+
 ## 4. 断言族：`verify-claims.mjs` 认哪些「完成声明」
 
 `vague-completion` 是 2026-11-13 新增的一族，专治**没有任何指标的**完成声明——

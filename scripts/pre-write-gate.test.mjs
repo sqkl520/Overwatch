@@ -31,6 +31,7 @@ import {
   markerSigOf, readGateSecret, ensureGateSecret, secretPathFor,
   MARKER_REL, SECRET_REL, MODES, BRAKES, WRITE_TOOLS, SHELL_TOOLS, READ_TOOLS, EDIT_SIDE_TOOLS,
   readPathsOfToolUse, pathKeyOf,
+  readTranscriptActivity, minQuestionsBeforeWriteOf, reasonForQuestions,
 } from '../scripts/pre-write-gate.mjs';
 
 // ── 装置 ──────────────────────────────────────────────────────────────
@@ -1008,6 +1009,380 @@ test('parseHookInput 拒绝数组与垃圾，接受对象', () => {
   assert.deepEqual(parseHookInput('{"a":1}'), { a: 1 });
 });
 
+// ── 10.5 `ask.minQuestionsBeforeWrite`：第一次写之前先问够 N 个问题 ──────────
+//
+// 用户原话（判据来源）：「提前问主要服务的是长时间工作这个目的。一旦开头提示词给的
+// 模糊，做出来的东西不是用户想要的就是白费力气了。做成配置项 …… 走错方向的风险
+// 由用户承担。」所以：默认 0 = 完全不启用；N>0 才判；只判「第一次写」。
+//
+// 这组测试的排序同样是「拦错了会怎样」：
+//   1. `0` 时**完全不参与**（连 transcript 都不许读一次）；
+//   2. 数的是**去重后的问题**，同一个问题问三遍只算一个；
+//   3. 已经写过的会话不再判（写到一半才拦会打断正在进行的活）；
+//   4. 读不到 transcript / 形态不可读 / 配置是垃圾 → 一律放行。
+
+/** 造一份 `readTranscriptActivity` 形状的对象。`questions` 是**去重后**的文本数组。 */
+const activityOf = ({ questions = [], askCalls = null, priorWriteCalls = 0, reads = [], unknownAskCalls = 0 } = {}) => ({
+  reads,
+  askCalls: askCalls === null ? questions.length : askCalls,
+  questions,
+  distinctQuestions: questions.length,
+  unknownAskCalls,
+  priorWriteCalls,
+});
+
+/** 带 activity 的 state。
+ *
+ *  `act` 省略 / `undefined` = **没有这条数据**（`getActivity()` 返回空，fail-open 那条路）。
+ *  `over.config.minQuestionsBeforeWrite` 默认给 3 —— 这样每条用例只写**与它无关**的那部分，
+ *  不会有「忘了设 need 所以判据根本没跑」这种假绿。需要别的值时显式覆盖。 */
+function stateWithActivity(act, over = {}) {
+  const st = stateFor({ ...over, config: { minQuestionsBeforeWrite: 3, ...(over.config || {}) } });
+  if (act !== undefined) st.activity = act;
+  return st;
+}
+
+test('minQuestionsBeforeWrite=0：这条判据完全不参与（连 transcript 都不读）', () => {
+  // 「逐字节相同」的判据不是看代码里有没有 `if`，而是：
+  // ① 0 时 `getActivity` **一次都不许被调用**（用一个抛异常的函数验）；
+  // ② 判决/输出/日志与「根本没有这个 state 字段」逐字相同。
+  //
+  // 比较时**剔掉 `at`**：它是 `new Date().toISOString()`，两次调用跨毫秒就会不等 ——
+  // 那是时钟，不是行为。剔掉之后剩下的每个字段都必须逐字相同。
+  const strip = (o) => {
+    if (!o || typeof o !== 'object') return o;
+    const { at, ...rest } = o;
+    return rest;
+  };
+  const st0 = stateFor({ config: { mode: 'deny' } });
+  const st0WithBomb = {
+    ...st0,
+    getActivity: () => { throw new Error('0 时说这条判据读了 transcript —— 默认值破坏了现有用户'); },
+  };
+  const a = decide(INPUT(), st0);
+  const b = decide(INPUT(), st0WithBomb);
+  assert.deepEqual(strip(b.log), strip(a.log),
+    'minQuestionsBeforeWrite=0 时，判决与日志必须与改动前逐字相同');
+  assert.deepEqual(b.action, a.action);
+  assert.deepEqual(b.output, a.output);
+  assert.equal(a.log.questions, undefined, '0 时不许往日志里写这条判据的字段');
+  assert.equal(a.log.minQuestions, undefined);
+  assert.equal(a.log.denyBy, undefined);
+  // 极端输入（写过/没写过/读过/没读过）也不许因为这条判据改变任何东西
+  for (const cfg of [{ mode: 'deny' }, { mode: 'observe' }, { mode: 'warn' }]) {
+    for (const reads of [[], ['/repo/a.mjs', '/repo/b.mjs', '/repo/c.mjs']]) {
+      const c = decide(INPUT(), stateFor({ config: cfg, reads }));
+      assert.equal(c.action, a2action(cfg.mode, reads), `${cfg.mode}/${reads.length} 的判决顺序被改了`);
+    }
+  }
+});
+
+/** 上面那条循环要一个独立期望值，否则它就是「拿自己验自己」。
+ *  `deny` 模式：读够 minReads 才放行；`observe` 只记账；`warn` 提醒但不拦。 */
+function a2action(mode, reads) {
+  if (reads.length >= defaultConfig().minReads) return 'allow';
+  return mode === 'deny' ? 'deny' : mode === 'warn' ? 'warn' : 'passthrough';
+}
+
+test('minQuestionsBeforeWrite=3 且一个都没问 → deny，reason 含「还差 3 个」', () => {
+  const st = stateWithActivity(activityOf({ questions: [] }), { config: { mode: 'deny' } });
+  const r = decide(INPUT(), st);
+  assert.equal(r.action, 'deny');
+  const reason = r.output.hookSpecificOutput.permissionDecisionReason;
+  assert.match(reason, /还差 3 个/, `reason 必须说清还差几个：${reason.slice(0, 120)}`);
+  assert.match(reason, /原样重试/, 'reason 必须告诉模型问完怎么回到这次写');
+  assert.match(reason, /AskUserQuestion/);
+  assert.equal(r.log.denyBy, 'questions');
+});
+
+test('minQuestionsBeforeWrite=3 且问了 3 个不同的问题 → allow', () => {
+  // 读侧判据**照常满足**（读了 3 个文件）：这样这条测试证明的是「新判据放行了」，
+  // 而不是「读侧判据碰巧也不拦」。两条判据都要过，allow 才算数。
+  const st = stateWithActivity(
+    activityOf({ questions: ['改哪个文件？', '用 A 还是 B？', '验收用哪条命令？'] }),
+    { config: { mode: 'deny' }, reads: ['/repo/README.md', '/repo/src/a.mjs', '/repo/src/b.mjs'] },
+  );
+  const r = decide(INPUT(), st);
+  assert.equal(r.action, 'allow', '问够了就必须放行 —— 这条判据不能顺手把读侧判据也收紧');
+  assert.equal(r.log.allowReason, 'auto-satisfied-by-transcript');
+  assert.equal(r.log.questions, 3);
+});
+
+test('minQuestionsBeforeWrite=3 且问了 3 次但同一个问题重复问 → 只算 1 个，仍然 deny', () => {
+  const st = stateWithActivity(activityOf({ questions: ['改哪个文件？'] }), {
+    config: { mode: 'deny' },
+    reads: ['/repo/README.md', '/repo/src/a.mjs', '/repo/src/b.mjs'],
+  });
+  const r = decide(INPUT(), st);
+  assert.equal(r.action, 'deny', '读侧已满足，仍被拦 —— 说明拦它的是这条判据');
+  assert.match(r.output.hookSpecificOutput.permissionDecisionReason, /还差 2 个/);
+  assert.equal(r.log.questions, 1, '去重后只有 1 个');
+  assert.equal(r.log.denyBy, 'questions');
+});
+
+test('第二次写（transcript 里已经有过写）→ 这条判据不再介入', () => {
+  const st = stateWithActivity(
+    activityOf({ questions: [], priorWriteCalls: 1 }),
+    { config: { mode: 'deny' }, reads: ['/repo/README.md', '/repo/src/a.mjs', '/repo/src/b.mjs'] },
+  );
+  const r = decide(INPUT(), st);
+  assert.equal(r.action, 'allow', '写到一半才拦会打断正在进行的活');
+  assert.equal(r.log.allowReason, 'auto-satisfied-by-transcript');
+  assert.equal(r.log.priorWrites, 1);
+  // 负向：把 priorWriteCalls 归零，同一份输入必须变成 deny —— 否则上一条测试是空的
+  const first = decide(INPUT(), stateWithActivity(activityOf({ questions: [] }), {
+    config: { mode: 'deny' }, reads: ['/repo/README.md', '/repo/src/a.mjs', '/repo/src/b.mjs'],
+  }));
+  assert.equal(first.action, 'deny');
+  assert.equal(first.log.denyBy, 'questions');
+});
+
+test('transcript 读不到 → 这条判据不拦（判决与未启用它时逐字相同）', () => {
+  // 「放行」在这一条上只能是「不因它而拦」：读侧判据照旧生效。
+  // 所以判据是**两次判决相等**，不是「一定是 allow」。
+  const off = decide(INPUT(), stateFor({ config: { mode: 'deny' } }));
+  const on = decide(INPUT(), stateWithActivity(undefined, { config: { mode: 'deny' } }));
+  assert.equal(on.action, off.action);
+  assert.equal(
+    on.output && on.output.hookSpecificOutput.permissionDecisionReason,
+    off.output && off.output.hookSpecificOutput.permissionDecisionReason,
+    '读不到 transcript 时必须走原来那条 reason，不许换成「去问问题」',
+  );
+  assert.equal(on.log.questions, 'unavailable');
+  // 显式给一个「读不出来」的 activity（磁盘上有文件但读不到）走同一条路
+  const unreadable = decide(INPUT(), stateWithActivity({ ...activityOf({}), unreadable: true },
+    { config: { mode: 'deny' } }));
+  assert.equal(unreadable.action, off.action);
+  assert.equal(unreadable.log.questions, 'unavailable');
+});
+
+test('PAUSE 文件存在 → 放行（叫停优先于这条新判据，也优先于读侧判据）', () => {
+  const st = stateWithActivity(activityOf({ questions: [] }), { config: { mode: 'deny' } });
+  st.paused = true;
+  const r = decide(INPUT(), st);
+  assert.equal(r.action, 'passthrough', '叫停路径必须能越过任何分支');
+  assert.equal(r.output, null);
+  assert.equal(r.log.allowReason, 'user-paused');
+});
+
+test('负向：PAUSE 不影响 minQuestionsBeforeWrite=0 的既有行为（默认关闭的判据不许顺带改别人）', () => {
+  // 「叫停路径」是这次**新增**的接线（改动前本闸不认 PAUSE 文件）。
+  // 如果它放在 `decide()` 最前面，现有用户（`minQuestionsBeforeWrite: 0`）
+  // 在 PAUSE 文件存在时的行为就会变 —— 那是默认值在改已发布的行为，方向再宽松也不行。
+  for (const mode of ['deny', 'observe', 'warn']) {
+    for (const reads of [[], ['/repo/a.mjs', '/repo/b.mjs', '/repo/c.mjs']]) {
+      const plain = decide(INPUT(), stateFor({ config: { mode }, reads }));
+      const paused = decide(INPUT(), { ...stateFor({ config: { mode }, reads }), paused: true });
+      assert.equal(paused.action, plain.action, `${mode}/${reads.length}：PAUSE 不许改变 minQuestions=0 的判决`);
+      assert.notEqual(plain.log.allowReason, 'user-paused');
+    }
+  }
+  // 反过来：一旦开了这条判据，PAUSE 就必须生效 —— 否则上一条测试只是「PAUSE 整个没接线」
+  const on = decide(INPUT(), { ...stateWithActivity(activityOf({ questions: [] })), paused: true });
+  assert.equal(on.log.allowReason, 'user-paused');
+});
+
+test('负向：同一份 activity，把 minQuestionsBeforeWrite 拨回 0 必须放行（证明这条测试不是空的）', () => {
+  const act = activityOf({ questions: [] });
+  const reads = ['/repo/README.md', '/repo/src/a.mjs', '/repo/src/b.mjs'];
+  const on = decide(INPUT(), stateWithActivity(act, { config: { mode: 'deny' }, reads }));
+  assert.equal(on.action, 'deny');
+  assert.equal(on.log.denyBy, 'questions');
+  const off = decide(INPUT(), stateWithActivity(act, { config: { mode: 'deny', minQuestionsBeforeWrite: 0 }, reads }));
+  assert.equal(off.action, 'allow');
+});
+
+test('形态不可读的提问（questions 是坏 JSON）不参与判定 —— 不知道就不许判', () => {
+  const st = stateWithActivity(activityOf({ questions: [], askCalls: 1, unknownAskCalls: 1 }), {
+    config: { mode: 'deny' },
+    reads: ['/repo/README.md', '/repo/src/a.mjs', '/repo/src/b.mjs'],
+  });
+  const r = decide(INPUT(), st);
+  assert.equal(r.action, 'allow', '解析失败 ≠ 没问，把它当 0 会拦一个按规矩做了的会话');
+  assert.equal(r.log.questions, 'unknown-form');
+  assert.equal(r.log.questionsUnknown, 1);
+  // 负向：同一份输入里只要有一个**可读**的问题（不足 3 个），就必须再一次被拦 ——
+  // 否则「unknown 放行」可能只是「这条判据整个不工作了」。
+  const mixed = decide(INPUT(), stateWithActivity(
+    activityOf({ questions: ['改哪个文件？'], askCalls: 2, unknownAskCalls: 1 }),
+    { config: { mode: 'deny' }, reads: ['/repo/README.md', '/repo/src/a.mjs', '/repo/src/b.mjs'] },
+  ));
+  assert.equal(mixed.action, 'deny');
+  assert.match(mixed.output.hookSpecificOutput.permissionDecisionReason, /还差 2 个/);
+});
+
+test('需要问题数由配置决定，reason 里的数字跟着变（文案与判据不能漂）', () => {
+  for (const [need, have, miss] of [[3, 0, 3], [5, 2, 3], [1, 0, 1]]) {
+    const st = stateWithActivity(activityOf({ questions: Array.from({ length: have }, (_, i) => `q${i}`) }),
+      { config: { mode: 'deny', minQuestionsBeforeWrite: need } });
+    const r = decide(INPUT(), st);
+    assert.equal(r.action, 'deny');
+    assert.match(r.output.hookSpecificOutput.permissionDecisionReason, new RegExp(`还差 ${miss} 个`));
+  }
+});
+
+test('这条判据同样受刹车约束：halt 给 continue:false，budget 前 N 次不刹车', () => {
+  const act = activityOf({ questions: [] });
+  const haltOut = decide(INPUT(), stateWithActivity(act, { config: { mode: 'deny', minQuestionsBeforeWrite: 3, brake: 'halt' } }));
+  assert.equal(haltOut.action, 'deny');
+  assert.equal(haltOut.output.continue, false);
+  assert.match(String(haltOut.output.stopReason), /问/);
+  const soft = decide(INPUT(), stateWithActivity(act,
+    { config: { mode: 'deny', minQuestionsBeforeWrite: 3, brake: 'budget', denyBudget: 2 }, denials: 0 }));
+  assert.equal(soft.action, 'deny');
+  assert.equal(soft.output.continue, undefined);
+});
+
+test('observe / warn 两档对这条判据同样不拦，且 warn 的 additionalContext 是可执行指令', () => {
+  const act = activityOf({ questions: [] });
+  const obs = decide(INPUT(), stateWithActivity(act, { config: { mode: 'observe', minQuestionsBeforeWrite: 3 } }));
+  assert.equal(obs.action, 'passthrough');
+  assert.equal(obs.log.decision, 'would-deny');
+  assert.match(obs.log.reason, /还差 3 个/);
+  const warn = decide(INPUT(), stateWithActivity(act, { config: { mode: 'warn', minQuestionsBeforeWrite: 3 } }));
+  assert.equal(warn.action, 'warn');
+  assert.match(warn.output.hookSpecificOutput.additionalContext, /还差 3 个/);
+});
+
+// ── 10.6 transcript 里真的数出「问了几个」──────────────────────────────
+
+test('readTranscriptActivity：按 tool_use id 去重、同一问题只算一个、ExitPlanMode 算一个', () => {
+  const dir = sandbox();
+  try {
+    const p = join(dir, 't.jsonl');
+    const line = (id, name, input) => JSON.stringify({
+      type: 'assistant', message: { content: [{ type: 'tool_use', id, name, input }] },
+    });
+    writeFileSync(p, [
+      line('a1', 'AskUserQuestion', { questions: [{ question: '改哪个文件？' }] }),
+      line('a1', 'AskUserQuestion', { questions: [{ question: '改哪个文件？' }] }), // 宿主重写的重复行
+      line('a2', 'AskUserQuestion', { questions: [{ question: '改哪个文件？' }] }), // 同一个问题再问一次
+      line('a3', 'AskUserQuestion', { questions: [{ question: '用 A 还是 B？' }, { question: '验收用哪条命令？' }] }),
+      line('e1', 'ExitPlanMode', { plan: 'x' }),
+      line('w1', 'Write', { file_path: join(dir, 'out.txt') }),
+      line('r1', 'Read', { file_path: join(dir, 'README.md') }),
+    ].join('\n') + '\n');
+    const act = readTranscriptActivity(p, { cwd: dir });
+    assert.equal(act.askCalls, 4, '按 id 去重后是 4 次调用（a1/a2/a3/e1）');
+    assert.equal(act.unknownAskCalls, 0);
+    // `questions` 是**去重后的问题原文**（同一个问题换个标点仍算同一个，
+    // 因为比较用的是 `normalizeText()` 之后的键）。
+    assert.equal(act.questions.length, 4, `去重后 4 个问题，实际：${JSON.stringify(act.questions)}`);
+    assert.equal(act.questions.filter((q) => q === '改哪个文件？').length, 1,
+      '同一个问题问两遍只能留下一条，否则「重复问」会把门槛刷过去');
+    assert.ok(act.questions.includes('ExitPlanMode'), 'ExitPlanMode 也算一次提问（与 question-audit 口径一致）');
+    assert.equal(act.distinctQuestions, 4);
+    assert.equal(act.priorWriteCalls, 1, 'transcript 里已经有一次写 → 这条判据此后不再介入');
+    assert.deepEqual(act.reads, [join(dir, 'README.md')]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('readTranscriptActivity 读不到文件 → 空结构、不抛（fail-open 的底座）', () => {
+  const act = readTranscriptActivity('/nonexistent-ow-transcript.jsonl');
+  assert.deepEqual(act.reads, []);
+  assert.equal(act.distinctQuestions, 0);
+  assert.equal(act.priorWriteCalls, 0);
+  assert.equal(act.bytesRead, 0);
+});
+
+test('runHook：env 覆盖 minQuestionsBeforeWrite（OW_ASK_MIN_QUESTIONS）真生效', () => {
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 'transcript.jsonl');
+    writeFileSync(tp, [
+      toolUseLine('Read', { file_path: join(dir, 'README.md') }),
+      toolUseLine('Read', { file_path: join(dir, 'src/a.mjs') }),
+      toolUseLine('Read', { file_path: join(dir, 'src/b.mjs') }),
+    ].join('\n') + '\n');
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '3' });
+    const out = runHook(INPUT({ cwd: dir, transcript_path: tp }), { env });
+    assert.equal(out.action, 'deny', '读过 3 个文件但一个问题没问 → 必须拦');
+    assert.match(out.output.hookSpecificOutput.permissionDecisionReason, /还差 3 个/);
+    assert.equal(existsSync(markerPathFor(dir)), false, '被拒的写不许留下标记');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('runHook：问够了就照旧写标记放行（auto，签名可验）', () => {
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 'transcript.jsonl');
+    writeFileSync(tp, [
+      toolUseLine('Read', { file_path: join(dir, 'README.md') }),
+      toolUseLine('Read', { file_path: join(dir, 'src/a.mjs') }),
+      toolUseLine('Read', { file_path: join(dir, 'src/b.mjs') }),
+      toolUseLine('AskUserQuestion', { questions: [{ question: 'Q1' }, { question: 'Q2' }, { question: 'Q3' }] }),
+    ].join('\n') + '\n');
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '3' });
+    const out = runHook(INPUT({ cwd: dir, transcript_path: tp }), { env });
+    assert.equal(out.action, 'allow');
+    assert.equal(readMarker(markerPathFor(dir)).data.satisfied_by, 'auto');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('runHook：PAUSE 文件存在时这条判据也不拦', () => {
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 'transcript.jsonl');
+    writeFileSync(tp, toolUseLine('Read', { file_path: join(dir, 'README.md') }) + '\n');
+    const pause = join(dir, 'gate.PAUSE');
+    writeFileSync(pause, '');
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '3', OVERWATCH_STOP_VERIFY_PAUSE: pause });
+    const out = runHook(INPUT({ cwd: dir, transcript_path: tp }), { env });
+    assert.equal(out.action, 'passthrough');
+    assert.equal(out.log.allowReason, 'user-paused');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('minQuestionsBeforeWriteOf：env > overwatch.config.json > 0，垃圾一律回落到 0', () => {
+  const dir = sandbox();
+  try {
+    const cfgFile = join(dir, 'overwatch.config.json');
+    writeFileSync(cfgFile, JSON.stringify({ version: 1, ask: { mode: 'always', minQuestionsBeforeWrite: 4 } }));
+    assert.equal(minQuestionsBeforeWriteOf({}, { configFile: cfgFile }), 4);
+    assert.equal(minQuestionsBeforeWriteOf({ OW_ASK_MIN_QUESTIONS: '2' }, { configFile: cfgFile }), 2,
+      'env 覆盖文件');
+    assert.equal(minQuestionsBeforeWriteOf({ OW_ASK_MIN_QUESTIONS: 'abc' }, { configFile: cfgFile }), 4,
+      '非法 env 不许把配置整体关掉');
+    writeFileSync(cfgFile, '{ 坏 json');
+    assert.equal(minQuestionsBeforeWriteOf({}, { configFile: cfgFile }), 0, '配置是垃圾 → 0（放行）');
+    writeFileSync(cfgFile, JSON.stringify({ version: 1, ask: { minQuestionsBeforeWrite: -3 } }));
+    assert.equal(minQuestionsBeforeWriteOf({}, { configFile: cfgFile }), 0);
+    assert.equal(minQuestionsBeforeWriteOf({}, { configFile: join(dir, 'nope.json') }), 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('reasonForQuestions：说的是可判定的条件，不是「请多提问」', () => {
+  const r = reasonForQuestions({ cwd: '/repo', need: 3, have: 1, halt: false });
+  assert.match(r, /还差 2 个/);
+  assert.match(r, /同一个问题重复问只算 1 个/);
+  assert.match(r, /改哪些文件|范围/);
+  assert.match(r, /原样重试/);
+  assert.doesNotMatch(r, /请多提问|多问问用户/);
+});
+
+test('e2e：OW_ASK_MIN_QUESTIONS=2 时 hook 真的输出 deny，且 continue:false', () => {
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 'transcript.jsonl');
+    writeFileSync(tp, [
+      toolUseLine('Read', { file_path: join(dir, 'README.md') }),
+      toolUseLine('Read', { file_path: join(dir, 'src/a.mjs') }),
+      toolUseLine('Read', { file_path: join(dir, 'src/b.mjs') }),
+    ].join('\n') + '\n');
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '2' });
+    const r = runHookProcess(INPUT({ cwd: dir, transcript_path: tp, tool_use_id: 'toolu_q' }), env);
+    assert.equal(r.status, 0, `hook 必须永远 exit 0：${r.stderr}`);
+    const o = JSON.parse(r.stdout);
+    assert.equal(o.hookSpecificOutput.permissionDecision, 'deny');
+    assert.equal(o.continue, false);
+    assert.match(o.hookSpecificOutput.permissionDecisionReason, /还差 2 个/);
+    // 同一份输入再跑一次（模拟「问完重试」前的那次重复触发）不该有两行台账
+    const rows = readFileSync(join(dir, 'log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].denyBy, 'questions');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 // ── 11. 端到端：真的 spawn 那个 hook ─────────────────────────────────
 
 import { spawnSync } from 'node:child_process';
@@ -1094,10 +1469,15 @@ test('e2e：status 子命令读得懂现状', () => {
     const a = runHookProcess('', {}, ['status', '--cwd', dir]);
     assert.equal(a.status, 0);
     assert.match(a.stdout, /marker state: absent/);
+    // 这一行是「配置项有没有执行侧」的唯一可见处：写了 3 却看到 0，就是配置没接上。
+    assert.match(a.stdout, /minQuestions: 0（这条判据不启用）/);
     writeMarker(markerPathFor(dir), { sessionId: 's1', satisfiedBy: 'claim' });
     const b = runHookProcess('', {}, ['status', '--cwd', dir]);
     assert.match(b.stdout, /marker state: exists/);
     assert.match(b.stdout, /claim/);
+    // env 覆盖也要在这里看得出来
+    const c = runHookProcess('', { OW_ASK_MIN_QUESTIONS: '4' }, ['status', '--cwd', dir]);
+    assert.match(c.stdout, /minQuestions: 4（第一次写之前必须先问够这么多个不同问题）/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

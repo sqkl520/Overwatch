@@ -113,6 +113,13 @@ import { fileURLToPath } from 'node:url';
 
 import { bashWriteScan } from './claim-ledger.mjs';
 import { claimOnce, claimKeyOf, recordSkipped } from './hook-dedupe.mjs';
+// 「一次提问的参数长什么样」的唯一解析处（2026-11-19 从 `question-audit.mjs` 搬出）。
+// **不能直接 import `question-audit.mjs`**：它 import `observe-reality-check.mjs`，
+// 后者在模块顶层求值 `GATE_SHELL_READ_VERBS` —— 环会让那一行在常量初始化前执行，
+// 直接 TDZ ReferenceError。见 `question-form.mjs` 文件头。
+import { questionsOfAsk, normalizeText } from './question-form.mjs';
+// 叫停路径（L1 文件闸）。**复用，不新造**：见 §叫停（`pausePathFor` 的注释）。
+import { isPaused, pausePathFor } from './stop-verify-hook.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..');
@@ -200,6 +207,16 @@ export function defaultConfig() {
     transcriptBytes: 1024 * 1024,
     /** 跨会话承认标记。默认否：新会话 = 没读过这个项目的新 AI。 */
     crossSession: false,
+    /** **第一次写之前必须已经问过几个问题**。`0` = 这条判据完全不启用（默认）。
+     *
+     *  判据来源是用户原话：「一旦开头提示词给的模糊，做出来的东西不是用户想要的
+     *  就是白费力气了 …… 做成配置项，让用户可以自定义开头问几个问题，
+     *  保留自由度，走错方向的风险由用户承担。」
+     *
+     *  默认 0 是硬要求：装上这个闸的现有用户行为必须**逐字节不变**。
+     *  开启方式是 `overwatch.config.json` 的 `ask.minQuestionsBeforeWrite`，
+     *  或环境变量 `OW_ASK_MIN_QUESTIONS`（临时试跑用）。见 `minQuestionsBeforeWriteOf()`。 */
+    minQuestionsBeforeWrite: 0,
   };
 }
 
@@ -231,6 +248,66 @@ export function configOf(env = {}) {
   const cs = String(env.OW_PRE_WRITE_GATE_CROSS_SESSION || '').trim().toLowerCase();
   cfg.crossSession = ['1', 'true', 'on', 'yes'].includes(cs);
   return cfg;
+}
+
+/** `OW_ASK_MIN_QUESTIONS` 的合法上界。20 与 `ask.maxQuestions` 的上界一致 ——
+ *  要求「问够 $N 个问题」而 `maxQuestions` 只允许一次问 20 个，两个数不该脱节。
+ *  超过这个值一律当非法（回落到配置文件的值），**不静默夹紧**：夹紧会让
+ *  「我写了 999」变成「其实是 20」，而用户以为自己关掉了这条路。 */
+export const MAX_MIN_QUESTIONS = 20;
+
+/** 读 `ask.minQuestionsBeforeWrite`：**env > `overwatch.config.json` > 0**。
+ *
+ *  ## 为什么要有这条判据，和为什么它默认关
+ *
+ *  用户原话：「提前问主要服务的是长时间工作这个目的。一旦开头提示词给的模糊，
+ *  做出来的东西不是用户想要的就是白费力气了 …… 做成配置项，让用户可以自定义
+ *  开头问几个问题，保留自由度，走错方向的风险由用户承担。」
+ *
+ *  所以：**默认 0，即这条判据完全不存在**。装了这个闸的现有用户升级后
+ *  行为必须逐字节不变。想开的人自己写一个 N，风险他自己承担 —— 这一点必须
+ *  写在使用者读得到的地方（`docs/CAPABILITIES.md`），不能只写在代码里。
+ *
+ *  ## 为什么读配置文件时**不走 `question-audit.validateConfig()`**
+ *
+ *  那个校验器的键白名单是硬编码的 `{mode, maxQuestions, requireReadFirst, minReads}`，
+ *  而它**还没有** `minQuestionsBeforeWrite`（本项先落地在闸门侧）。走它的话，
+ *  用户一写这个键就会被判 `unknown-key`，`loadConfig` 返回 `config:null`，
+ *  于是 `launch` 的 roster 也跟着读不出来 —— 一个新开关把无关功能带塌了。
+ *  所以这里**只读自己那一个键**，任何读不出来都回落到 0（fail-open）：
+ *  这条判据的失效方向必须是「不拦」。
+ *
+ *  等 `question-audit.validateConfig()` 也加上这个键（同一个改动里的后续工作），
+ *  这里可以改成复用它，判据仍然只有一份。
+ *
+ *  @param {object} env
+ *  @param {{configFile?:string}} [opts] `configFile` 缺省为会话 cwd 下的 `overwatch.config.json`
+ */
+export function minQuestionsBeforeWriteOf(env = {}, { configFile = null, cwd = null } = {}) {
+  const fromConfig = () => {
+    const p = String(configFile || (cwd ? join(String(cwd), 'overwatch.config.json') : ''));
+    if (!p || !existsSync(p)) return 0;
+    let raw;
+    try { raw = JSON.parse(readFileSync(p, 'utf8')); } catch { return 0; }
+    const ask = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw.ask : null;
+    if (!ask || typeof ask !== 'object' || Array.isArray(ask)) return 0;
+    const v = ask.minQuestionsBeforeWrite;
+    if (v === undefined) return 0;
+    // 只认整数。字符串 `"3"` 一律当没写 —— 隐式类型转换正是静默校验失效的来源
+    // （`question-audit.validateConfig` 的 `bad-range` 说的是同一件事）。
+    if (!Number.isInteger(v) || v < 0 || v > MAX_MIN_QUESTIONS) return 0;
+    return v;
+  };
+
+  const raw = String(env.OW_ASK_MIN_QUESTIONS ?? '').trim();
+  if (raw) {
+    const v = Number(raw);
+    // 缺省与空串必须回落到「配置文件」，**不能**当 0 —— 与 `configOf` 的 `num()`
+    // 踩过的是同一个坑：`Number('') === 0` 会静默关掉一个开关。
+    // 非法值也回落到配置文件，而不是 0：写错一个环境变量不该把用户刚开的功能关掉。
+    if (Number.isFinite(v) && Number.isInteger(v) && v >= 0 && v <= MAX_MIN_QUESTIONS) return v;
+  }
+  return fromConfig();
 }
 
 /** 标记文件绝对路径。`cwd` 是会话根（宿主实测：就是会话根，不是文件所在目录）。 */
@@ -663,7 +740,136 @@ export function readTranscriptReads(transcriptPath, { bytes = 1024 * 1024, readV
   return out;
 }
 
-/** 有界从尾��读。返回 `{buf, bytesRead}` 或 null。
+/** 一次 transcript 工具调用算不算「写」。**判据与 `writeIntentOf` 同源**，
+ *  但这里只用最窄的一条：`Write`/`Edit`/`MultiEdit`/`NotebookEdit` 与能从命令里
+ *  认出来的 shell 写。理由见 `readTranscriptActivity()` 的 `priorWriteCalls`。 */
+function isWriteUse(name, input, cwd) {
+  if (!String(name || '')) return false;
+  try { return writeIntentOf(name, input, cwd).isWrite; } catch { return false; }
+}
+
+/** 从 transcript 里数：本会话**问过几个不同的问题**、**写过没有**、**读过哪些文件**。
+ *  **只读，不写**。一次有界读（尾部 `bytes`）算出三样东西。
+ *
+ *  ## 为什么和 `readTranscriptReads()` 分成两个函数
+ *
+ *  `readTranscriptReads()` 是已有判据的唯一实现，五个消费者依赖它（闸门 / 重放器 /
+ *  提问审计 / 两个测量脚本）。它只抽「读过哪些文件」。这里要的是另外两样，
+ *  硬塞进去会让它的返回值变成一个所有调用方都要多拿一份的对象 —— 那是改动更大、
+ *  更容易漂的方向。所以**读盘逻辑共用 `readTailBytes`，解析逻辑各自成一处**，
+ *  没有第二份「怎么算读过」的实现。
+ *
+ *  ## 三样东西的判据
+ *
+ *  · `questions` —— **去重后的问题原文**。键是 `normalizeText(question)`，
+ *    所以同一个问题换个标点/空格仍算同一个。`ExitPlanMode` 贡献一个固定键
+ *    `'ExitPlanMode'`：它是「计划批准」，同样是一次「我停下来等你」。
+ *
+ *    **口径不一致，如实记在这里**（2026-11-19 自查发现）：本文件把
+ *    `AskUserQuestion` 与 `ExitPlanMode` **都算**，`measure-ask-vs-tell.mjs`
+ *    也两个都算，而 `question-audit.mjs:404` **只认 `AskUserQuestion`**。
+ *    三处两种答案。
+ *
+ *    此前这里写着「与 question-audit.mjs / measure-ask-vs-tell.mjs 的口径一致」——
+ *    **那句话是错的**，注释声称的一致性在代码里不存在。
+ *
+ *    为什么现在不改那两处：`question-audit.mjs` 的既有报告与测试都建立在
+ *    「只认 AskUserQuestion」上，改它会动一批已验证的数字；而这次改动不依赖它。
+ *    失效方向也安全 —— 本文件数得**更宽**（多算计划批准），所以闸门更容易放行、
+ *    不会误拦。代价是两边数字对不上：审计说「0 次提问」时闸门可能认为「问过 1 次」。
+ *    要统一时按 `measure-ask-vs-tell.mjs` 的口径（两个都算），并把审计侧的报告重跑。
+ *
+ *  · `askCalls` —— **按 `tool_use.id` 去重后**的提问调用次数。宿主会把同一次调用
+ *    写成两行（实测全语料 33,090 行重复），不去重会系统性算高 39%。
+ *
+ *  · `priorWriteCalls` —— 转录里**已经有过**几笔写。带 `block.role !== 'assistant'`
+ *    这层是因为 bash 的 `echo > f` 也可能出现在别处；`writeIntentOf` 对未知工具
+ *    返回 `isWrite:false`，所以这里只会数到真认识的写。
+ *    **不数「是不是本次这次调用」** —— 闸门在 PreToolUse 阶段跑，本次调用还没落进
+ *    transcript，所以这里数到的写都属于「之前」。
+ *
+ *  ## fail-open
+ *
+ *  路径为空 / 读不到 / 全是坏 JSON → 返回空结构，`bytesRead:0`。
+ *  调用方据此判定「这条判据没有数据」，**不许因此拦人**。
+ *
+ *  @returns {{questions:string[], askCalls:number, distinctQuestions:number,
+ *             unknownAskCalls:number, priorWriteCalls:number, reads:string[],
+ *             unreadable:boolean, bytesRead:number, lines:number, unparsable:number}}
+ */
+export function readTranscriptActivity(transcriptPath, { bytes = 1024 * 1024, readVerbs = SHELL_READ_VERBS, cwd = null } = {}) {
+  const out = {
+    questions: [], askCalls: 0, distinctQuestions: 0, unknownAskCalls: 0,
+    priorWriteCalls: 0, reads: [], unreadable: true, bytesRead: 0, lines: 0, unparsable: 0,
+  };
+  const p = String(transcriptPath || '');
+  if (!p) return out;
+  let buf;
+  try {
+    const r = readTailBytes(p, bytes);
+    if (!r) return out;
+    buf = r.buf;
+    out.bytesRead = r.bytesRead;
+  } catch {
+    return out;
+  }
+  // 读到了（哪怕 0 字节）—— `unreadable:false` 表示「这份数据是真的看过了」。
+  // 空文件 = 「这个会话什么都没问」是一个**真实的**读数，不是「读不到」。
+  out.unreadable = false;
+  const text = buf.toString('utf8');
+  const lines = text.split('\n');
+  if (out.bytesRead >= bytes && lines.length > 1) lines.shift();  // 半条首行
+
+  const seenIds = new Set();
+  const seenQ = new Set();
+  const seenReads = new Set();
+  for (const line of lines) {
+    const s = line.trim();
+    if (!s) continue;
+    out.lines++;
+    let rec;
+    try { rec = JSON.parse(s); } catch { out.unparsable++; continue; }
+    const content = rec && rec.message && Array.isArray(rec.message.content) ? rec.message.content : null;
+    if (!content) continue;
+    for (const b of content) {
+      if (!b || b.type !== 'tool_use') continue;
+      // 宿主重写留下的副本行不是第二次调用（`question-audit.mjs` 实测 33,090 行）。
+      if (typeof b.id === 'string' && b.id) {
+        if (seenIds.has(b.id)) continue;
+        seenIds.add(b.id);
+      }
+      for (const raw of readPathsOfToolUse(b.name, b.input, readVerbs, cwd)) {
+        const k = pathKeyOf(raw);
+        if (!k || seenReads.has(k)) continue;
+        seenReads.add(k);
+        out.reads.push(raw);
+      }
+      if (b.name === 'AskUserQuestion' || b.name === 'ExitPlanMode') {
+        out.askCalls++;
+        if (b.name === 'ExitPlanMode') {
+          // 计划批准 = 一次「我停下来等你」。用一个固定键，不给它编一个问题文本 ——
+          // 编了就等于凭空造出「问过什么」的证据。
+          if (!seenQ.has('exitplanmode')) { seenQ.add('exitplanmode'); out.questions.push('ExitPlanMode'); }
+          continue;
+        }
+        const q = questionsOfAsk(b.input);
+        if (q.unknown) { out.unknownAskCalls++; continue; }
+        for (const item of q.questions) {
+          const key = normalizeText(item.question);
+          if (!key || seenQ.has(key)) continue;
+          seenQ.add(key);
+          out.questions.push(item.question);
+        }
+      } else if (isWriteUse(b.name, b.input, cwd)) {
+        out.priorWriteCalls++;
+      }
+    }
+  }
+  out.distinctQuestions = out.questions.length;
+  return out;
+}
+
+/** 有界从尾部读。返回 `{buf, bytesRead}` 或 null。
  *
  *  用 fd + `readSync` 而不是 `readFileSync` 再截：开源节流——一个 1.5 GB transcript
  *  读进来再切，等于每小时把整个语料搬进内存若干次，而判定只需要尾部。
@@ -909,6 +1115,54 @@ export function reasonFor({ cwd, markerPath, gateCommand, minReads, halt, denial
   return lines.join('\n');
 }
 
+/** 「先问够 N 个问题」这条判据的 reason。**同样是可执行指令链，不是建议。**
+ *
+ *  与 `reasonFor()` 的关系：两条判据各有各的失败原因，混成一段会让模型
+ *  分不清现在该干什么（读文件？还是问问题？）。所以文案分开、格式一致。
+ *
+ *  要求（来自用户原话「开头提示词给的模糊，做出来的东西不是用户想要的」）：
+ *    ① 说清**还差几个**（可判定的数字，不是「请多提问」）；
+ *    ② 说清**往哪些方向问**（范围 / 取舍 / 验收标准 —— 三样都是「做出来会不会白费」的判据）；
+ *    ③ 说清**问完怎么回来**（原样重试这次写；闸门会自己重新数，不需要跑 mark）；
+ *    ④ 说清**重复不算**（否则模型会把同一个问题拆成两句来刷数）。
+ *
+ *  `have` 是去重后已有的问题数。`halt` 与 `reasonFor()` 同一语义：真拒绝时本回合会结束。 */
+export function reasonForQuestions({ cwd, need, have, halt, denialCount, maxDenials }) {
+  const needN = Math.max(1, Number(need) || 1);
+  const haveN = Math.max(0, Number(have) || 0);
+  const miss = Math.max(0, needN - haveN);
+  const c = String(cwd || '.');
+  const lines = [
+    `[overwatch] 写前闸：本会话还没问够问题，所以这次写入被拒绝。`,
+    ``,
+    `配置要求：第一次写文件之前，至少问过 ${needN} 个**不同**的问题（\`ask.minQuestionsBeforeWrite\`）。`,
+    `现在数到 ${haveN} 个（同一个问题重复问只算 1 个），**还差 ${miss} 个**。`,
+    ``,
+    `为什么有这条：开头需求一旦模糊，做完才发现方向不对就是白费力气。`,
+    `问什么才有用 —— 只问那些**答案会改变你接下来怎么写**的事，不要问能自己从仓库里读出来的：`,
+    `  · 范围：这次改哪些文件 / 明确不碰哪些（「顺带一起改」是最常翻车的一类）。`,
+    `  · 取舍：两个都能做时选哪个，以及为什么（不要替用户选，也不要两个都做）。`,
+    `  · 验收：用户怎么判断「这就算做完了」—— 要跑哪条命令、看哪个输出。`,
+    `  · 反例：用户已经明确说过的，别再问一遍；那是浪费他的一次回答。`,
+    ``,
+    `做法：用 AskUserQuestion 一次问 ${miss} 个（一次调用里放多个问题算多个），`,
+    `然后**原样重试你刚才那次写** —— 闸门会自己从 transcript 重新数，不需要跑任何命令。`,
+    `若你确实认为没有需要问的，就明说理由，然后重试；本闸不会因为「你觉得不需要」而放行，`,
+    `但会在 reason 里留下这一条，事后可审计。`,
+  ];
+  if (halt) {
+    lines.push(
+      ``,
+      `本次拒绝同时结束了本回合（宿主对 PreToolUse 拒绝**没有次数上限**，不刹车会无限重试）。`,
+      `下一步：先提问，再重试写入。`,
+    );
+  } else if (denialCount > 0) {
+    lines.push(``, `这是本回合第 ${denialCount + 1}/${maxDenials} 次拒绝；到上限后本回合会被强制结束。`);
+  }
+  if (c && c !== '.') lines.push(``, `（会话目录：${c}）`);
+  return lines.join('\n');
+}
+
 // ── 判定（纯函数）────────────────────────────────────────────────────
 
 /** 判定一次 PreToolUse。**纯函数**：不读盘、不写盘、不读环境变量。
@@ -988,6 +1242,118 @@ export function decide(input, state = {}) {
     ? (state.getReads() || [])
     : (Array.isArray(state.reads && state.reads.paths) ? state.reads.paths : []);
   log.reads = reads.length;
+
+  // ── 判据零（`ask.minQuestionsBeforeWrite`）：第一次写之前先问够 N 个问题 ────────
+  //
+  // 安排在这里的三条理由，每条都是判据的一部分，不是实现细节：
+  //
+  //   ① **在 `markerValidity` 之后**。标记存在 = 这个会话已经过闸（或显式跑了
+  //      `mark` 逃生口）。逃生口的意义就是「我知道我在干什么」；再拿提问去堵它，
+  //      等于把逃生口拆掉 —— 而这个闸的失效方向必须是「能干活」。
+  //   ② **在两条读侧判据之前**。它是**独立**的第二道闸：读够了不等于问对了。
+  //      两条判据各自 deny、各自给 reason，混在一起模型会不知道先做哪件事。
+  //   ③ **`minQuestionsBeforeWrite === 0` 时整个分支不存在** —— 连
+  //      `state.getActivity` 都不许调（测试里用一个会抛异常的函数钉住了这一点）。
+  //      这是「默认值不破坏现有用户」这条硬要求的**唯一**可验证形态：
+  //      不是看代码里有没有 `if`，而是看那条读盘路径有没有被走到。
+  //
+  // 只判**第一次写**：`priorWriteCalls > 0` 直接跳过。写到一半才拦会打断正在进行的活，
+  // 而这条判据要防的是「开头方向就错了」，那时候还什么都没写。
+  const needQ = Number(cfg.minQuestionsBeforeWrite) || 0;
+  let askGate = null;   // `null` = 这条判据不参与；否则是 `{need, have, miss, unknown}`
+  // ── L1 叫停路径：排在**这条判据**的所有分支之前 ───────────────────────
+  //
+  // 复用 `stop-verify-hook.mjs` 的 `isPaused()` / `pausePathFor()`，不新造一个开关：
+  //   · 造第二个 PAUSE 文件等于要求用户记住两个路径，而他只会在被锁住时才发现第二个也在；
+  //   · `check-structure.mjs` 的 `checkStopHookKillSwitch()` 已经在守「默认开启的强拦
+  //     必须有可调用的叫停路径」；复用同一个函数，本闸自动落在那条规则的覆盖范围内。
+  //
+  // **刻意放在 `needQ > 0` 之内，而不是放在 `decide()` 的最前面。** 放在最前面会让
+  // `minQuestionsBeforeWrite = 0` 的现有用户在 PAUSE 文件存在时行为改变（本闸从
+  // 「照常判」变成「一律放行」）—— 而「0 时逐字节不变」是这次改动的硬要求。
+  // 一个默认关闭的判据不许顺带改掉别人已有的行为，哪怕方向是「更宽松」。
+  if (needQ > 0 && state.paused === true) {
+    return passthrough('user-paused', { pausePath: state.pausePath || null });
+  }
+  if (needQ > 0) {
+    const act = typeof state.getActivity === 'function'
+      ? state.getActivity()
+      : (state.activity && typeof state.activity === 'object' ? state.activity : null);
+    if (!act || act.unreadable === true) {
+      // 读不到 transcript / 没有这条数据 = **不知道**，而不知道不许判。
+      // 与整个闸的 fail-open 一致：这条判据的失效方向只能是「不拦」。
+      log.questions = 'unavailable';
+    } else {
+      log.questions = Number(act.distinctQuestions) || 0;
+      log.questionsUnknown = Number(act.unknownAskCalls) || 0;
+      log.priorWrites = Number(act.priorWriteCalls) || 0;
+      // 形态不可读的提问（`questions` 是坏 JSON）不参与：不知道就不许判。
+      // 一条都问不出来、却有不可读的调用 —— 说明它是问过的，只是我们读不懂。
+      if (Number(act.unknownAskCalls) > 0 && Number(act.distinctQuestions) === 0) {
+        log.questions = 'unknown-form';
+      } else if (Number(act.priorWriteCalls) > 0) {
+        // 已经写过 —— 这条判据不再介入。`log.questions` 留着，方便事后分桶。
+      } else {
+        const have = Number(act.distinctQuestions) || 0;
+        if (have < needQ) askGate = { need: needQ, have, miss: needQ - have };
+      }
+    }
+  }
+
+  if (askGate) {
+    const commonQ = {
+      cwd, need: askGate.need, have: askGate.have,
+      denialCount: Number(state.denials) || 0,
+      maxDenials: Number(state.denyBudget) || 0,
+    };
+    const stopReasonQ = '[overwatch] pre-write gate: 第一次写文件前没问够问题，已拒绝并结束本回合。';
+    if (cfg.mode === 'observe') {
+      return {
+        action: 'passthrough', output: null, markWrite: null,
+        log: {
+          ...log, decision: 'would-deny', allowReason: 'observe-mode',
+          denyBy: 'questions', reason: reasonForQuestions({ ...commonQ, halt: false }),
+        },
+      };
+    }
+    if (cfg.mode === 'warn') {
+      return {
+        action: 'warn',
+        output: {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'allow',
+            additionalContext: reasonForQuestions({ ...commonQ, halt: false }),
+          },
+        },
+        markWrite: null,
+        log: { ...log, decision: 'warn', allowReason: 'warn-mode', denyBy: 'questions' },
+      };
+    }
+    // deny。刹车策略与另一条判据**共用同一份** `brake` / `denyBudget` / 计数器 ——
+    // 不新造机制，也不给它单独一份预算：用户设的「这个回合最多拦几次」说的是整个闸。
+    const haltQ = cfg.brake === 'halt'
+      || (Number(state.denials) || 0) >= (Number(cfg.denyBudget) || 0);
+    const reasonQ = reasonForQuestions({ ...commonQ, halt: haltQ });
+    const outputQ = {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: reasonQ,
+      },
+    };
+    if (haltQ) {
+      outputQ.continue = false;
+      outputQ.stopReason = stopReasonQ;
+    }
+    return {
+      action: 'deny', output: outputQ, markWrite: null,
+      log: {
+        ...log, decision: 'deny', halted: haltQ, satisfiedBy: null,
+        denyBy: 'questions', reasonLen: reasonQ.length,
+      },
+    };
+  }
 
   // ── 判据一（Edit 侧）：改**已有**文件时，判据换成「读过这个文件本身」。 ──────────
   //
@@ -1203,6 +1569,26 @@ export function runHook(input, { env = {}, nowMs = Date.now(), cwd: cwdOverride 
     return cached;
   };
 
+  // 「问过几个问题 / 写过没有」——**同一个 transcript 尾部只读一次**。
+  //
+  // 与 `getReads` 合用一个 `cachedActivity`：`readTranscriptActivity()` 已经把
+  // 「读过哪些文件」一并算出来了，所以两条判据都开的时候，读盘次数仍然是 1 次
+  // 而不是 2 次。**这里不共用 `getReads` 的缓存对象**是有意的：两者的调用时机
+  // 不同（`getReads` 在标记缺失时必被调；`getActivity` 只在 `needQ>0` 时被调），
+  // 共用一个变量会让「0 时连读盘都没发生」这条硬要求变得依赖调用顺序。
+  //
+  // **`needQ === 0` 时这个函数永远不会被调用** —— `decide()` 里那道分支根本不存在。
+  // 这就是「默认值不破坏现有用户」的可验证形态。
+  let cachedActivity = null;
+  const getActivity = () => {
+    if (cachedActivity === null) {
+      cachedActivity = (input && input.transcript_path)
+        ? readTranscriptActivity(input.transcript_path, { bytes: cfg.transcriptBytes, cwd })
+        : { questions: [], distinctQuestions: 0, unknownAskCalls: 0, priorWriteCalls: 0, reads: [], unreadable: true };
+    }
+    return cachedActivity;
+  };
+
   // 密钥**只读不生成**：校验一次判定的路径不该在盘上留东西。生成只发生在
   // `writeMarker({satisfiedBy:"auto"})` 里 —— 那才是真需要签名的时刻。
   // 副作用集中在这里、`ensureGateSecret` 只在写标记里调用，所以这两个读盘动作
@@ -1215,9 +1601,20 @@ export function runHook(input, { env = {}, nowMs = Date.now(), cwd: cwdOverride 
     marker: readMarker(markerPath),
     secret: readGateSecret(secretPath),
     getReads,
+    getActivity,
+    // L1 叫停：路径与判据都来自 `stop-verify-hook.mjs`（见 `decide()` 里的注释）。
+    paused: isPaused(env),
+    pausePath: pausePathFor(env),
     denials: bumpDenials(denialPath, promptId, { readOnly: true }),
     gateCommand: gateCommandFor(input),
   };
+  // `ask.minQuestionsBeforeWrite` 的生效值。**只在这一行算**，且**一定**要覆盖
+  // `defaultConfig()` 的 0 —— 否则配置文件里写了也不生效（那正是本仓库反复批判的
+  // 「配置项存在但没有执行侧」）。
+  //
+  // 读不出来时 `minQuestionsBeforeWriteOf()` 回落到 0（fail-open），
+  // 所以配置是垃圾也不会让用户写不了文件。
+  state.config = { ...cfg, minQuestionsBeforeWrite: minQuestionsBeforeWriteOf(env, { cwd }) };
 
   const out = decide(input, state);
 
@@ -1306,6 +1703,10 @@ export function cli(argv = [], env = process.env, nowMs = Date.now()) {
     const m = readMarker(markerPath);
     const cfg = configOf(env);
     const sec = readGateSecret(secretPathFor(cwd));
+    // `ask.minQuestionsBeforeWrite` 的**生效值**（env > 配置文件 > 0）。看清楚它，
+    // 否则「我明明写了 3，为什么没拦」和「我写了 0，为什么拦了」都要靠猜 ——
+    // 这个仓库对「配置项存在但没有执行侧」已经有过太多教训。
+    const minQ = minQuestionsBeforeWriteOf(env, { cwd });
     const sig = m.exists && m.data && m.data.satisfied_by === 'auto'
       ? (verifyMarkerSig(m.data, sec) ? 'valid' : 'INVALID（缺签名或密钥不符 —— 这条 auto 不算数）')
       : '—';
@@ -1313,6 +1714,7 @@ export function cli(argv = [], env = process.env, nowMs = Date.now()) {
       `mode        : ${cfg.mode}`,
       `brake       : ${cfg.brake}${cfg.brake === 'budget' ? `（前 ${cfg.denyBudget} 次不刹车）` : ''}`,
       `minReads    : ${cfg.minReads}`,
+      `minQuestions: ${minQ}${minQ === 0 ? '（这条判据不启用）' : '（第一次写之前必须先问够这么多个不同问题）'}`,
       `cwd         : ${cwd}`,
       `marker      : ${markerPath}`,
       `marker state: ${m.exists ? (m.error ? `exists-but-broken (${m.error})` : `exists ${JSON.stringify(m.data)}`) : 'absent'}`,

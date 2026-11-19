@@ -253,6 +253,43 @@ test('validateConfig 负向：requireReadFirst 传字符串也拒绝', () => {
   assert.equal(validateConfig(c).ok, false);
 });
 
+// `ask.minQuestionsBeforeWrite`（2026-11-19，写前闸的执行侧）。这三条守的是
+// 「键白名单」与「执行侧取值范围」两处不会漂：`pre-write-gate.mjs` 的
+// `MAX_MIN_QUESTIONS` 也是 20，两边任一改动都会在这些测试里红。
+test('validateConfig：ask.minQuestionsBeforeWrite 缺省算 0（老配置不会突然变非法）', () => {
+  const c = good();
+  delete c.ask.minQuestionsBeforeWrite;
+  const r = validateConfig(c);
+  assert.equal(r.ok, true, `缺省不该报错：${JSON.stringify(r.errors)}`);
+  assert.equal(r.config.ask.minQuestionsBeforeWrite, 0);
+});
+
+test('validateConfig：ask.minQuestionsBeforeWrite 接受 0..20 的整数', () => {
+  for (const v of [0, 1, 3, 20]) {
+    const c = good();
+    c.ask.minQuestionsBeforeWrite = v;
+    const r = validateConfig(c);
+    assert.equal(r.ok, true, `${v} 应被接受：${JSON.stringify(r.errors)}`);
+    assert.equal(r.config.ask.minQuestionsBeforeWrite, v);
+  }
+});
+
+test('validateConfig 负向：ask.minQuestionsBeforeWrite 的越界 / 字符串 / 小数都拒绝', () => {
+  for (const v of [-1, 21, '3', 2.5, null, true]) {
+    const c = good();
+    c.ask.minQuestionsBeforeWrite = v;
+    const r = validateConfig(c);
+    assert.equal(r.ok, false, `${JSON.stringify(v)} 应被拒绝`);
+    assert.ok(r.errors.some((e) => e.code === 'bad-range' && e.path === 'ask.minQuestionsBeforeWrite'));
+  }
+});
+
+test('负向：键白名单不会因为上面那三条放松 —— 拼错的 minQuestionsBeforeWrite 仍报 unknown-key', () => {
+  const c = good();
+  c.ask.minQuestionsBeforeWrites = 3;
+  assert.ok(validateConfig(c).errors.some((e) => e.code === 'unknown-key' && e.path === 'ask.minQuestionsBeforeWrites'));
+});
+
 test('validateConfig 负向：未知角色名必须报错', () => {
   const c = good();
   c.agent.roster = ['oversight-executor', 'totally-made-up'];

@@ -21,6 +21,111 @@
 
 ---
 
+## [Unreleased] - 2026-11-19（写前闸多一道闸：第一次写之前，先问够 N 个问题）
+
+用户原话是这条改动的**判据来源**，不是修饰：
+
+> 提前问主要服务的是长时间工作这个目的。一旦开头提示词给的模糊，做出来的东西不是用户想要的就是白费力气了。
+> 做成配置项，让用户可以自定义开头问几个问题，保留自由度，走错方向的风险由用户承担。
+
+### Added
+
+- **`ask.minQuestionsBeforeWrite`：第一次写文件之前，transcript 里必须已经有 ≥N 个去重后的问题。**
+  **默认 `0` = 这条判据完全不存在**，装了这个闸的现有项目升级后行为逐字节不变。
+
+  | 值 | 行为 |
+  |---|---|
+  | `0`（默认） | 判据不启用。**连 transcript 都不读** —— 测试里用一个会抛异常的 `getActivity` 钉住了这一点，而不是看代码里有没有 `if` |
+  | `N>0` | 第一次写之前必须已有 ≥N 个**不同**问题（`AskUserQuestion` + `ExitPlanMode`，与 `question-audit.mjs` 同口径） |
+  | 环境变量 | `OW_ASK_MIN_QUESTIONS` **优先于**配置文件（临时试跑用） |
+
+  五条判据细节，每条都是判据的一部分：
+
+  1. **只判第一次写。** `transcript` 里已经有过写 → 这条判据不再介入。写到一半才拦会打断正在进行的活，
+     而这条判据要防的是「开头方向就错了」——那时候还什么都没写。
+  2. **去重后计数。** 同一问题重复问只算 1 个（键是 `normalizeText(question)`），
+     否则把一个问题拆成三句就能刷过门槛。`tool_use` 行按 `id` 去重（宿主重写会留重复行，实测全语料 33,090 行）。
+  3. **形态不可读的提问不参与判定。** `questions` 是坏 JSON 的调用（实测 6/197 次）记 `unknownAskCalls`，
+     一条可读问题都没有时整条判据放行 —— 解析失败 ≠ 没问。
+  4. **在 `markerValidity` 之后、两条读侧判据之前。** 标记存在（含 `mark` 逃生口）不受这条约束：
+     逃生口的意义就是「我知道我在干什么」。与读侧判据并列而不是串联 —— 两条各自 deny、各自给 reason，
+     混成一段模型会不知道先做哪件事。
+  5. **fail-open 到底。** transcript 读不到、配置文件是垃圾、键值超范围 → 一律回落到 `0`。
+     这条判据的失效方向只能是「不拦」。
+
+  拒绝文案是可执行的：说清**还差几个**、**往哪些方向问**（范围 / 取舍 / 验收 / 别问已经说过的）、
+  **问完原样重试这次写**。不是「请多提问」。
+
+- **`scripts/question-form.mjs`：`questionsOfAsk()` / `normalizeText()` 从 `question-audit.mjs` 搬出。**
+  搬家的理由是环：写前闸也要数「问过几个问题」，而 `pre-write-gate → question-audit →
+  observe-reality-check → pre-write-gate` 会形成一个环，`observe-reality-check.mjs` 在**模块顶层**
+  求值 `GATE_SHELL_READ_VERBS`，环一存在那一行就在常量初始化前执行 → 直接 TDZ `ReferenceError`
+  （不是静默降级，是整条链路起不来）。判据仍然只有一份：`question-audit.mjs` 改成转出口，
+  它的 69 条测试与一切调用方一行未改。
+
+### Changed
+
+- **叫停路径复用而不是新造。** `pre-write-gate.mjs` 现在调 `stop-verify-hook.mjs` 的
+  `isPaused()` / `pausePathFor()`，排在**所有**判据之前。两条理由：造第二个 PAUSE 文件等于要求用户
+  记住两个路径，而他只会在被锁住时才发现第二个也存在；`check-structure.mjs` 的
+  `checkStopHookKillSwitch()` 已经在守「默认开启的强拦必须有可调用的叫停路径」，
+  复用同一个函数让本闸自动落进那条规则的覆盖面，而不是靠注释声称自己有叫停路径。
+  刹车也共用同一份 `brake` / `denyBudget` / 计数器 —— 没有第二个预算。
+- **`overwatch.config.json` 的 `ask` 段加 `minQuestionsBeforeWrite: 0`，
+  `question-audit.validateConfig()` 的白名单同时收下这个键。**
+  只读不校验会让用户一写这个键就 `unknown-key` → `loadConfig()` 返回 `config:null` →
+  `launch` 的 roster 跟着读不出来：一个新开关把无关功能带塌。
+  校验的范围（`0..20`）与执行侧的 `MAX_MIN_QUESTIONS` 逐字相同，由
+  `question-audit.test.mjs` 的四条用例钉住；**缺省不报错**（老配置不会突然变非法）。
+  注意：执行侧读配置**不走** `validateConfig()` —— 它读的是自己那一个键，
+  因为「闸门能不能工作」不该取决于配置校验器的版本。见 `minQuestionsBeforeWriteOf()`。
+- **`pre-write-gate.mjs status` 多打一行 `minQuestions`**：写了 3 却看到 0，就是配置没接上。
+  这个仓库对「配置项存在但没有执行侧」已经有过太多教训，生效值必须有个地方看得见。
+- 文档：`docs/CAPABILITIES.md` 新增 §3.5（怎么开、和另外两条判据的顺序、诚实边界）；
+  `templates/pre-write-gate.settings.json` 的 `_how_to_enable` 加了同一段。
+
+### 测试
+
+`scripts/pre-write-gate.test.mjs` 99 → 120 条（新增 21 条），`scripts/question-audit.test.mjs`
+69 → 73 条（新增 4 条），全仓 1691 → 1716 条。硬门对账的四处数字已同步。
+
+七条硬要求逐条有测试，且**每条旁边都有负向对照**：
+
+| 要求 | 用例 | 负向对照 |
+|---|---|---|
+| `0` 时行为与改前完全一致 | `minQuestionsBeforeWrite=0：这条判据完全不参与（连 transcript 都不读）` | 用一个**会抛异常**的 `getActivity` 证明那条路径没被走到；判决/输出/日志逐字相同 |
+| `:3` 且问 0 个 → deny，reason 含「还差 3 个」 | 同名用例 | —— |
+| `:3` 且问 3 个不同 → allow | 同名用例 | 读侧判据同时满足，证明放行来自新判据 |
+| `:3` 且同一问题问 3 次 → 只算 1 个，仍 deny | 同名用例 | —— |
+| 第二次写 → 不再判 | 同名用例 | 把 `priorWriteCalls` 归零，同一份输入必须变 deny |
+| transcript 读不到 → 放行 | 同名用例 | 判决与**未启用这条判据**时逐字相同（不是「一定是 allow」——读侧判据照旧生效） |
+| PAUSE 存在 → 放行 | 同名用例 + `runHook` 端到端用例 | —— |
+
+另外：`readTranscriptActivity` 的去重（同 id 重复行 / 同一问题问两遍 / `ExitPlanMode` 算一次）、
+`minQuestionsBeforeWriteOf` 的三级优先级与垃圾回落、`reasonForQuestions` 不含「请多提问」、
+`status` 打印生效值，各有一条。
+
+**全量 `node --test scripts/` 前后三个台账增量均为 0**
+（`tasks/runs/stop-hook/<今天>.jsonl` / `tasks/runs/stop-hook-samples.jsonl` /
+`tasks/runs/pre-write-gate/<今天>.jsonl`）；`check-structure.mjs` 全绿。
+
+### 没做的部分（及理由）
+
+- **`launch.mjs` 的 `askProtocol()` 不加这一条。** 那段系统提示只能**建议**「开局先问」，
+  而这条判据的价值在于它是**可判定的**（数得清、拦得住）。把一句建议塞进提示里
+  会让读者以为两处是同一件事，而它们一个是 prompt、一个是闸门。
+  更重要的是：`askProtocol()` 只在 `overwatch launch` 起的会话里生效，装了 hook 的
+  普通会话看不到它 —— 用户会以为自己开了、实际一半会话没开。闸门这一侧不区分会话来源。
+- **不判「问得准不准」。** 问三个敷衍的问题照样能过闸。这需要语义理解，是本仓库
+  反复声明判不了的（`docs/spec/2026-11-14-question-audit.md` §8）。这一条必须写在
+  用户读得到的地方，已在 `docs/CAPABILITIES.md` §3.5 的「诚实边界」里。
+- **不按 `prompt_id` 重置。** 同一会话里的第二次 `prompt`（用户又说了一句话）不会重新要求提问：
+  「这个会话已经写过文件」这件事一旦为真就不再变，而 `readTranscriptActivity()` 数的是整个
+  transcript 尾部。换一种口径需要判断「哪些写属于上一轮」，那在没有轮次标记的 transcript 上
+  只能靠猜 —— 而这正是本仓库反对的那种「看起来有依据的猜测」。
+
+---
+
 ## [Unreleased] - 2026-11-18（让 `--health` 分得出「进程死了」和「进程卡住了」）
 
 ### Added
