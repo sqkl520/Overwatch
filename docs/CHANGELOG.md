@@ -21,6 +21,88 @@
 
 ---
 
+## [Unreleased] - 2026-11-21 README 按参考项目骨架重写（中英两份）
+
+用户要求「完全学习参考项目的 README」，但本仓库不是 App、没有 Release、star 为 0，
+所以照搬骨架里有两段不能照抄（版本以 Releases 为准 / Star History + Contributors），
+必须换成诚实的说法。
+
+### Changed
+
+1. **`README.md` 重排成参考骨架**：居中首屏（徽章 + 三个卖点 + 链接行）→ 警示块 →
+   `✨ 功能特性`（四组：需求传递三道闸 / 证据核对 / 会话观测 / 自检与台账）→ `🚀 快速开始`
+   （四步，含 `overwatch doctor` 真实输出）→ `❓ 常见问题`（13 条，全部取自
+   `docs/GUIDE.md` §9、`docs/CAPABILITIES.md` §2/§3/§3.5、`tasks/dev-findings.md`）→
+   `🔧 它是怎么工作的`（ASCII hook 架构图 + 技术栈表 + 3 个 `<details>`）→
+   断言 vs 证据 + 诚实的数字 → 六种状态 → 已知局限 → 为什么不能自动接力 →
+   `📌 当前进度`（三道闸逐个交代）→ `📦 构建与验证` → `🤝 开发与贡献` → `📚 文档` →
+   `⚖️ 许可与致谢`。
+
+2. **`README-EN.md` 同骨架重写，不是逐字直译**：英文版按「英文读者会问什么」重写措辞，
+   表格与结构对齐，但不复述中文版的汉语语境。
+
+3. **徽章逐个重核（依据见下）**：
+   - 测试数 `1627` → **`1792`**：`check-structure.mjs` 的 `checkTestCount()` 用
+     `/^\s*test\(/gm` 数 `scripts/*.test.mjs` 实测 1792（`node --test` 的 pass 是 1793，
+     差 2 条 skipped；硬门数与徽章口径必须同源，故取 1792）。
+   - Node 徽章由「≥18.20.4」改为「≥18.20.4 · tests 20.16+」：原先只写工具下限，
+     而跑测试的真实下限是 20.16.0（`scripts/overwatch.mjs:130-131`）。
+   - CI 徽章：`.github/workflows/validate.yml` 存在、`gh api` 查到 `state: active`，
+     最近 5 次 run 全部 `success`（最近一次 2026-11-20 `44807586097`，25s）。
+   - 依赖数 `0`：`scripts/*.mjs` 的 `from '…'` 只有 `node:` 内建与相对路径，
+     无 `package.json`、无 `node_modules`，实测非标准库导入 0 条。
+   - License `MIT`：`LICENSE` 首行 `MIT License`。
+
+4. **警示块按用户要求加「高一牲用 AI 辅助开发（vibe coding）」那段，但把「App」改成「工具库」**：
+   原句逐字要求写进 README，本仓库不是 App —— 保留「高一牲 / vibe coding / Issues / Star 喵」
+   四个要素，主体名词换成「工具库」，并补一句「不是 App，也不是插件」正面澄清，
+   避免读者拿 App 的安装预期来找安装包。
+
+5. **「版本以 Releases 为准」不能照抄，换成等价立场**：本仓库 `git tag` = 0、
+   `gh release list` 为空。故写成「对外可用的版本就是你 clone 到的那一刻的 `main`」，
+   内部阶段号（`0.2.0` + `[Unreleased]`）指向 CHANGELOG 头部并标明「不是可下载的版本」。
+
+6. **不加 Star History / Contributors（有意）**：`gh repo view` 实测 `stargazerCount: 0`，
+   star-history 会画空图；`gh api .../contributors` 只有 2 条，而 `git log` 显示
+   `sqkl520` / `sqcola` / `sqcooola` 三个邮箱是同一人。放一张只有自己的图表，
+   比不放更容易让人误判项目状态。理由写进 README 正文，不是偷偷省略。
+
+7. **`📌 当前进度` 用三道闸而非 fixN 轮次**：参考项目按修复轮次列表，本仓库没有轮次编号。
+   表格逐闸交代：写前闸已实现但默认关、清单机制「工具在但没闸」（附 1.4% 覆盖率实测）、
+   收工闸默认 off（台账 355 条判定里拦住 2 条）。
+
+### 保留（不是新写的，是从旧 README 原样接过来的骨头）
+
+「诚实的数字」（192 条断言 / 80.7% UNCHECKABLE）、「六种状态只有三个能驱动动作」
+（含 129 会话实测表）、「已知局限」四行实测表 + 多 agent 15× token、
+「唯一站得住的差异」四档判定表与 STALE_ONLY 真实输出、「为什么不能自动接力」三条、
+`overwatch doctor` 真实终端输出、面板三处值得看。以上内容一处未删，只换了位置。
+
+### Verified
+
+- `node scripts/check-structure.mjs` → `✓ 结构检查全部通过`（exit 0）
+- `node scripts/check-links.mjs` → 170 份 `.md` / 145 条相对链接 / **0 断链**
+- `node --test scripts/` → `tests 1795 / pass 1793 / fail 0 / skipped 2`（43 个文件）
+- README 里提到的命令逐条实跑：`overwatch.mjs`、`launch --dry-run`、`scan-sessions --days 3`、
+  `verify-claims --days 3|7`、`oversight-tui --plain`、`watch --inbox` / `--health`、
+  `install-watcher status`、`pre-write-gate status --cwd .`、`claim-ledger verify`、
+  `measure-checklist-coverage --days 7`、`build-payload --verify-self`、`analyze-hook-samples`、
+  `asked --hours 1`、`check-structure`、`check-links`。全部 exit 0 或符合文档声明的非零语义。
+- 新增数字的来源：524 会话三态分布（`scan-sessions --json`，**默认 7 天窗口**；`--days 3` 下是
+  78 会话 / `EXPLORING 65 / PRODUCING 10 / BLOCKED 3`，两个口径都实跑过，正文引用的是前者）、
+  172 条断言分布（`verify-claims --days 7`）、清单覆盖率 1.4%
+  （`measure-checklist-coverage --days 7`，不含沙箱 72 份 / 派发 54 / 清单 1）、
+  收工闸台账 355 行 / blocked 2（`tasks/runs/stop-hook/*.jsonl` 逐行解析）。
+
+### Known
+
+- **`replay-stop-gate.mjs --days 3` 在本机 60 秒内没跑完**，`--days 30` 更是超出 120 秒。
+  故 README 不引用它的拦截率数字，只引台账里可直接解析的 blocked 计数。这是本次的取舍，
+  不是它坏了 —— `docs/CAPABILITIES.md` 里那条命令本身仍然指向一个能跑通的入口，
+  只是耗时随语料增长，本机已到「需要更长窗口」的量级。
+
+---
+
 ## [Unreleased] - 2026-11-21 `DF-041` 修复：叫停文件从「一个路径」变成「一族路径」
 
 缺陷（登记于 `tasks/dev-findings.md` `DF-041`，`open` → `fixed`）：
@@ -78,16 +160,19 @@
   其余 74 条绿 → 恢复后 78 条全绿。这就是「改之前那条测试必须红」的证据。
 - 全量 `node --test scripts/`：**tests 1795 / pass 1793 / fail 0 / skipped 2**
   （1792 条 `test(` + 3 条由循环注册），`node scripts/check-structure.mjs` 绿。
-- 台账增量：跑硬门与全量测试前后，`tasks/runs/stop-hook/2026-11-21.jsonl` 与
-  `tasks/runs/pre-write-gate/2026-11-20.jsonl` 行数**不变**（0 条非本会话行为）。
+- 台账增量：`tasks/runs/stop-hook/2026-11-21.jsonl` 与
+  `tasks/runs/pre-write-gate/2026-11-20.jsonl` 在本轮确实**有新增行**（两个 hook 就在本会话
+  的 Bash 调用上跑，这是它们的正常记账）；按 `sessionId` 逐行核过，**非本会话行为 0 条**
+  （分别为 10 / 51 行，全部属于本会话 `ea4ef562…`）。`stop-hook-samples.jsonl` 行数不变。
 
 ### Not changed
 
 - **没有自动迁移、没有删除旧路径的文件，也没有改默认写盘位置。** 本次只改「读哪些路径」。
 - `resolveStateDir()` 的「新优先 / 旧兜底」规则**没有改** —— 它对数据是对的，改它会波及
   `watch` / `asked` / `notify` / `install-watcher` 四份调用方。
-- `templates/*.settings.json` 里的示例路径保留旧名：旧路径仍生效，改模板等于要求用户
-  再学一个新路径，收益为零。
+- **`templates/` 两份的说明文字改了，但只补了新路径，没有删旧路径。** 原先这里写的是
+  「模板保留旧名不改」——那句话在写完 templates 之后就不成立了，一并改掉。模板是用户
+  第一眼看到的东西，只写旧名等于继续把人引到非主路径上。
 
 ---
 
