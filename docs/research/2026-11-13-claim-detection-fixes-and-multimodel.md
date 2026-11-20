@@ -162,7 +162,7 @@ REMOVED 0
 实测环境：
 
 ```
-$ curl http://127.0.0.1:15721/v1/models        # cc-switch 本地网关（PID 12664，D:\CC Switch\cc-switch.exe）
+$ curl http://127.0.0.1:15721/v1/models        # cc-switch 本地网关（PID 12664，<app-home>\cc-switch.exe）
 {"models":[{"display_name":"MiniMax-M2.7-free"},{"display_name":"openai/gpt-5.6-luna"}]}
 ```
 

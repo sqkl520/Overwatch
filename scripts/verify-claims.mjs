@@ -1819,7 +1819,7 @@ function commandMatcherFor(family) {
 
 /** 从一条可能很长的复合命令里挑出「真正干活的那一段」。
  *
- *  实测形态：`export JAVA_HOME="/d/j" && "D:/maven/apache-maven-3.9.9/bin/mvn.cmd"
+ *  实测形态：`export JAVA_HOME="/d/j" && "<maven-home>/bin/mvn.cmd"
  *  -f "D:/a/b/pom.xml" clean verify`。整条贴给用户是噪声，他真正要重跑的只有后半段。
  *  做法：按 `&&` / `||` / `;` / 换行切段，取**最后一段命中该族匹配器的**；
  *  一段都不命中就原样返回第一行（宁可不裁剪，也不要剪出一个跑不起来的命令）。 */

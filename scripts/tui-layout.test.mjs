@@ -471,7 +471,7 @@ test('shortPath：末两段，带 `…/` 说明前面被省了', () => {
   assert.equal(shortPath('C:/Projects/Overwatch'), '…/Projects/Overwatch');
   assert.equal(shortPath('C:/x'), 'x');
   // 盘符不是有辨识度的一段，不该占一格
-  assert.equal(shortPath('C:/C盘清理路径'), 'C盘清理路径');
+  assert.equal(shortPath('C:/某中文目录'), '某中文目录');
   assert.equal(shortPath(''), '');
 });
 

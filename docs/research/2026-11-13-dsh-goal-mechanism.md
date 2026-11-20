@@ -4,10 +4,10 @@
 - 角色：检索 Agent DS1。产出形态：**exploration**（逆向分析，不是设计稿）
 - 对象：本机安装的 DeepSeek Harness，**`@deepseek-ai/dsh*` 全部包版本 `0.2.1-rc.2`**，桌面壳 `dshd/version` = `44.7.0`
 - 方法：
-  1. `D:\dsh\dshd\resources\app.asar`（182,794,869 B，18,309 个条目）——自写 asar 解析器逐条解出文件表与偏移，
+  1. `<dsh-home>\dshd\resources\app.asar`（182,794,869 B，18,309 个条目）——自写 asar 解析器逐条解出文件表与偏移，
      再按前缀抽取 30 余个 `@deepseek-ai/dsh-*` 包（含 `lib/*.js` 与 `README.md`）。**下面所有 `文件:行号` 都是抽取出的真实 JS 的行号**，
      括号里附 asar 内偏移供复核（绝对字节 = 4,779,796 + offset）。
-  2. `D:\dsh\dshd\resources\app.asar.unpacked\`、`~/.dsh/`（profiles / sessions / presets）——确认真实运行配置。
+  2. `<dsh-home>\dshd\resources\app.asar.unpacked\`、`~/.dsh/`（profiles / sessions / presets）——确认真实运行配置。
   3. **真实会话日志**：`~/.dsh/sessions/**/session.v4.jsonl.zstd` 共 **1,426 个会话**，用 Node 内置 zstd 全量解压后统计
      `todo/write`、`goal/change`、`goal` 来源 `user/message` 的真实分布（不是推测）。
   4. `.tmp-analysis/dsh-ref`（`deepseek-ai/dsh-superagent-prototype`）——只看它把「目标」落到工单/授权上的那一段。

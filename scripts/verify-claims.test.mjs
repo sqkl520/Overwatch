@@ -539,12 +539,12 @@ test('normalizeCommand：剥掉 heredoc 正文与 echo 实参', () => {
 
 test('normalizeCommand：引号里的命令串要保留，引号里的路径压成 basename', () => {
   assert.match(normalizeCommand('powershell -Command "npm test"'), /npm test/);
-  assert.match(normalizeCommand('"D:/maven/apache-maven-3.9.9/bin/mvn.cmd" clean verify'), /mvn\.cmd/);
-  assert.doesNotMatch(normalizeCommand('"D:/maven/apache-maven-3.9.9/bin/mvn.cmd" clean verify'), /apache-maven/);
+  assert.match(normalizeCommand('"D:/sdk/maven-dist/bin/mvn.cmd" clean verify'), /mvn\.cmd/);
+  assert.doesNotMatch(normalizeCommand('"D:/sdk/maven-dist/bin/mvn.cmd" clean verify'), /maven-dist/);
 });
 
-test('isTestCommand：maven 动词离可执行文件很远也认（本机真实形态）', () => {
-  assert.equal(isTestCommand('export JAVA_HOME="/d/j" && "D:/maven/apache-maven-3.9.9/bin/mvn.cmd" -f "D:/a/b/pom.xml" clean verify'), true);
+test('isTestCommand：maven 动词离可执行文件很远也认（真实语料的形状，路径已脱敏）', () => {
+  assert.equal(isTestCommand('export JAVA_HOME="/d/j" && "D:/sdk/maven-dist/bin/mvn.cmd" -f "D:/a/b/pom.xml" clean verify'), true);
   assert.equal(isTestCommand('cd x && ./gradlew :FCL:testReleaseUnitTest --console=plain'), true);
   assert.equal(isTestCommand('cd x && node --test scripts/*.test.mjs'), true);
 });
@@ -1110,8 +1110,8 @@ test('recoveryCommandFor：会话里跑过就抄它 —— Maven 项目给 mvn�
       detail: { testRuns: 1, testPassed: 0 },
       attempts: [{
         index: 4, ok: true,
-        // 本机真实形态：一段 export + 一个带长路径的 mvn.cmd
-        cmd: 'export JAVA_HOME="/d/j" && "D:/maven/apache-maven-3.9.9/bin/mvn.cmd" -f "D:/a/b/pom.xml" clean verify',
+        // 真实语料的形状：一段 export + 一个带长路径的 mvn.cmd（路径已脱敏）
+        cmd: 'export JAVA_HOME="/d/j" && "D:/sdk/maven-dist/bin/mvn.cmd" -f "D:/a/b/pom.xml" clean verify',
       }],
     },
   });

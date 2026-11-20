@@ -21,6 +21,546 @@
 
 ---
 
+## [Unreleased] - 2026-11-21 `DF-041` 修复：叫停文件从「一个路径」变成「一族路径」
+
+缺陷（登记于 `tasks/dev-findings.md` `DF-041`，`open` → `fixed`）：
+`stop-verify-hook.mjs` 的 `pausePathFor()` 硬编码了旧状态目录名
+`join(base, 'Overwatch', 'stop-hook.PAUSE')`，而 `state-dir.mjs:30-32` 已把目录改名成
+`UntilDone` / `untildone`。后果不是「路径拼写不好看」，是**闸关不掉**：
+用户按新文档在 `%LOCALAPPDATA%\UntilDone\` 放 PAUSE 文件**不生效**，
+必须猜中旧目录才行 —— 而这是本 hook **唯一的**叫停开关（`DF-020` 记过状态目录被整个
+清空的事故，所以它故意放在仓库外）。
+
+### Changed
+
+1. **新增 `pausePathsFor(env)`，返回整族候选路径（主路径在前）；`isPaused()` 改为
+   「任一条存在即真」。** 候选顺序：`OVERWATCH_STOP_VERIFY_PAUSE`（显式，唯一生效、
+   不叠加）→ `$OVERWATCH_STATE_DIR/stop-hook.PAUSE` → `<stateRoot>/UntilDone|untildone/`
+   → `<stateRoot>/Overwatch|overwatch/`。
+   **判定方向刻意与 `resolveStateDir()` 相反**：那条规则「新目录存在就用新的，否则沿用旧的」
+   是为**数据**服务的（别让历史看起来消失了）；PAUSE 文件的语义是「用户要求停止」，
+   所以任一存在即暂停（fail-safe：宁可多放行一次，不可漏掉一次叫停）。这层差异写在
+   两处注释里，避免下一个读代码的人「统一」掉它。
+2. **向后兼容**：旧路径的检测**没有删**。现有用户在 `%LOCALAPPDATA%\Overwatch\` 里已有的
+   PAUSE 文件照常生效 —— 删掉它等于**静默解除**用户的叫停，正是 `DF-041` 当初
+   「不自行修」的理由。
+3. **路径拼接改走 `state-dir.mjs` 的 `stateRoot()` / `STATE_DIR_NAME` / `LEGACY_DIR_NAME`**，
+   不再在本文件写第三份。原来那段 `env.LOCALAPPDATA || env.XDG_STATE_HOME || join(homedir(), '.local', 'state')`
+   在 win32 上没有 `%LOCALAPPDATA%` 时会落到 `.local/state`，与 `state-dir.mjs` 的
+   `AppData/Local` 并非同一处 —— 同一台机器两个「状态根」是本仓反复付账的那类漂移。
+   顺带 `OVERWATCH_STATE_DIR` 第一次对叫停路径生效（`DF-041` 影响 2）。
+4. **可观测性：新增 `pausedPathOf(env)`（返回命中的那一条，未命中返回 null）与
+   `PAUSE_FILE_NAME`。** 两个目录都认之后，「用户想停」与「用户把文件放错了地方」在布尔
+   层面完全一样 —— 这正是本缺陷的形态。所以：
+   - 台账的 `allowed-user-paused` 行新增 `pauseHit`（真命中的路径）与 `pausePaths`（候选
+     数量）；旧字段 `pausePath`（主路径）**保留**，台账消费方不被破坏；
+   - `pre-write-gate.mjs status --cwd <项目>` 把候选路径全部列出并标出 `← 命中` /
+     `not paused` —— 用户自查「我该把文件放哪」不必读源码。这是「最小可观测方案」，
+     代价是 `status` 多 2–4 行输出。
+5. `pre-write-gate.mjs` 的 `state` 里 `paused` 改为由 `pauseHit` 推出（**只调一次**
+   `pausedPathOf()`）：分两次算会让「判据说暂停了、日志说没命中」成为可能，而这两句
+   必须永远一致。
+6. `check-structure.mjs` 的 `checkStopHookKillSwitch()` 增加两条必需项：`pausePathsFor` 与
+   `pausedPathOf` 必须**有可调用的导出 + 真实的调用点**。退回「硬编码单个路径」的形态
+   会同时失去旧目录兼容与可观测性，那正是本条缺陷的成因。
+7. 文档同步：`docs/CAPABILITIES.md` 的两处（实测表 + 叫停路径表）改成列出四条候选路径；
+   `templates/` 两份模板里的叫停路径说明未改（模板只是示例，且旧路径仍生效，不改不会说假话）。
+8. 回归测试数 1784 → **1792**（新增 8 条 `DF-041` 用例），四处声明同步
+   （`README.md` / `CLAUDE.md` / `docs/GUIDE.md` / `.github/workflows/validate.yml`）。
+
+### 负向验证
+
+- **先复现**：临时目录里 `LOCALAPPDATA=<tmp>`，只在 `<tmp>/UntilDone/` 放 PAUSE →
+  改前 `isPaused` 返回 **false**（`pausePathFor` 指到 `<tmp>/Overwatch/`）；只在旧目录放 → true。
+  改后前者 true、后者仍 true。
+- **把新实现退回旧形态**（`pausePathsFor` 只返回旧目录一条），新增用例里
+  **4 条变红**（新目录 / 两处都有 / `OVERWATCH_STATE_DIR` / 候选非空），
+  其余 74 条绿 → 恢复后 78 条全绿。这就是「改之前那条测试必须红」的证据。
+- 全量 `node --test scripts/`：**tests 1795 / pass 1793 / fail 0 / skipped 2**
+  （1792 条 `test(` + 3 条由循环注册），`node scripts/check-structure.mjs` 绿。
+- 台账增量：跑硬门与全量测试前后，`tasks/runs/stop-hook/2026-11-21.jsonl` 与
+  `tasks/runs/pre-write-gate/2026-11-20.jsonl` 行数**不变**（0 条非本会话行为）。
+
+### Not changed
+
+- **没有自动迁移、没有删除旧路径的文件，也没有改默认写盘位置。** 本次只改「读哪些路径」。
+- `resolveStateDir()` 的「新优先 / 旧兜底」规则**没有改** —— 它对数据是对的，改它会波及
+  `watch` / `asked` / `notify` / `install-watcher` 四份调用方。
+- `templates/*.settings.json` 里的示例路径保留旧名：旧路径仍生效，改模板等于要求用户
+  再学一个新路径，收益为零。
+
+---
+
+## [Unreleased] - 2026-11-21 路径判据之上再加一条：没有盘符的本机标识符
+
+上一轮（见本文件下方「硬门那道『零盘符』检查其实只认 7 个目录名」）把 8 条本机绝对路径
+脱敏了，判据也从「7 个前缀」改成「任意盘符」。**还剩一处漏网，而且性质不同**：
+
+`docs/research/2026-11-10-tui-implementation.md` 的两块 TUI 截图里，「路径副行」列只印
+目录尾段 —— `tui-layout.mjs` 的 `shortPath()` 会剥掉盘符与父目录。于是那列里裸着一个
+**真实的中文项目名**，整串没有盘符前缀，`WIN_ABS_RE` 对它完全是瞎的，所以它从未进过
+那 8 条清单，硬门一直报绿。
+
+这不是「正则再写宽一点」能补的：输入里根本没有路径，只有名字。也就是说那条判据守的
+命题本身表述有误 —— 该守的是「可发布区没有本机事实」，盘符只是它的一种形态。
+
+### Changed
+
+1. **截图那一行换成同形态假名（与 `DF-039` #4 处同一个假名，仓内一致），并在该节抬头
+   加了脱敏口径声明。** 为什么不整段重跑再截一次：那会改掉被论证的数字（截图是四档宽度
+   实测的原始输出，重跑得到的是另一次运行的证据，不是当时那一次）。假名与真名
+   **显示宽度相同（11 列）、字符数相同**，所以「四档宽度下超宽行数为 0」「30 列撤路径副行」
+   的每一个坐标都不变 —— 换掉的是身份，没换掉任何被论证的量。这是比改截图更小的改法，
+   也是唯一不破坏论证的改法。
+2. **新增第二类判据：`KNOWN_LOCAL_IDENTIFIERS`（散列黑名单）+ `findKnownIdentifiers()`**
+   （`scripts/published-paths.mjs`）。全文滑窗，不依赖盘符、不依赖分词（分词会把「紧贴
+   路径分隔符的那一形态」切开）。
+
+   - **公开区只放散列**：「长度 + 两个不同基的多项式散列」。清单本身**不可读回原文**，
+     所以新判据不会把泄漏从文档搬到判据文件（本仓已经踩过那次：把 8 条原文抄进
+     CHANGELOG，硬门立刻多报 10 项）。
+   - **命中结果只回报行号，不回报原文** —— 回报等于把泄漏重复进硬门输出与 CI 日志。
+     这一点有一条测试钉住。
+   - **代价（写在这里，不假装免费）**：它是黑名单，没登记的真实名字照样漏（与
+     `verify-claims.mjs`「那种黑名单永远漏词」是同一个局限）；登记一条必须知道原文，
+     所以只能在作者机器上核；每次跑门多一遍全文滑窗，实测 4.5 MB 可发布区 **约 130 ms**。
+     它的价值不在「覆盖所有泄漏」，而在「同一条泄漏不会第二次悄悄回来」。
+3. **台账也被这条判据扫。** `tasks/` 不在 `ROOT_SCAN_SKIP` 之外的那个扫描集里，但
+   `tasks/dev-findings.md` 是**被 git 跟踪、随公开仓库发出去**的（`CLAUDE.md` 目录归属表
+   标「可发布」）。上一轮判断「`tasks/` 不在扫描范围所以留原文没事」只对了一半：范围外
+   只是「门不管」，而门不管的文件照样发出去。`DF-039` 条目里那几处原文已改成形态描述，
+   可复核性没丢（长度、字符数、slug 全部保留），丢的只是那 6 个字本身。
+   **台账只跑标识符判据，不跑路径判据**：台账里存的是脱敏后的对照夹具
+   （盘符 + 假目录名一类），它们是「改成了什么」的证据，对它报违规只会逼人把证据也删掉。
+
+### 负向验证
+
+- 把真名放回截图那一行 → `check-structure.mjs` 报 **1 项**（`第 175 行出现已知的本机标识符`）；
+  还原 → **0 项**。
+- 把真名写进 `tasks/dev-findings.md` → 报 **1 项**；还原 → **0 项**。
+- 意外收获（比单元测试更能说明问题）：判据上线后**第一次跑就红在 `published-paths.mjs` 自己身上**
+  —— 我在注释里举例时写了原文，门立刻抓住了它。注释已改成「紧贴路径分隔符的那一形态」。
+- 单元测试 26 → 33 条（新增 §7：抓到无盘符标识符 / 紧贴分隔符也抓到 / 同行去重 /
+  命中结果不含原文 / 空输入与坏条目安全返回 / 键是确定性的且两个基不同 /
+  登记的条目里没有一条能读回名字）。
+
+### Not changed
+
+- **没有为了让门变绿而放宽任何判据。** 截图改的是内容（假名），不是判据；台账改的是
+  写法（形态描述），不是把判据从 `tasks/` 挪开。
+- `scripts/published-paths.test.mjs` 里仍写真实盘符形态（该文件被 `PATH_EXEMPT` 豁免）：
+  测试必须写真实形态才能验判据。但**新增的 §7 用例用假名字** —— 豁免是为了验形态，
+  不是为了把真名存进仓里。
+
+---
+
+## [Unreleased] - 2026-11-21 死链判据的范围从手写清单改成问 git：根级四份文档第一次被守住
+
+`scripts/check-links.mjs` 与 `check-structure.mjs` 的 `checkLinks()` 是**两份实现、同一份
+手写清单**：`['README.md', 'CLAUDE.md']` + `walk('docs')`。于是根级
+`CONTRIBUTING.md` / `CONTRIBUTING-EN.md` / `SECURITY.md` / `SECURITY-EN.md` / `README-EN.md`
+一份都不在范围内（根级 `.md` 实测 7 份，清单覆盖 2 份），而两边都报「0 断链」。
+`CLAUDE.md` 的常用命令、`docs/CAPABILITIES.md:46`、CI 三处都把它当作覆盖全仓的判据。
+这是 `DF-040`；与 `DF-031`（66 条探针静默跳过）、`DF-039`（路径正则只认 7 个前缀）同类同因：
+**范围是人手写的清单，门说绿但它检查的东西覆盖不到问题。**
+
+### Changed
+
+1. **判据抽成 `scripts/link-check.mjs`（纯函数 + 21 条单测）。** 抽出的理由与
+   `published-paths.mjs`（`DF-039`）逐字相同：判据原来有一半写在 `check-structure.mjs` 里，
+   而那个文件一被 import 就跑完全部门禁并 `process.exit()`——所以这条判据**一条测试都没有**
+   （实测 `ls scripts/check-links*` → 无 `.test.mjs`）。现在两个入口共用一份判据，不再漂移。
+2. **扫描范围问 git，不写清单**：`git ls-files '*.md'` + `--others --exclude-standard`。
+   扫描文件数 **147 → 170**，检查的相对链接 **93 → 112**，根级 `.md` 覆盖 **2/7 → 7/7**。
+   新增覆盖：根级 5 份、`templates/` 5 份、`.claude/agents/` 12 份、
+   `.claude/skills/oversight/SKILL.md`、`tasks/` 2 份、`.github/` 3 份。
+
+   **为什么不按目录扫**：工作区磁盘上有 839 份 `.md`，会随仓库发出去的只有 170 份。
+   差额是 `.scratch/`、`.tmp-analysis/`（别人的克隆）以及 `docs/research/` 下五份被
+   `gitignore` 的私有报告。按目录扫会把它们全部当成该守的东西，报出与产品无关的断链。
+   判据要守的命题是「**发出去的东西**里链接不悬空」——与 `checkAbsolutePaths()` 判
+   「会不会发出去」用同一个依据。
+
+3. **判据同时收紧三条（不是放松）**：
+
+   | 新增 | 改前为什么漏 |
+   |---|---|
+   | 锚点 `#xxx` 核对 | 旧正则 `\]\(([^)#\s]+\.md)(?:#[^)]*)?\)` 把 `#` 之后整段丢掉，且纯锚点链接（`](#x)`）一开始就被 `[^)#\s]+` 排除——对锚点的覆盖是 **0 条** |
+   | 目标「会不会发出去」 | 旧判据只问 `existsSync`。指向被 gitignore 的私有文件 = 本机绿、干净 clone 红（新增 `UNPUBLISHED`） |
+   | 非 `.md` 相对链接（图片、`LICENSE`） | 旧正则只匹配 `.md` 结尾。实测全仓当前 0 条断，不改变结论，只补盲区 |
+
+   另：**先剥代码块再提取链接**。`docs/CHANGELOG.md` 自己就引用了一段
+   `AI 说：「… [skill/output/](skill/output/) 下…」` 的围栏块——不剥代码块，判据会对着
+   引文报断链。行号保持不变（报错要给行号）。
+
+### Fixed
+
+4. **`README.md:53` 的 `#-诚实的数字` 是死链。** 对应标题是 `### 诚实的数字`（无 emoji），
+   GitHub 的 slug 是 `诚实的数字`，没有前导 `-`。同一份文件里的 `#-30-秒上手` 是对的，
+   因为标题是 `## 🚀 30 秒上手`——emoji 被删、紧随空格变连字符，那个 `-` 是 emoji 留下的；
+   写错的那条是从 emoji 标题抄过来的。改成 `#诚实的数字`。
+
+   **这条断链从写下的那天起就不可能被任何一版旧判据发现**：实测旧正则对 `README.md` 的
+   纯锚点链接覆盖 0 条。
+
+### 负向验证
+
+把 `README.md` 的修复还原（`#诚实的数字` → `#-诚实的数字`），两道门都实测变红：
+
+```
+$ node scripts/check-links.mjs
+死链  README.md:53  →  #-诚实的数字  （锚点在该文件里不存在）
+扫描 170 份 .md，检查 112 个相对链接，1 个断链        # exit 1
+
+$ node scripts/check-structure.mjs
+✗ 5 项违规：… [README.md] 第 53 行锚点在该文件里不存在：#-诚实的数字
+```
+
+单元层面另有一条 §2 用例直接否证旧判据（「锚点写错要报」），以及 §6 两条
+**在真仓库上跑范围**的用例：`markdownFiles()` 必须覆盖每一份根级 `.md`——
+下次加一份根级文档而门没跟上，它们会红（旧写法下不会）。
+
+### 依据与边界
+
+- 改前基线存档：`node scripts/check-links.mjs` → **93 个链接 0 断链**（147 份文件的范围内）。
+  改后 → **170 份 .md / 112 个相对链接 / 0 断链**。
+- `node --test scripts/` → `tests 1787 / pass 1785 / fail 0 / skipped 2`（连跑两次同结果）；
+  两条 `skipped` 是 win32 / 非 win32 互斥用例，不是失败。
+  `node scripts/check-structure.mjs` → 绿。测试数声明同步改为 `1784`
+  （源码 `^\s*test\(` 计数；实跑比声明多 3 条是子测试计数口径不同，见 `CONTRIBUTING.md`
+  的「不要拿 `ℹ tests` 那个数去改文档」。本文件新增 21 条，其余差额由同日其他改动带入）。
+- 未核实：`.claude/agents/*.md` 与 `.github/` 下三份模板当前 0 条相对链接，纳入范围不改变
+  结论——纳入的理由不是「现在有问题」，而是「下次有人加链接时有人在看」。
+- 未修（登记在 `DF-040`「顺带发现」）：`checkDocReferences()` 的 `LIVING_DOCS` 是另一份
+  15 份文件的手写清单，同样的病，不在本次范围。
+
+---
+
+上一轮把 `SECURITY.md` 从中英两版摆正了方向，但正文仍只有渠道、响应时间、作用域三节，
+**没有一节是去代码里核实过的**。本轮重写为可逐条复算的版本，并把每一类攻击面绑到
+`文件:行号`。`CONTRIBUTING` 侧只做定向增补（不整篇重写：另一轮已把八节补齐，
+整篇覆盖会丢掉它的实测数字）。
+
+### 核实结果（本轮新增的事实，全部可复算）
+
+1. **网络出站：全仓只有一处套接字，连的是本机命名管道。**
+   `grep -rn "from 'node:net'\|from 'node:http'\|from 'node:https'\|from 'node:tls'\|from 'node:dgram'" scripts/`
+   → 唯一命中 `scripts/probe-relay.mjs:37`。`fetch` / `WebSocket` / `undici` 零命中
+   （`verify-claims.mjs:455` 的 `fetch\s+first` 是匹配 git push 报错文本的正则）。
+   `gen-width-table.mjs:22-23`、`width-table.mjs:7`、`published-paths.mjs:28` 三处 `https://`
+   全在**注释**里。
+2. **`messagingSocketPath` 只判非空，不校验前缀或形状**（`probe-relay.mjs:90` 之后就
+   `net.createConnection(socketPath)`）。信任前提是「你的家目录可信」——写进文档而不是留着。
+3. **没有任何监听端口**：`grep -rn "createServer\|\.listen(" scripts/*.mjs` 零命中。
+4. **`~/.claude/` 只读、从不写**：`writeFileSync` / `appendFileSync` / `rmSync` / `mkdirSync`
+   的调用点里没有一处路径含 `.claude` / `projects` / `sessions` / `jobs`。
+5. **全仓没有 `shell: true`**（`grep -rn "shell: true" scripts/` 零命中），子进程一律参数数组。
+   全部 spawn 调用点列成表，逐条标注「是不是你没让它执行的」。
+6. **`launch` 起的宿主继承整个 `process.env`**（`childEnv()`，`launch.mjs:409`）：这是必须的
+   （宿主靠这些变量工作），但意味着 shell 里有什么，会话里就有什么。写进「防不住什么」。
+7. **`uia-probe.ps1` 从不调用 Send**：全文件 `InvokePattern` 只出现两次（`:593` / `:685`），
+   都是「探测该模式是否存在」，没有 `.Invoke(` 调用；且没有任何 `.mjs` 引用它。
+
+### Changed
+
+1. **`SECURITY.md` / `SECURITY-EN.md` 重写**：新增「范围（逐条给代码位置）」「文件读/写清单」
+   「它会不会执行你没让它执行的命令」「本库防不住什么」「已知的残余风险」「已知的加固措施」
+   「加固建议」。原有的私密报告渠道、备用路径、7/14/90 天窗口、作用域清单**逐条保留**。
+2. **支持范围改为「没有版本号可谈」并给出实测**：`git tag` 为空、
+   `gh api repos/sqkl520/UntilDone/branches/main/protection` → `Branch not protected`。
+   后者同时是一个**攻击面**（能推 `main` 的凭据就能直接改 hook 行为），因此必须写出来。
+3. **残余风险一节从 `tasks/dev-findings.md` 挑出安全相关的 7 条**：
+   `DF-030`（台账污染不可区分，只能用时间切）、`DF-021` 残留风险（归档同盘，不是备份）、
+   `DF-026`（并发下偶发红 → 「全绿」这个信号不可靠）、`DF-034`（无法复现的数字被用来论证
+   「闸不该拦」）、`DF-032`/`DF-035`/`DF-037`/`DF-038`（编造数字这一失败模式复发四次，
+   故本仓任何「实测数字」都应视为待复核）、`DF-039`（覆盖面小于声称，改后抓出 8 条真泄漏）、
+   `DF-013`（OSC 52 让只读渲染器改写剪贴板，已修，留作样本）。
+
+### 新增发现
+
+8. **叫停文件路径硬编码了旧目录名，不跟随改名规则。**
+   `stop-verify-hook.mjs:120` 写的是 `join(base, 'Overwatch', 'stop-hook.PAUSE')`，
+   而 `state-dir.mjs:30-32` 的规则是「新目录存在就用新的，否则沿用旧的」。
+   结果是该文件**固定住在旧目录**，也不认 `OVERWATCH_STATE_DIR`。
+   有 `OVERWATCH_STOP_VERIFY_PAUSE` 可显式指定，所以不是坏掉的，但是一个陷阱
+   （清空状态目录后叫停文件仍在，反之亦然）。**已登记为 `DF-041`（`open`）**，
+   并写进 `SECURITY.md` §6 末段与 §8。
+   不自行修的理由写在条目里：改默认路径会**静默解除**现有用户已经生效的叫停。
+
+### 依据与边界
+
+- 四份文件首行语言互链已核（`CONTRIBUTING.md`↔`CONTRIBUTING-EN.md`、`SECURITY.md`↔`SECURITY-EN.md`）。
+- **四份文件现在在链接扫描范围内了 —— 但这不是本轮做的。** 收尾时另一路改动把判据抽成
+  `scripts/link-check.mjs`（`DF-040`），扫描范围从「`README.md` + `CLAUDE.md` + `docs/`」
+  改成问 `git ls-files '*.md'`（实测 170 份），于是 `CONTRIBUTING*.md` / `SECURITY*.md`
+  四份第一次被守住。本轮先前写下的「这四份不在扫描范围内」因此**在同一天内变成假话**，
+  已同步改掉两份 `CONTRIBUTING`。
+- **测试数一律不写死在正文里。** 写这一节的过程中源码里的 `test(` 从 1756 涨到 1784 又到
+  1787（同一天，多路并行改动），所以 `CONTRIBUTING` 两份只给形状
+  （`tests N / pass N-2 / fail 0 / skipped 2`），不钉一个必然过期的数。
+- `node scripts/check-links.mjs` → **170 份 .md / 112 个相对链接 / 0 断链**；
+  `node scripts/check-structure.mjs` → 绿。
+- `node --test scripts/`：本轮内跑过三次。第一次 `fail 1`，唯一那条红是
+  `launch.test.mjs` 的「宿主原形 … exit 6」，单跑该文件 29/29 全绿，属 `DF-026` 记的
+  并发偶发；后两次 `fail 0`（末次 `tests 1787 / pass 1785 / skipped 2`）。
+  本轮的改动只涉及 `.md`，没有任何 `.mjs` 被本任务修改。
+- 未核实：Managed 部署下的私有漏洞报告开关行为（只看得到本仓库这一份）。
+  没有声称跨平台；`SECURITY.md` 里 Windows 之外的路径行为以 `state-dir.mjs` / `startupDir()` 为准。
+
+---
+
+
+`CONTRIBUTING.md` / `CONTRIBUTING-EN.md` 此前只有「前置条件 / 提 PR 之前 / 改动要求 / 代码约定 /
+提交 / 分支与 PR / 会被退回的改动 / 报告安全问题」八节，读者拿不到三件事：这个项目是什么、
+出了问题该提供什么、本地那几条命令各管什么。本轮只做**增补**，原有八节一字未删。
+
+### Added
+
+1. **「这是什么项目」+ 三件实话。** 三条各自有出处，不是套话：
+   - **单人维护、无响应承诺**：`SECURITY.md`「这些是目标，不是合同。这是一个单人维护的项目」；
+     普通 issue 与 PR 在仓库里没有任何时限声明。
+   - **产品目标未被自己的数据支持**：`README.md`「三道闸中间那道还没有实现，收工闸默认是
+     观测模式」；`docs/adr/0004-ask-is-investment.md` §3.1 的「不能再声称」清单；
+     README「诚实的数字」192 条断言里 `UNCHECKABLE` 155 条（80.7%）。
+   - **部分边界是平台的墙**：`README.md`「为什么不能自动接力」。
+2. **「报告问题」。** 按 `.github/ISSUE_TEMPLATE/bug_report.md` 的实际字段改写，并把
+   「版本号」换成**克隆的提交 hash**（`git tag | wc -l` = 0，`gh release list` 为空，
+   `main` 就是发布物）。另加一条模板里没有的观察：`overwatch.mjs` **不报终端类型与 shell**
+   （八项里无此项），所以模板 Environment 块中那两行必须由报告者自己填。
+3. **「本地怎么验证」。** 三条命令各自的作用、耗时（实测：硬门 2.7 s；全量
+   `tests 1759 / pass 1757 / fail 0 / skipped 2`，两次墙钟 50.1 s / 38.2 s，
+   文档因此不把耗时当判据）、什么时候跑。两条 `skipped`
+   的来历写清：`pre-write-gate.test.mjs:495/509` 与 `probe-parser-divergence.test.mjs:49`
+   是 win32 / 非 win32 互斥用例，`skipped` 不是失败。
+4. **「「绿」的标准」。** 说清本仓库比「0 失败 + 条数不减少」更严：`checkTestCount()` 把
+   `^\s*test\(` 的计数与 `README.md` / `CLAUDE.md` / `docs/GUIDE.md` / CI 工作流四处逐一
+   对账，四处全对才绿；并点出「实跑 1759 比声明 1756 多」是子测试计数口径不同，
+   **不要拿前者去改后者**。
+5. **「不要提交的东西」。** 按 `.gitignore` 的八类列成表，每类给理由；其中
+   `.tmp-*` 一类附上四次误提交的真实 hash（`3a2a883` / `39cc75d` / `b14f6ae` / `7d49543`，
+   逐个 `git show --stat` 核过，确实各含一个 `.tmp-*` 文件）。
+
+顺带写出一条此前没人说过的缺口：**`CONTRIBUTING.md` 自身不在链接扫描范围内**。
+`scripts/check-links.mjs` 的 `files` 只含 `README.md` / `CLAUDE.md`（外加 `walk('docs')`），
+`check-structure.mjs` 的 `checkLinks()` 同一范围。所以这份文件里的相对链接没有任何门守着 ——
+本轮两份文件各 2 条相对链接，用一次性脚本按所在目录解析核过，0 断链，但那是手工复核，不是硬门。
+
+### 依据与边界
+
+- 新增段落里每个数字都是本机实跑：`node scripts/check-links.mjs` → 93 个链接 0 断链；
+  `node scripts/check-structure.mjs` → 绿；`node --test scripts/` → 0 fail。
+- **没有改 `CONTRIBUTING.md` 原有八节**，因此不涉及对既有结论的推翻。
+- 未验证：这三条命令在 Linux/macOS 上的耗时（本文只写本机 win32 实测值，
+  没有跨平台声明）。
+
+---
+
+## [Unreleased] - 2026-11-21 硬门那道「零盘符」检查其实只认 7 个目录名
+
+审计的一行结论：**可发布区的路径检测正则覆盖不到真实泄漏**。原判据是
+
+```js
+/[A-Za-z]:[\\/](?:Users|Projects|Server|Java|maven|Nodejs|Git)[^\s)"'`]*/g
+```
+
+它**只认 7 个前缀**，而这 7 个恰好是作者本机装过东西的目录名。于是它实际守的命题不是
+「可发布区没有本机绝对路径」，而是「作者这台机器上那 7 个目录没被写进文档」——
+后者碰巧为真，前者一直是假的。硬门从改前到改后一直是绿的，差别只在换了个判据之后
+才露出 8 条真泄漏。
+
+### Changed
+
+1. **判据搬到 `scripts/published-paths.mjs`，认任意盘符。** 搬家的理由不是分文件好看，
+   是**它以前一条测试都写不了**：`check-structure.mjs` 一被 import 就跑完全部门禁并
+   `process.exit()`。一个不能被测的正则，写错的方式和一整个模块写错是一样多的。
+
+   新正则（`WIN_ABS_RE`）：
+
+   ```js
+   /(?<![A-Za-z0-9])[A-Za-z]:[\\/](?:[^\s"'`()<>|{}[\]（）、。，；：！？#]| (?=[A-Za-z0-9_.])(?![A-Za-z]:[\\/]))*/g
+   ```
+
+   三处细节都留了代价注释：`(?<![A-Za-z0-9])` 挡 URL；排除全角标点防止吞整句；
+   允许单个空格（安装路径常带空格），但空格后**再排除**「盘符+分隔符」——
+   这条是被自己的用例打回来的：两条相邻路径曾被粘成一条。
+
+2. **新增 POSIX 家目录判据（`POSIX_ABS_RE`）。** 只认 `/home|Users|root/<名字>`，
+   不认 `/tmp`、`/var/tmp`、`/opt`（系统公共目录，不含身份）；用户名本身是占位符
+   （`user`/`alice`/`me`…）时放行。理由是 CI 在 Linux 上跑、`docs/` 大量讨论 POSIX 行为，
+   而家目录路径泄露的信息（用户名 + 目录结构）与盘符路径同类。
+
+3. **`SECURITY.md` 进扫描范围 —— 但不是靠「把它加进那个数组」。** 根级文件的扫描名单
+   改成**问 git**（`git ls-files` + `--others --exclude-standard` 的根级部分）：
+   可发布区的定义本来就是「会随仓库发出去的内容」。手写名单的失效方式是结构性的
+   （下次加一份根级文档，它照样不在名单里，门照样绿），与 `checkTestCount()` 拒写死
+   数字是同一个理由。
+   顺带修掉一处**本次改造引入的**误报：第一版用 `readdirSync(ROOT)` 全扫，把根目录下
+   一个被 `.tmp-*` 忽略的草稿判成了「可发布」——`isGitignored()` 只做精确/前缀匹配、
+   不展开 glob，这条也记在这里，免得下次有人再用它判可发布集。
+
+4. **测试数 1730 → 1756**（`README.md:255` / `CLAUDE.md:46` / `docs/GUIDE.md:509` /
+   `.github/workflows/validate.yml:31`），新增 `scripts/published-paths.test.mjs` 26 条；
+   测试文件数 41 → 42。
+
+### 负向验证
+
+把 `WIN_ABS_RE` 换回旧正则（保留新测试），`node --test scripts/published-paths.test.mjs`：
+
+```
+ℹ tests 26   ℹ pass 16   ℹ fail 10
+✖ 抓到非已知前缀的本机路径（旧正则的七前缀之外）
+✖ 抓到目录名带空格的安装路径（旧正则只报到空格前）
+✖ 抓到任意伪造目录，不要求目录真实存在
+✖ 尖括号占位符不抓（脱敏做对了的文档天然通过）
+✖ 白名单里每一条都能被自己的判据认出来（防止清单腐烂成死字面量）
+✖ 中文行文里的全角标点会截断路径，不会把整句吞进来
+✖ 命令行里的参数不会被吞进路径
+✖ 紧跟中文的路径不会被吞掉后缀（中文不是 ASCII 单词字符）
+✖ 违规带行号，且同一行同一路径只报一次
+✖ 两个正则都是 g 标志且没有共享 lastIndex 状态（连续调用结果稳定）
+```
+
+换回新正则：26/26 全绿。硬门：改前 `✓ 结构检查全部通过`（0 项），改后 **8 项违规**——
+那 8 条是真泄漏，**没有为了让门变绿而加进白名单**，清单见 `tasks/dev-findings.md` 的 `DF-039`。
+
+**集成级负向验证**（比单元测试更硬的那一步）：把 `WIN_ABS_RE` 换回旧正则再跑
+`node scripts/check-structure.mjs`，硬门只报 **1 项**（`verify-claims.mjs:1822`，
+它恰好以 `D:/maven/...` 命中旧的 `maven` 前缀）；新正则报 **8 项**。
+差的这 7 条，就是「旧判据看不见、而硬门一直说全部通过」的那 7 条。
+
+另：`git show HEAD:<file>` 取原文用新判据扫，8 条**逐条命中**——证明它们不是本次改造
+引入的，而是改造前就躺在仓库里。
+
+### Fixed（同一轮后续：那 8 条泄漏已脱敏）
+
+**旧判据看不见的 8 条，逐条处理完毕，硬门 8 项违规 → 0 项。** 这件事本身值得单独记：
+那 8 条在改判据之前**一直存在、一直报绿**，不是本轮引入的。改判据只是让它们第一次
+被看见；再脱敏才让「可发布区没有本机绝对路径」这句从假的变成真的。
+
+下表**只写形态、不写原文**——原文逐条列在 `tasks/dev-findings.md` 的 `DF-039`（那本台账
+不属判据扫描的可发布集，且「改前 → 改后」的对照本身就是修复证据）。
+
+| # | 位置 | 原形态 → 改成 |
+|---|---|---|
+| 1 | `docs/research/2026-11-13-claim-detection-fixes-and-multimodel.md:165` | `<drive>:\<app 名带空格>\<app>.exe` → `<app-home>\<app>.exe` |
+| 2 | `docs/research/2026-11-13-dsh-goal-mechanism.md:7` | `<drive>:\<dsh 安装根>\dshd\resources\app.asar` → `<dsh-home>\dshd\resources\app.asar` |
+| 3 | `docs/research/2026-11-13-dsh-goal-mechanism.md:10` | 同上 + `.unpacked\` → 同上 + `.unpacked\` |
+| 4 | `docs/research/2026-11-14-portability-audit.md:115` | 盘符 + 中文目录名（真实项目名） → `<drive>:\C盘示例目录`（**见下，不是普通占位符**） |
+| 5 | `scripts/pre-write-gate.mjs:610` | 仓库自身的本机绝对路径 → `<repo>/docs/changelog.md` |
+| 6 | `scripts/tui-layout.mjs:848` | 盘符 + 中文目录名 → `C:\<中文目录名>` |
+| 7 | `scripts/tui-layout.mjs:849` | 同 #6 的正斜杠变体 → `…/C:/<中文目录名>`（保留斜杠差异） |
+| 8 | `scripts/verify-claims.mjs:1822` | `<drive>:/<maven 安装根，含版本号>/bin/mvn.cmd` → `<maven-home>/bin/mvn.cmd` |
+
+**#4 不能套占位符。** 那一整节论证的是「slug 有损编码」：那条真实的中文 cwd 被宿主编成
+`C--C-----`，真实路径形态**就是证据**。写成 `<repo>` 会让论证失去说服力。做法是换成
+**另一个同形态的假名**，并把编码结果一并更新。
+
+编码规则不是猜的，是从本机 160 个真实 slug 目录反推并验证的：
+`cwd.replace(/[^A-Za-z0-9]/g, '-')`（逐字符、非 ASCII 与分隔符都变 `-`），
+147 条精确复现、3 条仅大小写差异、9 条无 transcript 可反推、1 条 cwd 已漂移。
+（对照：文档里另有一条 `D--Projects---`，两个不同中文项目名编成同一个 slug 的碰撞演示。）
+
+- 改前：盘符 + 5 个汉字的目录名 → `C--C-----`（9 个字符）
+- 改后：`<drive>:\C盘示例目录`（仍 5 个汉字）→ `C--C-----`（同样 9 个字符）
+
+即：**编码结果不变**，因为它只取决于「非 ASCII 字符的个数」，而假名与真名的汉字数相同
+（都是 5 个）。这一点恰好让脱敏零成本 —— 论证的每一处坐标都还在原处。
+
+**顺带改了三处测试**（断言的是行为，不是那些字符串本身）：`tui-layout.test.mjs:474` 的
+`shortPath` 用例换成「盘符 + 中文目录名」的假名；`verify-claims.test.mjs:542-547,1114` 的
+maven 路径换成 `<drive>:/<sdk 目录>/bin/mvn.cmd`（`doesNotMatch` 的断言对象随之从版本名
+改成目录名）；`published-paths.test.mjs:43` 的带空格目录换成 `<drive>:\<App Name>\<app>.exe`
+（那条用例本来就是「造一个带空格的目录」，用真实应用名不必要）。
+全量测试 `node --test scripts/`：**1759 条 / 1757 pass / 2 skipped / 0 fail**。硬门数源码
+得 1756，差 3 条来自 `overwatch.test.mjs:305` 那个 `for` 循环里的 `test()`（源码里只算 1 条，
+运行时跑 4 轮）—— 两个数口径不同，都对，所以本次没有增删测试条数声明。
+
+### Not changed（有一次改判）
+
+- **没给「本仓库自己的盘符路径」开白名单。** 实测：非豁免区（除 `*.test.mjs`）一条都没有，
+  它只出现在被 `PATH_EXEMPT` 豁免的测试里。既然没有文档需要引用自己的本机路径，
+  开一条前缀白名单就是凭空开洞 —— 那会把「仓库根 + 本机临时子目录」一并放行。
+  这条仍然成立：8 条脱敏用的是 `<repo>` 这类占位符，不是白名单。
+- ~~**那 8 条泄漏一条没改。**~~ **已改判**：上一轮的范围是「让门看得见」，脱敏是后续独立
+  任务；两者都完成后才记这一节，所以这条旧结论现在不成立。**没加一条白名单**仍是事实。
+
+---
+
+
+任务原话是「`CONTRIBUTING.md` 和 `SECURITY.md` 没有 `-EN` 版本，首行没有语言互链」。
+**这个前提是错的**：两份文件当时**已经是英文**（`CONTRIBUTING.md` 正文是英文、标题 `# Contributing`；
+`SECURITY.md` 标题 `# Security Policy`）。真正缺的是**中文版**——按 `docs/PROJECT-RULES.md` §6
+的配对方向，`CONTRIBUTING.md` 是中文位、`CONTRIBUTING-EN.md` 是英文位。
+
+所以这一轮做的不是「翻译一份中文文档」，是**把方向摆正**：
+原有英文正文移到 `CONTRIBUTING-EN.md` / `SECURITY-EN.md`，`CONTRIBUTING.md` / `SECURITY.md`
+按 §6 重写为中文，四份文件首行都加语言互链。
+
+### Changed
+
+1. **`CONTRIBUTING.md` 从英文改写为中文版，英文正文移入新增的 `CONTRIBUTING-EN.md`。**
+   首行分别是 `[English]` 指向 `CONTRIBUTING-EN.md`、`[简体中文]` 指向 `CONTRIBUTING.md`
+   （此处不写成 markdown 链接：两份文件在仓库根，`docs/` 下的相对链接会把它们解析成断链）。
+   事实一致：两个 Node 下限（工具 18.20.4 / 测试 20.16.0，取自 `scripts/overwatch.mjs:130-131`）、
+   同样的两条命令、同样的硬门口径。
+
+2. **`SECURITY.md` 从英文改写为中文版，英文正文移入新增的 `SECURITY-EN.md`。**
+   首行互链同上。响应窗口（7 / 14 / 90 天）与作用域清单逐条保留。
+
+3. **两份英文版不是逐字直译。** 英文读者需要的信息密度不同，按英文习惯重写；
+   命令、阈值、渠道、响应时间与中文版逐项一致。
+
+### Fixed
+
+4. **【事实错误】`SECURITY.md` 声称私密报告渠道可用，而那个开关当时是关的。**
+   原文写「Use GitHub's private vulnerability reporting — [open a draft advisory]」。
+   实测 `gh api repos/sqkl520/UntilDone/private-vulnerability-reporting` →
+   `{"enabled":false}`，即那个链接对任何人都打不开。
+   **这不是措辞问题**：按 `docs/PROJECT-RULES.md` §7.3，一个指向不存在流程的安全报告渠道
+   比没有这个文件更糟——报告者会以为已经私下报过了。
+   处置：已在仓库设置里启用该功能，复测 `{"enabled":true}`；两份文档都写明
+   「这是个可以再被关掉的开关」并保留了原有的备用路径（开一个只说一句话的 issue）。
+   取证命令：`gh api repos/sqkl520/UntilDone/private-vulnerability-reporting`。
+
+5. **【事实错误】`SECURITY.md` 写「不往网络上发任何东西」，而 `scripts/probe-relay.mjs` 会连套接字。**
+   该文件 `import net from 'node:net'`（第 37 行），`canConnect()` / `sendFrame()` 各调一次
+   `net.createConnection(socketPath)`（第 91、128 行），连的是
+   `~/.claude/sessions/*.json` 里记录的本机命名管道。它**不连网络**，但原句「sends nothing
+   over the network」对一个会 `connect()` 的脚本是错的，且 `--send <pid>` 会真的投递一条消息。
+   处置：两份文档把它单列成「一处必须说明的例外」，写清它连的是本机管道、不跑就不连。
+
+6. **`CONTRIBUTING` 里的「硬门核四份文件」之后补了一句它核不到哪。**
+   `scripts/check-structure.mjs` 的 `checkTestCount()` 只对账 `README.md`、`CLAUDE.md`、
+   `docs/GUIDE.md`、`.github/workflows/validate.yml` 四处；`README-EN.md` 的徽章不在其中
+   （实测两处徽章都还写着 `1627`，而源码 `test(` 已是四位数上半）。两份文档现在都点名了这个缺口，
+   不给读者留「徽章数字有人管」的错觉。
+
+7. **加了「提交格式是约定不是门」这句实话。**
+   `CONTRIBUTING` 原文给出 `type(scope): ...` 格式并列了六种 type。实测 `git log` 139 个提交里
+   只有 2 个符合该格式（`grep -cE "^(feat|fix|docs|test|refactor|chore|perf)(\([^)]*\))?: "`）。
+   规则本身没问题，但把它写成既成事实会让新贡献者以为照做是必须的、不照做会被拦。
+   两份文档改成「这是约定，不是硬门」，并删掉了原文漏写的 `perf`（`PROJECT-RULES.md` §3.2 列了七种）。
+
+### Not done (说清楚为什么)
+
+8. **没有加「这几对文件必须成对存在且首行互链」的硬门检查。**
+   理由是并发的：`scripts/check-structure.mjs` 在本轮期间正被另一处改动重构
+   （`WIN_PATH` 正则搬去新增的 `scripts/published-paths.mjs`、`PUBLISHED_FILES` 增列
+   `README-EN.md` 与 `SECURITY.md`），本文件 mtime 在 01:10 → 01:39 之间被改。
+   按派发约定「发现文件已被改动而冲突，只做文档部分、跳过这一条」，
+   所以这条留作欠账，不硬塞。加它的位置是现成的：`checkLinks()` 旁边。
+   顺带记下：这道门跑出来是 **12 项违规**（8 条本机路径 + 4 条测试数 1730 ≠ 实测 1756），
+   全部属于并发改动，与本轮四份文档无关——取证：`node scripts/check-structure.mjs`
+   的输出里没有任何一条提到 `CONTRIBUTING` 或 `SECURITY`。
+
+### 验证
+
+- `node scripts/check-links.mjs` → **检查 93 个链接，0 个断链**（四份新文件的相对链接都解析得到）
+- `node --test scripts/` → 全量全绿（数字以硬门口径为准，本条目不另抄一个）
+- 四份文档首行互链逐条 `head -1` 核对，两两指向正确
+
+---
+
 ## [Unreleased] - 2026-11-19 第三轮（第二轮验收判 FAIL 后的修复：分块回扫的三个静默丢数据点）
 
 上一段修好五条、但**新引入**一个判据级缺陷：分块回扫在块边界静默丢整行，而 `truncated`

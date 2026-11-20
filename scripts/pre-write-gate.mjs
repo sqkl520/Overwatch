@@ -119,7 +119,7 @@ import { claimOnce, claimKeyOf, recordSkipped } from './hook-dedupe.mjs';
 // 直接 TDZ ReferenceError。见 `question-form.mjs` 文件头。
 import { questionsOfAsk, normalizeText } from './question-form.mjs';
 // 叫停路径（L1 文件闸）。**复用，不新造**：见 §叫停（`pausePathFor` 的注释）。
-import { isPaused, pausePathFor } from './stop-verify-hook.mjs';
+import { pausePathFor, pausedPathOf, pausePathsFor } from './stop-verify-hook.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..');
@@ -607,7 +607,7 @@ function sedInputFile(argv) {
 /** 把一条读到的路径落到**绝对路径**上，基准是会话 `cwd`。`DF-027` 的第二个缺陷。
  *
  *  `pathKeyOf()` 只做分隔符归一、**不做消解**，所以修前 `docs/changelog.md`
- *  永远不等于 `d:/projects/overwatch/docs/changelog.md`：Edit 侧的目标来自
+ *  永远不等于 `<repo>/docs/changelog.md`：Edit 侧的目标来自
  *  `tool_input.file_path`（绝对），shell 侧来自命令原文（常常是相对），
  *  `target-read` 那条判据对任何用 shell 读文件的会话恒不命中。
  *
@@ -1567,7 +1567,8 @@ export function decide(input, state = {}) {
   let askGate = null;   // `null` = 这条判据不参与；否则是 `{need, have, miss, unknown}`
   // ── L1 叫停路径：排在**这条判据**的所有分支之前 ───────────────────────
   //
-  // 复用 `stop-verify-hook.mjs` 的 `isPaused()` / `pausePathFor()`，不新造一个开关：
+  // 复用 `stop-verify-hook.mjs` 的 `pausedPathOf()` / `pausePathsFor()`（`isPaused()` 是
+  // 它的布尔投影），不新造一个开关：
   //   · 造第二个 PAUSE 文件等于要求用户记住两个路径，而他只会在被锁住时才发现第二个也在；
   //   · `check-structure.mjs` 的 `checkStopHookKillSwitch()` 已经在守「默认开启的强拦
   //     必须有可调用的叫停路径」；复用同一个函数，本闸自动落在那条规则的覆盖范围内。
@@ -1577,7 +1578,9 @@ export function decide(input, state = {}) {
   // 「照常判」变成「一律放行」）—— 而「0 时逐字节不变」是这次改动的硬要求。
   // 一个默认关闭的判据不许顺带改掉别人已有的行为，哪怕方向是「更宽松」。
   if (needQ > 0 && state.paused === true) {
-    return passthrough('user-paused', { pausePath: state.pausePath || null });
+    // `pauseHit` = 真命中的那一条候选路径（`DF-041`）。只报主路径的话，
+    // 「我把 PAUSE 放在 UntilDone 里了」和「它命中的是 Overwatch 那份旧文件」分不开。
+    return passthrough('user-paused', { pausePath: state.pauseHit || state.pausePath || null });
   }
 
   // ── 子 agent 不参与这条判据（2026-11-19，验收第 6 条）──────────────────
@@ -1946,6 +1949,7 @@ export function runHook(input, { env = {}, nowMs = Date.now(), cwd: cwdOverride 
   // `writeMarker({satisfiedBy:"auto"})` 里 —— 那才是真需要签名的时刻。
   // 副作用集中在这里、`ensureGateSecret` 只在写标记里调用，所以这两个读盘动作
   // 都归 `runHook`，`decide()` 依旧是纯函数。
+  const pauseHit = pausedPathOf(env);
   const state = {
     config: cfg,
     cwd,
@@ -1956,8 +1960,12 @@ export function runHook(input, { env = {}, nowMs = Date.now(), cwd: cwdOverride 
     getReads,
     getActivity,
     // L1 叫停：路径与判据都来自 `stop-verify-hook.mjs`（见 `decide()` 里的注释）。
-    paused: isPaused(env),
+    // `paused` 由 `pauseHit` 推出 —— **只调一次 `pausedPathOf()`**。分两次算两条候选路径
+    // 会让「判据说暂停了、日志说没命中」成为可能，而这两句必须永远一致。
+    paused: pauseHit !== null,
+    pauseHit,
     pausePath: pausePathFor(env),
+    pausePaths: pausePathsFor(env).length,
     denials: bumpDenials(denialPath, promptId, { readOnly: true }),
     gateCommand: gateCommandFor(input),
   };
@@ -2063,6 +2071,20 @@ export function cli(argv = [], env = process.env, nowMs = Date.now()) {
     const sig = m.exists && m.data && m.data.satisfied_by === 'auto'
       ? (verifyMarkerSig(m.data, sec) ? 'valid' : 'INVALID（缺签名或密钥不符 —— 这条 auto 不算数）')
       : '—';
+    // ── 叫停路径的现状：**列出全部候选，标出命中的那一条**（`DF-041`）──
+    //
+    // 两个目录都认之后，「用户想停」与「用户把文件放错了地方」在布尔层面完全一样。
+    // 所以这里把「正在检查哪些路径、命中的是哪一条」直接印出来 —— 用户自查
+    // 「我该把文件放哪」不该靠读源码。不命中也照样列出路径：那才是「没生效」时
+    // 唯一能回答「我到底该放哪」的地方。
+    const pausePaths = pausePathsFor(env);
+    const pauseHit = pausedPathOf(env);
+    const pauseLines = pausePaths.length
+      ? [
+        `pause       : ${pauseHit ? `PAUSED（命中 ${pauseHit}）` : 'not paused'}`,
+        ...pausePaths.map((p, idx) => `pause path ${idx + 1}: ${p}${p === pauseHit ? '  ← 命中' : ''}`),
+      ]
+      : ['pause       : 无可检查路径（连状态根都算不出来 —— 设 OVERWATCH_STOP_VERIFY_PAUSE）'];
     const lines = [
       `mode        : ${cfg.mode}`,
       `brake       : ${cfg.brake}${cfg.brake === 'budget' ? `（前 ${cfg.denyBudget} 次不刹车）` : ''}`,
@@ -2073,6 +2095,7 @@ export function cli(argv = [], env = process.env, nowMs = Date.now()) {
       `marker state: ${m.exists ? (m.error ? `exists-but-broken (${m.error})` : `exists ${JSON.stringify(m.data)}`) : 'absent'}`,
       `secret      : ${sec ? 'present' : 'absent'}（${secretPathFor(cwd)}）`,
       `marker sig  : ${sig}`,
+      ...pauseLines,
     ];
     process.stdout.write(lines.join('\n') + '\n');
     return 0;

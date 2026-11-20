@@ -845,8 +845,8 @@ export function titleOf(view) {
 export function shortPath(full) {
   const parts = String(full ?? '').split(/[\\/]/).filter(Boolean);
   if (!parts.length) return '';
-  // 盘符（`C:`）不是有辨识度的一段：`C:\C盘清理路径` 只该显示末段，
-  // 写成 `…/C:/C盘清理路径` 会让人以为多了一层目录。
+  // 盘符（`C:`）不是有辨识度的一段：`C:\<中文目录名>` 只该显示末段，
+  // 写成 `…/C:/<中文目录名>` 会让人以为多了一层目录。
   const real = parts.filter((p) => !/^[A-Za-z]:$/.test(p));
   if (!real.length) return parts[parts.length - 1];
   if (real.length === 1) return real[0];

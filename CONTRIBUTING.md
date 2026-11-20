@@ -1,119 +1,324 @@
-# Contributing
+[English](CONTRIBUTING-EN.md) | 简体中文
 
-This repository has no build step, no dependency install, and no package
-manager. If you can run `node`, you can run everything here.
+# 参与贡献
 
-## Prerequisites
+没有构建步骤，没有依赖安装，没有包管理器。你只要能跑 `node`，这里的一切就能跑。
 
-- **Node ≥ 18.20.4** to run the tools.
-- **Node ≥ 20.16.0** to run the test suite — it uses `import.meta.dirname` and
-  `process.getBuiltinModule`, which landed later.
-- Nothing else. There is no `package.json` and running `npm install` is neither
-  needed nor wanted.
+## 这是什么项目
 
-`node scripts/overwatch.mjs` reports both thresholds separately, so a machine
-that can run the tools but not the tests will say exactly that.
+UntilDone：约束 AI 在动手前把需求问清楚，然后**一次做到底** —— 不给「一轮一个骨架、二轮一层皮毛」。
+交付形态是**纯 Claude Code 配置库**：markdown 角色定义 + 零依赖 Node 脚本，没有常驻进程、
+没有数据库、没有守护循环（`docs/adr/0001-config-only.md`）。跨会话监控、状态判定、TUI、
+接力草稿都是这个框架的**附属能力**，不是产品定义。
 
-## Before you open a pull request
+先说三件实话，免得你白等：
 
-Both of these have to pass. The first one is not optional — it enforces rules
-that have been broken before and are easy to break again.
+- **单人维护，没有响应承诺。** 普通 issue 与 PR 都没有时限承诺。只有安全报告有一套
+  7/14/90 天的目标值，而 `SECURITY.md` 自己写着「这些是目标，不是合同」。
+- **产品目标还没有被自己的数据支持。** 「一次做完」是目标，不是已实现的事实：README
+  「它解决什么问题」那节写着三道闸**中间那道还没有实现**、收工闸默认是观测模式（只记账、不拦）；
+  `docs/adr/0004-ask-is-investment.md` §3.1 专门列了**不能声称**的话（「这套方法提高了效率」
+  「提前问能减少返工」都在里面）；README 的实测里 80.7% 的可核对断言是 `UNCHECKABLE`。
+  `docs/design/` 下的东西**全部未实现**，别把路线图当现状读。
+- **有些边界是平台的墙，不是待办。** 比如不能自动把消息发进运行中的会话：宿主会话是独立进程，
+  没有受支持的注入接口（`README.md`「为什么不能自动接力」）。这类 issue 会被解释，不会被排期。
+
+能接受这三点就往下看。**PR 会被认真读** —— 但读的是证据（负向测试、可追溯的出处），不是措辞。
+
+## 报告问题
+
+**先搜一遍 [Issues](https://github.com/sqkl520/UntilDone/issues)**（含已关闭的），
+再看一眼 `docs/research/README.md` 的「已被推翻的结论」表 —— 有几类看起来像 bug 的现象，
+根因已经写在那里。
+
+开 issue 请用模板（`.github/ISSUE_TEMPLATE/bug_report.md`）。缺了下面任何一项都查不动：
+
+| 需要 | 为什么 |
+|---|---|
+| **克隆的提交 hash**（`git rev-parse --short HEAD`） | 本仓库没有 tag、没有 Release，`main` 就是发布物 —— 没有 hash 无法知道你跑的是哪一版 |
+| **`node scripts/overwatch.mjs` 的整块输出** | Node 版本与平台（`node` / `platform` 两行）在那里。**注意它不报终端类型和 shell**，模板里那两行请自己补 |
+| **完整命令，按顺序** | `--days`、`--project`、`OW_*` 环境变量任一不同，结论都可能不同 |
+| **语料规模** | 多少份 transcript、多大、会话是活的还是已结束 —— 本库所有判定都是**事后重建**，语料形态决定你看到什么 |
+| **输出里哪几行不对** | 直接贴；**先脱敏**：项目名、本机路径、transcript 片段、会话 id |
+| **期望 vs 实际**（状态判定类） | 你期望判成什么、它报了什么。能引到 transcript 里那几行最好 —— 那是区分「真漏判」和「阈值分歧」最快的办法 |
+| **离开你的语料还复现吗** | 能用空语料/合成语料复现，这个问题就可维护；不能也照说，不用装作能 |
+
+功能请求用 `feature_request.md`，它问的不是「加个按钮」，而是「你在做什么事的时候卡住了」。
+模板末尾那两个问题最好先自己答一遍，答不上来的请求大概率会被解释而不是被实现：
+
+- **这是驱动动作的状态，还是描述？** `FAILED` / `BLOCKED` / `WAITING` 才驱动动作并触发通知，
+  其余三个是描述，描述不驱动重跑、不改布局（`README.md`「六种状态」）。
+- **能不能不靠人看就判得了？** 需要有人盯着屏幕才能决定的，只能做报告，不能做闸。
+
+## 前置条件
+
+两个不同的 Node 下限，因为它们卡的是两件不同的事：
+
+- **Node ≥ 18.20.4**：跑工具。
+- **Node ≥ 20.16.0**：跑测试。测试用了 `import.meta.dirname` 和
+  `process.getBuiltinModule`，这两个 API 比工具所需的版本晚。
+
+没有 `package.json`，`npm install` 既不必要也不欢迎 —— 仓库里没有依赖可装，跑一次只会
+多出一个 `node_modules/`（它被 `.gitignore` 排除，见「不要提交的东西」）。
+
+**怎么确认自己的够不够**（一条命令，不要猜）：
+
+```bash
+node scripts/overwatch.mjs doctor
+```
+
+第一行就是答案，形如：
+
+```
+[   1ms] node        v26.12.1 · 工具下限 18.20.4 满足 · 测试下限 20.16.0 满足 · import.meta.dirname 在 · process.getBuiltinModule 在
+```
+
+它**既报版本号也直接探测那两个 API**（`checkNode()`）—— 版本号是推断，API 在不在是事实。
+一台能跑工具但跑不了测试的机器，会直接这么说，而不是等到后面抛一个看不懂的错。
+
+| 需要 | 为什么需要 | 能不能不给 |
+|---|---|---|
+| Node（见上表） | 全部工具与测试都是 `.mjs` | 不能 |
+| 一个 TTY 终端 | 交互面板要读按键 | **能**：非 TTY 用 `node scripts/oversight-tui.mjs --plain`，或直接跑其它命令 |
+| `git` | 硬门用 `git ls-files` 判「哪些文件会随仓库发出去」，CHANGELOG 对账读 `git log` | **能**：不在 git 仓库里时它退回按目录扫描，结论更粗但不会崩（`gitPublishableRootFiles()` 返回 `null` 时走 `readdirSync` 分支） |
+| 网络 | —— | **不需要**。本库不联网，见 `SECURITY.md` |
+| 登录 / 账号 | —— | **不需要**。`doctor` 与全部扫描都只读本机文件 |
+
+## 提 PR 之前
+
+下面两条都必须过。第一条不是可选的 —— 它守的规则都是**曾经被违反过、而且很容易再违反**的。
 
 ```bash
 node scripts/check-structure.mjs
 node --test scripts/
 ```
 
-`check-structure.mjs` checks, among other things: that every path in the docs
-exists, that no machine-specific absolute path reached a publishable file, that
-the test count quoted in four files matches the source, that `docs/CHANGELOG.md`
-has an entry for the commit, and that the two ledgers are well-formed. It is
-allowed to fail your change for a reason that has nothing to do with your code —
-read the message before assuming it is wrong.
+`check-structure.mjs` 检查的内容包括：现行文档里点名的每个路径都真实存在、
+没有任何本机绝对路径漏进可发布文件、四份文件里引用的回归测试数源码对得上、
+`docs/CHANGELOG.md` 对最近的提交有对应条目、两本台账格式合法。
 
-If you add or remove a test, the hard gate will tell you the new count. Update
-the four files it names; do not guess the number.
+它**允许**因为与你的代码无关的理由判你红 —— 先读报错信息，再判断它是不是错的。
 
-## Change requirements
+如果你加或删了测试，硬门会把新数字告诉你，并点名哪几份文件对不上。改那几份，别猜数字。
 
-**If you change behaviour, change `docs/` in the same commit.** This repository
-has a rule against "code now, docs later", because later does not arrive. The
-specific places that go stale:
+**一个同类缺口，写出来而不是藏着**：硬门对账的是上面四处。两份 README（`README.md` /
+`README-EN.md`）**顶部徽章里那个数不在其中**，所以它可能悄悄过期而硬门不报 ——
+它**至少过期过一次**（2026-11-21 之前徽章长期写着 `1627`，而源码里 `test(` 早已过千 —— 见
+`docs/CHANGELOG.md` 同日的条目）。你要是动了测试数，记得手动把两个徽章也改掉。
 
-| What you changed | What else must change |
-|---|---|
-| A user-visible capability | `docs/CAPABILITIES.md` — the hard gate checks that the commands listed there exist |
-| A state threshold or a verdict rule | `docs/spec/state-model.md` |
-| A finding or a known deviation | `tasks/dev-findings.md` or `tasks/accepted-deviations.md` |
-| Anything under `scripts/` | `docs/CHANGELOG.md` — the hard gate fails without an entry |
+## 本地怎么验证
 
-**Every claim needs a source.** The CHANGELOG's own rule is: write the commit
-hash, file path, function name, or measured number. A sentence that cannot be
-traced to one of those does not go in.
+三条命令，各管一件事。前两条是提交门槛，第三条是自查。
 
-**"Fixed" needs negative evidence.** Put the bug back and watch the test go red.
-A single green run is not evidence that the test can detect the bug.
+### `node scripts/check-structure.mjs` —— 结构硬门，约 3 秒
 
-## Code conventions
+它不扫你的会话语料，只读仓库自己的文件（本机 2026-11-20 实测 2.7 s）。它做的事：
 
-- **Zero dependencies.** Do not add a package. If something seems to need one,
-  the answer is usually that it needs less than you think — this repository
-  reimplements terminal width tables and escape sanitising rather than
-  importing them.
-- **Comments say why, not what.** The existing comments explain why a rule
-  exists and what breaks without it. Match that. A comment restating the next
-  line will be asked to leave.
-- **Two display paths, one source.** Anything the TUI renders must come from
-  the same function the plain-text path uses. This has drifted twice; both
-  times a session that was visible in one view was missing from the other.
-- **"Cannot tell" is its own state.** Never render an unknown as a zero, as a
-  blank, or as "all clear". If the data was not read, say so.
+- 现行文档里点名的每个 `scripts/`、`docs/`、`templates/`、`.claude/` 路径都真实存在
+- 可发布区（根级文件 + `docs/`、`scripts/`、`templates/` 等目录 + `.claude/agents/`）没有本机绝对路径
+- 回归测试数与四处声明对账（见下一节）
+- `docs/CHANGELOG.md` 覆盖了最近改过源码/规格的提交
+- 两本台账格式合法；`.gitignore` 没有排除产品本体目录
+- `node --check` 全过；每个导出的纯函数能被真的调用一次而不是只 import
+- 文档相对链接不悬空；`docs/CAPABILITIES.md` 里每条命令的脚本与 `--flag` 真实存在
+- 研究索引、设计索引登记齐全；agent frontmatter 字段齐全
 
-## Commits
+**什么时候跑**：每次改完，提交前。它允许因为与你的改动无关的理由判红 ——
+先读报错信息再判断它是否弄错了，别把它当成可以跳过的步骤。
 
-```
-type(scope): what changed, and why it matters
-```
+### `node --test scripts/` —— 全量回归测试，半分钟到一分钟
 
-Types in use: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
+**别引用任何文档里写死的条数，包括这一份。** 测试数每天在涨（写这一段的那天里，源码里的
+`test(` 就从 1756 涨到 1784），所以这里只给**形状**：末行是
+`tests N / pass N-2 / fail 0 / skipped 2`。耗时同样别当判据 —— 本机同一份代码两次跑出过
+`50.1 s` 与 `38.2 s`。以你自己跑出来的结果为准。
 
-Write the body for someone reading `git log` in six months with no context.
-Explain what was wrong, what you measured, and what the fix costs. If you
-removed something, say what would break if it came back.
+两条 `skipped` 是平台互斥用例（`pathKeyOf` 与 `diffOf` 的大小写折叠，Windows 上跑 win32 那条、
+跳过非 win32 那条），**`skipped` 不是失败**。
 
-Before committing:
+用目录形式 `scripts/` 而不是 `scripts/*.test.mjs`：Node 22 之前不展开 glob，
+在 cmd.exe / PowerShell 上通配符会原样传给 Node 并报「文件找不到」。
+
+**什么时候跑**：改了任何行为、加了任何测试之后。CI 把同一条命令拆成两段跑
+（快的一段 + `launch.test.mjs` / `build-payload.test.mjs` 串行），
+原因是那两个文件会起几十个真进程、与其余文件抢资源 —— 拆开只是调度不同，一条测试都没少。
+
+### `node scripts/overwatch.mjs doctor` —— 8 项前提，预算 1000 ms
+
+报的是**读到了什么**，不是「通过/不通过」。八项：`node` / `transcripts` / `sources` /
+`claude/` / `gate` / `watcher` / `platform` / `plan`。
+
+**什么时候跑**：干净 clone 之后第一件事；怀疑环境问题（Node 太旧、找不到会话记录）时；
+报 bug 时把它整块贴进 issue。退出码：`0` 正常，`2` transcript 根不存在，
+`3` transcript 根读不出（这是环境问题，不是「没有会话」），`5` 参数错误。
+
+一行里有三个数要分清：`workMs`（工具自己花的）、`bootMs`（Node 启动）、
+`wallMs`（你用 `time` 量到的）。它还会额外说明「父进程拉起 node 自身的成本约 170–210 ms」
+不在任何预算里 —— 不写出来，doctor 报 850 ms 而你量到 1020 ms，就成了「这工具在骗我」。
+
+## 「绿」的标准
+
+比「0 失败，且条数不低于改动前」更严格：**硬门会把一个具体的数字和四处文档对账。**
 
 ```bash
-git status        # stage only what you meant to change
-git diff          # read your own diff
+node scripts/check-structure.mjs   # 必须 ✓ 结构检查全部通过
+node --test scripts/               # 必须 fail 0
 ```
 
-Do not use `git add -A`. This repository has a `.gitignore` that is correct for
-it and a habit of accumulating scratch files; `-A` will pick those up.
+测试条数的判据是 `check-structure.mjs` 的 `checkTestCount()`：它数 `scripts/*.test.mjs` 里
+`^\s*test\(` 的出现次数（不跑测试，所以它不会因为你某条测试挂了就报「数字不对」），
+再与本仓库四处的声明逐一比对：
 
-## Branches and pull requests
+| 文件 | 它认的那句话 |
+|---|---|
+| `README.md` | `（N 条回归测试` |
+| `CLAUDE.md` | `全量回归测试（N 条` |
+| `docs/GUIDE.md` | `N 项全绿` |
+| `.github/workflows/validate.yml` | `全部回归测试（N 条` |
 
-`main` is the only branch. Open a pull request rather than pushing to it
-directly — CI runs the same two checks and it is easier to talk about a diff
-than about a commit that already landed.
+四处全对上才绿。**加了测试没改这四处 = 直接红**，报错会告诉新数字和哪几份文件对不上；
+照着改，不要手数。反过来，删了一处声明也红（「删掉声明等于没人再核它」）。
 
-## What gets pushed back
+三个容易误判的地方：
 
-Some things will be asked to change even if they work:
+- **实跑条数比声明的数字多。** 硬门数的是 `test(` 调用，`node --test` 会把子测试单独计数。
+  对账用前者，看结果用后者 —— 别拿 `ℹ tests` 那个数去改文档里声明的那个数，两者永远差几条。
+- **文档里写死的数字会过期，硬门只能保证它自洽。** 见到两者不一致时，先跑一遍硬门看它报的
+  `actual` 是多少。
 
-- **A new metric that cannot drive an action.** This repository deliberately
-  distinguishes states that mean "you need to do something" from states that
-  merely describe. Adding the second kind to the first kind's display has been
-  rejected before.
-- **A gate that can be satisfied without doing the work.** If a check can be
-  passed by writing a sentence instead of doing the thing, it is a ritual, not
-  a gate.
-- **A measurement whose denominator changed to make the number look better.**
-  There is a documented instance of a 115/115 = 100% figure that turned out to
-  be tautological. It is checked for now.
+链接则是**按 git 清单扫的**，不是按目录扫：`scripts/link-check.mjs` 问
+`git ls-files '*.md'`（实测 170 份），所以这份文件、两份 README、`SECURITY.md` 都在范围内。
+这条判据曾经用手写清单，只扫 `README.md` / `CLAUDE.md` / `docs/`，而这四份根级文档一份都不在
+里面 —— 两边都报「0 断链」（`DF-040`）。所以：**你在这份文件里加相对链接，是会被核的**；
+但你贴的路径（反引号里那种）不会被核，那仍然要自己对。
 
-None of this is about style. Each one is a failure this project has already had.
+## 改动要求
 
-## Reporting a security issue
+**改了行为，就在同一个提交里改 `docs/`。** 本仓库有一条规则反对「先写代码、文档回头补」，
+因为「回头」永远不会到来。具体会过期的地方：
 
-Do not open a public issue. See [SECURITY.md](SECURITY.md).
+| 你改了什么 | 还必须改什么 |
+|---|---|
+| 用户可见的能力 | `docs/CAPABILITIES.md` —— 硬门会核那里列出的每条命令真实存在、参数真实可用 |
+| 状态阈值或判定规则 | `docs/spec/state-model.md` |
+| 一条发现或一个已知偏差 | `tasks/dev-findings.md` 或 `tasks/accepted-deviations.md` |
+| `scripts/` 下的任何东西 | `docs/CHANGELOG.md` —— 没条目硬门直接红 |
+
+**每句话都要有出处。** CHANGELOG 自己的规则：写出 commit hash、文件路径、函数名，
+或实测数字。追不到这四者之一的句子，不要写。
+
+**「修好了」要有负向证据。** 把 bug 放回去，看着测试变红。只跑一次绿灯不算证据证明
+这条测试能发现这个 bug。这件事已经脚本化了，三处各管一批修复：
+
+```bash
+node scripts/verify-bugfix-negatives.mjs        # TUI 那批（tui-bugfixes.test.mjs）
+node scripts/verify-claim-fix-negatives.mjs     # 断言识别那批（verify-claims.test.mjs）
+node scripts/verify-tui-negatives.mjs           # TUI 第二轮重做
+```
+
+它们**不改 git 状态**：回退前把原文件读进内存，跑完立刻写回（`finally` 保证），
+而且会先确认基线是绿的 —— 否则「变红」什么也证明不了。手工做这件事一定会漏，
+而且要重跑好几次全量测试，所以才做成命令。
+
+## 代码约定
+
+- **零依赖。** 不要加包。如果觉得某个东西需要依赖，答案通常是它需要的比你想象的少 ——
+  本仓库连终端宽度表和转义净化都是自己实现的，而不是 import 一个包。
+- **注释说「为什么」，不是「做什么」。** 现有注释解释一条规则为什么存在、没有它会坏在哪。
+  照着这个写。复述下一行代码的注释会被要求删掉。
+- **两条显示路径，一个数据源。** TUI 渲染的任何东西都必须来自纯文本路径用的同一个函数。
+  这件事漂移过两次；两次都是一个视图里可见的会话在另一个视图里消失了。
+- **「判不了」自成一态。** 永远不要把未知渲染成 0、空白或「全部正常」。
+  数据没读到，就说没读到。`watch.mjs` 的进程存活判据是 `true / false / null` 三态，
+  `null` 就是「判不了」—— 把 `null` 写成 `false` 等于宣称进程死了。
+- **配置项必须有执行侧。** 一个只被读、不被用的开关，和不存在是一样的。
+  `agent.roster` 就是现成的反例：它只影响调度、不影响挂载，而且当前没有一行代码在执行它 ——
+  这件事写进了 `docs/spec/2026-11-14-launch.md`，而不是留给读者自己发现。
+
+## 提交
+
+文档里写的格式是：
+
+```
+type(scope): 改了什么，以及为什么重要
+```
+
+在用的类型：`feat`、`fix`、`docs`、`test`、`refactor`、`chore`、`perf`。
+
+如实说明它的状态：**这个格式是约定，不是硬门。** 本仓库历史里绝大多数提交
+是用一句普通的话描述改动的。你要是照着格式写，很好；不照写也不会被拒。
+
+正文写给六个月后、毫无上下文地看 `git log` 的人。说清原来错在哪、你实测到了什么、
+这个修法的代价是什么。如果你删了什么东西，说明它要是回来会坏在哪。
+
+提交前：
+
+```bash
+git status        # 只暂存你确实想改的
+git diff          # 读一遍自己的 diff
+```
+
+不要用 `git add -A`。本仓库有一个对它来说正确的 `.gitignore`，以及一个攒临时文件的习惯；
+`-A` 会把那些一并加进来。
+
+## 分支与 PR
+
+`main` 是唯一的分支。相比直接推上去，更推荐开 PR —— CI 跑同一套检查，
+而且讨论一个 diff 比讨论一个已经落地的提交容易。这件事没人强制：
+`main` 目前**没有分支保护**，维护者可以直接推。
+
+CI 跑的是：结构硬门、载荷布局检查、全量测试。这是上面两条命令的超集；
+本地两条都过，CI 应当是一致的。
+
+## 会被退回的改动
+
+有些东西即使能用也会被要求改：
+
+- **一个驱动不了任何动作的新指标。** 本仓库刻意区分「你需要做点什么」的状态
+  和「只是描述」的状态。把后一类塞进前一类的位置，以前被退回过。
+- **一道不做实事也能满足的闸。** 如果一条检查能靠写一句话通过，而不是靠把事做了，
+  那是仪式，不是闸。
+- **为了让数字好看而换了分母的测量。** 有一处已记录在案的例子：115/115 = 100%
+  的结论，事后发现是同义反复（先按问号把「在等人做决定」分走，再在剩下的里面数问号，
+  `docs/research/README.md` 记着这次被红队指出）。现在有测试盯着它。
+- **一条覆盖面说得比实际大的判据。** `DF-039`：硬门那道「可发布区零盘符」的检查只认
+  7 个固定前缀，而它报的是「可发布区没有本机绝对路径」。前者碰巧成立，后者一直是假的，
+  输出却始终是「全部检查通过」。改后的判据（`scripts/published-paths.mjs`，带单测）
+  第一轮就抓出 8 条真泄漏 —— 这就是「看见 ≠ 判红」的代价。
+- **同一句假话换一个说法。** `DF-038` 是同一失败模式的第四次复发：修的是文字，
+  而替换后的文字仍然是假的（「三处一处口径」在另两处代码里根本不是同一个判据）。
+  改断言的时候，先跑一遍能证明它的命令。
+
+这些都不是风格问题。每一条都是本项目已经犯过的错。
+
+## 不要提交的东西
+
+`.gitignore` 里每一条的理由都写在那个文件里，下面是最容易误提的几类：
+
+| 路径 | 为什么 |
+|---|---|
+| `tasks/runs/` | **运行台账**，由主线程写入，含会话 ID 与本机路径。按设计被 gitignore，`.gitkeep` 例外保留 |
+| `.claude/settings.local.json`、`CLAUDE.local.md`、`*.local.md`、`local/` | 本机私有配置，只对你这台机器有意义 |
+| `.claude/.ow-*` | 写前闸的本机会话标记与**签名密钥**。密钥进仓 = 公开 HMAC 密钥，任何人都能伪造 `satisfied_by:"auto"`，签名机制随之作废 |
+| `.tmp-*`、`.tmp-analysis/`、`tmp/`、`.scratch/` | 临时探针落点，里面常有真实 transcript 切片、会话 id、本机路径。**历史上已被误提交四次**（`3a2a883` / `39cc75d` / `b14f6ae` / `7d49543`） |
+| `dist/` | plugin 载荷的构建产物，由 `scripts/build-payload.mjs` 生成。它是**第二真源而且会漂移**：`.claude/` 是项目布局，`dist/` 是 plugin 布局，两份都入库必然有一份没人测。`--check` 负责在漂移时报红，所以它只生成不提交 |
+| `scripts/install/start-watch.vbs` | 安装器生成的启动器，内容依赖本机仓库路径。**模板** `start-watch.vbs.template` 才是版本控制的真源，必须提交 |
+| `node_modules/`、`*.log` | 本仓库没有 `package.json`，也没有日志该入库的理由 |
+| `docs/research/2026-11-02-host-interfaces.md` 等五份 | 记录了本机宿主/第三方网关的接口逆向、令牌与 ACL 暴露面、命名管道协议细节。文件留在磁盘上，第一行带 `<!-- PRIVATE: 不在公开范围内 -->` |
+
+**`docs/`、`tasks/`、`.claude/` 不在 `.gitignore` 里，这是刻意的** ——
+它们就是本仓库的产品本体。参考项目忽略这几个目录对它正确，照抄过来会让
+`git add -A` 静默什么都不加。`check-structure.mjs` 的 `checkGitignoreSanity()` 专门拦这条。
+
+提交前自查：
+
+```bash
+git status
+git diff --cached
+```
+
+看到上面任何一类出现在暂存区，就 `git restore --staged <file>`。
+
+## 报告安全问题
+
+不要开公开 issue。见 [SECURITY.md](SECURITY.md)。

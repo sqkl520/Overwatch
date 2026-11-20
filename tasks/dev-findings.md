@@ -449,7 +449,7 @@
   `scripts/pre-write-gate.mjs:852-856`（Edit 侧目标匹配）
 - **证据**（本会话实测，可复算）：
 
-  那次被判 `would-deny` 的调用是 `Edit D:\Projects\Overwatch\docs\CHANGELOG.md`，
+  那次被判 `would-deny` 的调用是 `Edit <repo>/docs/CHANGELOG.md`，
   日志里 `reads:4`、`allowReason:"observe-mode"`、`target:(none)`。
   同一会话另外 8 次 Edit 全部 `allow / target-read`，唯一区别是**我读 CHANGELOG 用的不是 `Read`**：
 
@@ -464,7 +464,7 @@
      而 `sed -n '1,30p' <file>` 是读文件的常见写法 —— 它数都不数。
   2. `head`/`tail`/`cat` 抽出来的是命令里的**原样字符串**（相对路径），而 `intent.paths`
      来自 `tool_input.file_path`（绝对路径）。`pathKeyOf()` 只做分隔符归一，**不做绝对化**，
-     于是 `docs/changelog.md` ≠ `d:/projects/overwatch/docs/changelog.md`，Edit 侧恒不命中。
+     于是 `docs/changelog.md` ≠ `<repo>/docs/changelog.md`，Edit 侧恒不命中。
 
 - **为什么这次没拦住我**：observe 模式。真开了 `deny` 会把这个会话的这一次合法编辑挡下来，
   并按 `brake:"halt"` 结束整个回合 —— 用户会看到「我明明读过它，闸说我读过」。
@@ -1475,5 +1475,426 @@ priorWriteCalls 差=0   distinctQuestions 差=0   reads 集合差=0
    有 70 组「不一致」，查下去是我的夹具让同一个 `tool_use_id` 有互相矛盾的
    `tool_result`（真实语料 7447 个会话里这种形状 **0 个**）。改成现实夹具后 **0/560**。
    **看到不一致先怀疑夹具，但要用真实语料证明夹具不现实，而不是嘴上说说。**
+
+### DF-039 [fixed] 硬门「可发布区零盘符」只认 7 个前缀，真实的 8 条本机路径一直报绿
+
+- **发现于**：2026-11-20，审计（主线程转派的实现任务）
+- **位置**：`scripts/check-structure.mjs:100`（改前）；判据现已搬到 `scripts/published-paths.mjs`
+- **状态**：fixed（2026-11-21）—— 判据换新后**看见**了 8 条，8 条随后逐条脱敏，
+  硬门从「改前 0 → 改后 8」走到「0 违规」。修复分两轮：判据（让门看得见）、
+  脱敏（让被看见的东西不再是泄漏）。
+
+#### 缺陷本体
+
+改前的正则：
+
+```js
+/[A-Za-z]:[\\/](?:Users|Projects|Server|Java|maven|Nodejs|Git)[^\s)"'`]*/g
+```
+
+只认 7 个前缀，而这 7 个恰好是作者本机装过东西的目录名。**它守的命题不是
+「可发布区没有本机绝对路径」，而是「这 7 个目录没被写进文档」**。后者碰巧成立，
+前者一直是假的。改前硬门输出 `✓ 结构检查全部通过`（0 项违规）。
+
+审计实测漏过的三种形态：
+
+| 路径形态 | 改前 |
+|---|---|
+| `D:\<app>\<sub>\x`（非已知前缀） | **MISSED** |
+| `D:\<App Name>\<app>.exe`（带空格） | **MISSED** |
+| `D:\<made-up-dir>\x`（任意目录） | **MISSED** |
+| `D:\Projects\<x>` | CAUGHT |
+| `D:\Java\<x>` | CAUGHT |
+
+第二重缺陷：判据写在 `check-structure.mjs` 里，而那个文件**一被 import 就跑完全部
+门禁并 `process.exit()`** —— 所以这条正则**一条测试都写不了**。一个不能被测的正则
+与一整个不能被测的模块，写错的方式一样多。
+
+#### 改后抓到的东西（真泄漏清单，**8 条已于 2026-11-21 全部脱敏**）
+
+改前 0 项违规 → 改判据后 **8 项**。8 条全是本机事实，逐条核实过「这条路径在本机真的存在」
+或「它确实是本仓库在作者机器上的位置」。
+
+**下面一栏写的是形态，不是原文**（口径修正见本节末尾「为什么最后把原文也脱掉了」）：
+
+| # | 文件:行号 | 路径形态（脱敏描述） | 判定依据 |
+|---|---|---|---|
+| 1 | `docs/research/2026-11-13-claim-detection-fixes-and-multimodel.md:165` | `<drive>:\<应用名带空格>\<app>.exe` | 本机存在；且同行带 PID，是「这台机器上的网关进程」的直接标识 |
+| 2 | `docs/research/2026-11-13-dsh-goal-mechanism.md:7` | `<drive>:\<dsh 安装根>\dshd\resources\app.asar` | 本机存在；泄漏第三方桌面应用的本机安装布局 |
+| 3 | `docs/research/2026-11-13-dsh-goal-mechanism.md:10` | 同 #2 + `.unpacked\` | 同上 |
+| 4 | `docs/research/2026-11-14-portability-audit.md:115` | `<drive>:\<中文项目名，6 字>` | 本机存在；**同时泄漏中文项目名**（整篇论文就是讲 slug 有损编码，示例本身把名字带出去了） |
+| 5 | `scripts/pre-write-gate.mjs:610` | `<repo>/docs/changelog.md`（小写盘符写法） | 仓库自身的本机位置；注释里当「绝对路径示例」用，脱敏成本为零 |
+| 6 | `scripts/tui-layout.mjs:848` | `<drive>:\<中文项目名，6 字>` | 同 #4，代码注释里当盘符示例 |
+| 7 | `scripts/tui-layout.mjs:849` | 同 #6，正斜杠变体 | 同上 |
+| 8 | `scripts/verify-claims.mjs:1822` | `<drive>:/<maven 安装根，含版本号>/bin/mvn.cmd` | 本机存在；泄漏 Maven 具体版本与安装位置 |
+
+**处置记录（2026-11-21，硬门 8 项 → 0 项）**
+
+| # | 改成 | 备注 |
+|---|---|---|
+| 1 | `<app-home>\cc-switch.exe` | 应用安装位是占位符，PID 是运行时事实、保留 |
+| 2 | `<dsh-home>\dshd\resources\app.asar` | 保留 asar 内部相对布局（`dshd\resources\` 是包结构，不是本机位置） |
+| 3 | `<dsh-home>\dshd\resources\app.asar.unpacked\` | 同上 |
+| 4 | `<drive>:\C盘示例目录` | **特殊处理**：见下 |
+| 5 | `<repo>/docs/changelog.md` | |
+| 6 | `C:\<中文目录名>` | 保留「盘符后跟中文」的形态，那是这行注释要讲的点 |
+| 7 | `…/C:/<中文目录名>` | 保留与 #6 的正斜杠差异 |
+| 8 | `<maven-home>/bin/mvn.cmd` | Maven 版本号一并去掉（`apache-maven-3.9.9` 本身也是本机事实） |
+
+**#4 为什么不能套普通占位符**：那一节论证的是 slug 有损编码，那条真实 cwd 被宿主编成
+`C--C-----` —— 真实路径形态**就是证据**，写成 `<repo>` 会让论证失去说服力。做法是换成
+**同形态的假名**并把编码结果一并更新：
+
+- 编码规则**实测反推**（不是猜）：从本机 160 个 `~/.claude/projects/<slug>/` 目录取每条
+  transcript 首行的 `cwd`，验证 `cwd.replace(/[^A-Za-z0-9]/g, '-')` ——
+  147 条精确复现、3 条仅大小写差异、9 条无 transcript 可反推、1 条 cwd 已漂移（目录留的是旧 cwd）。
+- 旧：`<drive>:<反斜杠><中文项目名，6 字>` → `C--C-----`（9 个字符，含 5 个汉字）
+- 新：`<drive>:\C盘示例目录` → `C--C-----`（同样 9 个字符、同样 5 个汉字）
+- **编码结果完全相同**，因为 slug 只取决于「非 ASCII 字符的个数」。论证里每一处坐标
+  （`C--C-----`、`C/////`、`C--` 前缀）都还在原处，而目录名不再是本机事实。
+- 全仓搜索该名字 / `C--C-----`：同节第 139 行的「依据」一句只有 slug、无真实路径，
+  只补了「目录名已脱敏」的口径说明。
+
+**降级说明（判断，不是事实）**：`C盘示例目录` 仍是「C 盘 + 中文目录」这一形态，读者可推断
+原目录名也是「C盘 + 4 字」。这是为了保住论证而接受的残留下限 —— 换成完全不含 `C盘` 的假名
+会让 `C--` 这个前缀失去解释力。真要彻底消除，得把整节的论证改成合成语料，那是重写，不是脱敏。
+
+#### 依赖这些字符串的测试（同步改过）
+
+- `scripts/tui-layout.test.mjs:474`：`shortPath` 的用例原本喂真实中文项目名，
+  现改为假名 `C:/某中文目录`（断言的是「盘符不占一格」，不依赖目录名）。
+- `scripts/verify-claims.test.mjs:542-547,1114`：那条例子里带 Maven 安装根（含版本号），
+  现改成 `D:/sdk/maven-dist/bin/mvn.cmd`（`doesNotMatch` 的断言对象一并改成 `maven-dist`，
+  断言的是「引号里路径被压成 basename」，不依赖具体版本号）。
+- `scripts/published-paths.test.mjs:43`：原本拿一个真实的带空格应用安装位当夹具，
+  现改成 `D:\App Name\app.exe`（断言的是「带空格的目录整条抓到」，用真实应用名不必要）。
+- **CHANGELOG 里只写形态、不写原文**：那 8 行原文若抄进 `docs/CHANGELOG.md`，会把泄漏
+  从一份文件搬到另一份（本任务中途真实踩到过：第一版照着表格抄原文，硬门立刻多报 10 项）。
+  所以 CHANGELOG 用 `<drive>:\<app 名带空格>\<app>.exe` 这类形态描述。
+- **`tasks/` 不在判据的扫描范围内**（`ROOT_SCAN_SKIP` 含 `tasks`），所以台账里的写法
+  不会让门变红 —— 这正是本节末尾「为什么最后把原文也脱掉了」要说清的事：不进扫描范围
+  ≠ 可以留原文，它只是「门不管」，而门不管的东西恰好是随仓库发出去的东西。
+
+**判定为「合法示例、已进白名单」的形态**（不在这 8 条里）：省略号形态（`D:\…`）、
+尖括号形态（`D:\Projects\<A>`）、中文占位符（`D:\你的项目`）、裸盘符根（`C:\`）、
+Windows 自带目录（`C:\Windows`）、单字母构造对照（`D:/a/b-c` 与 `D:/a/b/c`）、
+`nope.exe` 一类假文件名。共 20 条字面量，理由逐条写在 `PLACEHOLDER_LITERALS` 里。
+
+#### 一条决策（与本缺陷直接相关，记下来免得下次重开）
+
+**本仓库自己的盘符路径判为「不加白名单」。** 实测：非豁免区（除 `*.test.mjs`）
+一条都没有 —— 它只出现在 `PATH_EXEMPT` 豁免的测试文件里（测试必须写真实盘符形态
+才能验判据）。既然没有文档需要引用自己的本机路径，给它开前缀白名单就是**凭空开洞**：
+那会把「仓库根 + 本机临时子目录」一并放行，而那正是本判据该抓的东西。
+脱敏成本是零（写 `<repo>`），所以不加。这条决策由 `published-paths.test.mjs` 的两条
+用例钉住（「本仓库自己的盘符路径**不在**白名单里」/「仓库根 + 本机临时子目录同样违规」）。
+
+#### 顺带修掉的两处「本次改造引入的」问题
+
+1. 第一版根级扫描用 `readdirSync(ROOT)` 全扫，把根目录下一个 `.tmp-*` 草稿
+   （另一个会话的临时文件）判成「可发布」，硬门多报了一条与产品无关的违规。
+   改成**问 git**（`git ls-files` 的根级部分）：可发布区的定义本来就是「会随仓库
+   发出去的内容」。顺带记下 `isGitignored()` 的局限 —— 它只做精确/前缀匹配、
+   **不展开 glob**，不能拿来判可发布集。
+2. 空格规则第一版会把两条相邻路径粘成一条（`D:\a\b E:\c\d`），被自己的用例打回。
+
+#### 影响
+
+如果不修：硬门对「本机泄漏」这个它明确声称在守的命题**零覆盖**，而输出始终是
+「全部通过」。这是本仓反复批判的那类判据（「看见 ≠ 判红」），也是 `DF-031`
+（静默跳过看起来和通过一样）的同一种形态：**判据只要不覆盖，报绿与报红都是噪声**。
+
+#### 建议归属（已完成）
+
+- 8 条泄漏的脱敏：**已完成（2026-11-21）**，见上「处置记录」。
+- ~~`tasks/dev-findings.md` 台账里的原文保留~~ **已改判（同日晚，见下「第二轮」）**。
+
+#### 第二轮（2026-11-21 深夜）：漏了第九条，而且是「无盘符」的那种
+
+**怎么发现的**：上一轮脱敏只覆盖了命中 `WIN_ABS_RE` 的 8 条。人工复核 TUI 截图段落时
+在 `docs/research/2026-11-10-tui-implementation.md:170` 看见那一行的「路径副行」列里
+**只有目录尾段**、没有盘符 —— 硬门的正则对它是瞎的，所以它从未进过那 8 条清单。
+
+**为什么这条比前 8 条更值得记**：前 8 条的判据缺陷是「前缀名单太窄」，本质是**同一个正则
+写窄了**。这一条的输入根本不含路径：`tui-layout.mjs` 的 `shortPath()` 会剥掉盘符与父目录，
+剩下的就是一个裸名字。也就是说「可发布区零盘符」这条命题本身**表述有误** ——
+该守的是「可发布区没有本机事实」，盘符只是它的一种形态。
+
+**处置**：
+
+1. 该行改成同形态假名（与 #4 处同一个假名，保持仓内一致），并在该节抬头加
+   **脱敏口径声明**：假名与真名**显示宽度相同（11 列）、字符数相同**，因此
+   「四档宽度下超宽行数为 0」「30 列撤路径副行」这些被论证的量一个都没变。
+   这是比「整段截图重跑一遍」更小的改法，也是唯一不破坏论证的改法。
+2. **台账自身的原文一并脱掉。** 上一轮的理由是「`tasks/` 不在扫描范围，且原文是修复证据」。
+   这条理由只对了一半：范围外只是「门不管」，而 `tasks/dev-findings.md` 是**被 git 跟踪、
+   会随公开仓库发出去**的（目录归属表标「可发布」）。把真名留在这里，等于在修复报告的
+   附录里再贴一遍。证据的可复核性不依赖原文 —— 「改前是真实中文项目名、6 字、slug 仍是
+   `C--C-----`」这些坐标全部保留，只是不再给出那 6 个字本身。
+3. **新增硬门判据**：`published-paths.mjs` 增加 `KNOWN_LOCAL_IDENTIFIERS`（**散列**黑名单）
+   + `findKnownIdentifiers()`，直接全文滑窗，不依赖盘符或分词。公开区只放
+   「长度 + 两个不同基的多项式散列」，**原文不进仓**，所以判据本身不制造新的泄漏面。
+   代价已写在代码注释里：它是黑名单（未登记的名字照样漏）、登记需知道原文（只能在作者
+   机器上核）、每次跑门多约 130 ms。
+4. **负向验证**：把真名放回那一行 → 硬门报 1 项（`第 175 行出现已知的本机标识符`）；
+   还原 → 0 项。另有一条意外收获：判据上线后**第一次跑就红在 `published-paths.mjs:279`** ——
+   我在注释里举例时写了原文，门立刻抓住了它自己。这比任何单元测试都更能说明它有效。
+
+---
+
+### DF-040 [fixed] 死链判据只扫 3 处，根级四份文档的断链一直报绿
+
+- **发现于**：2026-11-21，审计（主线程转派的实现任务）
+- **位置**：`scripts/check-links.mjs:5`（改前）与 `scripts/check-structure.mjs` 的 `checkLinks()`（改前）——
+  两处是**两份实现、同一份手写清单**
+- **状态**：fixed（2026-11-21）—— 判据抽到 `scripts/link-check.mjs`（有单测），
+  范围改成问 git，改后扫出 1 条真断链并修好
+
+#### 缺陷本体
+
+改前两份实现的扫描范围逐字相同：
+
+```js
+// check-links.mjs:5
+const files = ['README.md', 'CLAUDE.md'];
+function walk(d) { ... }   // walk('docs')
+
+// check-structure.mjs 的 checkLinks()
+const files = ['README.md', 'CLAUDE.md'].filter((f) => existsSync(join(ROOT, f)));
+walkMd(join(ROOT, 'docs'));
+```
+
+于是根目录的 `CONTRIBUTING.md` / `CONTRIBUTING-EN.md` / `SECURITY.md` / `SECURITY-EN.md`
+**一份都不在范围内**（`README-EN.md` 也不在 —— 它连 `README` 这个名字都没被写进清单）。
+实测：根级 `.md` 共 7 份，清单覆盖其中 2 份。
+
+`CLAUDE.md` 把 `node scripts/check-links.mjs` 列在常用命令里，`docs/CAPABILITIES.md:46`
+把它列为「文档相对链接不悬空」的判据，CI 也依赖它。**三处都把它当作覆盖全仓的门，
+而它只守 3 处里的 147 份文件。** 报绿，但绿的是「这 147 份没问题」。
+
+这与 `DF-031`（66 条探针静默跳过）、`DF-039`（路径正则只认 7 个前缀）是同一类：
+**门说绿，但它检查的东西覆盖不到问题**。三者的根因也同一个 —— 范围/判据是人手写的清单。
+
+第二重缺陷与 `DF-039` 逐字相同：判据写在两个地方，其中一个在 `check-structure.mjs` 里，
+而那个文件一被 import 就跑完全部门禁并 `process.exit()`。**所以这条判据一条测试都没有。**
+实测 `ls scripts/check-links*` → 只有 `check-links.mjs`，无 `.test.mjs`。
+
+#### 改法
+
+1. **判据抽成 `scripts/link-check.mjs`**（纯函数 + 单测 `link-check.test.mjs`，21 条用例）。
+   两个入口（CLI 与硬门）共用它，不再有两份实现漂移。
+2. **范围改成问 git**，不写清单：`git ls-files '*.md'` + `--others --exclude-standard`。
+
+   为什么不「扫根目录所有 `.md`」、也不「walk 整个仓库」：工作区磁盘上有 **839** 份 `.md`，
+   而会随仓库发出去的只有 **170** 份。差额是 `.scratch/`、`.tmp-analysis/`（别人的克隆）、
+   以及 `docs/research/` 下五份被 `gitignore` 的私有报告。按目录扫会把这些全部当成
+   「该守的东西」，报出一堆与产品无关的断链。判据要守的命题是「**发出去的东西**里链接不悬空」，
+   那就只该扫会发出去的那些 —— 与 `checkAbsolutePaths()` 判「会不会发出去」用的是同一个依据
+   （`DF-039` 已经为这件事踩过一次坑，见该条目「顺带修掉的两处」第 1 点）。
+3. **同时收紧三条判据**（不是放松）：
+
+   | 新增 | 改前为什么漏 |
+   |---|---|
+   | 锚点（`#xxx`）核对 | 旧正则 `\]\(([^)#\s]+\.md)(?:#[^)]*)?\)` 把 `#` 之后**整段丢掉**，且纯锚点链接（`](#x)`）一开始就被 `[^)#\s]+` 排除。对锚点的覆盖是 **0 条** |
+   | 目标「会不会发出去」 | 旧判据只问 `existsSync`。指向被 gitignore 的私有文件 = 本机绿、干净 clone 红 |
+   | 非 `.md` 相对链接（图片、`LICENSE`） | 旧正则只匹配 `.md` 结尾。实测全仓当前 0 条断，所以这条不改变结论，只是补上盲区 |
+
+4. **必须先剥代码块再提取链接**。`docs/CHANGELOG.md:1733` 原样引用了一段
+   `AI 说：「… [skill/output/](skill/output/) 下…」` 的围栏块 —— 不剥代码块，判据会
+   对着引文报断链，人就会去「修」一段不应改的引文。行号保持不变（报错要给行号）。
+
+#### 改前 0 → 改后 1（逐条）
+
+| # | 位置 | 链接 | 判定 | 处置 |
+|---|---|---|---|---|
+| 1 | `README.md:53` | `#-诚实的数字` | **真断链** | 改成 `#诚实的数字` |
+
+**为什么是真断链，不是判据不够用**：`README.md:161` 的标题是 `### 诚实的数字`（无 emoji），
+GitHub 的 slug 是 `诚实的数字` —— 没有前导 `-`。同一份文件里 `#-30-秒上手` 是对的，
+因为对应标题是 `## 🚀 30 秒上手`：emoji 被删、紧随的空格变连字符，**那个 `-` 是 emoji 留下的**。
+写错的那条是从 emoji 标题那条抄过来的。实测点开它不会跳到「诚实的数字」那一节。
+
+**逐条排除的「判据不够用」候选**（都是判据改进，不是放松）：
+
+| 现象 | 结论 |
+|---|---|
+| `docs/CHANGELOG.md:1733` / `docs/research/2026-11-14-verify-cmd-false-positive.md:57` 的 `[skill/output/](skill/output/)` | 围栏块里的**引文**，不是链接。剥代码块后消失 |
+| `docs/CHANGELOG.md` 等 3 处 `](?:Users\|Projects\|…)` | 讲正则的示例，同样在代码块里 |
+| `docs/FOR-USERS.md:243` 的 `[adr/](adr/)` | 目录链接，目录存在。判据放行目录（GitHub 会列目录内容） |
+| `docs/spec/tui-visual.md:3` 的 `../../scripts/tui-theme.mjs` | 非 `.md` 相对链接，按所在目录解析后存在 |
+| 23 条 `https://…` 与 3 条纯锚点 | 外部地址按协议头整类跳过；纯锚点核本文件标题 |
+
+`checkFileLinks()` 的判据比改前**严**：多了锚点、多了「会不会发出去」、多了非 `.md`，
+一条都没放松。**没有为了让数字变绿而改判据。**
+
+#### 负向验证（两道门都实测变红）
+
+把 `README.md` 的修复还原（`#诚实的数字` → `#-诚实的数字`），实测：
+
+```
+$ node scripts/check-links.mjs
+死链  README.md:53  →  #-诚实的数字  （锚点在该文件里不存在）
+
+扫描 170 份 .md，检查 112 个相对链接，1 个断链          # exit 1
+
+$ node scripts/check-structure.mjs
+✗ 5 项违规：
+  [README.md] 第 53 行锚点在该文件里不存在：#-诚实的数字   # 另有 4 项测试数欠账，见下
+```
+
+**旧实现为什么看不见它**（用 `HEAD:README.md` 原文实测）：旧正则对 `README.md` 的纯锚点
+链接覆盖 **0 条** —— `[^)#\s]+` 在第一个字符就排除了 `#`。所以这条断链从写下的那天起
+就不可能被任何一版旧判据发现。
+
+#### 范围对照（实测）
+
+| | 改前 | 改后 |
+|---|---|---|
+| 扫描文件数 | 147（`README.md` + `CLAUDE.md` + `docs/**`） | **170**（`git ls-files '*.md'`） |
+| 根级 `.md` 覆盖 | 2 / 7 | **7 / 7** |
+| 检查的相对链接 | 93 | **112** |
+| 断链 | 0 | 1（已修）→ 0 |
+
+新增覆盖的 23 份：根级 5 份（`README-EN.md` / `CONTRIBUTING.md` / `CONTRIBUTING-EN.md` /
+`SECURITY.md` / `SECURITY-EN.md`）、`templates/` 5 份、`.claude/agents/` 12 份、
+`.claude/skills/oversight/SKILL.md`、`tasks/` 2 份、`.github/` 3 份。
+
+**`tasks/` 为什么纳入**：`.gitignore` 只忽略 `tasks/runs/`（私有台账），`tasks/*.md` 两本台账
+本身在可发布区（`CLAUDE.md` 目录归属表明写）。`git ls-files` 天然把 `tasks/runs/` 排除在外，
+不需要额外规则。实测这两份台账当前 **0 条相对链接**，所以纳入不改变结论 —— 但下次有人在
+台账里链一份 `tasks/runs/` 下的运行产物，门会报 `UNPUBLISHED`（那正是该报的）。
+
+#### 测试
+
+新增 `scripts/link-check.test.mjs`，21 条。分工与 `published-paths.test.mjs` 相同：
+**第一节的职责不是「证明现在能抓」，而是「证明旧写法会红」**——
+
+- §1（3 条）根级文档 / `templates/` / 英文对照文档里的断链：旧清单扫不到，换成旧清单必红。
+- §2（3 条）锚点写错要报、写对不报、emoji 与重名标题的 slug 规则。
+- §3（4 条）围栏块 / 行内代码 / 引用块内围栏里的示例不是链接；`stripCode` 保持行号。
+- §4（1 条）外部地址整类跳过。
+- §5（2 条）指向被忽略文件报 `UNPUBLISHED`；`publishable` 为 null 时不判（git 降级路径）。
+- §6（2 条）**范围本身**：`markdownFiles()` 覆盖每一份根级 `.md`，且不混进 `.scratch/`。
+  这两条在真仓库上跑 —— 下次加一份根级文档而门没跟上，它们会红（旧写法下不会）。
+- §7（2 条）`../` 按所在目录回退；目录链接放行。
+- §8（3 条）报错文本、行号指向链接所在行、多条断链全部报出。
+
+#### 顺带发现（未修，留给主线程排期）
+
+`check-links.mjs` 只核**链接**，不核正文里反引号写的路径引用。那半条由
+`checkDocReferences()` 守着，但它只认 `LIVING_DOCS` 那份 **15 份文件的清单**：
+
+```js
+const LIVING_DOCS = [
+  'README.md', 'CLAUDE.md', 'docs/README.md', 'docs/GUIDE.md', ... 共 15 条
+];
+```
+
+**同样的手写清单病**：`CONTRIBUTING.md` / `CONTRIBUTING-EN.md` / `SECURITY.md` /
+`SECURITY-EN.md` 都不在里面，而它们正文里有大量反引号路径引用（`README.md` 的某一节名、
+`docs/adr/0004-ask-is-investment.md`、`scripts/*.mjs` 等）。已验证的两条当前都是对的
+（`CONTRIBUTING.md:24` 引的「为什么不能自动接力」在 `README.md:226`；两处引用的
+`tasks/dev-findings.md` / `tasks/accepted-deviations.md` 都存在），所以不是现存缺陷，
+是**覆盖缺口**。
+
+不在本任务范围内：本任务的声明产出形态是 `artifact`，改的是「链接」判据；把
+`checkDocReferences()` 的范围也改成问 git 是另一处改动，登记在此。`checkDocCommands()`、
+`checkDocConstants()` 共用同一份 `LIVING_DOCS`，三处要一起改。
+
+#### 影响
+
+如果不修：根级四份文档（对外第一入口，`CONTRIBUTING` 与 `SECURITY` 是 GitHub 会自动
+在 issue/PR 页面上挂出来的两份）的任何相对链接断了都无人知道，而 `CLAUDE.md`、
+`CAPABILITIES.md`、CI 三处都把这个命令当作可靠判据在引用。
+
+### DF-041 [fixed] 叫停文件硬编码旧目录名，不跟随 `state-dir.mjs` 的改名规则，也不认 `OVERWATCH_STATE_DIR`
+
+- **发现于**：2026-11-21，按「每一条安全断言都要追到代码位置」重写 `SECURITY.md` 时自查
+- **修复于**：2026-11-21（同日，独立任务）。本条目下方的「为什么不自行修」保留原文，
+  它记录的是当时为什么不能顺手改 —— 修法就是照着那段写的要求做的。
+- **位置**：`scripts/stop-verify-hook.mjs`（`pausePathsFor()` / `pausedPathOf()` / `isPaused()`）
+- **证据**（可复算）：
+
+  ```js
+  // stop-verify-hook.mjs:117
+  export function pausePathFor(env = process.env) {
+    if (env.OVERWATCH_STOP_VERIFY_PAUSE) return env.OVERWATCH_STOP_VERIFY_PAUSE;
+    const base = env.LOCALAPPDATA || env.XDG_STATE_HOME || join(homedir(), '.local', 'state');
+    return join(base, 'Overwatch', 'stop-hook.PAUSE');   // ← 硬编码 'Overwatch'
+  }
+  ```
+
+  同一时刻，其它状态文件的规则在 `state-dir.mjs:30-32`：
+
+  ```js
+  export const STATE_DIR_NAME  = { win32: 'UntilDone', posix: 'untildone' };
+  export const LEGACY_DIR_NAME = { win32: 'Overwatch', posix: 'overwatch' };
+  ```
+
+  规则是「新目录存在就用新的；新目录不存在、旧目录存在，就继续用旧的」。
+  叫停文件**完全没有走这条规则**：它固定落在旧的 `Overwatch` 目录下。
+
+- **影响**：
+  1. **叫停文件与其它状态文件不同目录。** 用户按文档清空 `%LOCALAPPDATA%/UntilDone`
+     （新名字）之后，叫停文件仍在旧的 `Overwatch` 目录里，闸门继续处于「被叫停」状态，
+     而用户以为自己清干净了 —— 这是本仓反复批判的那类「静默不一样」。
+  2. **`OVERWATCH_STATE_DIR` 对它无效。** 两个 hook 与 `hook-dedupe` 都认那个变量
+     （这一致性是 2026-11-18 为 `DF-031` 专门补的，见 `stop-verify-hook.mjs:444-451` 的注释），
+     唯独叫停文件不认。于是「我用 `OVERWATCH_STATE_DIR` 把副作用关进临时目录了」
+     这句话对叫停路径**是假的**。
+  3. 不是坏掉的：`OVERWATCH_STOP_VERIFY_PAUSE` 可以显式指定，所以有逃生口。
+     但默认路径是错的，而默认路径就是大多数人会用的那条。
+
+- **为什么不自行修**：改它会**移动一个现有文件的位置**。真实用户的机器上可能已经有
+  `Overwatch/stop-hook.PAUSE` 在生效；直接切到新目录等于**静默解除他们的叫停**——
+  恰好是把「用户明确要求停止拦截」这件事悄悄撤销。正确修法要在两个位置都查
+  （新路径或旧路径任一存在即视为叫停），并且 `OVERWATCH_STATE_DIR` 要能同时覆盖两者。
+  这是行为变更，不是路径拼写修正，本任务（写作）无权决定。
+- **建议归属**：独立任务。写测试时要覆盖四种组合：新旧目录各一份 × `OVERWATCH_STATE_DIR` 有/无。
+- **已在文档里交底**：`SECURITY.md` §6 末段与 §8「加固建议」都写了这一条，所以读者不会
+  被蒙在鼓里；本条是把它登记成待排期的债。
+
+#### 修复（2026-11-21）
+
+- **改法**：`pausePathFor()` 拆成两层 ——
+  `pausePathsFor(env)` 返回整族候选（**主路径在前**），`isPaused()` 改为
+  「调用 `pausedPathOf(env)`，任一条存在即真」。候选顺序：
+
+  | # | 路径 | 说明 |
+  |---|---|---|
+  | 1 | `$OVERWATCH_STOP_VERIFY_PAUSE` | 显式指定。给了就**只有**这一条，不叠加 |
+  | 2 | `$OVERWATCH_STATE_DIR/stop-hook.PAUSE` | 补上「影响 2」，与其他副作用同一约定 |
+  | 3 | `<stateRoot>/UntilDone`（POSIX `untildone`）`/stop-hook.PAUSE` | 主路径 |
+  | 4 | `<stateRoot>/Overwatch`（POSIX `overwatch`）`/stop-hook.PAUSE` | **向后兼容，不许删** |
+
+- **判定方向与 `resolveStateDir()` 刻意相反**：那里是「新存在用新、否则用旧」（为**数据**
+  服务，避免历史看起来消失）；这里是「任一存在即暂停」（为**叫停**服务）。理由写进代码注释，
+  免得下一次有人把它「统一」掉 —— 统一成任一侧都会重新造出一个「关不掉」或「误关」的形态。
+- **向后兼容怎么保证**：第 4 条候选就是旧路径，**没有删**。现有用户在
+  `%LOCALAPPDATA%\Overwatch\` 里的文件照常生效。删它等于静默解除用户的叫停，
+  正是本条当初「不自行修」的唯一理由。
+- **路径拼接复用 `state-dir.mjs`** 的 `stateRoot()` / `STATE_DIR_NAME` / `LEGACY_DIR_NAME`，
+  不再写第三份。顺带修掉一处同源漂移：原实现在 win32 缺 `%LOCALAPPDATA%` 时回落到
+  `.local/state`，而 `state-dir.mjs` 回落到 `AppData/Local`。
+- **可观测性（本条新增要求）**：「两个路径都查」之后，「用户想停」与「用户放错了地方」
+  在布尔层面完全一样。最小方案做了三件事，都很小：
+  1. 台账 `allowed-user-paused` 行新增 `pauseHit`（真命中的路径）+ `pausePaths`（候选数）；
+     旧字段 `pausePath`（主路径）保留，不破坏已有消费方。
+  2. `pre-write-gate.mjs status --cwd <项目>` 把候选路径全部列出，命中项标 `← 命中`，
+     没命中则首行写 `pause       : not paused` —— **「没生效」时它才最有用**，
+     因为它直接回答了「我到底该把文件放哪」。
+  3. 未命中时也列路径（只列路径不列「不存在」），避免把 `status` 变成一堆 existsSync 的日志。
+  代价：`status` 多 2–4 行；台账每行多两个字段。
+- **负向证据**：把 `pausePathsFor` 退回「只返回旧目录一条」，新增 8 条用例里 4 条变红
+  （新目录 / 两处都有 / `OVERWATCH_STATE_DIR` / 候选非空），恢复后 78 条全绿。
+- **未做**：不自动迁移文件、不改默认写盘位置、不动 `resolveStateDir()`、
+  不改 `templates/` 里的示例路径（旧路径仍生效，改它只会让用户多学一个新名字）。
+- **仍存的相关风险（不在本条内）**：`SECURITY.md` §6 那句「你以为清空了状态目录，叫停文件
+  还在」现在要改述 —— 两处都认之后，**清空一处不再能解除叫停**。那是 fail-safe 方向的
+  代价，已写进 `docs/CAPABILITIES.md` 的候选路径表，本文档不重复。
+
+---
+
+---
 
 _（新增条目追加在此行上方）_

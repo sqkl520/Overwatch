@@ -43,7 +43,7 @@
 | 产出对账：子 agent 说产出的东西，磁盘上在不在 | `node scripts/claim-ledger.mjs verify --run <run-id>` | `COMPLETE` / `PARTIAL` / `MISSING` / `CONFLICT` 等逐任务结论 |
 | 从 transcript 抽子 agent 的写入痕迹（不需要它配合） | `node scripts/claim-ledger.mjs observe --run <run-id> --session <会话目录>` | 每条写文件的调用（`Write`/`Edit` + 路径可确定解析的 Bash 写入），含失败的调用，并打印「判不出」的逐类计数 |
 | 全量回归测试 | `node --test scripts/` | 全绿；条数以命令输出为准 |
-| 文档相对链接不悬空 | `node scripts/check-links.mjs` | 断链数，非 0 即失败 |
+| 文档相对链接不悬空 | `node scripts/check-links.mjs` | 断链数，非 0 即失败。范围是 `git ls-files '*.md'`（实测 170 份，含根级与 `templates/`），判据在 `scripts/link-check.mjs`：文件在不在、锚点在不在、目标会不会被 gitignore 掉 |
 | 生成仓库社交预览图（1280×640） | `node scripts/make-social-preview.mjs --out docs/assets/social-preview.png` | 一张 PNG；GitHub 的 social preview 没有 API，要人工上传 |
 | 清单机制在真实使用中覆盖多少 | `node scripts/measure-checklist-coverage.mjs --days 7` | 派发率 / 清单率两个口径（含沙箱、不含沙箱）。**数字低不是缺陷，是「加闸值不值得」的依据** |
 | 把 Stop 闸改成 block 会拦多少个真实会话 | `node scripts/replay-stop-gate.mjs --days 30` | 三档：全部 / 非沙箱 / **★ 会真的跑闸（真实项目 + 主会话）**。**只看 ★ 那一行** —— 子 agent transcript 不产生 Stop 事件，混进去会把拦截率虚高数倍 |
@@ -101,6 +101,7 @@ hook 进程的环境变量继承自**宿主进程**，不是你的终端。桌�
 **实测（2026-11-18，47MB transcript，真实主会话）**：
 - 无证据的完成声明 → 输出 `{"decision":"block", reason:...}`，exit 0
 - 同一输入 + `%LOCALAPPDATA%/Overwatch/stop-hook.PAUSE` 存在 → 无输出（不拦）
+  （该次实测时叫停文件只认旧目录名；2026-11-21 起 `UntilDone/` 与 `Overwatch/` **任一存在即生效**，见 `DF-041`）
 - 同一输入 + `stop_hook_active:true` → 无输出（不拦，防循环）
 - 每次判定耗时 **374–445ms**
 
@@ -166,8 +167,18 @@ node scripts/pre-write-gate.mjs status --cwd D:\你的项目    # 看 minQuestio
 | 1 | Edit 侧：`target-read` | 读过**这个文件本身** |
 | 2 | Write 侧：`minReads` | 读过 ≥N 个**不同**文件 |
 
-叫停路径与另一条闸**共用同一个文件**：`%LOCALAPPDATA%/Overwatch/stop-hook.PAUSE`
-存在即放行（`pre-write-gate.mjs` 调的是 `stop-verify-hook.mjs` 的 `isPaused()`）。
+叫停路径与另一条闸**共用同一族文件**（`DF-041`，2026-11-21 起）：
+任一存在即放行，主路径在前。
+
+| 顺序 | 路径 | 语义 |
+|---|---|---|
+| 1 | `$OVERWATCH_STOP_VERIFY_PAUSE` | 显式指定。给了就**只有**这一条生效，不叠加 |
+| 2 | `$OVERWATCH_STATE_DIR/stop-hook.PAUSE` | 本仓统一的临时区变量，两个 hook 与 `hook-dedupe` 都认 |
+| 3 | `%LOCALAPPDATA%/UntilDone/stop-hook.PAUSE`（POSIX：`$XDG_STATE_HOME/untildone/`） | 主路径 |
+| 4 | `%LOCALAPPDATA%/Overwatch/stop-hook.PAUSE`（POSIX：`…/overwatch/`） | **向后兼容，不许删** |
+
+本次判定命中的是哪一条，会记进台账的 `pauseHit` 字段；
+`node scripts/pre-write-gate.mjs status --cwd <项目>` 会把四条路径全部列出并标出命中项。
 刹车也共用同一份 `brake` / `denyBudget`，没有第二个预算。
 
 **它为什么默认关、以及这条判据的诚实边界**：

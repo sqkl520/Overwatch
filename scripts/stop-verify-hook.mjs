@@ -50,7 +50,6 @@
 
 import { appendFileSync, mkdirSync, existsSync, readFileSync, statSync, writeFileSync, realpathSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
-import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -59,6 +58,7 @@ import {
   familyName,
 } from './verify-claims.mjs';
 import { detectProjectCommands, commandHint } from './project-commands.mjs';
+import { stateRoot, STATE_DIR_NAME, LEGACY_DIR_NAME } from './state-dir.mjs';
 import { createHash } from 'node:crypto';
 import { claimOnce, claimKeyOf, recordSkipped } from './hook-dedupe.mjs';
 
@@ -110,14 +110,77 @@ export function modeOf(env = process.env) {
 // 子 agent / 后台任务 / 外部命令**停不了** —— 那需要宿主提供 abort 接口，
 // 本仓已把「实时干预运行中的会话」列为做不到（CAPABILITIES.md，ADR-0001 §代价·3）。
 
-/** L1 的闸门文件路径。放**仓库外**（`%LOCALAPPDATA%/Overwatch/`），两条理由：
+/** 叫停文件名。改名只影响**目录**，文件名不动 —— 用户手里已有的文件不必重命名。 */
+export const PAUSE_FILE_NAME = 'stop-hook.PAUSE';
+
+/** L1 的闸门文件路径族。放**仓库外**（`%LOCALAPPDATA%/<状态目录>/`），两条理由：
  *  ① 被 hook 的项目通常不是本仓库（模板里 `CLAUDE_PROJECT_DIR` 是用户当前项目），
  *     放 `tasks/runs/` 会落到别人的仓库里去；
- *  ② `DF-020` 记录过状态目录被整个清空且无告警，别把「唯一能关门的开关」也放进去。 */
+ *  ② `DF-020` 记录过状态目录被整个清空且无告警，别把「唯一能关门的开关」也放进去。
+ *
+ *  **为什么是一个列表而不是一个路径（`DF-041`，2026-11-21 修）**：
+ *  `state-dir.mjs` 把状态目录从 `Overwatch` / `overwatch` 改名成 `UntilDone` / `untildone`，
+ *  而这里此前硬编码旧名。后果是**闸关不掉**：用户按新文档在 `UntilDone/` 放文件不生效，
+ *  必须猜中旧目录才行 —— 而这是本 hook 唯一的叫停开关。
+ *
+ *  目录解析规则**刻意不照抄** `resolveStateDir()` 的「新存在用新、否则用旧」：
+ *  那条规则的目的是「别让历史数据看起来消失了」，对**数据**正确；而 PAUSE 文件的语义是
+ *  「用户要求停止」。用户可能因为看到旧文档、旧脚本、或自己迁移到一半，把文件放在任一处。
+ *  所以这里的方向是 **fail-safe：任何一条候选路径存在都算叫停**（宁可多放行一次，
+ *  不可漏掉一次叫停）。
+ *
+ *  候选顺序 = 优先级，主路径在前：
+ *    1. `OVERWATCH_STOP_VERIFY_PAUSE`（显式指定，唯一生效，不叠加）
+ *    2. `$OVERWATCH_STATE_DIR/stop-hook.PAUSE` —— 本仓统一的临时区变量。两个 hook 与
+ *       `hook-dedupe` 都认它，「我把副作用关进临时目录了」这句话对叫停路径也必须为真
+ *       （`DF-041` 影响 2）。
+ *    3. `<stateRoot>/UntilDone|untildone/stop-hook.PAUSE` —— 新目录
+ *    4. `<stateRoot>/Overwatch|overwatch/stop-hook.PAUSE` —— 旧目录（**向后兼容，不许删**）
+ *
+ *  路径拼接**复用 `state-dir.mjs` 的 `stateRoot()` 与两个目录名常量**，不在本文件写第三份。
+ *  此前那段 `env.LOCALAPPDATA || env.XDG_STATE_HOME || join(homedir(), '.local', 'state')`
+ *  在 win32 上没有 `%LOCALAPPDATA%` 时会回落到 `.local/state`，与 `state-dir.mjs` 的
+ *  `AppData/Local` 不是同一个地方 —— 同一台机器两个「状态根」正是本仓反复付账的那类漂移。 */
+export function pausePathsFor(env = process.env) {
+  const explicit = String(env.OVERWATCH_STOP_VERIFY_PAUSE || '').trim();
+  if (explicit) return [explicit];
+
+  const plat = process.platform === 'win32' ? 'win32' : 'posix';
+  const out = [];
+  const stateDir = String(env.OVERWATCH_STATE_DIR || '').trim();
+  if (stateDir) out.push(join(stateDir, PAUSE_FILE_NAME));
+  try {
+    const root = stateRoot(env);
+    out.push(join(root, STATE_DIR_NAME[plat], PAUSE_FILE_NAME));
+    out.push(join(root, LEGACY_DIR_NAME[plat], PAUSE_FILE_NAME));
+  } catch { /* 连状态根都算不出来：至少保留上面那条显式路径 */ }
+
+  // 去重（`OVERWATCH_STATE_DIR` 恰好指到状态目录本身时会出现重复项）。
+  return [...new Set(out)];
+}
+
+/** **主**闸门文件路径 = `pausePathsFor()` 的第一项。
+ *
+ *  保留这个名字是因为它在 `pre-write-gate.mjs`、模板与文档里已被引用；语义从
+ *  「唯一路径」变成「用户最该放文件的那一个」。**判定不走它** —— 判定走
+ *  `pausedPathOf()` 的全量候选，否则旧路径上的文件会被这条主路径挡住。 */
 export function pausePathFor(env = process.env) {
-  if (env.OVERWATCH_STOP_VERIFY_PAUSE) return env.OVERWATCH_STOP_VERIFY_PAUSE;
-  const base = env.LOCALAPPDATA || env.XDG_STATE_HOME || join(homedir(), '.local', 'state');
-  return join(base, 'Overwatch', 'stop-hook.PAUSE');
+  const all = pausePathsFor(env);
+  return all[0] || join(stateRoot(env), STATE_DIR_NAME.posix, PAUSE_FILE_NAME);
+}
+
+/** L1：返回**命中的那条**路径；没命中返回 null。
+ *
+ *  与 `isPaused()` 分开是为了可观测：只回布尔的话，「用户想停」与「用户把文件放错了地方」
+ *  在日志与 `status` 输出里长得一样。命中的是哪一条要能说出来。 */
+export function pausedPathOf(env = process.env) {
+  let paths;
+  try { paths = pausePathsFor(env); } catch { return null; }
+  for (const p of paths) {
+    if (!p) continue;
+    try { if (existsSync(p)) return p; } catch { /* 单条读不了不影响其余候选 */ }
+  }
+  return null;
 }
 
 /** L1：闸门文件存在 = 用户要求停止拦截。**必须在任何判定之前检查**。
@@ -125,7 +188,7 @@ export function pausePathFor(env = process.env) {
  *  「不可被 hook 覆盖」= hook 的任何分支都无法越过它。它**可以**被模型用 Bash 删掉 ——
  *  但那是一次会在 transcript 里留痕的操作，事后可审计。这里不假装它是安全的。 */
 export function isPaused(env = process.env) {
-  try { return existsSync(pausePathFor(env)); } catch { return false; }
+  return pausedPathOf(env) !== null;
 }
 
 /** L2：最后一条**真人**消息是否晚于上次拦截 → 用户已经表态，此后不再拦。
@@ -869,12 +932,19 @@ export function runHook({ input, env = process.env, nowMs = Date.now(), sampleLo
     // L1（闸门文件）在最前，因为它是唯一与上下文无关的一层 —— 用户不需要理解
     // 这个 hook 判什么，只要让文件存在就能关门。
     if (mode === 'block' && isPaused(env)) {
+      // **记「命中的是哪一条」，不记主路径。** 两个候选都检查之后，
+      // 「用户想停」与「用户把文件放错了地方」在布尔层面长得完全一样 ——
+      // 而后者正是 `DF-041` 这次要修的那种事故。`pausePath` 保留（旧字段，勿破坏台账消费方），
+      // 新增 `pausePaths`（正在检查的全集）与 `pauseHit`（真命中的那一条），
+      // 于是「我放的是 UntilDone，为什么日志说 Overwatch」不用猜。
       appendLog({
         at: new Date(nowMs).toISOString(), sessionId, mode,
         hookEventName: safeString(i.hook_event_name) || null,
         stopHookActive: Boolean(i.stop_hook_active),
         outcome: 'allowed-user-paused',
         pausePath: pausePathFor(env),
+        pauseHit: pausedPathOf(env),
+        pausePaths: pausePathsFor(env).length,
       }, env, nowMs);
       return null;
     }

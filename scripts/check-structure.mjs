@@ -13,6 +13,9 @@ import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join, relative, extname, dirname, resolve } from 'node:path';
 
+import { publishedPathViolations, findKnownIdentifiers } from './published-paths.mjs';
+import { scanLinks, KIND_TEXT } from './link-check.mjs';
+
 const ROOT = process.cwd();
 const violations = [];
 const warnings = [];
@@ -24,7 +27,19 @@ const warn = (file, msg) => warnings.push({ file, msg });
 
 /** 可发布区：出现本机盘符即为违规（ADR-0001 §发布区零盘符） */
 const PUBLISHED_DIRS = ['docs', 'templates', 'rules', 'scripts', 'spec-adr'];
-const PUBLISHED_FILES = ['README.md', 'CLAUDE.md', 'LICENSE', 'CONTRIBUTING.md'];
+/** 根级文件同属可发布区。
+ *
+ *  `SECURITY.md` 曾不在这里 —— 它是**最该被扫的那一份**：安全披露文档天然会把
+ *  攻击面写成具体路径（「`scripts/x.mjs` 的这一段会被注入」），一旦抄进本机绝对路径，
+ *  泄漏的既是身份也是可打击点。审计指出它不在扫描范围内（`DF-039`）。
+ *
+ *  修法不是「把 SECURITY.md 加进这个数组」，而是**根级 `.md` 一律自动纳入**：
+ *  手写清单的失效方式是结构性的 —— 下一次有人加一份根级文档，它照样不在名单里，
+ *  而门照样绿。这与 `checkTestCount()` 拒写死数字、选择数源码是同一个理由。
+ *  这个数组只留「非 `.md` 但必须扫」的例外。 */
+const PUBLISHED_FILES_EXTRA = ['LICENSE'];
+/** 根级目录不扫（产物 / 依赖 / 私有台账），其余根级文件按扩展名决定。 */
+const ROOT_SCAN_SKIP = new Set(['node_modules', 'dist', 'tasks', 'local', '.git']);
 
 /** 私有区：允许出现本机路径，但必须被 .gitignore 排除 */
 const PRIVATE_PATHS = ['tasks/runs', 'local', '.claude/settings.local.json', 'CLAUDE.local.md'];
@@ -94,19 +109,68 @@ function isGitignored(path) {
   });
 }
 
+/** 「这个根级文件会不会随仓库发出去」——即 git 眼里的可发布集。
+ *
+ *  不用 `isGitignored()` 判：那个函数只做精确/前缀匹配，不展开 glob，而 `.gitignore`
+ *  里恰恰全是 glob（`.tmp-*`、`dist/`、`*.log`）。实测漏判：根目录下一个 `.tmp-qa.json`
+ *  （另一个会话的草稿）被判成「可发布」，硬门于是报了一条跟产品毫无关系的违规。
+ *
+ *  可发布区的定义本来就是「会随仓库发出去的内容」，那就让 git 回答：
+ *  已跟踪的 + 未跟踪但未被忽略的。干净 clone 上这两种恰好等于仓库里的全部文件。
+ *  不是 git 仓库（解压后的发布包）时返回 null，调用方退化为「按扩展名扫全部」。 */
+function gitPublishableRootFiles() {
+  const run = (args) => {
+    const r = spawnSync('git', args, { cwd: ROOT, encoding: 'utf8' });
+    return r.status === 0 ? String(r.stdout || '') : null;
+  };
+  const tracked = run(['ls-files', '-z']);
+  if (tracked === null) return null;
+  const untracked = run(['ls-files', '--others', '--exclude-standard', '-z']) || '';
+  const out = new Set();
+  for (const rec of (tracked + untracked).split('\0')) {
+    if (!rec) continue;
+    const name = rec.replace(/\\/g, '/');
+    if (name.includes('/')) continue;          // 只看根级
+    out.add(name);
+  }
+  return out;
+}
+
 // ── 检查 1：可发布区零盘符 ────────────────────────────────────────────
 
+/** 判据本体在 `scripts/published-paths.mjs`（纯函数，有单测）。
+ *  这里只负责「扫哪些文件、怎么报」。
+ *
+ *  **为什么把正则搬出去**：原先它写在这个文件里，而 `check-structure.mjs` 一被 import
+ *  就跑完全部门禁并 `process.exit()`，于是它**一条测试都写不了**。结果是一个只认 7 个
+ *  固定前缀（`Users|Projects|Server|Java|maven|Nodejs|Git`）的正则在这里活了很久，
+ *  凡是不在这 7 个前缀下的本机路径全部漏过，硬门照绿（`DF-039`）。
+ *  判据搬出去之后，「正则漏了某个形态」会直接红在测试上。
+ *  具体漏过的字面量写在 `published-paths.test.mjs`（测试文件被 `PATH_EXEMPT` 豁免）。
+ */
 function checkAbsolutePaths() {
-  const WIN_PATH = /[A-Za-z]:[\\/](?:Users|Projects|Server|Java|maven|Nodejs|Git)[^\s)"'`]*/g;
   const targets = [];
 
   for (const d of PUBLISHED_DIRS) {
     if (!existsSync(join(ROOT, d))) continue;
     targets.push(...walk(join(ROOT, d)));
   }
-  for (const f of PUBLISHED_FILES) {
+  // 根级文件：会随仓库发出去的那些，全部自动纳入（含 SECURITY.md / README-EN.md）。
+  //
+  // **判「会不会发出去」用 git，不用手写清单、也不用 `isGitignored()`**：
+  //  - 手写清单的失效方式是结构性的（加一份根级文档，它就不在名单里，门照样绿）——
+  //    与 `checkTestCount()` 拒写死数字是同一个理由；
+  //  - `isGitignored()` 不展开 glob，实测把一个 `.tmp-qa.json` 草稿判成「可发布」，
+  //    硬门于是报了一条跟产品毫无关系的违规。
+  const publishable = gitPublishableRootFiles();
+  const rootFiles = publishable
+    ? [...publishable]
+    : readdirSync(ROOT).filter((f) => !ROOT_SCAN_SKIP.has(f) && !isGitignored(f));
+  for (const f of [...PUBLISHED_FILES_EXTRA, ...rootFiles]) {
     const p = join(ROOT, f);
-    if (existsSync(p)) targets.push(p);
+    if (!existsSync(p) || !statSync(p).isFile()) continue;
+    if (!['.md', '.mjs', '.js', '.json', '.yml', '.yaml', '.txt'].includes(extname(f))) continue;
+    targets.push(p);
   }
   if (existsSync(join(ROOT, '.claude', 'agents'))) {
     targets.push(...walk(join(ROOT, '.claude', 'agents')));
@@ -118,16 +182,39 @@ function checkAbsolutePaths() {
     if (!['.md', '.mjs', '.js', '.json', '.yml', '.yaml', '.txt'].includes(extname(file))) continue;
     let text;
     try { text = readFileSync(file, 'utf8'); } catch { continue; }
-    const hits = text.match(WIN_PATH);
-    if (hits) {
-      // 文档里作为「反例」引用的本机路径是允许的，但必须是行内代码且带说明
-      const meaningful = [...new Set(hits)].filter((h) => {
-        const line = text.split('\n').find((l) => l.includes(h)) || '';
-        return !(line.includes('反例') || line.includes('示例') || line.includes('例如') || line.includes('实测'));
-      });
-      for (const h of meaningful) {
-        fail(r, `可发布区出现本机绝对路径：${h.slice(0, 60)}`);
-      }
+    // 逐个报「行号 + 路径」，不再报「第几次出现」。旧版的 `text.split('\n').find(l => l.includes(h))`
+    // 取的是**第一个含该子串的行**，于是同一个路径在文件里出现十次时，九次的真实位置丢失。
+    for (const v of publishedPathViolations(text)) {
+      fail(r, `第 ${v.line} 行出现本机绝对路径：${v.path.slice(0, 90)}`
+        + '（改成 `<repo>` / `D:\\…` 这类占位符，或放进 tasks/ 私有区）');
+    }
+    // 第二个判据：**没有盘符前缀**的本机标识符。上面那条正则认的是「盘符 + 分隔符」，
+    // 而 TUI 的路径副行只印目录尾段 —— 真实中文项目名可以整串裸奔在文档里。
+    // 这里**故意不回报原文**：回报等于把泄漏重复一遍到硬门输出与 CI 日志里。
+    for (const v of findKnownIdentifiers(text)) {
+      fail(r, `第 ${v.line} 行出现已知的本机标识符（无盘符前缀，故路径判据抓不到）。`
+        + '改成同形态假名，或在截图旁声明项目名已脱敏');
+    }
+  }
+
+  // 台账（`tasks/`）单列：**只跑标识符判据，不跑路径判据。**
+  //
+  // 为什么不跑路径判据：台账里存的是**脱敏后的对照夹具**（盘符 + 假目录名、
+  // 假 SDK 安装根、假应用安装位），它们是「改成了什么」的证据，不是本机事实。
+  // 对它们报违规只会逼人把证据也删掉。
+  //
+  // 为什么标识符判据必须覆盖台账：台账在可发布区（CLAUDE.md 目录归属表标「是」），
+  // 且**被 git 跟踪**。上一轮的判断（「`tasks/` 不在扫描范围，所以留原文没事」）只对了一半：
+  // 范围外只是「门不管」，而门不管的文件照样随公开仓库发出去 —— 那正是把泄漏从一份文件
+  // 搬到另一份。这一条由 `DF-039` 第二轮的实事故钉住。
+  for (const f of ['tasks/dev-findings.md', 'tasks/accepted-deviations.md']) {
+    const p = join(ROOT, f);
+    if (!existsSync(p)) continue;
+    let text;
+    try { text = readFileSync(p, 'utf8'); } catch { continue; }
+    for (const v of findKnownIdentifiers(text)) {
+      fail(f, `第 ${v.line} 行出现已知的本机标识符。台账也随仓库发布 ——`
+        + '把原文写进台账 = 把泄漏搬到隔壁文件');
     }
   }
 }
@@ -380,7 +467,12 @@ const PROBE_ARGS = {
   decide: '[{ input: {}, records: [] }]', buildReason: '[{}]',
   logPathFor: '[{}]', statePathFor: '[{}]', readBlockCount: '["s", { env: {} }]',
   // 2026-11-16 用户叫停三层：全部纯读，无副作用。
-  pausePathFor: '[{}]', isPaused: '[{}]', lastBlockAt: '["s", { env: {} }]',
+  // 2026-11-21 `DF-041`：路径从「一个」变成「一族」（新旧状态目录都认），
+  // 探针三种都登记 —— `pausePathsFor` 空 env 必须返回**非空**数组（返回空 = 闸关不掉），
+  // 这一条由 `stop-verify-hook.test.mjs` 的 `DF-041` 用例守。
+  pausePathFor: '[{}]', pausePathsFor: '[{}]', pausedPathOf: '[{}]',
+  isPaused: '[{}]', lastBlockAt: '["s", { env: {} }]',
+  PAUSE_FILE_NAME: '[]',
   userIntervenedSince: '["s", { records: [], env: {} }]',
   readTotalBlocks: '["s", { env: {} }]',
   // 2026-11-18 `DF-029`：Stop 的去重键构造。纯函数，空输入必须返回 null 而不是抛
@@ -671,6 +763,30 @@ const PROBE_ARGS = {
   isAskToolName: '["AskUserQuestion"]',
   DEFAULT_MAX_SCAN_BYTES: '[]',
 
+  // published-paths.mjs（`DF-039`）：判据是纯函数，探针取最小可构造输入。
+  // 给一个**不含任何路径**的短串：「没有命中」是它们的正常分支，正好顺带验一遍；
+  // 正确性（能不能抓到 / 会不会误放行）由 published-paths.test.mjs 逐条钉。
+  normalizePathHit: '"x"',
+  pathKeyOf: '"x"',
+  isPlaceholderPath: '["D:\\\\x"]',
+  findAbsolutePaths: '"no paths here"',
+  publishedPathViolations: '"line one\\nline two"',
+  // 2026-11-21 第二轮：已知本机标识符判据。探针给一个**不含任何中文**的串 ——
+  // 「没有命中」是它的正常分支；命中路径由 published-paths.test.mjs 用假名字钉。
+  knownIdentifierKeyOf: '"probe"',
+  findKnownIdentifiers: '"no identifiers here"',
+
+  // link-check.mjs（`DF-040`：文档相对链接的唯一判据）。
+  // 纯函数给最小可构造输入：一段不含任何链接的文本必须安全返回空结果。
+  // 读盘的三个（markdownFiles / publishableFiles / scanLinks）**不能进探针**：
+  // 它们会 spawn git、并遍历整仓 170 份 .md —— 那正是「把跑一遍放进硬门」的灾难
+  // （同 checkDocCommands 上方的理由）。它们的正确性由 link-check.test.mjs
+  // 的临时目录端到端用例覆盖，`scanLinks` 也在那里用小目录真的跑一遍。
+  stripCode: '"```\\nx\\n```"', slugifyAnchor: '"🚀 30 秒上手"',
+  anchorsOf: '"# x"', isExternalLink: '"https://x"', linkOccurrences: '"no links"',
+  describeBroken: '[{ file: "a.md", link: "b.md", line: 1, kind: "MISSING" }]',
+  checkFileLinks: '[{ root: "/nonexistent-ow-probe", file: "a.md", text: "no links" }]',
+
   // observe-reality-check.mjs（2026-11-14 写前闸的真实语料重放）：
   // 判定函数全是纯的，探针取最小可构造输入。读盘的几个用不存在的路径 ——
   // 那正是「什么都没有」的正常路径，顺带把空分支也验一遍。
@@ -907,29 +1023,22 @@ function checkImportable() {
 // ── 检查 9：文档相对链接 ──────────────────────────────────────────────
 
 /** 相对链接必须按其所在目录解析。曾用仓库根当基准，导致 `../adr/x.md`
- *  这类正确链接被误报为断链，于是检查器只好退化成建议门。 */
+ *  这类正确链接被误报为断链，于是检查器只好退化成建议门。
+ *
+ *  **判据本体搬到 `scripts/link-check.mjs`**（`DF-040`）。原先这里和
+ *  `check-links.mjs` 是**两份实现、同一份手写文件清单**：
+ *
+ *      const files = ['README.md', 'CLAUDE.md'] ... walkMd(join(ROOT, 'docs'))
+ *
+ *  于是根级 `CONTRIBUTING.md` / `CONTRIBUTING-EN.md` / `SECURITY.md` / `SECURITY-EN.md`
+ *  一份都不在范围内，两边都报「0 断链」。手写清单的失效方式是结构性的 ——
+ *  与 `checkAbsolutePaths()` 判「会不会发出去」弃用手写清单是同一个理由。
+ *
+ *  现在两边共用一份判据、一份范围（问 git），并且判据有单测
+ *  （`link-check.test.mjs`）。这里只负责把结果转成 `fail()`。 */
 function checkLinks() {
-  const files = ['README.md', 'CLAUDE.md'].filter((f) => existsSync(join(ROOT, f)));
-  const walkMd = (d) => {
-    if (!existsSync(d)) return;
-    for (const e of readdirSync(d, { withFileTypes: true })) {
-      const p = join(d, e.name);
-      if (e.isDirectory()) walkMd(p);
-      else if (e.name.endsWith('.md')) files.push(p);
-    }
-  };
-  walkMd(join(ROOT, 'docs'));
-
-  for (const f of files) {
-    let text;
-    try { text = readFileSync(f, 'utf8'); } catch { continue; }
-    const dir = dirname(f);
-    for (const m of text.matchAll(/\]\(([^)#\s]+\.md)(?:#[^)]*)?\)/g)) {
-      if (!existsSync(resolve(dir, m[1]))) {
-        fail(rel(f), `文档链接指向不存在的文件：${m[1]}`);
-      }
-    }
-  }
+  const { broken } = scanLinks({ root: ROOT });
+  for (const b of broken) fail(b.file, `第 ${b.line} 行${KIND_TEXT[b.kind] || '链接有问题'}：${b.link}`);
 }
 
 /** 参数白名单的代价：新加的纯函数若忘了登记，就不会被探到。
@@ -1113,7 +1222,8 @@ function checkUnregisteredExports() {
     'MAX_BLOCKS', 'RESET_AFTER_MS', 'modeOf', 'parseHookInput', 'readStdin',
     'resolveAssistantText', 'decide', 'buildReason', 'logPathFor', 'appendLog',
     'statePathFor', 'bumpBlockCount', 'resetBlockCount', 'readBlockCount', 'readTotalBlocks', 'runHook',
-    'pausePathFor', 'isPaused', 'lastBlockAt', 'userIntervenedSince',
+    'pausePathFor', 'pausePathsFor', 'pausedPathOf', 'PAUSE_FILE_NAME',
+    'isPaused', 'lastBlockAt', 'userIntervenedSince',
     // 2026-11-18 `DF-029`：Stop 的去重键构造（纯函数，输入进、字符串出）。
     'stopTurnKeyOf',
     'loadRecords', 'loadSubagentRecords', 'SUBAGENT_TAIL_BYTES',
@@ -1354,6 +1464,32 @@ function checkUnregisteredExports() {
   ];
   for (const k of OBSERVE_REALITY_FNS) REGISTERED.add(k);
 
+  // published-paths.mjs（`DF-039`：「可发布区零盘符」判据的唯一实现）。
+  // 四个函数已进 PROBE_ARGS 实际调用（探针取一个不含任何路径的短串：必须安全返回
+  // 空数组 / 原样字符串，不抛）。三个正则/表常量是**数据**，不是函数。
+  // 2026-11-21 第二轮加了「无盘符前缀的本机标识符」判据（散列黑名单）：
+  // `knownIdentifierKeyOf` / `findKnownIdentifiers` 进 PROBE_ARGS 实际调用，
+  // `KNOWN_LOCAL_IDENTIFIERS` 是数据（而且**故意不可读回**，见该常量上方注释）。
+  const PUBLISHED_PATHS_FNS = [
+    'WIN_ABS_RE', 'POSIX_ABS_RE', 'PLACEHOLDER_LITERALS',
+    'normalizePathHit', 'pathKeyOf', 'isPlaceholderPath',
+    'findAbsolutePaths', 'publishedPathViolations',
+    'KNOWN_LOCAL_IDENTIFIERS', 'knownIdentifierKeyOf', 'findKnownIdentifiers',
+  ];
+  for (const k of PUBLISHED_PATHS_FNS) REGISTERED.add(k);
+
+  // link-check.mjs（`DF-040`：文档相对链接的唯一判据）。
+  // 六条纯函数已进 PROBE_ARGS 实际调用；`markdownFiles` / `publishableFiles` /
+  // `scanLinks` 要 spawn git 并遍历全仓（170 份 .md），**不能**进硬门 ——
+  // 它们的正确性由 link-check.test.mjs 在临时目录里真的跑一遍覆盖。
+  // `KIND_TEXT` 是数据（一张文案表），不是函数。
+  const LINK_CHECK_FNS = [
+    'KIND_TEXT',
+    'stripCode', 'slugifyAnchor', 'anchorsOf', 'isExternalLink', 'linkOccurrences',
+    'describeBroken', 'checkFileLinks', 'markdownFiles', 'publishableFiles', 'scanLinks',
+  ];
+  for (const k of LINK_CHECK_FNS) REGISTERED.add(k);
+
   // compose-agent-prompt.mjs（2026-11-14 提示词分层拼装）：判定层纯函数已进 PROBE_ARGS
   // 实际调用，这里显式登记免得被「未登记导出」刷屏。main 是 CLI 入口，
   // 由 compose-agent-prompt.test.mjs 的端到端用例覆盖。
@@ -1581,6 +1717,11 @@ function checkStopHookKillSwitch() {
   const required = [
     { name: 'isPaused', call: 'isPaused', label: 'L1 文件闸（`isPaused()` 且真被调用）' },
     { name: 'pausePathFor', call: 'pausePathFor', label: 'L1 闸门文件路径（可调用）' },
+    // `DF-041`：叫停路径必须是一**族**而不是一个。判据是「有可调用的导出 + 有调用点」——
+    // 退回硬编码单个路径的形态会让 `pausePathsFor` 连同旧目录的兼容一起消失，
+    // 而那正是「闸关不掉」的成因。
+    { name: 'pausePathsFor', call: 'pausePathsFor', label: 'L1 叫停路径族（`pausePathsFor()` 且真被调用）' },
+    { name: 'pausedPathOf', call: 'pausedPathOf', label: 'L1 命中路径（`pausedPathOf()` 且真被调用 —— 可观测性）' },
     { name: 'userIntervenedSince', call: 'userIntervenedSince', label: 'L2 用户发话（`userIntervenedSince()` 且真被调用）' },
   ];
   const missing = [];

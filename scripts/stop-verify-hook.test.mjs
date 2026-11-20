@@ -23,7 +23,8 @@ import { tmpdir } from 'node:os';
 import {
   decide, buildReason, modeOf, parseHookInput, resolveAssistantText,
   readBlockCount, readTotalBlocks, bumpBlockCount, resetBlockCount, appendLog, logPathFor, statePathFor,
-  isPaused, pausePathFor, userIntervenedSince, lastBlockAt,
+  isPaused, pausePathFor, pausePathsFor, pausedPathOf, PAUSE_FILE_NAME,
+  userIntervenedSince, lastBlockAt,
   runHook, loadSubagentRecords, BLOCKING_STATUS, MAX_BLOCKS, ESCALATE_AT, RESET_AFTER_MS,
   samplePathFor, sampleLogEnabled, toolSummaryOf, buildSample, appendSample,
   rawFamilyHits, SAMPLE_TEXT_LIMIT, stopTurnKeyOf,
@@ -954,7 +955,145 @@ test('L2 接线：runHook 真的在拦截前查了「用户是否已发话」（
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-// ── 15. `DF-029`：同一个回合结束点被触发两次时，只判一次、只记一行 ────────
+// ── 14b. `DF-041`：叫停文件必须新旧状态目录都认 ───────────────────────
+//
+// 缺陷：`pausePathFor()` 硬编码旧目录名 `Overwatch`，用户按新文档在 `UntilDone/` 放
+// PAUSE 不生效 —— 而这是**唯一的叫停开关**，放错地方意味着闸关不掉。
+//
+// 判定方向与 `state-dir.mjs` 的「新存在用新、否则用旧」**刻意不同**：那条规则是为
+// 「别让历史数据看起来消失了」服务的；PAUSE 文件的语义是「用户要求停止」，
+// 所以**任一候选存在即暂停**（fail-safe：宁可多放行一次，不可漏掉一次叫停）。
+
+/** 把「状态根」指到临时目录。`stateRoot()` 按 `process.platform` 选变量，
+ *  两个都给，测试才在 Windows 与 Linux 上都走同一条分支、且**都不碰真实家目录**。 */
+const rootEnv = (root, extra = {}) => ({
+  LOCALAPPDATA: root, XDG_STATE_HOME: root, ...extra,
+});
+
+/** 状态目录名按平台取，不写死 `UntilDone` —— 硬编码平台名会让这条测试在 Linux 上假红。 */
+const DIR_NAMES = process.platform === 'win32'
+  ? { next: 'UntilDone', prev: 'Overwatch' }
+  : { next: 'untildone', prev: 'overwatch' };
+
+const pauseIn = (root, which) => join(root, DIR_NAMES[which], 'stop-hook.PAUSE');
+
+test('DF-041：只在新状态目录放 PAUSE → 暂停（改前 false，这就是缺陷本身）', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ow-df041-new-'));
+  try {
+    mkdirSync(join(root, DIR_NAMES.next), { recursive: true });
+    writeFileSync(pauseIn(root, 'next'), '');
+    const env = rootEnv(root);
+    assert.equal(pausedPathOf(env), pauseIn(root, 'next'), '命中的必须是新路径那一条');
+    assert.equal(isPaused(env), true, '新目录的 PAUSE 必须生效 —— 否则闸关不掉');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('DF-041：只在旧状态目录放 PAUSE → 仍然暂停（向后兼容，不许删）', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ow-df041-old-'));
+  try {
+    mkdirSync(join(root, DIR_NAMES.prev), { recursive: true });
+    writeFileSync(pauseIn(root, 'prev'), '');
+    const env = rootEnv(root);
+    assert.equal(pausedPathOf(env), pauseIn(root, 'prev'));
+    assert.equal(isPaused(env), true,
+      '旧路径必须仍然生效：现有用户机器上可能早有这个文件，无视它 = 静默解除他们的叫停');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('DF-041：两处都放 PAUSE → 暂停，且命中的是**主路径**（新目录优先）', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ow-df041-both-'));
+  try {
+    for (const w of ['next', 'prev']) {
+      mkdirSync(join(root, DIR_NAMES[w]), { recursive: true });
+      writeFileSync(pauseIn(root, w), '');
+    }
+    const env = rootEnv(root);
+    assert.equal(isPaused(env), true);
+    assert.equal(pausedPathOf(env), pauseIn(root, 'next'),
+      '两条都在时报告主路径 —— 「命中哪一条」不能随 candidate 遍历顺序漂移');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('DF-041：两处都没有 → 不暂停（负向：证明上面三条不是恒真）', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ow-df041-none-'));
+  try {
+    const env = rootEnv(root);
+    assert.equal(pausedPathOf(env), null);
+    assert.equal(isPaused(env), false);
+    // 目录存在但文件不在，同样不算 —— 判的是文件，不是目录。
+    for (const w of ['next', 'prev']) mkdirSync(join(root, DIR_NAMES[w]), { recursive: true });
+    assert.equal(isPaused(env), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('DF-041：OVERWATCH_STOP_VERIFY_PAUSE 仍然优先，且路径族收敛为它一条', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ow-df041-explicit-'));
+  try {
+    // 状态根里两个默认位置都放上，显式变量指向第三条 —— 显式的那条决定一切。
+    for (const w of ['next', 'prev']) {
+      mkdirSync(join(root, DIR_NAMES[w]), { recursive: true });
+      writeFileSync(pauseIn(root, w), '');
+    }
+    const explicit = join(root, 'explicit.PAUSE');
+    const env = rootEnv(root, { OVERWATCH_STOP_VERIFY_PAUSE: explicit });
+    assert.deepEqual(pausePathsFor(env), [explicit],
+      '显式指定时不叠加默认候选：用户说了「就是这一个」，就不该再也关不掉');
+    assert.equal(isPaused(env), false, '显式路径不存在 → 不暂停（即便默认位置上还有文件）');
+    writeFileSync(explicit, '');
+    assert.equal(pausedPathOf(env), explicit);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('DF-041：OVERWATCH_STATE_DIR 对叫停文件也生效（DF-041 影响 2）', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ow-df041-statedir-'));
+  try {
+    // 「我用 OVERWATCH_STATE_DIR 把副作用关进临时目录了」这句话，对叫停路径也必须为真。
+    const stateDir = join(root, 'isolated');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, 'stop-hook.PAUSE'), '');
+    const env = rootEnv(join(root, 'unused'), { OVERWATCH_STATE_DIR: stateDir });
+    assert.equal(isPaused(env), true);
+    assert.equal(pausedPathOf(env), join(stateDir, 'stop-hook.PAUSE'));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('DF-041：pausePathsFor 永不返回空 —— 空候选 = 静默的闸关不掉', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ow-df041-shape-'));
+  try {
+    const paths = pausePathsFor(rootEnv(root));
+    assert.ok(paths.length >= 2, '至少要有新 + 旧两条');
+    assert.ok(paths.every((p) => p.endsWith('stop-hook.PAUSE')));
+    assert.equal(paths[0], pausePathFor(rootEnv(root)), '主路径 = 候选第一项');
+    assert.equal(new Set(paths).size, paths.length, '候选不得重复（existsSync 多查一次是浪费，判断也会含糊）');
+    // 空 env 也要能算出来（回落到状态根本身），不许抛。
+    assert.ok(pausePathsFor({}).length >= 2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('DF-041 接线：runHook 因**旧路径**的 PAUSE 放行，且日志记下命中的是哪一条', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ow-df041-wire-'));
+  try {
+    const dir = join(root, 'work');
+    mkdirSync(dir, { recursive: true });
+    // 工作目录与状态根分开：状态根放 PAUSE，日志/state/dedupe 都在 work 下。
+    const env = envIn(dir, { OVERWATCH_STOP_VERIFY: 'block', ...rootEnv(root) });
+    assert.ok(runHook({ input: inputOf({ cwd: dir }), env, sampleLog: false }),
+      '前提：没有 PAUSE 时这个输入会被拦');
+
+    mkdirSync(join(root, DIR_NAMES.prev), { recursive: true });
+    writeFileSync(pauseIn(root, 'prev'), '');
+    assert.equal(runHook({ input: inputOf({ cwd: dir, prompt_id: 'p-2' }), env, sampleLog: false }), null);
+
+    const rows = readFileSync(env.OVERWATCH_STOP_VERIFY_LOG, 'utf8').trim().split('\n').map(JSON.parse);
+    const last = rows[rows.length - 1];
+    assert.equal(last.outcome, 'allowed-user-paused');
+    assert.equal(last.pauseHit, pauseIn(root, 'prev'),
+      '「用户想停」与「用户放错了地方」只能靠这一项区分 —— 必须记下真命中的路径');
+    assert.equal(last.pausePath, pausePathFor(env), '旧字段保留，台账消费方不被破坏');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
 //
 // 场景：`.claude/settings.local.json` 注册了本 hook，`overwatch launch` 又用
 // `--settings` 注入同名一条，宿主的实测行为是**叠加** —— 同一次 Stop 起两个进程。
