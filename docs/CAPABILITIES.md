@@ -119,8 +119,25 @@ hook 进程的环境变量继承自**宿主进程**，不是你的终端。桌�
 （测试用「0 时连 transcript 都不读」钉住了这一点，不是看代码里有没有 `if`）。
 
 `N > 0` 时：第一次写文件之前，transcript 里必须已经有 ≥N 个**去重后**的问题
-（`AskUserQuestion` + `ExitPlanMode`，与 `measure-ask-vs-tell.mjs` 同一口径）。
+（`AskUserQuestion` + `ExitPlanMode`，判据实现是 `pre-write-gate.mjs` 的 `isAskToolName()`）。
+**注意三处判据并不统一，如实列出**：
+
+| 模块 | 认哪些 | 与闸门是否一致 |
+|---|---|---|
+| `pre-write-gate.mjs`（本条判据） | `AskUserQuestion` + `ExitPlanMode`（大小写敏感） | — |
+| `measure-ask-vs-tell.mjs` | 同两个名字，但先小写化再比较 | 行为等价（宿主给的工具名大小写固定） |
+| `question-audit.mjs` | 主分支**硬编码只认 `AskUserQuestion`** | **不一致**：只有 `ExitPlanMode` 的会话，闸门数 1、审计数 0 |
+
+此前这里写「三处一处口径」——**那句话是假的**，`measure-ask-vs-tell.mjs` 根本没 import
+`isAskToolName`，`question-audit.mjs` 的主分支也不走它。2026-11-20 独立验收判 FAIL 时指出。
 只判**第一次写** —— 写过就不再判，写到一半才拦会打断正在进行的活。
+「写过」的定义是**真写成过**：该调用的 `tool_result` 存在且不是错误。
+被闸门拒掉的那次写不算（否则「拒 → 重试」会把判据自己解除）。
+
+**子 agent 不参与这条判据**（直接放行，日志记 `questions:"subagent-exempt"`）。
+理由是硬的：`oversight-executor` / `oversight-repair` 的工具白名单里没有 `AskUserQuestion`，
+被拒后它物理上做不到 reason 要求的事；而且子 agent 的调用 `transcript_path` 指向主 transcript，
+拿主 transcript 的计数去判子 agent 的第一次写，判的是别人的账。
 
 | 步骤 | 做什么 |
 |---|---|
@@ -145,7 +162,7 @@ node scripts/pre-write-gate.mjs status --cwd D:\你的项目    # 看 minQuestio
 
 | 顺序 | 判据 | 什么时候放行 |
 |---|---|---|
-| 0 | `minQuestionsBeforeWrite` | 问够了 N 个不同问题，或**这个会话已经写过文件** |
+| 0 | `minQuestionsBeforeWrite` | 问够了 N 个不同问题，或**这个会话真写成过文件**，或这是子 agent（有 `agent_id`） |
 | 1 | Edit 侧：`target-read` | 读过**这个文件本身** |
 | 2 | Write 侧：`minReads` | 读过 ≥N 个**不同**文件 |
 
@@ -161,7 +178,18 @@ node scripts/pre-write-gate.mjs status --cwd D:\你的项目    # 看 minQuestio
 - 形态不可读的提问（`questions` 是坏 JSON，实测 6/197 次）**不参与判定**：
   解析失败 ≠ 没问，把它当 0 会拦一个按规矩做了的会话。
 - transcript 读不到、配置是垃圾、键值超范围 → 一律回落到 `0`（不拦）。
+- **长会话不会永久锁死。** 尾窗口（默认 1 MB）里一个提问都没有时，闸门会**向前回扫**，
+  最多到 `OW_PRE_WRITE_GATE_TRANSCRIPT_SCAN_BYTES`（默认 8 MB，实测 213 ms）。
+  **够数即停**：`need` 满足时只付 1 MB 那一档（本机 8 MB 会话实测 35.5 ms / 1 块）。
+  扫到上限仍不够 → **放行**并在日志记 `scanTruncated:true`；任何一块解析失败或块边界
+  无法对齐，同样记 `scanTruncated:true` —— **读得不完整就明确说出来**，不报一个假的
+  「读完了、没问题」。块边界**对齐到行首**（跨边界的整行会拼回来解析一次），
+  不会因为一行跨在 1 MB 边界上而静默消失。
+  「没有证据在窗口里」永远不等于「没问过」。本机实测：172 个 >1 MB 会话里
+  49 个的提问全部落在尾窗口之外（最大 102.9 MB / 全文 9 问 / 尾内 0 问）——
+  不回扫的话这些会话在 `brake=halt` 下**无解**。
 - 走 `mark` 逃生口（或标记已存在）的会话不受这条约束 —— 逃生口的意义就是「我知道我在干什么」。
+- **子 agent 直接放行。** 见 §3.5 开头的理由；日志 `questions` 记 `"subagent-exempt"`。
 
 ## 4. 断言族：`verify-claims.mjs` 认哪些「完成声明」
 

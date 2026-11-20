@@ -252,7 +252,7 @@ UntilDone/
 
 ## 🤝 参与
 
-- 跑测试：`node --test scripts/`（1716 条回归测试；**这个数字由硬门数源码 `test(` 调用对账，写错即红**，
+- 跑测试：`node --test scripts/`（1730 条回归测试；**这个数字由硬门数源码 `test(` 调用对账，写错即红**，
   所以照抄即可、不必手工数。实跑报告会比它多几条 —— 子测试会被单独计数。要 Node ≥ 20.16，因为用了 `import.meta.dirname`）。
 - 结构硬门：`node scripts/check-structure.mjs`
 - 两条都必须绿才能提交，细节见 [CONTRIBUTING.md](CONTRIBUTING.md)

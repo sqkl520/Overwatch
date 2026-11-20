@@ -59,7 +59,7 @@ import { join, dirname, resolve, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-import { readPathsOfToolUse, pathKeyOf } from './pre-write-gate.mjs';
+import { readPathsOfToolUse, pathKeyOf, isAskToolName } from './pre-write-gate.mjs';
 import { questionsOfAsk, normalizeText } from './question-form.mjs';
 // 复用既有的去重判据与宽口径读取判据，不另写一份。
 // `dedupeForks()` 判的是「前 N 条调用序列是否逐字相同」；
@@ -414,6 +414,28 @@ export function scanSession(records, { minReads = 3 } = {}) {
           // 子 agent 在主 transcript 里只有一个 `Agent` 调用记录，它读了什么不在这里。
           agentCallsBefore: agentCalls,
         });
+      } else if (b.name === 'ExitPlanMode' && isAskToolName(b.name)) {
+        // 计划批准也算一次「我停下来等你」——**与 `pre-write-gate.mjs` 同一口径**
+        // （`isAskToolName()` 是唯一实现，2026-11-19 统一）。
+        //
+        // 为什么之前只认 `AskUserQuestion`：`questionsKnown` / `too-many-questions`
+        // 都是围绕「一次调用里放了几个问题」设计的，而 `ExitPlanMode` 没有 `questions`
+        // 字段。但 `askCalls`（提问调用次数）与 `firstAsk`（第一次提问的位置）是
+        // 口径敏感的 —— 一个只有计划批准的会话，旧口径把它判成 `no-ask`
+        // （「从不提问」），而它明明停下来等过一次人。
+        //
+        // 计 1 个问题：计划批准是**一次**停下来等，不给它编一个问题文本。
+        // 本机实测（436 个含 ExitPlanMode 的会话）：判决翻转 1 个（`no-ask` → `read-first`），
+        // **新增阻塞违规 0 个** —— 所以这不是「为了让数字变好看」，是修一个分类错误。
+        asks.push({
+          at: callIndex,
+          id: typeof b.id === 'string' ? b.id : null,
+          questionCount: 1,
+          questionsUnknown: false,
+          form: 'exit-plan-mode',
+          questions: [],
+          agentCallsBefore: agentCalls,
+        });
       }
 
       if (b.name === 'Agent') agentCalls++;
@@ -421,6 +443,26 @@ export function scanSession(records, { minReads = 3 } = {}) {
   }
 
   const known = asks.filter((a) => !a.questionsUnknown);
+  // ── 去重口径（2026-11-19，验收第 3 条）────────────────────────────────
+  //
+  // `questionsKnown` 是**总问题数**：一次调用里放了 3 个就记 3，重复问也各记一次。
+  // 它回答的是「一共问了几件事」，用于 `too-many-questions`（用户原话「一次问清最多 5 个」）。
+  //
+  // `distinctQuestions` 是**去重后的问题个数**：键是 `normalizeText(question)`，
+  // `ExitPlanMode` 贡献一个固定键 —— **与写前闸的 `readTranscriptActivity()` 逐字同一口径**
+  // （两处都调 `normalizeText()`，比较逻辑一致）。
+  //
+  // 两者必须都报，不能只报一个：同一个问题问 3 次，闸门数 1（够不够放行的判据），
+  // 审计数 3（一共花了几次往返）。此前两处都自称「同一口径」而数字不同，
+  // 是因为它们其实在数**不同的东西**。现在把差别变成两个有名字的字段。
+  const distinctKeys = new Set();
+  for (const a of asks) {
+    if (a.form === 'exit-plan-mode') { distinctKeys.add('exitplanmode'); continue; }
+    for (const q of (a.questions || [])) {
+      const k = normalizeText(q.question);
+      if (k) distinctKeys.add(k);
+    }
+  }
   return {
     toolCalls: callIndex,
     duplicateCallLines,
@@ -429,6 +471,8 @@ export function scanSession(records, { minReads = 3 } = {}) {
     askCalls: asks.length,
     // 只有「形态可读」的调用才计入问题数；不知道的不算 0、也不算 1。
     questionsKnown: known.reduce((n, a) => n + a.questionCount, 0),
+    /** 去重后的问题个数（与写前闸同一口径）。见上方注释。 */
+    distinctQuestions: distinctKeys.size,
     questionsUnknownCalls: asks.length - known.length,
     filesRead: readFiles.size,
     filesWritten: writtenFiles.size,
@@ -681,6 +725,7 @@ export function summarize(rows, cfg, opts = {}) {
   let withAsk = 0;
   let askCalls = 0;
   let questionsKnown = 0;
+  let distinctQuestions = 0;
   let unknownCalls = 0;
   let dupLines = 0;
   let wroteWithoutAsk = 0;
@@ -695,6 +740,7 @@ export function summarize(rows, cfg, opts = {}) {
     sessions++;
     askCalls += s.askCalls || 0;
     questionsKnown += s.questionsKnown || 0;
+    distinctQuestions += s.distinctQuestions || 0;
     unknownCalls += s.questionsUnknownCalls || 0;
     dupLines += s.duplicateCallLines || 0;
     const v = judgeReadFirst(s);
@@ -716,7 +762,7 @@ export function summarize(rows, cfg, opts = {}) {
 
   const violations = out.reduce((n, r) => n + r.violations.length, 0);
   return {
-    sessions, withAsk, askCalls, questionsKnown, unknownCalls, dupLines,
+    sessions, withAsk, askCalls, questionsKnown, distinctQuestions, unknownCalls, dupLines,
     wroteWithoutAsk, complexSessions, nearDupPairs,
     verdicts, narrowVerdicts, violCounts, violations, rows: out,
   };
@@ -880,7 +926,8 @@ export function formatReport(result, { cfg, configPath, configFound } = {}) {
   lines.push('## 判据二：问了几次、每次几问（可判定）');
   lines.push('');
   lines.push(`  提问调用  ${s.askCalls} 次（按 tool_use id 去重；丢弃了 ${s.dupLines} 行重复记录）`);
-  lines.push(`  问题总数  ${s.questionsKnown} 个`);
+  lines.push(`  问题总数  ${s.questionsKnown} 个（同一问题问两遍算两个 —— 这是「一共问了几件事」）`);
+  lines.push(`  去重后    ${s.distinctQuestions} 个（同一问题问两遍算一个 —— 与写前闸 \`ask.minQuestionsBeforeWrite\` 同一口径）`);
   lines.push(`  形态不可读 ${s.unknownCalls} 次（questions 不是可解析的数组——不知道，不算 0）`);
   const perSess = asked ? (s.questionsKnown / asked).toFixed(1) : '0';
   lines.push(`  平均会话  ${perSess} 个问题 / ${asked ? (s.askCalls / asked).toFixed(1) : 0} 次调用`);
@@ -1033,6 +1080,7 @@ export function cli(argv = process.argv.slice(2)) {
         toolCalls: r.session.toolCalls,
         askCalls: r.session.askCalls,
         questionsKnown: r.session.questionsKnown,
+        distinctQuestions: r.session.distinctQuestions,
         questionsUnknownCalls: r.session.questionsUnknownCalls,
         filesRead: r.session.filesRead,
         filesWritten: r.session.filesWritten,

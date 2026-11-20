@@ -194,6 +194,17 @@ const SHELL_READ_VERBS = Object.freeze(['cat', 'head', 'tail', 'type', 'get-cont
  *  它是**数据**，不是判据入口 —— 想让重放器用别的动词表，走 `readVerbs` 参数。 */
 export const GATE_SHELL_READ_VERBS = SHELL_READ_VERBS;
 
+/** 回扫上限的默认值。8 MB 是按实测定的：本机 485 份主 transcript 里 >8 MB 的有 70 份，
+ *  而验收点出的 49 个「尾部 1 MB 内 0 问」的会话最大 102.9 MB —— 8 MB 覆盖不了全部，
+ *  所以到上限仍不够时必须 `truncated` + 放行，而不是判 deny。
+ *  8 MB 的实测耗时 213 ms（见 `readTranscriptActivity` 文件头；2026-11-19 重测）。
+ *
+ *  **必须声明在 `defaultConfig()` 之前**：它被那个函数引用，而 `defaultConfig()` 里
+ *  引用一个 `const` 是 TDZ 风险 —— 只要有人在模块顶层先调一次就 `ReferenceError`。
+ *  `question-form.mjs` 的文件头记的正是同一类事故（环导致常量初始化前被求值）。
+ *  当前没有模块顶层调用，所以没炸；但「现在没炸」不是「不会炸」。 */
+export const DEFAULT_MAX_SCAN_BYTES = 8 * 1024 * 1024;
+
 /** 默认配置。全部可用环境变量覆盖，测试靠传 `env` 对象注入。 */
 export function defaultConfig() {
   return {
@@ -205,6 +216,10 @@ export function defaultConfig() {
     minReads: 3,
     /** 读 transcript 尾部多少字节。判定只花一次有界读，不扫全文件。 */
     transcriptBytes: 1024 * 1024,
+    /** `ask.minQuestionsBeforeWrite > 0` 时，一块不够就向前回扫，最多扫到这么多字节
+     *  （从文件尾算起）。8 MB 的实测耗时 213 ms，见 `readTranscriptActivity()` §有界回扫。
+     *  到上限仍不够 → 放行（`truncated`），绝不拿「没读到」当「没问过」。 */
+    transcriptScanBytes: DEFAULT_MAX_SCAN_BYTES,
     /** 跨会话承认标记。默认否：新会话 = 没读过这个项目的新 AI。 */
     crossSession: false,
     /** **第一次写之前必须已经问过几个问题**。`0` = 这条判据完全不启用（默认）。
@@ -244,6 +259,8 @@ export function configOf(env = {}) {
   if (mr !== null) cfg.minReads = mr;
   const tb = num('OW_PRE_WRITE_GATE_TRANSCRIPT_BYTES', 4096, 64 * 1024 * 1024);
   if (tb !== null) cfg.transcriptBytes = tb;
+  const tsb = num('OW_PRE_WRITE_GATE_TRANSCRIPT_SCAN_BYTES', 4096, 512 * 1024 * 1024);
+  if (tsb !== null) cfg.transcriptScanBytes = tsb;
 
   const cs = String(env.OW_PRE_WRITE_GATE_CROSS_SESSION || '').trim().toLowerCase();
   cfg.crossSession = ['1', 'true', 'on', 'yes'].includes(cs);
@@ -748,8 +765,8 @@ function isWriteUse(name, input, cwd) {
   try { return writeIntentOf(name, input, cwd).isWrite; } catch { return false; }
 }
 
-/** 从 transcript 里数：本会话**问过几个不同的问题**、**写过没有**、**读过哪些文件**。
- *  **只读，不写**。一次有界读（尾部 `bytes`）算出三样东西。
+/** 从 transcript 里数：本会话**问过几个不同的问题**、**写成过几次**、**读过哪些文件**。
+ *  **只读，不写**。一次有界读（默认尾部 `bytes`，不够则**有界回扫**）算出三样东西。
  *
  *  ## 为什么和 `readTranscriptReads()` 分成两个函数
  *
@@ -763,30 +780,76 @@ function isWriteUse(name, input, cwd) {
  *
  *  · `questions` —— **去重后的问题原文**。键是 `normalizeText(question)`，
  *    所以同一个问题换个标点/空格仍算同一个。`ExitPlanMode` 贡献一个固定键
- *    `'ExitPlanMode'`：它是「计划批准」，同样是一次「我停下来等你」。
+ *    `'exitplanmode'`：它是「计划批准」，同样是一次「我停下来等你」。
  *
- *    **口径不一致，如实记在这里**（2026-11-19 自查发现）：本文件把
- *    `AskUserQuestion` 与 `ExitPlanMode` **都算**，`measure-ask-vs-tell.mjs`
- *    也两个都算，而 `question-audit.mjs:404` **只认 `AskUserQuestion`**。
- *    三处两种答案。
- *
- *    此前这里写着「与 question-audit.mjs / measure-ask-vs-tell.mjs 的口径一致」——
- *    **那句话是错的**，注释声称的一致性在代码里不存在。
- *
- *    为什么现在不改那两处：`question-audit.mjs` 的既有报告与测试都建立在
- *    「只认 AskUserQuestion」上，改它会动一批已验证的数字；而这次改动不依赖它。
- *    失效方向也安全 —— 本文件数得**更宽**（多算计划批准），所以闸门更容易放行、
- *    不会误拦。代价是两边数字对不上：审计说「0 次提问」时闸门可能认为「问过 1 次」。
- *    要统一时按 `measure-ask-vs-tell.mjs` 的口径（两个都算），并把审计侧的报告重跑。
+ *    **口径**：`AskUserQuestion` 与 `ExitPlanMode` **都算**，与
+ *    `measure-ask-vs-tell.mjs` 一致。`question-audit.mjs` 的 `scanSession()` 现在
+ *    也走同一个 `isAskToolName()`（2026-11-19 统一），两处一处口径。
  *
  *  · `askCalls` —— **按 `tool_use.id` 去重后**的提问调用次数。宿主会把同一次调用
  *    写成两行（实测全语料 33,090 行重复），不去重会系统性算高 39%。
  *
- *  · `priorWriteCalls` —— 转录里**已经有过**几笔写。带 `block.role !== 'assistant'`
- *    这层是因为 bash 的 `echo > f` 也可能出现在别处；`writeIntentOf` 对未知工具
- *    返回 `isWrite:false`，所以这里只会数到真认识的写。
- *    **不数「是不是本次这次调用」** —— 闸门在 PreToolUse 阶段跑，本次调用还没落进
- *    transcript，所以这里数到的写都属于「之前」。
+ *  · `priorWriteCalls` —— 转录里**真的写成过**几笔写。定义改过两次，每次都因为
+ *    原来的定义在真宿主上不成立（见 §两次修正）。现行定义：
+ *    **该 `tool_use` 有对应的 `tool_result`，且那个 result 不是错误。**
+ *
+ *    ## 两次修正（2026-11-19，验收判 FAIL 的那两条）
+ *
+ *    **修正一：`priorWriteCalls` 恒 ≥ 1，判据从不执行。**
+ *    原实现把「尾部窗口里出现过写调用」整片算作「之前写过」，注释理由是
+ *    「闸门在 PreToolUse 阶段跑，本次调用还没落进 transcript」。
+ *    **这个前提是假的**：真 `claude.exe` 上实测（mock 模型 + 真宿主，
+ *    `2026-11-19` 复现），hook 触发时本次 `Write` 的 `tool_use` **已经落盘**，
+ *    只是还没有 `tool_result`。于是每一笔写都被数成「之前写过」，
+ *    `priorWriteCalls > 0` 恒成立，这条判据**一次都不执行**。
+ *
+ *    **修正二：被拒的写也被算成「写成过」。**
+ *    顺着修正一继续查（同一次复现）：被闸门拒绝的那次写的 `tool_result`
+ *    是 `is_error:true`，文件**从未落盘**。原实现不区分 result，于是
+ *    「被拒 → 重试」这条路第一次被拒，第二次就被当成「已经写过」放行 ——
+ *    判据被自己的拒绝动作解除了。
+ *
+ *    两次修正合起来只有一条判据：**`tool_result` 存在且非 error**。
+ *    它同时解决「本次调用自身」（无 result）与「被拒的调用」（error result）
+ *    两个假阳性，而且不需要拿 `tool_use_id` 去比 —— 比 id 只能解决前者。
+ *    拿不到 `is_error` 字段（老格式）时按「成功」算：方向是更容易跳过判据（宽松），
+ *    与全文件的 fail-open 取向一致。
+ *
+ *  ## 有界回扫（修正三）
+ *
+ *  只读尾部 1 MB 会让长会话**永久锁死**：本机实测 172 个 >1 MB 会话里 49 个的提问
+ *  全部落在窗口外（最大 102.9 MB / 全文 9 问 / 尾内 0 问）。那种会话 `have < need`
+ *  恒成立，`brake="halt"` 下每次拒都结束回合 —— 用户没有出路。
+ *
+ *  所以 `need > 0` 且一块不够时**向前回扫**，直到够数或到 `maxScanBytes`（默认 8 MB）。
+ *  仍然不够且还有未扫内容 → `truncated: true`，调用方**必须据此放行**（不判）。
+ *  「没读到」永远不是「没问过」。
+ *
+ *  实测耗时（本机，`pre-write-gate.mjs` 的 `readTailBytes` + 逐行 `JSON.parse`，
+ *  8 MB 会话）：单块 1 MB 27.3 ms / 扫满 8 MB 213.1 ms。
+ *  `need` 满足即停（问题落在尾块里时 35.5 ms、只读 1 块），所以常见情况只付 1 MB 那一档。
+ *  **改前那句「`need` 满足即停」是假的**：`out.distinctQuestions` 只在循环外赋值，
+ *  循环内读到的永远是初值 0，早停是死代码、每次扫满上限（旧实现同一场景 200.1 ms / 8 块）。
+ *
+ *  ## 块边界对齐到行首（修正四，2026-11-19 第二轮验收 FAIL 的根因）
+ *
+ *  旧实现只对每块的**首行**做 `shift()`：块起点不落在行首时，被切开的那一行
+ *  **同时是上一块的末行**——尾半段被 `shift()` 丢掉、头半段留在上一块里单独
+ * `JSON.parse` 失败，两半都不进任何计数，**整条记录静默消失**，而 `truncated`
+ * 仍报 `false`。实测量化（7397 份 transcript）：9965 行跨在 1 MB 边界上，
+ * 同一 8 MB 窗口下对比单块 vs 分块，4258 个 >1 MB 会话里 `priorWriteCalls`
+ * 不一致 220 个、`reads` 不一致 79 个。端到端误拦已复现：文件 1 MB+98 字节、
+ * 三个问题都在文件开头 → 头块把提问行切掉、`q=0`、`truncated=false` → 误拦。
+ *
+ *  现行做法：**块边界对齐到行首，并把右邻块丢掉的那半行补回来**。
+ *  块 k 从 `start` 开始、右边界 `effEnd`；`start > 0` 时丢掉 `[start, 首个 \n]`
+ *  这段半行，并把它交给下一轮（`carry`）——下一轮的右边界延伸到 `start + carry`，
+ *  于是那一行在被切开的另一侧**是完整的一行**。覆盖率因此是连续的
+ *  `[start_n, size)`，没有空洞，也不需要「重复解析边界行、靠集合幂等兜住」。
+ *
+ *  兜底：任何一块出现 `unparsable > 0`，或整块落在同一行里（行比块还长），
+ *  `truncated` 一律置 `true`。静默丢数据是这次 FAIL 的根本原因——宁可让下游
+ *  知道「这次读得不完整」，也不能报一个假的「读完了，没问题」。
  *
  *  ## fail-open
  *
@@ -795,105 +858,290 @@ function isWriteUse(name, input, cwd) {
  *
  *  @returns {{questions:string[], askCalls:number, distinctQuestions:number,
  *             unknownAskCalls:number, priorWriteCalls:number, reads:string[],
- *             unreadable:boolean, bytesRead:number, lines:number, unparsable:number}}
+ *             unreadable:boolean, truncated:boolean, chunks:number,
+ *             bytesRead:number, lines:number, unparsable:number}}
  */
-export function readTranscriptActivity(transcriptPath, { bytes = 1024 * 1024, readVerbs = SHELL_READ_VERBS, cwd = null } = {}) {
+export function readTranscriptActivity(transcriptPath, {
+  bytes = 1024 * 1024, readVerbs = SHELL_READ_VERBS, cwd = null,
+  /** 需要几个问题。`>0` 才启用回扫；`0`（默认）= 只读一块，行为与引入回扫前逐字相同。 */
+  need = 0,
+  /** 回扫上限（字节，从文件尾算起）。 */
+  maxScanBytes = DEFAULT_MAX_SCAN_BYTES,
+} = {}) {
   const out = {
     questions: [], askCalls: 0, distinctQuestions: 0, unknownAskCalls: 0,
-    priorWriteCalls: 0, reads: [], unreadable: true, bytesRead: 0, lines: 0, unparsable: 0,
+    priorWriteCalls: 0, reads: [], unreadable: true, truncated: false, chunks: 0,
+    bytesRead: 0, lines: 0, unparsable: 0,
   };
   const p = String(transcriptPath || '');
   if (!p) return out;
-  let buf;
-  try {
-    const r = readTailBytes(p, bytes);
-    if (!r) return out;
-    buf = r.buf;
-    out.bytesRead = r.bytesRead;
-  } catch {
-    return out;
-  }
-  // 读到了（哪怕 0 字节）—— `unreadable:false` 表示「这份数据是真的看过了」。
-  // 空文件 = 「这个会话什么都没问」是一个**真实的**读数，不是「读不到」。
-  out.unreadable = false;
-  const text = buf.toString('utf8');
-  const lines = text.split('\n');
-  if (out.bytesRead >= bytes && lines.length > 1) lines.shift();  // 半条首行
 
-  const seenIds = new Set();
-  const seenQ = new Set();
-  const seenReads = new Set();
+  // 跨块共享的解析状态。用集合而不是累加：块与块不重叠，但保守起见仍按集合去重
+  // （同一条 `tool_use` 被宿主写成两行是**真实存在**的，见 `askCalls` 的口径）。
+  // `results` 也必须在这里而不是在 `ingestActivity()` 里新建 —— `tool_use` 与它的
+  // `tool_result` 是两行，块边界可以落在两者之间（见 `ingestActivity()` 文件头）。
+  const acc = {
+    seenIds: new Set(), seenQ: new Set(), seenReads: new Set(),
+    results: new Map(),     // tool_use_id -> isError，跨块共享
+    writeIds: new Set(),    // 写成过的写调用 id，**结算放到循环后**（见 ingestActivity）
+  };
+  const wantQ = Math.max(0, Number(need) || 0);
+  const cap = Math.max(0, Number(maxScanBytes) || 0);
+  /** 已扫到的左边界（绝对偏移）。`null` = 还没读过，等价于文件尾。 */
+  let end = null;
+  let size = 0;
+  /** 右邻块丢掉的那半行（本块某一行被块边界切开的**右半段**，还没有左半段）。 */
+  let carry = Buffer.alloc(0);
+
+  for (;;) {
+    let r;
+    try {
+      r = readTailBytesFrom(p, bytes, end === null ? 0 : size - end);
+    } catch {
+      break;
+    }
+    if (!r) break;
+    size = r.size;
+    out.unreadable = false;
+    if (!r.bytesRead) break;        // 读不动了（空文件 / 防御空转）
+    out.chunks++;
+    out.bytesRead += r.bytesRead;
+
+    const blockEnd = end === null ? size : end;
+    const blockStart = blockEnd - r.bytesRead;
+
+    // 块 [blockStart, blockEnd)。它从行首开始**当且仅当** `blockStart === 0`。
+    // 否则从中间切进去：开头那半行不在这里解析，而是当作 `carry` 交给左侧块，
+    // 由左侧块用自己那半段拼成完整行解析一次 —— 全局恰好一次。
+    // 旧实现只 `shift()` 不回收，两半各自 JSON.parse 失败、整条记录静默消失，
+    // 而 `truncated` 仍报 false（见函数头 §块边界对齐到行首）。
+    let buf = r.buf;
+    let nextEnd = blockStart;
+    let headPartial = null;         // 本块被切开的**首行左半段**，交给左侧块
+    if (blockStart > 0) {
+      const nl = buf.indexOf(0x0a);
+      if (nl < 0) {
+        // 整块落在同一行里（行比块还长）：整块都是某行的中段，继续向左凑。
+        // 这一段的字节没有交给 `ingestActivity`，但 `end` 会一直往前推；若最后
+        // 停在文件头，那整行会在 `blockStart === 0` 那一次被完整解析。真正读完
+        // 不了的只有「到上限」那种，那时 `truncated` 本来就为 `true`。
+        carry = Buffer.concat([buf, carry]);
+        end = blockStart;
+        if (!wantQ) break;                        // 不回扫（默认路径）
+        if (carry.length >= cap) break;           // 一行就吃满上限，没得读了
+        continue;
+      }
+      if (nl > 0) headPartial = buf.subarray(0, nl);
+      buf = buf.subarray(nl + 1);                 // 从此处起对齐到行首
+      // **未覆盖区间的右端点就是 `blockStart`**，不是 `blockStart + nl + 1`。
+      // `[blockStart, blockStart + nl)` 这段（被切开的行的**后半段**）已经放进
+      // `headPartial`，由左侧块拼成完整行解析；算进 `nextEnd` 会重复解析它。
+      nextEnd = blockStart;
+    }
+
+    // `buf` 从行首开始，但末端可能被块边界截断。按**字节**找最后一个换行，
+    // 中间整行直接解析，末尾那半行与 `carry`（右邻块的左半段）拼成一行。
+    // 在这里而不是在字符串上分，是为了不把被截断的多字节字符解码成 U+FFFD。
+    const lastNl = buf.lastIndexOf(0x0a);
+    const lines = [];
+    if (lastNl >= 0) {
+      const head = buf.subarray(0, lastNl).toString('utf8');
+      if (head) lines.push(...head.split('\n'));
+    }
+    const tailBytes = lastNl >= 0 ? buf.subarray(lastNl + 1) : buf;
+    // `tailBytes` 什么时候是完整行：`carry` 非空时两段拼起来是完整行；`carry`
+    // 为空时它本身就是完整行（文件末行没有结尾换行，或右邻块正好从行首开始）。
+    if (tailBytes.length || carry.length) {
+      const joined = Buffer.concat([tailBytes, carry]);
+      if (joined.length) lines.push(joined.toString('utf8'));
+    }
+    carry = headPartial || Buffer.alloc(0);
+
+    if (lines.length) ingestActivity(out, acc, lines, { readVerbs, cwd });
+    // 早停必须读**实时**的去重数：`out.distinctQuestions` 只在循环外赋一次值的
+    // 旧实现里，循环内读到的永远是初值 0，早停是死代码、每次扫满上限
+    // （2026-11-19 第二轮验收 FAIL 的第 1 条）。
+    out.distinctQuestions = acc.seenQ.size;
+
+    if (nextEnd === 0) { end = 0; break; }        // 已经读到文件头
+    end = nextEnd;
+    if (!wantQ) break;                             // 不回扫（默认路径）
+    if (out.distinctQuestions >= wantQ) break;     // 够了（早停）
+    if (size - end >= cap) break;                  // 到回扫上限
+  }
+
+  out.distinctQuestions = acc.seenQ.size;
+  // `priorWriteCalls` 在这里一次性结算，**不在 `ingestActivity()` 里边扫边加**：
+  // 回扫是从尾向前的，写调用与它的 `tool_result` 可以跨块、中间还隔着重复副本行。
+  // 边扫边加会让结果取决于**扫到的先后**（实测 5.93 MB 会话单块 86 / 分块 85）。
+  // 结算口径与逐行读完全一致：`tool_use` 是写、有对应 result、且 result 非 error。
+  out.priorWriteCalls = 0;
+  for (const id of acc.writeIds) {
+    if (acc.results.has(id) && acc.results.get(id) !== true) out.priorWriteCalls++;
+  }
+  // 「还有没看过的内容」= 决策者必须知道的第三态。没读到 ≠ 没有。
+  //
+  // 三种停法要分开算，**这一条不能沿用旧口径**：
+  //   · 读到文件头（`end === 0`）→ 全读了，`false`。
+  //   · **够数提前停**（`distinctQuestions >= need`）→ `false`。这是必须的：
+  //     下游 `decide()` 是「先看 `truncated`，`true` 就放行且不判」。旧实现
+  //     「`fromEnd < size` 即 truncated」配上修好的早停会把**每一次**够数的判定
+  //     都变成被迫放行 —— 闸门又变回永不执行。**早停与 truncated 是一对**，
+  //     只修其中一个会把缺陷从一个方向搬到另一个方向。
+  //   · 其余（到上限 / 读不动 / 停在文件中间）→ `true`。
+  const reachedStart = end === 0 || (end === null && size === 0);
+  const metNeed = wantQ > 0 && out.distinctQuestions >= wantQ;
+  out.truncated = out.unreadable === false && !reachedStart && !metNeed;
+  // **兜底**：任何一块出现解析失败（`unparsable > 0`），说明这次读不完整 ——
+  // 静默丢数据是第二轮 FAIL 的根本原因。宁可让下游看到 `truncated` 后放行，
+  // 也不能报一个假的「读完了、没问题」。
+  if (out.unreadable === false && out.unparsable > 0) out.truncated = true;
+  return out;
+}
+
+/** 把一块 transcript 文本解析进 `out` / `acc`。**可被多块重复调用**（幂等）。
+ *
+ *  `acc.results`（`tool_use_id -> isError`）**必须跨块累积**，不能每块新建一个 Map：
+ *  `tool_use` 与它的 `tool_result` 是两行，块边界可以落在两者之间。块内局部的 Map
+ *  在那种情况下永远看不到对方那一半，`priorWriteCalls` 就**少算** —— 实测量化
+ *  （同一份夹具、唯一 id、块 300 字节）：单块 20 笔，分块只剩 8 笔。这是分块逻辑
+ *  的第三个静默丢数据点，与块边界丢整行同源（各块独立解析），一并修在这里。 */
+function ingestActivity(out, acc, lines, { readVerbs, cwd }) {
+  // 第一趟收集 tool_result：`priorWriteCalls` 的判据依赖它（见函数头 §两次修正）。
+  // `is_error` 缺失（undefined）按成功算 —— 老格式不写这个字段，方向是宽松。
+  const results = acc.results;   // tool_use_id -> isError(boolean)，**跨块共享**
+  // 注意：这一趟只是把 result 收进共享 Map；`priorWriteCalls` 的加法在循环外结算（见文件尾）。
+  for (const line of lines) {
+    const rec = parseLine(line);
+    if (!rec) continue;
+    const content = rec.message && Array.isArray(rec.message.content) ? rec.message.content : null;
+    if (!content) continue;
+    for (const b of content) {
+      if (!b || b.type !== 'tool_result') continue;
+      if (typeof b.tool_use_id === 'string' && b.tool_use_id) results.set(b.tool_use_id, b.is_error === true);
+    }
+  }
+
   for (const line of lines) {
     const s = line.trim();
     if (!s) continue;
+    const rec = parseLine(line);
+    if (!rec) { out.unparsable++; continue; }
     out.lines++;
-    let rec;
-    try { rec = JSON.parse(s); } catch { out.unparsable++; continue; }
-    const content = rec && rec.message && Array.isArray(rec.message.content) ? rec.message.content : null;
+    const content = rec.message && Array.isArray(rec.message.content) ? rec.message.content : null;
     if (!content) continue;
     for (const b of content) {
       if (!b || b.type !== 'tool_use') continue;
       // 宿主重写留下的副本行不是第二次调用（`question-audit.mjs` 实测 33,090 行）。
       if (typeof b.id === 'string' && b.id) {
-        if (seenIds.has(b.id)) continue;
-        seenIds.add(b.id);
+        if (acc.seenIds.has(b.id)) continue;
+        acc.seenIds.add(b.id);
       }
       for (const raw of readPathsOfToolUse(b.name, b.input, readVerbs, cwd)) {
         const k = pathKeyOf(raw);
-        if (!k || seenReads.has(k)) continue;
-        seenReads.add(k);
+        if (!k || acc.seenReads.has(k)) continue;
+        acc.seenReads.add(k);
         out.reads.push(raw);
       }
-      if (b.name === 'AskUserQuestion' || b.name === 'ExitPlanMode') {
+      if (isAskToolName(b.name)) {
         out.askCalls++;
         if (b.name === 'ExitPlanMode') {
           // 计划批准 = 一次「我停下来等你」。用一个固定键，不给它编一个问题文本 ——
           // 编了就等于凭空造出「问过什么」的证据。
-          if (!seenQ.has('exitplanmode')) { seenQ.add('exitplanmode'); out.questions.push('ExitPlanMode'); }
+          recordQuestion(out, acc, 'exitplanmode', 'ExitPlanMode');
           continue;
         }
         const q = questionsOfAsk(b.input);
         if (q.unknown) { out.unknownAskCalls++; continue; }
-        for (const item of q.questions) {
-          const key = normalizeText(item.question);
-          if (!key || seenQ.has(key)) continue;
-          seenQ.add(key);
-          out.questions.push(item.question);
-        }
+        for (const item of q.questions) recordQuestion(out, acc, normalizeText(item.question), item.question);
       } else if (isWriteUse(b.name, b.input, cwd)) {
-        out.priorWriteCalls++;
+        // **只有真落盘的写才算「之前写过」。** 判据是 tool_result 存在且非 error：
+        //   · 本次调用（hook 触发时 tool_use 已落盘、还没 result）→ 不算；
+        //   · 被闸门拒掉的写（result 是 is_error:true，文件从未写）→ 不算；
+        //   · 真正写成了的 → 算。
+        // 前两条正是 2026-11-19 验收判 FAIL 的那两条（见函数头 §两次修正）。
+        //
+        // **这里只登记 id，不做加法。** 回扫是**从尾向前**的，而 `tool_use` 与它的
+        // `tool_result` 可以隔着几百行（真实语料里有重复副本行与 thinking 块隔着）。
+        // 边扫边加会出现这种顺序依赖：右块先处理到写调用、它的 result 还在 `carry`
+        // 里没解析 → 不加；等左块解析到 result 时，那个 `tool_use` 已被 `seenIds`
+        // 判成重复而跳过 → 这笔**永远不加**。实测 5.93 MB 会话：单块 86 / 分块 85。
+        // 结算放到循环之后（见 `readTranscriptActivity()` 尾部），与块序无关。
+        const id = typeof b.id === 'string' ? b.id : '';
+        if (id) acc.writeIds.add(id);
       }
     }
   }
-  out.distinctQuestions = out.questions.length;
-  return out;
 }
 
-/** 有界从尾部读。返回 `{buf, bytesRead}` 或 null。
+/** `JSON.parse` 一行，坏行返回 null（调用方决定怎么记）。 */
+function parseLine(line) {
+  const s = typeof line === 'string' ? line.trim() : '';
+  if (!s) return null;
+  try {
+    const o = JSON.parse(s);
+    return o && typeof o === 'object' ? o : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 记一个问题（按归一化文本去重）。空键直接丢弃 —— 空白问题不是问题。 */
+function recordQuestion(out, acc, key, text) {
+  if (!key || acc.seenQ.has(key)) return;
+  acc.seenQ.add(key);
+  out.questions.push(text);
+}
+
+/** 哪些工具名算「一次提问」。**这一处就是唯一口径**，`question-audit.mjs` 的
+ *  `scanSession()` 也用它，两处不再各写一份（2026-11-19 统一）。
  *
- *  用 fd + `readSync` 而不是 `readFileSync` 再截：开源节流——一个 1.5 GB transcript
- *  读进来再切，等于每小时把整个语料搬进内存若干次，而判定只需要尾部。
- *  单独抽出来也是为了让它可被单测打桩（读不到就返回 null）。 */
-function readTailBytes(p, bytes) {
+ *  为什么 `ExitPlanMode` 算：它是「我停下来等你批准」，与提问在**判据语义**上同类
+ *  （都代表模型主动停下来要人做决定）。用户原话要防的是「一句话都没问就开始写」，
+ *  计划批准同样打破了那句话。 */
+export function isAskToolName(name) {
+  return name === 'AskUserQuestion' || name === 'ExitPlanMode';
+}
+
+/** 有界从尾部读：读文件末尾 `bytes` 字节之前 `fromEnd` 字节处的窗口。
+ *  返回 `{buf, bytesRead, size}` 或 null。`size` 是文件总大小。
+ *
+ *  与 `readTailBytes` 的唯一区别是多了 `fromEnd`（回扫用）与 `size`（判「读到文件头没有」）。
+ *  合成一个函数而不是写两份 readSync 循环：两份循环就是两个 bug 位。 */
+function readTailBytesFrom(p, bytes, fromEnd = 0) {
   let fd = null;
   try {
     fd = openSync(p, 'r');
     const size = fstatSync(fd).size;
-    const want = Math.max(0, Math.min(size, Number(bytes) || 0));
-    if (!want) return { buf: Buffer.alloc(0), bytesRead: 0 };
+    const end = Math.max(0, size - Math.max(0, Number(fromEnd) || 0));
+    const want = Math.max(0, Math.min(end, Number(bytes) || 0));
+    if (!want) return { buf: Buffer.alloc(0), bytesRead: 0, size };
+    const start = end - want;
     const buf = Buffer.alloc(want);
     let got = 0;
     while (got < want) {
-      const n = readSync(fd, buf, got, want - got, size - want + got);
+      const n = readSync(fd, buf, got, want - got, start + got);
       if (n <= 0) break;
       got += n;
     }
-    return { buf: got === want ? buf : buf.subarray(0, got), bytesRead: got };
+    return { buf: got === want ? buf : buf.subarray(0, got), bytesRead: got, size };
   } catch {
     return null;
   } finally {
     if (fd !== null) { try { closeSync(fd); } catch { /* ignore */ } }
   }
+}
+
+/** 有界从尾部读最后 `bytes` 字节。返回 `{buf, bytesRead, size}` 或 null。
+ *
+ *  **只是 `readTailBytesFrom(p, bytes, 0)`**：不要在这里再写一份 `readSync` 循环。
+ *  两份循环就是两个 bug 位，而这两条路径（读侧判据 / 写侧判据）必须从同一个
+ *  「怎么从文件尾读一段」的实现出发，否则窗口边界行为迟早会分叉。
+ *
+ *  `size` 是**文件总大小**（不是读了多少）：调用方靠它判断「尾部窗口之外还有没有东西」。
+ *  没有它就只能猜 —— 而「猜不到就不判」和「以为读完了所以判」是两种完全不同的结论。 */
+function readTailBytes(p, bytes) {
+  return readTailBytesFrom(p, bytes, 0);
 }
 
 // ── 标记文件 ─────────────────────────────────────────────────────────
@@ -1084,7 +1332,16 @@ export function markerValidity(state, input, cfg = defaultConfig()) {
 /** 生成 reason。**唯一要求**：模型读完这一段就知道下一条命令该敲什么。
  *
  *  实测依据：reason 原文会作为 `is_error` 的 `tool_result` 内容回到模型（B1/D4）。
- *  所以它是一段 prompt，不是一条错误消息。 */
+ *  所以它是一段 prompt，不是一条错误消息。
+ *
+ *  ## `halt` 下第 3 步的文案必须换（2026-11-19，验收第 5 条）
+ *
+ *  原实现两种刹车下都用「创建标记，然后**原样重试**你刚才那次写」，然后在 `halt`
+ *  分支追加「本次拒绝同时结束了本回合」。两句在 `halt` 下**互相否定**：回合都结束了，
+ *  没有「刚才那次写」可以重试。与 `reasonForQuestions()` 是同一个病，同一处修。
+ *
+ *  修法：`halt` 时第 3 步只说「创建标记」（那条命令仍然有效、仍然该跑），
+ *  并明确「本回合已结束，不会有重试」。`budget` 时才说「然后重试这次写」。 */
 export function reasonFor({ cwd, markerPath, gateCommand, minReads, halt, denialCount, maxDenials }) {
   const c = String(cwd || '.');
   const need = Number(minReads) || 3;
@@ -1095,7 +1352,9 @@ export function reasonFor({ cwd, markerPath, gateCommand, minReads, halt, denial
     `1. 读 ${c}/CLAUDE.md（若不存在则跳过）、${c}/README.md，`,
     `   以及至少 ${Math.max(0, need - 2)} 个源码文件（用 Read，不要用 Bash cat）。这算「读过项目」。`,
     `2. 若有你还不确定的点，用 AskUserQuestion 一次问清（最多 5 个）；没有就跳过这步。`,
-    `3. 创建标记，然后原样重试你刚才那次写：`,
+    halt
+      ? `3. 创建标记（这条命令本身仍然有效）：`
+      : `3. 创建标记，然后重试你刚才那次写：`,
     `   ${gateCommand}`,
     ``,
     `标记一旦存在，本会话后续的写不会再被拦。`,
@@ -1104,10 +1363,15 @@ export function reasonFor({ cwd, markerPath, gateCommand, minReads, halt, denial
     `「自己说的」（"claim"，一条自述）—— 两者事后都查得到；手写的 "auto" 标记会被拒。`,
   ];
   if (halt) {
+    // 面向**用户**，不是模型：这一回合已经结束，模型拿不到下一轮。
     lines.push(
       ``,
-      `本次拒绝同时结束了本回合（reason: 宿主对 PreToolUse 拒绝**没有次数上限**，不刹车会无限重试）。`,
-      `下一步：先用 Read 读上面的文件，再运行第 3 步的命令，然后重试写入。`,
+      `── 本回合已结束 ──`,
+      `这条拒绝带 \`continue:false\`（宿主对 PreToolUse 拒绝**没有次数上限**，不刹车会无限重试），`,
+      `所以本回合已经停了，不会有「重试这次写」。下一步由**你（用户）**决定：`,
+      `重新发一句话，或在会话里先跑上面第 3 步的命令。`,
+      `想关掉这道闸：把 \`ask.minQuestionsBeforeWrite\` 改回 0、设 \`OW_ASK_MIN_QUESTIONS=0\`、`,
+      `或建 PAUSE 文件（与 Stop 闸共用，见 docs/CAPABILITIES.md §3.5）。`,
     );
   } else if (denialCount > 0) {
     lines.push(``, `这是本回合第 ${denialCount + 1}/${maxDenials} 次拒绝；到上限后本回合会被强制结束。`);
@@ -1120,13 +1384,26 @@ export function reasonFor({ cwd, markerPath, gateCommand, minReads, halt, denial
  *  与 `reasonFor()` 的关系：两条判据各有各的失败原因，混成一段会让模型
  *  分不清现在该干什么（读文件？还是问问题？）。所以文案分开、格式一致。
  *
- *  要求（来自用户原话「开头提示词给的模糊，做出来的东西不是用户想要的」）：
- *    ① 说清**还差几个**（可判定的数字，不是「请多提问」）；
- *    ② 说清**往哪些方向问**（范围 / 取舍 / 验收标准 —— 三样都是「做出来会不会白费」的判据）；
- *    ③ 说清**问完怎么回来**（原样重试这次写；闸门会自己重新数，不需要跑 mark）；
- *    ④ 说清**重复不算**（否则模型会把同一个问题拆成两句来刷数）。
+ *  ## 两种刹车下文案必须不同（2026-11-19，验收第 5 条）
  *
- *  `have` 是去重后已有的问题数。`halt` 与 `reasonFor()` 同一语义：真拒绝时本回合会结束。 */
+ *  原本文案在两种模式下写同一句话，结果自相矛盾：既说「**原样重试**你刚才那次写」，
+ *  又说「本次拒绝**同时结束了本回合**」。`halt` 下这两句不可能同时成立 ——
+ *  回合已经结束，没有「刚才那次写」可以重试；用户要做的**是重新发一句话**。
+ *  这是「给出做不到的指令」，与第 6 条同一个病。
+ *
+ *  所以：
+ *    · `halt=true`  → 面向**用户**：这一回合已经停了，你能做的是重新发一句话
+ *      （或先跑 status 看生效值）。**不提「重试」**，因为不存在可重试的东西。
+ *    · `halt=false` → 面向**模型**：本回合还活着，问完之后重试这次写，闸门会重新数。
+ *
+ *  另外两条被删掉的：
+ *    · 「若你确实认为没有需要问的，就明说理由，然后重试」—— 重试必然再被拒
+ *      （判据只看 transcript 里的问题数，不看理由），那是一条**永远失败**的指令。
+ *    · 「会在 reason 里留下这一条，事后可审计」—— 没有落地物。日志当时只记
+ *      `reasonLen`，reason 原文根本没进台账。现在改成实话：日志记的是
+ *      **判据的读数**（`questions` / `priorWrites` / `denyBy`），不是你的理由。
+ *
+ *  `have` 是去重后已有的问题数。 */
 export function reasonForQuestions({ cwd, need, have, halt, denialCount, maxDenials }) {
   const needN = Math.max(1, Number(need) || 1);
   const haveN = Math.max(0, Number(have) || 0);
@@ -1145,21 +1422,42 @@ export function reasonForQuestions({ cwd, need, have, halt, denialCount, maxDeni
     `  · 验收：用户怎么判断「这就算做完了」—— 要跑哪条命令、看哪个输出。`,
     `  · 反例：用户已经明确说过的，别再问一遍；那是浪费他的一次回答。`,
     ``,
-    `做法：用 AskUserQuestion 一次问 ${miss} 个（一次调用里放多个问题算多个），`,
-    `然后**原样重试你刚才那次写** —— 闸门会自己从 transcript 重新数，不需要跑任何命令。`,
-    `若你确实认为没有需要问的，就明说理由，然后重试；本闸不会因为「你觉得不需要」而放行，`,
-    `但会在 reason 里留下这一条，事后可审计。`,
+    `做法：用 AskUserQuestion 一次问 ${miss} 个（一次调用里放多个问题算多个）。`,
   ];
   if (halt) {
+    // 面向用户。**不许出现「重试」**：本回合已经结束，没有可重试的东西。
     lines.push(
       ``,
-      `本次拒绝同时结束了本回合（宿主对 PreToolUse 拒绝**没有次数上限**，不刹车会无限重试）。`,
-      `下一步：先提问，再重试写入。`,
+      `── 本回合已结束 ──`,
+      `这一条拒绝带 \`continue:false\`，所以本回合已经停了，不会有人「重试」这次写`
+      + `（宿主对 PreToolUse 拒绝没有次数上限，不刹车会无限重试）。`,
+      `接下来由**你（用户）**决定：`,
+      `  · 直接在下一条消息里把要求说清楚（这就是这条判据想要的结果）；或`,
+      `  · 想先确认生效值，跑「看生效值」那条命令（见下方）。`,
+      ``,
+      `如果你认为这条判据不该开：把 overwatch.config.json 的 \`ask.minQuestionsBeforeWrite\` 改回 0，`
+      + `或临时设 \`OW_ASK_MIN_QUESTIONS=0\`。`,
+      `想让闸门暂停而不改配置：建一个 PAUSE 文件（与 Stop 闸共用，路径见 docs/CAPABILITIES.md §3.5），存在即放行。`,
+      ``,
+      `审计说明：台账里记的是**判据的读数**（本次数到 ${haveN} 个问题、要求 ${needN} 个、`
+      + `拒绝原因 questions），不是任何人的理由。`,
     );
-  } else if (denialCount > 0) {
-    lines.push(``, `这是本回合第 ${denialCount + 1}/${maxDenials} 次拒绝；到上限后本回合会被强制结束。`);
+  } else {
+    // 面向模型。回合还活着，问完可以重试这次写。
+    lines.push(
+      ``,
+      `然后重试你刚才那次写 —— 闸门会自己从 transcript 重新数，不需要跑任何命令。`,
+      `注意：本闸不会因为「你觉得不需要问」而放行（判据只数 transcript 里的问题个数，`
+      + `不看理由），所以别把「说明理由」当成一条出路。`,
+      ``,
+      `审计说明：台账里记的是**判据的读数**（本次数到 ${haveN} 个问题、要求 ${needN} 个、`
+      + `拒绝原因 questions），不是任何人的理由。`,
+    );
+    if (denialCount > 0) {
+      lines.push(``, `这是本回合第 ${denialCount + 1}/${maxDenials} 次拒绝；到上限后本回合会被强制结束。`);
+    }
   }
-  if (c && c !== '.') lines.push(``, `（会话目录：${c}）`);
+  if (c && c !== '.') lines.push(``, `会话目录：${c}`, `看生效值：node scripts/pre-write-gate.mjs status --cwd "${c}"`);
   return lines.join('\n');
 }
 
@@ -1259,6 +1557,12 @@ export function decide(input, state = {}) {
   //
   // 只判**第一次写**：`priorWriteCalls > 0` 直接跳过。写到一半才拦会打断正在进行的活，
   // 而这条判据要防的是「开头方向就错了」，那时候还什么都没写。
+  //
+  // **`priorWriteCalls` 的定义改过两次**（2026-11-19，验收判 FAIL 后）：现在它只数
+  // 「有非 error 的 `tool_result` 的写」。原来把「本次调用自身」（hook 触发时已落进
+  // transcript、还没 result）与被闸门拒掉的写（result 是 `is_error:true` 但文件没写）
+  // 都算成了「之前写过」—— 前者让判据一次都不执行，后者让「拒 → 重试」把判据自己解除。
+  // 见 `readTranscriptActivity()` §两次修正。
   const needQ = Number(cfg.minQuestionsBeforeWrite) || 0;
   let askGate = null;   // `null` = 这条判据不参与；否则是 `{need, have, miss, unknown}`
   // ── L1 叫停路径：排在**这条判据**的所有分支之前 ───────────────────────
@@ -1275,7 +1579,33 @@ export function decide(input, state = {}) {
   if (needQ > 0 && state.paused === true) {
     return passthrough('user-paused', { pausePath: state.pausePath || null });
   }
-  if (needQ > 0) {
+
+  // ── 子 agent 不参与这条判据（2026-11-19，验收第 6 条）──────────────────
+  //
+  // **为什么直接放行，而不是「让子 agent 也去问」**：
+  //
+  //   ① 多数子 agent 的 `tools:` 白名单里**没有** `AskUserQuestion`
+  //      （`.claude/agents/oversight-executor.md` / `oversight-repair.md` 都是
+  //      `Read, Write, Edit, Bash, Glob, Grep`）。被拒之后它**物理上做不到** reason
+  //      要求的事，而 `brake="halt"` 会直接结束回合 —— 子 agent 的工作永远不会完成。
+  //      这是「给出做不到的指令」，比不拦更糟。
+  //   ② 就算某个 agent 有提问工具，它的提问也不该由这里判：子 agent 的输入不是用户
+  //      直接给的，所谓「开头需求模糊」在派发那一刻就由主线程决定了。
+  //   ③ 判据的可观测性在这里是断的：子 agent 的调用 `transcript_path` 指向**主**
+  //      transcript（实测见 `docs/research/2026-11-14-widened-evidence-sources.md` §4.2），
+  //      所以「这个子 agent 问过几个问题」在主 transcript 里根本数不出来。
+  //      拿主 transcript 的计数去判一个子 agent 的第一次写，判的是别人的账。
+  //
+  // 识别方式：宿主在 stdin 里给 `agent_id`（且只对子 agent 调用给）。字段缺失 =
+  // 主线程调用，照常判。**不存在中间态**，所以不需要额外配置。
+  //
+  // 注意这条**只**豁免提问判据，不豁免读侧判据：读侧判据对子 agent 的失效方向是
+  // 「多读几个文件就过」，而它本来就打算读 —— 那不是硬锁。
+  const isSubagent = Boolean(input.agent_id);
+  if (needQ > 0 && isSubagent) {
+    log.questions = 'subagent-exempt';
+    log.agentId = String(input.agent_id).slice(0, 40);
+  } else if (needQ > 0) {
     const act = typeof state.getActivity === 'function'
       ? state.getActivity()
       : (state.activity && typeof state.activity === 'object' ? state.activity : null);
@@ -1292,7 +1622,15 @@ export function decide(input, state = {}) {
       if (Number(act.unknownAskCalls) > 0 && Number(act.distinctQuestions) === 0) {
         log.questions = 'unknown-form';
       } else if (Number(act.priorWriteCalls) > 0) {
-        // 已经写过 —— 这条判据不再介入。`log.questions` 留着，方便事后分桶。
+        // 已经**写成过**（不是「发起过」、不是「被拒过」）—— 这条判据不再介入。
+        // `log.questions` 留着，方便事后分桶。
+        log.questions = Number(act.distinctQuestions) || 0;
+      } else if (act.truncated === true) {
+        // **有没扫到的内容**：回扫到上限仍不够数。这种情况下 `have` 是「至少这么多」，
+        // 不是真值 —— 拿它去拦就是拿「没读到」当「没问过」（修正三）。
+        // 所以不判，并把这件事记进日志：它不是正常放行，是被迫放行。
+        log.questions = `truncated-after-${Number(act.chunks) || 0}-chunks`;
+        log.scanTruncated = true;
       } else {
         const have = Number(act.distinctQuestions) || 0;
         if (have < needQ) askGate = { need: needQ, have, miss: needQ - have };
@@ -1350,7 +1688,10 @@ export function decide(input, state = {}) {
       action: 'deny', output: outputQ, markWrite: null,
       log: {
         ...log, decision: 'deny', halted: haltQ, satisfiedBy: null,
-        denyBy: 'questions', reasonLen: reasonQ.length,
+        // `reason` 原文进台账：这里**必须**有落地物。「事后可审计」若能指到这个字段
+        // 才是真的；只记 `reasonLen` 的时候那句话是空的（2026-11-19，验收第 5 条）。
+        // 台账在 `tasks/runs/`（gitignored、本机），所以 reason 里的绝对路径不外泄。
+        denyBy: 'questions', reason: reasonQ, reasonLen: reasonQ.length,
       },
     };
   }
@@ -1451,7 +1792,7 @@ export function decide(input, state = {}) {
   }
   return {
     action: 'deny', output, markWrite: null,
-    log: { ...log, decision: 'deny', halted: halt, satisfiedBy: null, reasonLen: reason.length },
+    log: { ...log, decision: 'deny', halted: halt, satisfiedBy: null, reason, reasonLen: reason.length },
   };
 }
 
@@ -1582,8 +1923,20 @@ export function runHook(input, { env = {}, nowMs = Date.now(), cwd: cwdOverride 
   let cachedActivity = null;
   const getActivity = () => {
     if (cachedActivity === null) {
+      // `need` 传进去才会回扫（`need=0` 时只读一块，行为与引入回扫前逐字相同）。
+      // `maxScanBytes` 由配置给：回扫是**有上限**的，到上限仍不够由 `truncated` 表达，
+      // 调用方据此放行 —— 见 `readTranscriptActivity()` §有界回扫。
+      //
+      // **`need` 必须读 `minQuestionsBeforeWriteOf()`，不能读 `cfg.minQuestionsBeforeWrite`。**
+      // 那个值在 `defaultConfig()` 里恒为 0，配置文件/env 的覆盖发生在下面
+      // `state.config = {...}` 那一行 —— 本闭包捕获的是 `cfg`，读它等于永远不回扫。
+      // 2026-11-19 实测过这个 bug：回扫函数正确、`state.config` 正确，只有这一行读错了变量，
+      // 于是长会话仍然永久锁死（`DF-038` 第 4 条的回归测试抓到的就是它）。
+      const needQ = Number(state.config && state.config.minQuestionsBeforeWrite) || 0;
       cachedActivity = (input && input.transcript_path)
-        ? readTranscriptActivity(input.transcript_path, { bytes: cfg.transcriptBytes, cwd })
+        ? readTranscriptActivity(input.transcript_path, {
+          bytes: cfg.transcriptBytes, cwd, need: needQ, maxScanBytes: cfg.transcriptScanBytes,
+        })
         : { questions: [], distinctQuestions: 0, unknownAskCalls: 0, priorWriteCalls: 0, reads: [], unreadable: true };
     }
     return cachedActivity;

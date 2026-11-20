@@ -20,9 +20,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync, readFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync, readFileSync, appendFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+
+import { scanSession as auditScanSession } from '../scripts/question-audit.mjs';
 
 import {
   decide, configOf, defaultConfig, writeIntentOf, powershellWriteScan, isGateOwnedPath,
@@ -184,8 +186,13 @@ test('reason 在 halt 与非 halt 两档里说法不同（模型要知道回合�
     .hookSpecificOutput.permissionDecisionReason;
   const soft = decide(INPUT(), stateFor({ config: { mode: 'deny', brake: 'budget', denyBudget: 3 }, denials: 0 })).output
     .hookSpecificOutput.permissionDecisionReason;
-  assert.match(halt, /结束了本回合/);
-  assert.doesNotMatch(soft, /结束了本回合/);
+  assert.match(halt, /本回合已结束/);
+  assert.doesNotMatch(soft, /本回合已结束/);
+  // 2026-11-19（验收第 5 条）：halt 下**不许下「重试」这条指令**—— 回合都结束了，
+  // 没有可重试的东西。判据是指令形式，不是「出现过『重试』二字」：
+  // 「不刹车会无限重试」是在解释宿主行为，那是事实，不是让模型去做的事。
+  assert.doesNotMatch(halt, /重试你刚才那次写|原样重试|问完怎么回到这次写/);
+  assert.match(soft, /重试你刚才那次写|重试/, 'budget 档才该叫它重试');
   assert.notEqual(halt, soft);
 });
 
@@ -880,7 +887,7 @@ test('reason 含可复制的命令、含最小读取数、含 AskUserQuestion', 
   assert.match(r, /node "\/repo\/scripts\/pre-write-gate\.mjs" mark --session s1/);
   assert.match(r, /至少 1 个源码文件/);
   assert.match(r, /AskUserQuestion/);
-  assert.match(r, /结束了本回合/);
+  assert.match(r, /本回合已结束/);
 });
 
 test('reason 里的读取数随 minReads 变（文案与实际判据不能漂）', () => {
@@ -1085,14 +1092,23 @@ function a2action(mode, reads) {
 }
 
 test('minQuestionsBeforeWrite=3 且一个都没问 → deny，reason 含「还差 3 个」', () => {
-  const st = stateWithActivity(activityOf({ questions: [] }), { config: { mode: 'deny' } });
+  // `brake="budget"`：这一档下回合还活着，文案才该说「重试」。
+  // `halt` 档的文案另有测试（`halt 与 budget 的文案必须不同`），两者不再混着断言。
+  const st = stateWithActivity(activityOf({ questions: [] }), { config: { mode: 'deny', brake: 'budget', denyBudget: 5 } });
   const r = decide(INPUT(), st);
   assert.equal(r.action, 'deny');
   const reason = r.output.hookSpecificOutput.permissionDecisionReason;
   assert.match(reason, /还差 3 个/, `reason 必须说清还差几个：${reason.slice(0, 120)}`);
-  assert.match(reason, /原样重试/, 'reason 必须告诉模型问完怎么回到这次写');
+  assert.match(reason, /重试/, 'budget 档 reason 必须告诉模型问完怎么回到这次写');
   assert.match(reason, /AskUserQuestion/);
   assert.equal(r.log.denyBy, 'questions');
+  // halt 档：同一份 activity 必须 deny，但文案里**不许**出现「重试」。
+  const h = decide(INPUT(), stateWithActivity(activityOf({ questions: [] }), { config: { mode: 'deny', brake: 'halt' } }));
+  assert.equal(h.action, 'deny');
+  const hr = h.output.hookSpecificOutput.permissionDecisionReason;
+  assert.doesNotMatch(hr, /重试你刚才那次写|原样重试/, `halt 下回合已结束，不许叫它重试：${hr.slice(-200)}`);
+  assert.match(hr, /本回合已结束/);
+  assert.match(hr, /重新发一句话|下一条消息/, 'halt 下要告诉用户下一步是什么');
 });
 
 test('minQuestionsBeforeWrite=3 且问了 3 个不同的问题 → allow', () => {
@@ -1253,6 +1269,10 @@ test('readTranscriptActivity：按 tool_use id 去重、同一问题只算一个
     const line = (id, name, input) => JSON.stringify({
       type: 'assistant', message: { content: [{ type: 'tool_use', id, name, input }] },
     });
+    // 写调用的 `tool_result`：`priorWriteCalls` 现在只数**真落盘**的写（见 §两次修正）。
+    const result = (id, isError = false) => JSON.stringify({
+      type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: isError }] },
+    });
     writeFileSync(p, [
       line('a1', 'AskUserQuestion', { questions: [{ question: '改哪个文件？' }] }),
       line('a1', 'AskUserQuestion', { questions: [{ question: '改哪个文件？' }] }), // 宿主重写的重复行
@@ -1260,6 +1280,10 @@ test('readTranscriptActivity：按 tool_use id 去重、同一问题只算一个
       line('a3', 'AskUserQuestion', { questions: [{ question: '用 A 还是 B？' }, { question: '验收用哪条命令？' }] }),
       line('e1', 'ExitPlanMode', { plan: 'x' }),
       line('w1', 'Write', { file_path: join(dir, 'out.txt') }),
+      result('w1'),                                                              // 真写成了
+      line('w2', 'Write', { file_path: join(dir, 'denied.txt') }),
+      result('w2', true),                                                        // 被拒，文件没写
+      line('w3', 'Write', { file_path: join(dir, 'pending.txt') }),              // 本次调用：还没 result
       line('r1', 'Read', { file_path: join(dir, 'README.md') }),
     ].join('\n') + '\n');
     const act = readTranscriptActivity(p, { cwd: dir });
@@ -1270,9 +1294,12 @@ test('readTranscriptActivity：按 tool_use id 去重、同一问题只算一个
     assert.equal(act.questions.length, 4, `去重后 4 个问题，实际：${JSON.stringify(act.questions)}`);
     assert.equal(act.questions.filter((q) => q === '改哪个文件？').length, 1,
       '同一个问题问两遍只能留下一条，否则「重复问」会把门槛刷过去');
-    assert.ok(act.questions.includes('ExitPlanMode'), 'ExitPlanMode 也算一次提问（与 question-audit 口径一致）');
+    assert.ok(act.questions.includes('ExitPlanMode'), 'ExitPlanMode 也算一次提问（与 question-audit 同口径）');
     assert.equal(act.distinctQuestions, 4);
-    assert.equal(act.priorWriteCalls, 1, 'transcript 里已经有一次写 → 这条判据此后不再介入');
+    // ── `priorWriteCalls` 的三态（2026-11-19，验收第 1 条）────────────────
+    // w1 写成 → 算；w2 被拒（is_error）→ 不算；w3 本次调用（无 result）→ 不算。
+    assert.equal(act.priorWriteCalls, 1,
+      '只有真落盘的写算「之前写过」：本次调用（无 result）与被拒的写（is_error）都不算');
     assert.deepEqual(act.reads, [join(dir, 'README.md')]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1356,8 +1383,14 @@ test('reasonForQuestions：说的是可判定的条件，不是「请多提问�
   assert.match(r, /还差 2 个/);
   assert.match(r, /同一个问题重复问只算 1 个/);
   assert.match(r, /改哪些文件|范围/);
-  assert.match(r, /原样重试/);
+  assert.match(r, /重试/);
   assert.doesNotMatch(r, /请多提问|多问问用户/);
+  // 2026-11-19（验收第 5 条）：那条「明说理由然后重试」是**永远失败**的指令，
+  // 必须消失。它不是「写了不好看」，是让模型照做一次就白跑一轮。
+  assert.doesNotMatch(r, /明说理由/);
+  // 「事后可审计」必须指向一个真落地物：现在台账里有 `reason` 原文字段。
+  assert.match(r, /审计/);
+  assert.doesNotMatch(r, /在 reason 里留下这一条/, 'reason 原文进台账才是落地物，不是留在 reason 里');
 });
 
 test('e2e：OW_ASK_MIN_QUESTIONS=2 时 hook 真的输出 deny，且 continue:false', () => {
@@ -1636,5 +1669,459 @@ test('DF-029：端到端 —— 同一个 stdin 喂两个进程，只有一行�
     assert.equal(b.stdout, '', '第二个进程必须完全静默（否则宿主会看到两条 deny）');
     const rows = readFileSync(join(dir, 'log.jsonl'), 'utf8').trim().split('\n');
     assert.equal(rows.length, 1, `两个进程必须只记一行，实测 ${rows.length}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── 11. 2026-11-19 验收判 FAIL 的六条：每条先红后绿的负向对照 ────────────
+//
+// 这一段是 `DF-038` 的回归网。六条缺陷里有五条的共同形状是
+// **「看起来验过了，实际没验到」**（`DF-031` 的同一类）：测试注入了真实宿主里
+// 不存在的状态，于是判据「通过」了但一次都没执行。
+// 所以这里的用例一律**从 transcript 文件出发**，不用 `activityOf()` 造数据 ——
+// 夹具本身曾经就是那个 bug。
+
+/** 造一份「读够 N 个文件」的 transcript 行序列。 */
+const readLines = (dir, n = 3) => Array.from({ length: n }, (_, i) =>
+  toolUseLine('Read', { file_path: join(dir, `f${i}.mjs`) }));
+const writeUse = (id, dir, name = 'out.txt') =>
+  JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id, name: 'Write', input: { file_path: join(dir, name), content: 'x' } }] } });
+const toolResult = (id, isError = false) =>
+  JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: isError }] } });
+
+test('DF-038 第 1 条（甲）：本次调用自身的 tool_use 在 transcript 里，不算「之前写过」', () => {
+  // 真宿主实测形态（2026-11-19，mock 模型 + 真 claude.exe）：
+  // hook 触发时本次 Write 的 tool_use **已经落盘**，还没有 tool_result。
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    writeFileSync(tp, [...readLines(dir), writeUse('tu_self', dir)].join('\n') + '\n');
+    const act = readTranscriptActivity(tp, { cwd: dir });
+    assert.equal(act.priorWriteCalls, 0,
+      '没有 tool_result 的写是本次调用，不是「之前」——数成 1 会让判据永远不执行');
+    // 端到端：这条 transcript 必须被拦，拦它的是 questions 判据。
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '3' });
+    const out = runHook(INPUT({ cwd: dir, transcript_path: tp, tool_use_id: 'tu_self' }), { env });
+    assert.equal(out.action, 'deny', `读过 3 个文件、0 提问、本次写尚未执行 → 必须拦。实际 ${JSON.stringify(out.log)}`);
+    assert.equal(out.log.denyBy, 'questions', '不是被读侧判据拦的 —— 那会把两条判据混为一谈');
+    // 负向：给它补上 tool_result（= 真写成了），同一份输入必须放行。
+    writeFileSync(tp, [...readLines(dir), writeUse('tu_done', dir), toolResult('tu_done')].join('\n') + '\n');
+    const after = runHook(INPUT({ cwd: dir, transcript_path: tp, tool_use_id: 'tu_next' }), { env });
+    assert.equal(after.action, 'allow', '真写成过的写 → 判据不再介入（写到一半才拦会打断活）');
+    assert.equal(after.log.questions, 0, '放行原因是 priorWrites，不是「问够了」');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 1 条（乙）：被闸门拒掉的写（is_error）不算「之前写过」', () => {
+  // 「拒 → 重试」是这条判据唯一的工作方式。若被拒的那次写算成「写成过」，
+  // 判据就被自己的拒绝动作解除了 —— 第一次拦住、第二次放行。
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    writeFileSync(tp, [
+      ...readLines(dir),
+      writeUse('tu_denied', dir), toolResult('tu_denied', true),   // 被拒，文件从未落盘
+      writeUse('tu_retry', dir),                                   // 模型重试（本次调用）
+    ].join('\n') + '\n');
+    const act = readTranscriptActivity(tp, { cwd: dir });
+    assert.equal(act.priorWriteCalls, 0, 'is_error:true 的写 = 没写成，不许当「之前写过」');
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '3' });
+    const out = runHook(INPUT({ cwd: dir, transcript_path: tp, tool_use_id: 'tu_retry' }), { env });
+    assert.equal(out.action, 'deny', '重试必须照样被拦 —— 否则「拒一次就解锁」');
+    assert.equal(out.log.denyBy, 'questions');
+    // 负向：同样的位置，把 is_error 改成 false（真写成过）→ 必须放行。
+    writeFileSync(tp, [
+      ...readLines(dir),
+      writeUse('tu_denied', dir), toolResult('tu_denied', false),
+      writeUse('tu_retry2', dir),
+    ].join('\n') + '\n');
+    const ok = runHook(INPUT({ cwd: dir, transcript_path: tp, tool_use_id: 'tu_retry2' }), { env });
+    assert.equal(ok.action, 'allow', '写成了 → 判据不再介入。这条负向证明上一条不是「永远 deny」');
+    // 老格式没有 is_error 字段：按成功算（方向宽松，与全文件 fail-open 一致）
+    writeFileSync(tp, [
+      ...readLines(dir),
+      writeUse('tu_old', dir),
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu_old' }] } }),
+      writeUse('tu_retry3', dir),
+    ].join('\n') + '\n');
+    assert.equal(readTranscriptActivity(tp, { cwd: dir }).priorWriteCalls, 1, '缺 is_error 按成功算');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 4 条：提问落在尾部 1MB 之外时长会话不得永久锁死', () => {
+  // 本机实测：172 个 >1MB 会话里 49 个的提问全部在尾部 1MB 之外（最大 102.9MB）。
+  // 那种会话 `have < need` 恒成立，halt 下每次拒都结束回合 —— 用户没有出路。
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    const asks = [
+      toolUseLine('AskUserQuestion', { questions: [{ question: 'Q1' }, { question: 'Q2' }, { question: 'Q3' }] }),
+    ];
+    // 填足够多的无关行，把提问推到尾部 1MB 之外。每行约 120 字节 → ~12000 行 ≈ 1.4MB
+    const filler = Array.from({ length: 12000 }, () =>
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: 'x'.repeat(80) }] } }));
+    writeFileSync(tp, [...asks, ...filler].join('\n') + '\n');
+    const size = statSync(tp).size;
+    assert.ok(size > 1024 * 1024, `夹具必须真的跨过 1MB 窗口（实测 ${size} 字节）`);
+
+    // 单块：提问滑出窗口 → 读不到（这是缺陷的形态）
+    const oneChunk = readTranscriptActivity(tp, { cwd: dir, need: 0 });
+    assert.equal(oneChunk.distinctQuestions, 0, '前提：一带窗口确实读不到');
+    // 回扫：`need>0` 才会回扫 → 必须数到 3 个
+    const scanned = readTranscriptActivity(tp, { cwd: dir, need: 3 });
+    assert.equal(scanned.distinctQuestions, 3, `回扫必须找到窗口外的问题，实际 ${scanned.distinctQuestions}`);
+    assert.equal(scanned.truncated, false, '全文都扫到了 → 不算截断');
+    assert.ok(scanned.chunks > 1, '确实分了多块读');
+
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '3' });
+    const out = runHook(INPUT({ cwd: dir, transcript_path: tp }), { env });
+    // 这条测试只关心**提问判据**有没有被永久锁死，读侧判据是另一回事：
+    // 所以断言「不是被 questions 拦的」，而不是「一定是 allow」——
+    // 夹具里没有读取记录，读侧判据照旧生效（那是对的）。
+    assert.notEqual(out.log.denyBy, 'questions',
+      `提问已满足，不许再以 questions 为由拒绝。实际日志：${JSON.stringify(out.log).slice(0, 300)}`);
+    assert.equal(out.log.questions, 3, '回扫出来的问题数必须进日志');
+    // 负向：把回扫上限压到 4KB（= 改前只有一块窗口的行为），同一条 transcript
+    // 必须**扫不到**提问。它这时不是去拦，而是 `truncated` → 放行并留痕 ——
+    // 「没读到」永远不许变成「没问过」。这条证明上面那个 `questions: 3`
+    // 确实来自回扫，而不是判据根本没工作。
+    const noScan = runHook(INPUT({ cwd: dir, transcript_path: tp, tool_use_id: 'tu_noscan' }), {
+      env: envIn(dir, {
+        OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '3',
+        OW_PRE_WRITE_GATE_TRANSCRIPT_BYTES: '4096', OW_PRE_WRITE_GATE_TRANSCRIPT_SCAN_BYTES: '4096',
+      }),
+    });
+    assert.equal(typeof noScan.log.questions, 'string', `扫不到时不报数字，报状态：${noScan.log.questions}`);
+    assert.match(String(noScan.log.questions), /^truncated-after-\d+-chunks$/,
+      '上限之内读不到 → 报 truncated，不报一个假的 0');
+    assert.equal(noScan.log.denyBy, undefined, 'truncated 时不许以 questions 为由拒绝');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 4 条（负向）：回扫到上限仍不够 → 必须放行，不许拿「没读到」当「没问过」', () => {
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    const filler = Array.from({ length: 12000 }, () =>
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: 'x'.repeat(80) }] } }));
+    // 提问在**最开头**，而回扫上限被设得很小 → 扫不到
+    writeFileSync(tp, [
+      toolUseLine('AskUserQuestion', { questions: [{ question: 'Q1' }] }),
+      ...filler,
+    ].join('\n') + '\n');
+    const act = readTranscriptActivity(tp, { cwd: dir, need: 3, maxScanBytes: 64 * 1024 });
+    assert.equal(act.distinctQuestions, 0, '前提：上限之内确实读不到');
+    assert.equal(act.truncated, true, '还有没扫到的内容 → 必须报 truncated');
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '3', OW_PRE_WRITE_GATE_TRANSCRIPT_SCAN_BYTES: '65536' });
+    const out = runHook(INPUT({ cwd: dir, transcript_path: tp }), { env });
+    assert.notEqual(out.log.denyBy, 'questions', 'truncated 时放行 —— 不知道就不许判');
+    assert.equal(out.log.scanTruncated, true, '放行必须留痕：这不是正常放行，是被迫放行');
+    // 负向：把上限放到够大，同一份输入必须**能读到**那个问题（证明上面是「上限」而非「实现读不到」）
+    const enough = readTranscriptActivity(tp, { cwd: dir, need: 3, maxScanBytes: 8 * 1024 * 1024 });
+    assert.equal(enough.distinctQuestions, 1);
+    assert.equal(enough.truncated, false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 6 条：子 agent（有 agent_id）不参与提问判据', () => {
+  // `.claude/agents/oversight-executor.md` / `oversight-repair.md` 的工具白名单
+  // 里**没有** AskUserQuestion。被拒后它物理上做不到 reason 要求的事，
+  // 而 brake=halt 直接结束回合 —— 子 agent 的工作永远不会完成。
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    writeFileSync(tp, [...readLines(dir)].join('\n') + '\n');
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '3' });
+    // 主线程：必须拦
+    const main = runHook(INPUT({ cwd: dir, transcript_path: tp, tool_use_id: 'tu_main' }), { env });
+    assert.equal(main.action, 'deny', '前提：主线程同一份输入必须被拦');
+    // 负向：agent_id 为空串**不算**子 agent（宿主不给这个字段时是 undefined，
+    // 但要防「给了空值」被当成豁免令）。这一条必须排在子 agent 那条**之前**：
+    // 子 agent 那次会因读侧判据满足而写标记，之后同一会话就都是 marker-present 了。
+    const empty = runHook(INPUT({ cwd: dir, transcript_path: tp, tool_use_id: 'tu_empty', agent_id: '' }), { env });
+    assert.equal(empty.action, 'deny', '空 agent_id 不是子 agent');
+    assert.equal(empty.log.denyBy, 'questions');
+    // 子 agent：放行（同一份 transcript、同一份配置，只有 agent_id 不同）
+    const sub = runHook(INPUT({ cwd: dir, transcript_path: tp, tool_use_id: 'tu_sub', agent_id: 'a51d9b20e2a5aa243', agent_type: 'general-purpose' }), { env });
+    assert.notEqual(sub.action, 'deny', '子 agent 不许被这条判据硬锁');
+    assert.equal(sub.log.questions, 'subagent-exempt', '放行原因必须写进日志，不能静默放行');
+    assert.equal(sub.log.agentId, 'a51d9b20e2a5aa243', '日志要能指到是哪个子 agent');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 7 条：块边界不得静默丢整行（文件 1MB+小数、问题在开头）', () => {
+  // 第二轮验收判 FAIL 的致命缺陷：`readTranscriptActivity()` 只对每块**首行**做
+  // `shift()`。块起点不落在行首时，被切开的那一行同时是上一块的末行 —— 两半各自
+  // `JSON.parse` 失败、整条记录消失，`truncated` 还报 `false`。
+  //
+  // 端到端复现形态：文件**略大于** 1 MB（1 MB + 98 字节），三个问题都在文件开头。
+  // 尾块正好覆盖整个文件，于是 `atFileStart` 为真、不 `shift()`，而块首那 98 字节
+  // 是 `AskUserQuestion` 行的**后半截**（它前面没有换行）→ 头块切在行中间。
+  // 改前：`q=0 / truncated=false / unparsable=2` → 端到端**误拦**。
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    const ask = toolUseLine('AskUserQuestion', {
+      questions: [{ question: 'Q1：改哪个文件？' }, { question: 'Q2：用什么验收？' }, { question: 'Q3：不碰哪些？' }],
+    });
+    const MB = 1024 * 1024;
+    // 填充行做**短**（~15 字节）：粒度够细才能把「超出 1MB 的那几个字节」精确
+    // 压在 (0, ask 行长度) 里 —— 那才是头块切在行中间的形态。
+    const filler = (i) => '{"i":' + i + '}';
+    const body = [];
+    let n = 0;
+    const push = (l) => { body.push(l); n += Buffer.byteLength(l) + 1; };
+    push(ask);
+    for (let i = 0; n < MB + Math.floor(Buffer.byteLength(ask) / 2); i++) push(filler(i));
+    writeFileSync(tp, body.join('\n') + '\n');
+    const size = statSync(tp).size;
+    assert.ok(size > MB && size - MB < Buffer.byteLength(ask),
+      `夹具必须让头块切在 ask 行中间（size=${size}，1MB=${MB}，ask 行 ${Buffer.byteLength(ask)} 字节）`);
+
+    const act = readTranscriptActivity(tp, { cwd: dir, need: 3 });
+    assert.equal(act.chunks, 2, '确实跨了两块');
+    assert.equal(act.distinctQuestions, 3,
+      `块边界切开的那一行必须被拼回来完整解析一次，实际数到 ${act.distinctQuestions} 个（unparsable=${act.unparsable}）`);
+    assert.equal(act.unparsable, 0, `块边界对齐到行首后，正常行不该有一行 parse 失败（实际 ${act.unparsable}）`);
+    assert.equal(act.truncated, false, '全文都读到了 → 不是截断');
+
+    // 端到端：改前这里是 deny（误拦）。问题在最开头、真值 3 ≥ need 3 → 必须**不**以 questions 为由拒绝。
+    const env = envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '3' });
+    const out = runHook(INPUT({ cwd: dir, transcript_path: tp, tool_use_id: 'tu_split' }), { env });
+    assert.notEqual(out.log.denyBy, 'questions',
+      `问题真值 3 ≥ 3，不许以 questions 为由拒绝。实际日志：${JSON.stringify(out.log).slice(0, 300)}`);
+    assert.equal(out.log.questions, 3, '数到的问题数必须进日志（不是 truncated 之后的被迫放行）');
+    assert.equal(out.log.scanTruncated, undefined, '这不是被迫放行');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 7 条（负向）：把块首那半行丢掉不补 → 同一份夹具必须变红', () => {
+  // 负向验证「上面那条不是空断言」：把边界对齐拆掉（退化成旧的「只 shift() 首行」），
+  // 同一份夹具必须数不到那三个问题。这里不复用实现，而是**直接算出两种读数**：
+  // 按旧口径手工切块、数 `unparsable`，证明被切开的那一行确实解析失败。
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    const ask = toolUseLine('AskUserQuestion', { questions: [{ question: 'A1' }, { question: 'A2' }, { question: 'A3' }] });
+    const MB = 1024 * 1024;
+    const filler = (i) => JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: 'y'.repeat(80) + i }] } });
+    const parts = [ask];
+    let n = Buffer.byteLength(ask) + 1;
+    for (let i = 0; n < MB + 40; i++) { const l = filler(i); parts.push(l); n += Buffer.byteLength(l) + 1; }
+    const text = parts.join('\n') + '\n';
+    writeFileSync(tp, text);
+    const size = Buffer.byteLength(text);
+
+    // 旧口径：头块 = [0, size-1MB)，末块 = 完整文件。两块各自 `JSON.parse` 各自的半行。
+    const headPart = text.slice(0, size - MB);          // 头半段（含 ask 行的左半截）
+    const tailPart = text.slice(size - MB);             // 被切开的行的右半段起头
+    let oldBad = 0;
+    for (const l of headPart.split('\n')) { const s = l.trim(); if (!s) continue; try { JSON.parse(s); } catch { oldBad++; } }
+    assert.ok(!tailPart.startsWith('\n'), '前提：边界确实切在一行中间（右半段不是以换行开头）');
+    assert.ok(oldBad >= 1, `旧口径下被切开的那一行必须 parse 失败（实际 ${oldBad}）——这条负向才成立`);
+    // 新实现必须把它拼回来。
+    const act = readTranscriptActivity(tp, { cwd: dir, need: 3 });
+    assert.equal(act.distinctQuestions, 3, '新实现必须数到 3');
+    assert.equal(act.unparsable, 0, '新实现不该有任何 parse 失败');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 8 条：`need` 满足即停（早停不是死代码）', () => {
+  // 第二轮验收的第 2 个致命缺陷：`out.distinctQuestions` 只在循环外赋值，
+  // 循环内读到的永远是初值 0 → 早停永不成立、每次扫满 `maxScanBytes`。
+  // 文档「`need` 满足即停，常见情况只付 1MB」在改前是假的。
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    const MB = 1024 * 1024;
+    const parts = [toolUseLine('AskUserQuestion', {
+      questions: [{ question: 'B1' }, { question: 'B2' }, { question: 'B3' }],
+    })];
+    let n = Buffer.byteLength(parts[0]) + 1;
+    // 造一个 4 MB 的文件。问题在**文件末尾**（尾块就能满足 need=3）→ 必须一块就停。
+    for (let i = 0; n < 4 * MB; i++) {
+      const l = JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: 'z'.repeat(80) + i }] } });
+      parts.push(l); n += Buffer.byteLength(l) + 1;
+    }
+    parts.push(toolUseLine('AskUserQuestion', {
+      questions: [{ question: 'B1' }, { question: 'B2' }, { question: 'B3' }],
+    }));
+    writeFileSync(tp, parts.join('\n') + '\n');
+    const size = statSync(tp).size;
+    assert.ok(size > 4 * MB, `夹具必须明显大于窗口（${size}）`);
+
+    const act = readTranscriptActivity(tp, { cwd: dir, need: 3 });
+    assert.equal(act.distinctQuestions, 3);
+    assert.equal(act.chunks, 1, `尾块就够 3 个 → 必须只读一块，实际读了 ${act.chunks} 块`);
+    assert.ok(act.bytesRead <= MB, `早停生效 → 只付 1MB，实际读了 ${act.bytesRead} 字节`);
+    assert.equal(act.truncated, false,
+      '够数是「判据所需的已确定」，不是「被迫放行」——否则修好早停会把闸门变成永不拒绝');
+
+    // 负向：need 大于真值时必须继续回扫（否则「早停」会把「没扫完」当成「够了」）。
+    const more = readTranscriptActivity(tp, { cwd: dir, need: 99 });
+    assert.ok(more.chunks > 1, `need 没满足必须继续扫，实际只读了 ${more.chunks} 块`);
+    assert.equal(more.truncated, false, '一直扫到文件头 → 不算截断');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 7 条兜底：有一行 parse 失败 → 必须报 truncated（不许静默丢数据）', () => {
+  // 第二轮 FAIL 的根本不是「解析失败」本身，而是**失败之后还报读完了**。
+  // 任何一块出现 `unparsable > 0`，`truncated` 必须为 `true`，下游据此放行。
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    const ask = toolUseLine('AskUserQuestion', { questions: [{ question: 'C1' }] });
+    // 中间插一行坏 JSON：这不是块边界的问题，是文件本身有坏行 —— 同样必须留痕。
+    writeFileSync(tp, [ask, '{"broken":', toolUseLine('Read', { file_path: join(dir, 'a.mjs') })].join('\n') + '\n');
+    const act = readTranscriptActivity(tp, { cwd: dir, need: 0 });
+    assert.equal(act.unparsable, 1, '前提：确实有一行读不懂');
+    assert.equal(act.truncated, true, '读不懂 → 必须报 truncated，不能报「读完了、没问题」');
+    // 负向：把坏行拿掉，同一份夹具必须回到 truncated:false（否则这个信号就永远为真，等于没有）。
+    writeFileSync(tp, [ask, toolUseLine('Read', { file_path: join(dir, 'a.mjs') })].join('\n') + '\n');
+    const clean = readTranscriptActivity(tp, { cwd: dir, need: 0 });
+    assert.equal(clean.unparsable, 0);
+    assert.equal(clean.truncated, false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 9 条：`tool_use` 与它的 `tool_result` 跨块时，`priorWriteCalls` 不得少算', () => {
+  // 分块逻辑的第三个静默丢数据点（与块边界丢整行同源：各块独立解析）。
+  // `ingestActivity()` 原来在**每块内**新建 `results` Map —— `tool_use` 与它的
+  // `tool_result` 是两行，块边界落在两者之间时，那块永远看不到另一半，
+  // `priorWriteCalls` 少算。实测（唯一 id、块 300 字节）：单块 20 笔，分块只剩 8 笔。
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    const lines = [];
+    for (let i = 0; i < 20; i++) {
+      lines.push(writeUse('tu_w' + i, dir, `f${i}.txt`));
+      lines.push(toolResult('tu_w' + i));
+      lines.push(toolUseLine('Read', { file_path: join(dir, `r${i}.mjs`) }));
+    }
+    writeFileSync(tp, lines.join('\n') + '\n');
+    const size = statSync(tp).size;
+
+    const base = readTranscriptActivity(tp, { cwd: dir, bytes: size + 10 });
+    assert.equal(base.priorWriteCalls, 20, `前提：单块读得出 20 笔（实际 ${base.priorWriteCalls}）`);
+
+    // 小到 200 字节的块：必然把很多 tool_use / tool_result 对切开。
+    const chunked = readTranscriptActivity(tp, { cwd: dir, bytes: 200, need: 1e9, maxScanBytes: size + 10 });
+    assert.ok(chunked.chunks > 10, `前提：确实切了很多块（${chunked.chunks}）`);
+    assert.equal(chunked.priorWriteCalls, base.priorWriteCalls,
+      `跨块读必须与单块逐字一致：单块 ${base.priorWriteCalls}，分块 ${chunked.priorWriteCalls}`);
+    assert.deepEqual(chunked.reads.slice().sort(), base.reads.slice().sort(), 'reads 也必须一致');
+    assert.equal(chunked.lines, base.lines, '解析到的行数也必须一致');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 10 条：`priorWriteCalls` 不得依赖扫描方向（写调用与 result 隔着重复副本行）', () => {
+  // 第三个顺序依赖：`priorWriteCalls` 原来是**边扫边加**，而回扫是**从尾向前**、
+  // `seenIds` 去重又是「先到先占」。这种布局会让那笔写永远不被计：
+  //   从左到右：[写 tool_use] [填充] [它的 result] [重复副本 tool_use]
+  //   从右向左 ：先看到重复副本 → 占住 seenIds；再看到 result（进 results）；
+  //              最后才看到真正的 tool_use → 被当成重复跳过 → 不加。
+  // 真实语料就这样丢了 1 笔（5.93 MB 会话：单块 86 / 分块 85，差的那笔在 4.92 MB）。
+  //
+  // 夹具参数是搜出来的（`pads=1 / chunk=400`）：块必须小到把「写调用」和
+  // 「result + 重复副本」切开，又大到不至于把 result 与副本也切开。
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    const w = writeUse('tu_w', dir, 'out.txt');
+    const pad = JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: 'p'.repeat(200) }] } });
+    writeFileSync(tp, [w, pad, toolResult('tu_w'), w].join('\n') + '\n');
+    const size = statSync(tp).size;
+
+    const base = readTranscriptActivity(tp, { cwd: dir, bytes: size + 10 });
+    assert.equal(base.priorWriteCalls, 1, `真值：这一笔写成了（实际 ${base.priorWriteCalls}）`);
+
+    const chunked = readTranscriptActivity(tp, { cwd: dir, bytes: 125, need: 1e9, maxScanBytes: size + 10 });
+    assert.ok(chunked.chunks >= 3, `前提：三样东西确实落在不同块（${chunked.chunks} 块）`);
+    assert.equal(chunked.priorWriteCalls, 1,
+      `分块必须与单块逐字一致：单块 1，分块 ${chunked.priorWriteCalls}`
+      + '（若为 0，说明结算又退回成「边扫边加」，依赖了从尾向前的扫描顺序）');
+    assert.equal(chunked.lines, base.lines, '解析到的行数也必须一致');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 5 条：拒绝文案的三种自相矛盾都不能再出现', () => {
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    writeFileSync(tp, readLines(dir).join('\n') + '\n');
+    const base = { cwd: dir, transcript_path: tp };
+    const envHalt = envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '3' });
+    const haltOut = runHook(INPUT(base), { env: envHalt });
+    const haltReason = haltOut.output.hookSpecificOutput.permissionDecisionReason;
+    // ① 「重试」与「本回合已结束」不许同时是**指令**
+    assert.match(haltReason, /本回合已结束/);
+    assert.doesNotMatch(haltReason, /重试你刚才那次写|原样重试/);
+    // ② 「明说理由然后重试」这条永远失败的指令必须消失
+    assert.doesNotMatch(haltReason, /明说理由/);
+    // ③ 「事后可审计」必须有落地物：日志里有 reason 原文，不只是长度
+    assert.equal(typeof haltOut.log.reason, 'string', 'reason 原文必须进台账（审计说法的落地物）');
+    assert.equal(haltOut.log.reason, haltReason, '台账里那份必须是真发出去的那份');
+    assert.equal(haltOut.log.reasonLen, haltReason.length, '长度字段保留（旧消费者还在读）');
+    // budget 档：文案必须不同，且那时才该说「重试」
+    const soft = runHook(INPUT({ ...base, tool_use_id: 'toolu_soft' }), {
+      env: envIn(dir, { OW_PRE_WRITE_GATE: 'deny', OW_ASK_MIN_QUESTIONS: '3', OW_PRE_WRITE_GATE_BRAKE: 'budget', OW_PRE_WRITE_GATE_DENY_BUDGET: '5' }),
+    });
+    const softReason = soft.output.hookSpecificOutput.permissionDecisionReason;
+    assert.equal(soft.output.continue, undefined, 'budget 档不许给 continue:false');
+    assert.match(softReason, /重试你刚才那次写/);
+    assert.doesNotMatch(softReason, /本回合已结束/);
+    assert.notEqual(softReason, haltReason, '两种刹车下文案必须不同');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 2/3 条：闸门与 question-audit 的提问口径一致（同文本同数字）', () => {
+  // 缺陷是「两处都自称同一口径，数字不同」。判据不是「注释怎么写」，
+  // 而是**拿同一份 transcript 分别喂两个实现，看数字对不对得上**。
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    writeFileSync(tp, [
+      toolUseLine('AskUserQuestion', { questions: [{ question: '改哪个文件？' }] }),
+      toolUseLine('AskUserQuestion', { questions: [{ question: '改哪个文件？' }] }),   // 同一问题再问
+      toolUseLine('AskUserQuestion', { questions: [{ question: '用 A 还是 B？' }, { question: '验收用哪条命令？' }] }),
+      toolUseLine('ExitPlanMode', { plan: 'x' }),
+    ].join('\n') + '\n');
+    const gate = readTranscriptActivity(tp, { cwd: dir });
+    const audit = auditScanSession(readFileSync(tp, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)));
+
+    // 提问调用次数：两处必须相等
+    assert.equal(gate.askCalls, audit.askCalls, `askCalls 不一致：闸门 ${gate.askCalls} / 审计 ${audit.askCalls}`);
+    // 去重后的问题个数：两处必须相等
+    assert.equal(gate.distinctQuestions, audit.distinctQuestions,
+      `distinctQuestions 不一致：闸门 ${gate.distinctQuestions} / 审计 ${audit.distinctQuestions}`);
+    assert.equal(gate.distinctQuestions, 4, '3 个不同文本 + ExitPlanMode');
+    // `questionsKnown` 是**另一件事**（总问题数，重复也各记一次）：3+2 = 5
+    // 它不是「同一口径」的对方，而是另一个有名字的指标 —— 这正是第 3 条的修法。
+    assert.equal(audit.questionsKnown, 5, 'questionsKnown 数的是总问题数，不是去重后的');
+    assert.notEqual(audit.questionsKnown, audit.distinctQuestions, '两个字段必须真的不同（否则第 3 条只是改名）');
+    // ExitPlanMode 在两处都必须算（第 2 条）
+    assert.ok(gate.questions.includes('ExitPlanMode'));
+    assert.ok(audit.asks.some((a) => a.form === 'exit-plan-mode'), '审计侧也必须认得 ExitPlanMode');
+    // `firstAsk` 是**第一次**提问的位置（第 1 次调用，AskUserQuestion），
+    // 而 ExitPlanMode 是第 4 次 —— 两处都按去重后的调用序号算。
+    assert.equal(audit.firstAsk, 1, 'firstAsk 是第一次提问的调用序号');
+    assert.equal(audit.asks.find((a) => a.form === 'exit-plan-mode').at, 4,
+      'ExitPlanMode 也进了 asks 序列（否则「只有计划批准」的会话会被判成从不提问）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('DF-038 第 2/3 条（负向）：旧口径（只认 AskUserQuestion、按总数算）必须与新口径不同', () => {
+  // 证明上面那条测试不是空的：如果 transcript 里只有 ExitPlanMode，
+  // 「只认 AskUserQuestion」会数 0，新口径数 1。
+  const dir = sandbox();
+  try {
+    const tp = join(dir, 't.jsonl');
+    writeFileSync(tp, toolUseLine('ExitPlanMode', { plan: 'x' }) + '\n');
+    const gate = readTranscriptActivity(tp, { cwd: dir });
+    assert.equal(gate.distinctQuestions, 1, '新口径：计划批准算一次提问');
+    // 旧口径的判据（只认 AskUserQuestion）在这份文件上是 0 —— 两个口径真的不同，
+    // 所以统一这件事是有内容的，不是改个注释。
+    const audit = auditScanSession(readFileSync(tp, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)));
+    assert.equal(audit.askCalls, 1, '审计侧现在也认计划批准（旧口径会给 0）');
+    assert.equal(audit.questionsKnown, 1, '计划批准计 1 个问题');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

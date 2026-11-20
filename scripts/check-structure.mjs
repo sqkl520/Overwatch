@@ -665,6 +665,11 @@ const PROBE_ARGS = {
   minQuestionsBeforeWriteOf: '[{}, { configFile: "/nonexistent-ow-probe.json" }]',
   reasonForQuestions: '[{ cwd: "/x", need: 3, have: 1, halt: false }]',
   MAX_MIN_QUESTIONS: '[]',
+  // 2026-11-19（`DF-038` 修复）：口径的唯一实现 + 回扫上限常量。
+  // `isAskToolName` 是**纯函数**，探针给三种名字（认的、不认的、空串），
+  // 把两个分支都走一遍 —— 只给一个已认的值等于没验「不认」这一支。
+  isAskToolName: '["AskUserQuestion"]',
+  DEFAULT_MAX_SCAN_BYTES: '[]',
 
   // observe-reality-check.mjs（2026-11-14 写前闸的真实语料重放）：
   // 判定函数全是纯的，探针取最小可构造输入。读盘的几个用不存在的路径 ——
@@ -1249,6 +1254,8 @@ function checkUnregisteredExports() {
     // 2026-11-19 `ask.minQuestionsBeforeWrite`。三个函数已进 PROBE_ARGS 实际调用，
     // 这里显式登记免得被「未登记导出」刷屏。
     'readTranscriptActivity', 'minQuestionsBeforeWriteOf', 'reasonForQuestions', 'MAX_MIN_QUESTIONS',
+    // 2026-11-19（`DF-038` 修复）：提问口径的唯一实现与回扫上限。两者都已进 PROBE_ARGS。
+    'isAskToolName', 'DEFAULT_MAX_SCAN_BYTES',
   ];
   for (const k of PRE_WRITE_GATE_FNS) REGISTERED.add(k);
 

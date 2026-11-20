@@ -21,6 +21,182 @@
 
 ---
 
+## [Unreleased] - 2026-11-19 第三轮（第二轮验收判 FAIL 后的修复：分块回扫的三个静默丢数据点）
+
+上一段修好五条、但**新引入**一个判据级缺陷：分块回扫在块边界静默丢整行，而 `truncated`
+仍报 `false`。失效方向是「静默误拦」，与本闸自己声明的 fail-open 相反 —— 独立验收判 **FAIL**。
+这一轮只改 `readTranscriptActivity()` / `ingestActivity()` 的分块逻辑（连同它们的测试），
+没有动上一轮已验 PASS 的判据业务逻辑（`priorWriteCalls` 定义、`agent_id` 豁免、文案）。
+每一条仍然先复现再修，每条修复旁有一条负向验证。复现证据见 `tasks/dev-findings.md` 的 `DF-038`。
+
+### Fixed
+
+1. **【致命】早停是死代码，每次扫满上限。** `out.distinctQuestions` 只在循环外赋值
+   （`out.distinctQuestions = out.questions.length`），循环内读到的永远是初值 `0` ——
+   `if (out.distinctQuestions >= wantQ) break` 永不成立。于是文档「`need` 满足即停，
+   常见情况只付 1 MB」**那句话是假的**。
+   实测（本机，问题在文件末尾、尾块即够数，8.00 MB 会话）：
+   改前 `need=3` → 200.1 ms / 8 块 / 读满 8.00 MB；改后 35.5 ms / **1 块** / 1.00 MB。
+   修法：循环内读 `acc.seenQ.size`（实时去重数），**不是**读 `out.questions.length`
+   （它要配合 `recordQuestion()` 的去重，直接读数组长度会算重复行）。
+
+2. **【致命】块边界静默丢整行，且 `truncated=false`。** 旧实现只对每块**首行**做
+   `lines.shift()`。块起点不落在行首时，被切开的那一行**同时是上一块的末行** ——
+   两半各自 `JSON.parse` 失败、计入 `unparsable`，**整条记录消失**，而 `truncated`
+   仍报 `false`。端到端误拦已复现：文件 1 MB+98 字节、三个问题都在文件开头 →
+   头块把提问行切掉 → `q=0 / truncated=false / unparsable=1` → 端到端 `deny`。
+   修法：块边界**对齐到行首**；被切开那一行的**右半段**交给左侧块，与左半段拼成
+   完整行解析**恰好一次**（`carry`）。全局覆盖率是连续的 `[start_n, size)`，没有空洞。
+   修后同一夹具：`q=3 / unparsable=0`，端到端不再以 `questions` 为由拒绝。
+
+3. **【顺带查出、同源】`tool_result` 与它的 `tool_use` 跨块时 `priorWriteCalls` 少算。**
+   `ingestActivity()` 原来在**每块内**新建 `results` Map，而 `tool_use` 与 `tool_result`
+   是两行、块边界可以落在两者之间。实测（唯一 id、块 200 字节）：单块 20 笔 / 分块 0 笔。
+   修法：`results` 提到 `acc` 里跨块共享。修后同一夹具分块与单块逐字一致。
+
+4. **兜底：读得不完整必须说出来。** 任何一块出现 `unparsable > 0`，`truncated` 一律置 `true`，
+   下游据此放行。静默丢数据是这次 FAIL 的根本原因 —— 解析修好了，信号也必须修。
+   （真实语料 7438 份 / 454 万行实测**天然不可解析行 = 0**，所以这条兜底不会把闸门变成永久放行。）
+
+5. **`truncated` 的口径跟着早停一起改。** 旧口径 `fromEnd < size` 配修好的早停会把
+   **每一次**够数的判定都变成「被迫放行」（下游先看 `truncated`，为真就不判）——
+   闸门又变回永不执行。现在三种停法分开算：读到文件头 → `false`；
+   **够数提前停 → `false`**；其余（到上限 / 读不动 / 停在中间）→ `true`。
+   **早停与 `truncated` 是一对**，只修一个会把缺陷从一个方向搬到另一个方向。
+
+6. **修掉一个不存在的符号。** `pre-write-gate.mjs:787` 的注释引用了
+   `exitPlanModeCountsAsAsk` —— 全仓库没有这个标识符（实际实现是 `isAskToolName()`）。
+   注释改成实现里真实存在的名字，避免下一个人按注释去找一个不存在的东西。
+
+### 测试
+
+`scripts/pre-write-gate.test.mjs` 128 → **134** 条（新增 6 条：第 7 条块边界 / 第 7 条负向 /
+第 8 条早停 / 第 7 条兜底 / 第 9 条跨块 `tool_result` / 第 10 条扫描方向不依赖）。
+全仓：**硬门口径（数源码里 `test(` 的调用，1724）→ 1730**；
+`node --test scripts/` 运行时报 **1727 → 1733**（差的 3 条是动态注册的，两个口径都记下来，不拿一个冒充另一个）。
+硬门对账的四处数字（`README.md` / `CLAUDE.md` / `docs/GUIDE.md` / `.github/workflows/validate.yml`）已同步。
+
+六条负向验证（用改前实现复算同一组断言，必须变红）：
+
+| 场景 | 改前读数 | 断言期望 |
+|---|---|---|
+| 1 MB+小数、问题在开头 | `q=0 / unparsable=1 / truncated=false` | `q=3 / unparsable=0` |
+| 4 MB、问题在末尾、`need=3` | `chunks=5 / bytesRead=4.19MB` | `chunks=1 / bytesRead≤1MB` |
+| 有坏行 | `unparsable=1 / truncated=false` | `truncated=true` |
+| `tool_use` 与 `tool_result` 跨块 | 单块 20 / 分块 0 | 分块 === 单块 |
+| 块边界切在行中间（手工切） | 头半段 `JSON.parse` 失败 ≥1 行 | 新实现 `unparsable=0` |
+| 写调用 / result / 重复副本分三块 | 单块 1 / 分块 0（边扫边加时） | 分块 === 单块 |
+
+`node --test scripts/` 全绿 **1733** 条（源码 1730 条，硬门按后者对账）；三个台账非本会话增量 **0**；`check-structure.mjs` 全绿。
+
+跨边界量化（本机 7439 份 transcript、4268 个 >1 MB 会话，去掉单块自己也读不完的，可比 4172 个；
+同一 8 MB 窗口、单块 vs 分块，按 `priorWriteCalls` / `distinctQuestions` / `reads` 内容比对）：
+***改前 172 个不一致 → 改后 0 个**。另有 **26 个**只剩**路径原文写法**的差异
+（斜杠方向 17 / 仅大小写 7 / 尾随斜杠 1 / 其他 1）：`pathKeyOf()` 归一后同一个键，
+`reads.length` / 判决 / `target-read` 判据完全相同，只是数组里留哪份原文取决于去重先到者。
+等价写法，不是丢数据，不在本轮范围，未修。
+**注**：本条此前写「2 个，两个都是尾随斜杠」——那个数字没有复算，
+`2026-11-20` 独立验收重数后是 26。结论方向不变，但数字是错的。
+
+### 复现装置（供下一个复算的人）
+
+```js
+// 1MB+小数、问题在开头：让「文件大小 - 1MB」落在 (0, ask 行长度) 之间。
+const MB = 1024 * 1024;
+const ask = JSON.stringify({ type:'assistant', message:{ content:[
+  { type:'tool_use', id:'tu_q1', name:'AskUserQuestion',
+    input:{ questions:[{question:'Q1'},{question:'Q2'},{question:'Q3'}] } } ] } });
+const parts = [ask]; let n = Buffer.byteLength(ask) + 1;
+for (let i = 0; n < MB + Math.floor(Buffer.byteLength(ask) / 2); i++) {
+  const l = `{"i":${i}}`;             // 短填充行：粒度够细才能精确压进 (0, askLen)
+  parts.push(l); n += Buffer.byteLength(l) + 1;
+}
+// 写进 temp 目录的 .jsonl，然后 readTranscriptActivity(p, { need: 3 })
+```
+
+---
+
+## [Unreleased] - 2026-11-19 晚（独立验收判 FAIL 后的修复：六条，第一条使判据从未执行过）
+
+上一段（同日）交付的 `ask.minQuestionsBeforeWrite` 被独立验收判 **FAIL**。六条缺陷，
+第一条是致命的：**判据在真实宿主上从不执行**。这一段的每一条都是先复现再修，
+每条修复旁有一条负向验证（把 bug 放回去，测试必须变红）。全部复现证据见
+`tasks/dev-findings.md` 的 `DF-038`。
+
+### Fixed
+
+1. **【致命】判据永远不执行。** `readTranscriptActivity()` 把尾部窗口里**所有**写调用
+   都算成「之前写过」，注释理由「hook 跑在 PreToolUse，本次调用还没落进 transcript」
+   **被真宿主实测证伪**（真 `claude.exe` 2.1.308 + mock 模型：hook 触发时本次 `Write`
+   的 `tool_use` 已落盘，只缺 `tool_result`）。于是 `priorWriteCalls ≥ 1` 恒成立。
+   修法：`priorWriteCalls` 改为**只数有非 error `tool_result` 的写**。
+2. **同一处第二个假阳性：被拒的写也算「写过」。** 顺第 1 条继续查出来的（同一次复现）：
+   闸门拒掉的那次写 `tool_result` 是 `is_error:true`、文件从未落盘，却让「重试」直接放行 ——
+   判据被自己的拒绝动作解除。上面那条统一的判据一并修掉了它。
+3. **`ExitPlanMode` 口径统一到一处。** `question-audit.mjs:404` 只认 `AskUserQuestion`，
+   闸门两个都算，而四处文档（`CAPABILITIES` / `CHANGELOG` / `settings` 模板 / 审计 spec）
+   声称「同一口径」—— **那句话是假的**。
+   现在工具名判据只有一个实现：`pre-write-gate.mjs` 的 `isAskToolName()`，审计侧 import 它。
+   选「两个都算」的理由：计划批准同样是「我停下来等你」，用户原话要防的是「一句话都没问就开始写」。
+   本机实测（436 个含 `ExitPlanMode` 的会话）：判决翻转 **1** 个（`no-ask` → `read-first`），
+   **新增阻塞违规 0 个** —— 这不是为了让数字好看，是修一个分类错误。
+4. **去重口径不再是「同一口径」的假话。** 闸门 `distinctQuestions=1`（同一问题问 3 次）与
+   审计 `questionsKnown=3` 差在**它们本来在数不同的东西**。现在审计报两个有名字的数：
+   `questionsKnown`（总问题数，用于 `too-many-questions`）与 `distinctQuestions`
+   （去重后个数，**与闸门放行判据同一实现**）。测试用同一份 transcript 分别喂两个实现对账。
+5. **长会话不再永久锁死。** 只读尾部 1 MB 时，提问滑出窗口的会话 `have < need` 恒成立，
+   `brake="halt"` 下每次拒都结束回合 —— 无解。现在 `need>0` 时**向前回扫**，
+   上限 `OW_PRE_WRITE_GATE_TRANSCRIPT_SCAN_BYTES`（默认 8 MB）；到上限仍不够 → **放行** + `scanTruncated:true`。
+   本机实测 >1 MB 会话 172 个，其中 **49 个**提问全在尾窗口外（最大 102.9 MB / 全文 9 问 / 尾内 0 问）。
+   耗时实测：1 MB 4.1 ms / 4 MB 31.1 ms / 8 MB 75.2 ms（48 MB 会话）。`need` 满足即停。
+6. **拒绝文案不再自相矛盾。** 原文案在同一段里既说「原样重试你刚才那次写」又说「本次拒绝同时结束了本回合」，
+   还有一条「明说理由然后重试」（重试必然再被拒，是永远失败的指令），以及「会在 reason 里留下这一条，
+   事后可审计」但日志只记 `reasonLen`（没有落地物）。
+   现在 `halt` / `budget` 两种文案彻底分开：`halt` 面向**用户**（本回合已结束，不提「重试」），
+   `budget` 才面向模型；删掉「明说理由」；**reason 原文写进台账**（`log.reason`），审计说法有了落地物。
+   `reasonFor()`（读侧判据）有同一处矛盾，一并修。
+7. **子 agent 不再被硬锁。** `oversight-executor` / `oversight-repair` 的工具白名单是
+   `Read, Write, Edit, Bash, Glob, Grep`，没有 `AskUserQuestion`：被拒后它物理上做不到 reason 要求的事，
+   而 `halt` 直接结束回合。现在宿主给了 `agent_id` 的调用**不参与**这条判据（直接放行，
+   日志 `questions:"subagent-exempt"` + `agentId`）。另有一条独立理由：子 agent 的 `transcript_path`
+   指向主 transcript（`docs/research/2026-11-14-widened-evidence-sources.md` §4.2），
+   拿主 transcript 的计数判子 agent 的第一次写，判的是别人的账。
+
+### 测试
+
+`scripts/pre-write-gate.test.mjs` 120 → 128 条（新增 8 条，含 8 条负向对照），
+全仓 1719 → **1727** 条。硬门对账的四处数字已同步。
+
+八条负向验证（把修复回退，对应测试必须变红）：
+
+| 回退什么 | 变红的测试 |
+|---|---|
+| `priorWriteCalls` 恢复成「出现过就算」 | `DF-038 第 1 条（甲）`、`（乙）` |
+| 回扫关掉（`need` 恒 0） | `DF-038 第 4 条` |
+| `truncated` 不再放行 | `DF-038 第 4 条`、`第 4 条（负向）` |
+| 子 agent 豁免去掉 | `DF-038 第 6 条` |
+| `reason` 不写台账 | `DF-038 第 5 条` |
+| `halt` 文案恢复「重试」 | `reason 在 halt 与非 halt 两档里说法不同` |
+| 审计退回只认 `AskUserQuestion` | `DF-038 第 2/3 条`（含负向那条） |
+| 审计 `distinctQuestions` 退回按总数 | `DF-038 第 2/3 条` |
+
+`node --test scripts/` 全绿 1727 条；三个台账增量均为 0；`check-structure.mjs` 全绿。
+
+### 复现装置（供下一个复算的人）
+
+第 1 条的前提只能靠真宿主验：本地 mock Messages API（SSE，约 60 行）+ 真 `claude.exe`，
+项目内注册一个 `PreToolUse` hook 探针，hook 里读 `transcript_path` 判断
+「本次 `tool_use_id` 是否已在文件里 / 是否已有 `tool_result`」。实测输出：
+
+```
+{"tool":"Write","tool_use_id":"toolu_stub_w1","currentToolUseIdPresent":true,
+ "thisCallToolUseInTranscript":true,"thisCallToolResultInTranscript":false}
+```
+
+同一份快照喂 `readTranscriptActivity()` → `priorWriteCalls = 1`（旧实现）。
+
+---
+
 ## [Unreleased] - 2026-11-19（写前闸多一道闸：第一次写之前，先问够 N 个问题）
 
 用户原话是这条改动的**判据来源**，不是修饰：
@@ -36,13 +212,16 @@
   | 值 | 行为 |
   |---|---|
   | `0`（默认） | 判据不启用。**连 transcript 都不读** —— 测试里用一个会抛异常的 `getActivity` 钉住了这一点，而不是看代码里有没有 `if` |
-  | `N>0` | 第一次写之前必须已有 ≥N 个**不同**问题（`AskUserQuestion` + `ExitPlanMode`，与 `question-audit.mjs` 同口径） |
+  | `N>0` | 第一次写之前必须已有 ≥N 个**不同**问题（`AskUserQuestion` + `ExitPlanMode`，判据实现是 `pre-write-gate.mjs` 的 `isAskToolName()`）。**三处判据并不统一**：`measure-ask-vs-tell.mjs` 用自己的 `ASK_TOOLS`（行为等价、实现不同），`question-audit.mjs` 主分支硬编码只认 `AskUserQuestion` —— 只有 `ExitPlanMode` 的会话，闸门数 1、审计数 0。**2026-11-20 验收判 FAIL 时指出**：本条此前写「三处一处口径」，那是假的；再往前一版写「与 question-audit.mjs 同口径」，也是假的 |
   | 环境变量 | `OW_ASK_MIN_QUESTIONS` **优先于**配置文件（临时试跑用） |
 
   五条判据细节，每条都是判据的一部分：
 
-  1. **只判第一次写。** `transcript` 里已经有过写 → 这条判据不再介入。写到一半才拦会打断正在进行的活，
+  1. **只判第一次写。** transcript 里**真写成过**的写 → 这条判据不再介入。写到一半才拦会打断正在进行的活，
      而这条判据要防的是「开头方向就错了」——那时候还什么都没写。
+     「真写成过」= 该 `tool_use` 有 `tool_result` 且 `is_error` 不为 true。**2026-11-19 修正**：
+     此前把「本次调用自身」（hook 触发时 `tool_use` 已落盘、还没 `tool_result`）与被拒的写
+     （`is_error:true`，文件从未落盘）都算成「写过」—— 前者让判据一次都不执行，后者让「拒 → 重试」自动解锁。
   2. **去重后计数。** 同一问题重复问只算 1 个（键是 `normalizeText(question)`），
      否则把一个问题拆成三句就能刷过门槛。`tool_use` 行按 `id` 去重（宿主重写会留重复行，实测全语料 33,090 行）。
   3. **形态不可读的提问不参与判定。** `questions` 是坏 JSON 的调用（实测 6/197 次）记 `unknownAskCalls`，
@@ -51,7 +230,7 @@
      逃生口的意义就是「我知道我在干什么」。与读侧判据并列而不是串联 —— 两条各自 deny、各自给 reason，
      混成一段模型会不知道先做哪件事。
   5. **fail-open 到底。** transcript 读不到、配置文件是垃圾、键值超范围 → 一律回落到 `0`。
-     这条判据的失效方向只能是「不拦」。
+     这条判据的失效方向只能是「不拦」。**回扫到上限仍不够也放行**（`scanTruncated:true`）。
 
   拒绝文案是可执行的：说清**还差几个**、**往哪些方向问**（范围 / 取舍 / 验收 / 别问已经说过的）、
   **问完原样重试这次写**。不是「请多提问」。
