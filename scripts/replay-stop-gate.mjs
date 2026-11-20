@@ -112,26 +112,33 @@ function evaluate(parsed, project) {
   return { strict: strictDec.action === 'block' ? strictDec : null, loose: looseBlocks };
 }
 
-function walk(root, cutoff, out) {
-  let ents;
-  try { ents = readdirSync(root, { withFileTypes: true }); } catch { return; }
-  for (const e of ents) {
-    const p = join(root, e.name);
-    if (e.isDirectory()) { walk(p, cutoff, out); continue; }
-    if (!e.name.endsWith('.jsonl')) continue;
-    let st;
-    try { st = statSync(p); } catch { continue; }
-    if (st.mtimeMs < cutoff) continue;
-    let txt;
-    try { txt = readFileSync(p, 'utf8'); } catch { continue; }
-    out.push({
-      path: p,
-      project: e.name,
-      sandbox: SANDBOX_RE.test(p),
-      subagent: SUBAGENT_RE.test(p),
-      content: txt,
-    });
-  }
+/** 只列出要处理的文件（**不读内容**）。
+ *
+ *  2026-11-21 修：原实现边遍历边 `readFileSync` 把全文塞进数组，6299 份 transcript
+ *  叠起来吃了 **14.8 GB 内存**（实测，任务管理器截图），把整机 CPU 挤到 21%。
+ *  读文件和算判定必须**在同一层循环里**，读完立刻丢 —— 判定只需要一份 transcript，
+ *  没有跨文件的状态。 */
+function walk(root, cutoff) {
+  const out = [];
+  const rec = (dir) => {
+    let ents;
+    try { ents = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) { rec(p); continue; }
+      if (!e.name.endsWith('.jsonl')) continue;
+      let st;
+      try { st = statSync(p); } catch { continue; }
+      if (st.mtimeMs < cutoff) continue;
+      out.push({
+        path: p,
+        sandbox: SANDBOX_RE.test(p),
+        subagent: SUBAGENT_RE.test(p),
+      });
+    }
+  };
+  rec(root);
+  return out;
 }
 
 /** CLI 入口。**必须走入口守卫**：结构硬门会 import 每个脚本去核对导出，
@@ -152,8 +159,7 @@ export function main(argv = process.argv.slice(2)) {
     process.exit(2);
   }
 
-  const files = [];
-  walk(root, Date.now() - opt.days * 864e5, files);
+  const files = walk(root, Date.now() - opt.days * 864e5);
 
   const buckets = {
     all: { n: 0, strictBlock: 0, looseBlockSessions: 0, looseBlocks: 0, reasons: {} },
@@ -163,12 +169,19 @@ export function main(argv = process.argv.slice(2)) {
   };
 
   for (const f of files) {
+    // **读文件和判判定在同一层**：读完立刻丢，峰值内存 = 单份最大的 transcript。
+    // 2026-11-21 之前这里是先 `walk()` 收齐全文本、再进循环 —— 6299 份叠起来
+    // 吃了 14.8 GB（实测）。
+    let txt;
+    try { txt = readFileSync(f.path, 'utf8'); } catch { continue; }
+
     const targets = [buckets.all];
     if (!f.sandbox) targets.push(buckets.real);
     // 子 agent 不产生 Stop 事件 —— 它们不进 `live` 这一档。
     if (!f.sandbox && !f.subagent) targets.push(buckets.live);
 
-    const parsed = parseTranscript(f.content);
+    const parsed = parseTranscript(txt);
+    txt = null;   // 交给 GC：后面的判定不需要原文
     const r = evaluate(parsed, { kind: 'node', test: 'npm run test', build: null, source: 'package.json' });
 
     for (const b of targets) {

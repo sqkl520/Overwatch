@@ -21,6 +21,76 @@
 
 ---
 
+## [Unreleased] - 2026-11-21 `replay-stop-gate` 边读边算（修我自己造的内存炸弹）
+
+### Fixed
+
+- **`replay-stop-gate.mjs` 把 6299 份 transcript 全文收进数组再判定，实测吃 14.8 GB**
+  （任务管理器截图：Working Set 15127 MB，整机 CPU 21%）。
+
+  根因：`walk()` 边遍历边 `readFileSync`，把 `content: txt` 存进结果数组；判定循环
+  在遍历**全部结束后**才开始。判定只需要一份 transcript，没有任何跨文件状态。
+
+  改法：`walk()` 只收路径不读内容；主循环里读一份、算一份、`txt = null` 立刻丢。
+  峰值内存从「全部文件之和」降到「最大单文件」。
+
+  这是我自己造的 bug。同一个脚本早先还被发现过一次「模块顶层执行导致硬门 import 时
+  真的跑全量回放」，两处都是同一个毛病：**没想清楚这个脚本会被谁在什么时候调用。**
+
+## [Unreleased] - 2026-11-21 两条硬约束的机械实现接上调用链（DF-042）
+
+审计发现：硬约束 2（≥5 Agent 含锐评/验收/修复）与硬约束 3（锐评不得看执行者自评）
+**都有机械实现，但在真实调用链上一次也触发不了**。两处的形状相同——
+检查写好了、测试也绿，而命令行入口从不传那个参数。
+
+### Fixed
+
+1. **`validate-run.mjs`：`requireComplex` 在 CLI 上不可达**（缺陷 A）。
+   原 `main()` 是 `targets.map((t) => validateFile(t))`，opts 被丢掉，于是
+   `requireComplex` 恒为默认 false，那三条角色检查**在命令行上从未执行**；
+   唯一触发它的是 `validate-run.test.mjs:94` 手动传参那条用例。
+
+   修法：`requireComplex` 改成**三态**（`true` / `false` / `undefined`），
+   `validateGraph` 返回值新增 `declared_complexity`；CLI 新增互斥的
+   `--complex` / `--simple`，两个都给时 exit 2（不静默挑一个）。
+   **不给声明时不拦，但每次输出第一行印「复杂度声明：未声明 —— 硬约束 2 没有执行」**
+   ——病根是「没检查」与「检查过并放行」在屏幕上同形，所以「没检查」必须出现在每一份输出里。
+   `--complex` 下「≥5 个子任务」由 warn 升为 error（硬约束 2 的两半同属一条约束）。
+   `--simple` 但图上 ≥5 子树或已含锐评/验收/修复之一时发警告（自相矛盾的声明要被指出）。
+
+   **默认值为什么不选激进**：实测两份 `tasks/runs/*/task-graph.json` 的 capability
+   全是 `executor`（0 个 review / acceptor / repair），`--complex` 会让两份全红。
+   它们是真的一路没检查过来的 run——那正是缺陷本身。默认开等于把历史逾期当新错报。
+
+2. **`compose-agent-prompt.mjs`：`FORBIDDEN_CONTEXT` 在真实调用中恒真**（缺陷 B）。
+   CLI 两处硬传 `context: {}`，而脚本在 `.claude/` / `templates/` / `docs/` 里零引用。
+   修法：新增 `--context-from <context.json>`——它是这条路唯一的入口，
+   同时被 `checkPromptSpec` 的独立性判据**检查**、被 `composePrompt` 的 §2.4 **渲染**
+   （只检查不发送的话，「通过」只能证明键名合法）。JSON 解析不了 exit 2，不回落成 `{}`。
+
+### Added
+
+3. **`skills/oversight/SKILL.md`**：Phase A 的校验命令改成 `--complex` / `--simple`，
+   并写清它决定硬约束 2 执不执行；Phase B 新增「用 `compose-agent-prompt` 拼提示词」整节，
+   含 `--gate` 为什么必要（`acceptor` 的工具里没有 Bash，手写 prompt 会让它只能判「不通过」）。
+4. **`check-structure.mjs` 新增 `checkPromptWiring()`**（与 `checkInboxWiring` 同模式）：
+   SKILL.md 必须引用 `compose-agent-prompt` 与 `--context-from`，且脚本得真的实现后者。
+   负向验证：删掉任一引用 → 硬门 exit 1；恢复 → exit 0。
+5. **测试**：`validate-run.test.mjs` 新增 10 条（含 1 条真回退：把 `validateFile(t, opts)`
+   改回 `validateFile(t)`，`--complex` 用例必须失效）；`compose-agent-prompt.test.mjs`
+   新增 8 条（含 1 条真回退：把 `context,` 改回 `context: {},`，独立性拒绝必须失效）。
+   全量 **1792 → 1810 条**（`node --test` pass 1811、skipped 2，硬门数与徽章取 1810）。
+6. **`docs/CAPABILITIES.md`** 补 5 行能力：`validate-run --complex` / `--simple`、
+   `compose-agent-prompt compose` / `--context-from` / `verify`。
+
+### 代价
+
+- `validate-run.mjs` 的输出多一行「复杂度声明」；提示词在给了 `--context-from` 时多一节 §2.4。
+- 未声明复杂度仍然 exit 0 —— 不新增阻塞，只让状态可见。
+- 不回填两份历史 task-graph.json：改它等于伪造当时的拆解。
+
+---
+
 ## [Unreleased] - 2026-11-21 README 按参考项目骨架重写（中英两份）
 
 用户要求「完全学习参考项目的 README」，但本仓库不是 App、没有 Release、star 为 0，
