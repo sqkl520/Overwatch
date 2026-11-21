@@ -363,11 +363,34 @@ test('仓库根的 overwatch.config.json 必须存在且合法', () => {
   assert.deepEqual(r.errors, []);
 });
 
-test('KNOWN_ROLES 与 .claude/agents 下的角色定义完全一致', () => {
+test('防漂的钉子：配置声明的 roles 集合 == 目录发现的集合', () => {
+  // 这条钉子**换了钉的对象，防的还是同一件事**。
+  //
+  // 旧版钉的是「`KNOWN_ROLES` 字面量 vs 目录」。那个字面量已经不存在了（DF-044）：
+  // `KNOWN_ROLES` 现在就是 `discoverRoles()` 的投影，拿它跟目录比对是拿同一份数据
+  // 的两个视图互相比 —— 永远相等，什么都不防。
+  //
+  // 现在钉两端都**真的独立**：
+  //   · 配置侧：`overwatch.config.json` 里手写的 `agent.roster`（人写的）
+  //   · 目录侧：`.claude/agents/*.md` 实际存在哪些 .md（盘上的）
+  // 语义仍然是「用户配了哪些岗位」必须真的存在。把它换成「注册表 vs 目录」会立刻退化。
   const dir = join(REPO, '.claude', 'agents');
-  const actual = readdirSync(dir).filter((f) => f.endsWith('.md')).map((f) => f.replace(/\.md$/, '')).sort();
-  assert.deepEqual([...KNOWN_ROLES].sort(), actual,
-    '角色清单写死在脚本里，会漂——这条断言就是防漂的那根钉子');
+  const onDisk = readdirSync(dir).filter((f) => f.endsWith('.md')).map((f) => f.replace(/\.md$/, '')).sort();
+
+  const raw = JSON.parse(readFileSync(join(REPO, CONFIG_FILE), 'utf8'));
+  const declared = [...(raw.agent && Array.isArray(raw.agent.roster) ? raw.agent.roster : [])].sort();
+  assert.ok(declared.length, '配置里必须有 roster —— 空 roster 等于没有可派发的岗位');
+
+  const missing = declared.filter((r) => !onDisk.includes(r));
+  assert.deepEqual(missing, [],
+    `配置声明了 ${missing.join(', ')}，而 .claude/agents/ 下没有这些 .md —— `
+    + '启动时会「只挂启用的 N 个」然后挂出几个不存在的角色，用户只看到会话里少了人');
+
+  // 反向也要钉：`KNOWN_ROLES` 是**给配置校验用的合法值全集**，它必须覆盖盘上全部角色，
+  // 否则「新增一个角色」与「把它写进 roster」之间会隔着一道没有报错的门。
+  const notKnown = onDisk.filter((f) => !KNOWN_ROLES.includes(f));
+  assert.deepEqual(notKnown, [],
+    `这些 .md 存在但不在 KNOWN_ROLES 里：${notKnown.join(', ')} —— 写进 roster 会被判 unknown-role`);
 });
 
 test('ASK_MODES 恰好是 always / never / auto 三个', () => {

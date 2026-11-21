@@ -8,6 +8,8 @@ description: |
   - 拿到一个 ST 子树，需要实现它
   - 需要按验收标准补齐交付物
 tools: Read, Write, Edit, Bash, Glob, Grep
+readonly: false
+display: exec
 model: inherit
 color: green
 maxTurns: 60

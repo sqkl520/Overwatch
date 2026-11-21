@@ -1893,8 +1893,279 @@ const LIVING_DOCS = [
   还在」现在要改述 —— 两处都认之后，**清空一处不再能解除叫停**。那是 fail-safe 方向的
   代价，已写进 `docs/CAPABILITIES.md` 的候选路径表，本文档不重复。
 
----
+### DF-042 [fixed] 两条硬约束的机械实现不可达：检查写好了、测试也绿，而真实调用链上永不触发
+
+- **发现于**：主线程审计（2026-11-21），来自「CLAUDE.md 的硬约束在代码里到底有没有执行点」这一问
+- **位置**：
+  - A：`scripts/validate-run.mjs:367`（原）`results = targets.map((t) => validateFile(t))` —— opts 被丢掉
+  - B：`scripts/compose-agent-prompt.mjs:941`、`:965`（原）两处硬传 `context: {}`
+- **证据（复现原文）**：
+
+  A 的复现——命令行入口下 `requireComplex` 恒为默认 false：
+
+  ```
+  $ node scripts/validate-run.mjs tasks/runs/2026-11-13-output-reconciliation/task-graph.json
+  ✓ tasks/runs/2026-11-13-output-reconciliation/task-graph.json     ← exit 0，那三条角色检查一条没跑
+  ```
+
+  同一个文件、手动传参才会红：
+
+  ```
+  $ node -e "…validateFile(f,{requireComplex:true})…"
+  复杂任务缺少 review / acceptor / repair 角色   ← 三条都在
+  ```
+
+  也就是说硬约束 2 的唯一执行点是 `validate-run.test.mjs:94` 手动传 `{ requireComplex: true }` 的那条用例。
+  文档里写着「复杂任务至少 5 个 Agent」，而**产品跑起来时一次都没检查过**。
+
+  B 的复现——`FORBIDDEN_CONTEXT` 在真实调用中恒真：`grep -rn compose-agent-prompt` 在
+  `.claude/` / `templates/` / `docs/CAPABILITIES.md` / `docs/spec/` 里**零命中**，
+  而 CLI 两处写死 `context: {}`，所以「锐评不得拿到执行者的自我评价」这条检查
+  永远没有对象可判。测试里手动传 `{ self_assessment: '我做了 90%' }` 才碰得到它。
+
+- **影响**：硬约束 2 与硬约束 3 是 CLAUDE.md 里排在最前面的两条，而它们**只存在于测试里**。
+  更坏的是形态：两者的输出都是一行 ✓ 或一段正常的 compose 报告——
+  **「没检查」与「检查过并放行」在屏幕上完全同形**。这正是 `DF-031` / `DF-033`
+  （探针静默跳过看起来与通过一样）的第三次复发，只是这次跳过的不是探针，是两条硬约束。
+- **修复**：
+  - A：`validateGraph` 的 `requireComplex` 改成**三态**（`true` / `false` / `undefined`），
+    返回值新增 `declared_complexity`；CLI 新增互斥的 `--complex` / `--simple`，
+    两个都给时 exit 2（不静默挑一个）。**不给声明时不拦，但每次输出第一行都印
+    「复杂度声明：未声明 —— 硬约束 2 没有执行」**——不检查是一次决定，它必须看得见。
+    另外把「≥5 个子任务」在 `--complex` 下从 warn 升为 error（硬约束 2 两半同属一条约束）。
+  - B：CLI 新增 `--context-from <file>`（JSON 对象），它同时被 `checkPromptSpec` 的独立性判据
+    **检查**、被 `composePrompt` 的 §2.4 **渲染**。解析失败 exit 2，不回落成 `{}`
+    （回落＝「你给的独立性输入被静默丢掉」，正是要防的失效形态）。
+  - C：`check-structure.mjs` 新增 `checkPromptWiring()`：SKILL.md 必须引用
+    `compose-agent-prompt` 与 `--context-from`，且脚本得真的实现后者。
+  - SKILL.md：Phase A 的校验命令改成 `--complex` / `--simple` 并写清它决定是否执行硬约束 2；
+    Phase B 新增「用 compose-agent-prompt 拼提示词」整节（含 `--gate` 为什么必要）。
+- **为什么默认值不选激进**：实测两份 `tasks/runs/*/task-graph.json` 的 capability
+  **全是 executor**（0 个 review / acceptor / repair），加 `--complex` 会两份全红。
+  但它们的 `run_id` 与 `goal` 说明它们是**真的**只派了执行 agent 的 run——
+  这正是缺陷本身：硬约束 2 从未生效，所以没人被迫补角色。
+  两份历史图不追溯（它们已经逾期，且属于「过去没检查」的事实），
+  但**从这次起每一份输出都写明声明状态**，于是同样的漏检不会再静默发生。
+- **负向验证（都真做了一次回退）**：
+  - 把 `validateFile(t, opts)` 改回 `validateFile(t)` → 新加的 `--complex` 用例变红（`exit 0`）。
+  - 把 `context,` 改回 `context: {},` → 独立性拒绝用例变红（放行到 exit 0）。
+  - 删掉 SKILL.md 里的 `compose-agent-prompt` / `--context-from` → 硬门报违规、exit 1；恢复后 exit 0。
+- **代价**：`validate-run.mjs` 的输出多了第一行「复杂度声明」；
+  `compose-agent-prompt` 的提示词在给了 `--context-from` 时多一节 §2.4。
+  两条都是「让状态可见」的代价，没有新增阻塞（未声明仍然 exit 0）。
+- **未做**：不回填两份历史 task-graph.json（那是过去的事实，改了等于伪造当时的拆解）；
+  不把 `--complex` 设成默认（会让所有单任务的 run 判死，而「是不是复杂」仍是规划判断）。
 
 ---
 
-_（新增条目追加在此行上方）_
+### DF-043 [partially fixed] 「两个根」不存在：一个 `ROOT` 同时被当成「用户项目」和「框架仓库」
+
+- **发现于**：2026-11-21 架构审计，来自「在别人项目里跑本框架的命令会发生什么」这一问。
+  本节只记 **B（两个根）**；**A（角色注册表）是 `DF-044`**，**C（规则三层）不在本轮范围**。
+- **位置**（逐处核对过，不是 grep 出来的清单）：
+  - `scripts/claim-ledger.mjs:69` `ROOT = resolve(HERE,'..')`，被 `:237,256,273,845,925` 的
+    `base = ROOT` 默认值、`:1143` 的 `--runs-dir` 默认值、`:1144` 的 `--root` 默认值共用。
+  - `scripts/compose-agent-prompt.mjs:77,911`：一个 `root` 同时当「去哪找 run」和「去哪找角色定义」。
+  - `scripts/render-plan.mjs:66,851,852`。
+  - `scripts/validate-run.mjs` 的 `--all` 必须显式给 `tasks/runs`（相对 cwd，自动调用方无从得知）。
+  - 同病根的五处 hook 台账：`stop-verify-hook.mjs:529,580,678`、`pre-write-gate.mjs:1819`、
+    `hook-dedupe.mjs:105`、`analyze-hook-samples.mjs:56`。
+- **证据（复现原文）**：`/tmp` 里建一个空 git 仓库当「用户项目」，从它跑：
+
+  ```
+  $ cd /tmp/xxxx/owtest && node <fw>/scripts/claim-ledger.mjs declare --run probe-test --task ST1 --paths a.md
+  已登记期望：ST1 → 1 个文件
+  nonce: 6a9f433d
+  $ ls <fw>/tasks/runs/probe-test/
+  claims.jsonl                      ← 落在框架仓库
+  $ ls /tmp/xxxx/owtest
+  .git                              ← 用户项目里什么都没有
+  ```
+
+  hook 侧同理：`.claude/settings.local.json` 把两个 hook 指到框架脚本，而宿主传给它们的 `cwd`
+  是用户项目；修前三处台账路径却都拼在 `REPO_ROOT` 上。
+- **根因**：**「根」这个词有两种合法语义，被一个变量名合并了。**
+
+  | 消费者 | 该拿什么根 | 为什么 |
+  |---|---|---|
+  | PreToolUse / Stop hook | 用户项目 | 它守的是用户正在改的那个项目，标记文件与刹车计数都在那儿 |
+  | `launch` | 框架仓库 | 它挂载的是自己的载荷（`.claude/` + agent 定义），载荷随包发布 |
+  | `claim-ledger` / `compose` / `validate-run` / `render-plan` | 用户项目 | 它们读写的是 run 台账，台账属于用户那次任务 |
+
+  前两行修前就对（hook 读 `input.cwd`、launch 用 `resolve(HERE,'..')`），第三行全错。
+- **修复**：新增 `scripts/project-root.mjs`（零兄弟依赖 —— 必须的：`question-audit → observe-reality-check
+  → pre-write-gate → claim-ledger` 已有 TDZ 环，本文件若去 import `loadConfig()` 会闭合成真环）。
+  - `frameworkRoot()`：只给随包资产用。
+  - `projectRoot()`：五级阶梯 `--root` → `UNTILDONE_ROOT` → `payload.cwd`（仅 hook）→
+    cwd 向上找 `.untildone/` 再退 `.git/` → **失败 `exit 2` + 打印试过的四级**。
+  - `runsDirInfo()` / `runsDirFor()`：显式 `--runs-dir` → `UNTILDONE_RUNS_DIR` → `paths.runs` →
+    `<root>/.untildone/runs`，并返回 `source` 供打印。
+  - 每次解析都打印**用了哪一级**（写 stderr，不污染 `--json` 的 stdout）。
+- **与派单的一处偏离（实测推翻派单的前提）**：派单写「第 5 级临时回落脚本位置并打印警告，
+  这样现有测试路径不变」。实测：去掉回落之后 `node --test scripts/` **1863 条全绿**
+  （含 claim-ledger / compose / render-plan / validate-run 四份端到端用例）。
+  既然代价为零，就不保留「静默写进框架目录」的逃生口 —— 那正是本缺陷的形态，
+  也与本节预声明标准 #12 的 `exit 2` 要求一致。`fallback:'framework'` 参数仍存在且有测试，
+  但四个生产调用点都不传，并有一条用例钉住这个决定。
+- **本仓库行为不变**：`overwatch.config.json` 加 `"paths": { "runs": "tasks/runs" }`；
+  `question-audit.validateConfig()` 顶层键白名单加 `paths`（不加就是 `unknown-key` → 整份配置判非法 →
+  `launch` 的 roster 与 question-audit 全部停摆，正是 `minQuestionsBeforeWrite` 那次的形态）。
+  `check-structure.mjs:19` 的 `ROOT = process.cwd()` **没动**：它已经对了，正是阶梯第 4 级的自然来源。
+- **负向验证（真做了一次回退）**：把 `projectRoot()` 第一行改成 `if (true) return frameworkRoot();`
+  → `project-root.test.mjs` **3 条变红**（「默认返回 null」「claim-ledger exit 2 且框架仓零新增」
+  「负向验证用例本身」）；同时从 `/tmp` 项目跑 `claim-ledger` 退回原样：
+  `[claim-ledger] runs 来自 overwatch.config.json paths.runs → D:\…\Overwatch\tasks\runs` 并真的写进去。
+  恢复后 29 条全绿。
+- **代价**：
+  - 每个 CLI 多两行 stderr（用了哪一级 / runs 来自哪）。这是「让状态可见」的代价，不阻塞。
+  - 第 5 级现在是硬失败（`exit 2`）而不是「回落到某个地方继续」。从仓库根以外、又不用 `--root` 的
+    调用会失败 —— 这是有意的：**猜一个落点比失败更贵**。
+- **未做**：
+  - hook 的**唯一一次**解析仍由宿主 payload 的 `cwd` 决定，**没有**接 `projectRoot()` 阶梯
+    （宿主一定会给 `cwd`，接进来只是多一条没人走的路径；而且 hook 在 PreToolUse 预算里，
+    多一次文件系统向上查找是净损失）。第 3 级存在的意义是给「宿主真没给 cwd」这一形态一个出口。
+  - `launch.mjs` 不动：它用 `REPO` 是对的（挂自己的载荷）。
+  - 本缺陷标 `partially fixed`：B 已修，**C（规则三层）未做**。
+
+#### 预声明验收标准（2026-11-21，DF-043）
+
+> 冻结于实现完成之前（三个实现 Agent 仍在跑）。**标准不得事后修改**，验收 Agent 一票否决。
+> 范围只有 **A（角色注册表）** 与 **B（两个根）**。**C（规则三层）不在本轮范围**——任何「三层已完成」的声明本轮不受理。
+>
+> 基线（干净 worktree，HEAD `9ae6c6d`，2026-11-21 实测复算）：`node --test scripts/` → tests **1795** / fail 0 / skipped 2；
+> 源码 `^\s*test\(` 计数 **1792**；机制源码里 12 个角色 id 的字面量 **29** 个（launch 12 / question-audit 15 / render-plan 2）；
+> 12 份角色 id 排序后 SHA-256 前 16 位 = **`40151cdd0c31eedf`**。
+> ⚠ 派单里写的「1813 条测试」与实测不符（工作区当前 1840 条且 5 红）。本清单以实测 1795/1792 为锚，不以 1813 为锚。
+
+| # | 条目 | 判据 | 怎么判（命令 / 代码位置） | 通过条件 |
+|---|---|---|---|---|
+| 1 | 不破坏现状：测试全绿 | 不破坏 | `node --test scripts/ 2>&1 \| grep -E "^ℹ (tests\|fail)"` | `tests` ≥ 1795 且 `fail 0` |
+| 2 | 条数只增不减且文档同数 | 不破坏 | `git grep -h -E "^\s*test\(" -- 'scripts/*.test.mjs' \| wc -l`；再 `node scripts/check-structure.mjs; echo $?` | 计数 ≥ 1792，README / CLAUDE / GUIDE / CI 四处数字与源码实测相等（`check-structure.mjs:343` 的 `checkTestCount` 会自己核） |
+| 3 | A 核心：加一个角色要改几个文件 | A | 干净 worktree 里**只**加 `.claude/agents/<新 id>.md`，跑到 `check-structure` + 全量测试两项全绿，数 `git status --short \| wc -l` | **≤2**（含新文件）。今天实测：只加 md → 硬门绿但 `KNOWN_ROLES 与 .claude/agents 下的角色定义完全一致` 红；再补 `question-audit.mjs` 一处 → 两绿，即**下限 3**。派单说的「9 个」我本轮未复现出完整口径，不作为判据 |
+| 4 | A 暗雷：`review` 子串不连坐 | A | 造 `.claude/agents/my-review-helper.md`（`tools: Read, Write, Edit, Bash`，正文不写「只能写报告」）跑硬门 | `exit 0`。今天实测 `exit 1`：`只读角色 "my-review-helper" 拥有写工具`（`check-structure.mjs:285`） |
+| 5 | A 只读来自数据，不来自名字 | A | 再建一份 frontmatter 写 `readonly: true` 且 `tools` 含 `Edit` 的角色，跑硬门 | `exit 1`，消息点名**该文件**与 **frontmatter 字段**，不是「名字像 review」 |
+| 6 | A 兼容：12 个 id 逐字不变 | A | `node -e "const f=require('fs'),h=require('crypto');const a=f.readdirSync('.claude/agents').filter(x=>x.endsWith('.md')).map(x=>x.replace(/\.md$/,'')).sort();console.log(a.length,h.createHash('sha256').update(a.join(',')).digest('hex').slice(0,16))"` | 输出 `12 40151cdd0c31eedf` |
+| 7 | D1：机制源码零角色名 | D1 | 去注释后数 `oversight-(12 个 id)` 在 `scripts/*.mjs`（排除 `*.test.mjs`）的出现次数；今天 29 | **0 次**。**`scripts/data/*.json` 等新增数据文件同样计入**——把名单搬进 `scripts/` 下的 JSON 不算通过 |
+| 8 | D1 白名单只许是配置默认值 | D1 | `git grep -n "'oversight-'" -- 'scripts/*.mjs' ':!*.test.mjs'`，并跑一条**换前缀**（如 `qa-`）的全链测试 | 字面量只出现在「读不到用户配置时的默认值」一处；换前缀后全链仍通 |
+| 9 | A 注册表真的被 6 处委托 | A | `git grep -n "discoverRoles\|resolveRole\|readonlyOf" -- 'scripts/*.mjs' ':!*.test.mjs'`，对照 `check-structure.mjs:52/285`、`question-audit.mjs:108`、`launch.mjs:102`、`render-plan.mjs:153`、`validate-run.mjs:42`（另加 `compose-agent-prompt.mjs:937` 的文件名拼装） | 全部经注册表；`AGENTS_EXPECTED` 的 12 个字面量已删（它是 D1 违规） |
+| 10 | B 核心：台账不写进框架仓 | B | `d=$(mktemp -d) && cd $d && git init -q`，从**框架外 cwd** 跑 `node <fw>/scripts/claim-ledger.mjs declare --run r1 --task ST1 --paths a.md` | `exit 0`；台账出现在 `$d` 下（`.untildone/runs/r1/claims.jsonl` 或 `tasks/runs/r1/`）；`git -C <fw> status --short` 无新增且 `<fw>/tasks/runs/r1` 不存在。今天实测反例：写进 `D:\…\Overwatch\tasks\runs\` |
+| 11 | B 五级每一级可单独测 | B | 逐级具名测试：①`--root` ②`UNTILDONE_ROOT` ③hook payload 的 `cwd` ④`process.cwd()` 向上找 `.untildone/`→`.git/` ⑤失败；`node scripts/project-root.mjs` 打印命中的级号 | 5 条测试各自独立存在，且**逐级删掉该分支时只有对应那条变红**（见反向验收） |
+| 12 | B 失败：exit 2 且打印已试位置 | B | 在既无 `.git`/`.untildone`、又未设 `UNTILDONE_ROOT` 的目录跑 #10 的命令 | **`exit 2`**（不是 0），stderr 列出 4 个已试级与各自取值。今天实测反例：`exit 0` + 回落框架根，stderr 自认「P1 过渡」 |
+| 13 | B 分工不混（三个根各归各位） | B | ①`cwd=/tmp/x` 跑 `pre-write-gate.mjs` 看标记/刹车文件落点 ②`node scripts/overwatch.mjs launch --dry-run` 看载荷路径 ③`compose-agent-prompt`/`validate-run` 看台账与图 | ①落 `/tmp/x` ②指向框架目录 ③指向项目根；三者都不交换 |
+| 14 | D4：拒绝指到用户的声明 | D4 | 三探针：①图里 capability 写 `qa` ②配置 `agent.roster: ["qa"]` ③角色 md 缺失 | ①含图文件路径 + `subtrees[i].capability` ②含配置文件路径 + `agent.roster` ③含找过的角色文件路径 + 前缀来自哪份配置；三者 exit 非 0（今天 ② 已 `exit 2` 且点名 `agent.roster`，可作范式） |
+| 15 | D2：异项目全流程 0 行源码 | D2 | 临时目录建项目：角色 `qa/reviewer/shipper`、`paths.runs` 与 `.claude/agents` 布局都不同；依次 `validate-run` → `compose-agent-prompt` → `claim-ledger declare/verify` → `render-plan` | 命令全部 `exit 0`（真失败除外）；**`git -C <fw> status --short` 全程零改动**、`<fw>` 内无任何新文件。注意：`check-structure` **不在**此列（它守的是框架仓结构，异项目里失败是正确行为，见末节第 3 条） |
+| 16 | D5：本仓自己是用户（角色是数据） | D5 | 本仓 12 个角色、`paths.runs=tasks/runs`、roster 全在 `overwatch.config.json`；删掉 `.claude/agents/oversight-probe.md` 跑硬门与测试 | 变红且消息点名该角色（说明它是数据，不是代码）；恢复后全绿 |
+| 17 | 新模块不得只靠警告暴露 | 全 | `node scripts/check-structure.mjs 2>&1 \| grep -c "未登记"`，对照 `roles.mjs` / `project-root.mjs` 的每个 `export` | 这两个文件 **0 条**「未登记」；每个导出要么进 `PROBE_ARGS`/`SANDBOX_ARGS`，要么进 `INTENTIONALLY_PROBED_FREE` 并写理由。今天工作区实测 28 条警告，而**警告不阻塞、exit 仍为 0** |
+| 18 | 用户视角（见下节量化） | D5 | 全新目录，只写 3 个文件后跑 #15 的链路 | 3 个文件 + 0 行框架源码；`overwatch` 不要求 `--root`（靠 `.untildone/` 或 `.git` 自证） |
+
+## 反向验收的做法
+
+每条「已生效」的声明都必须**删掉实现后变红**，且红法必须是 `exit` 非 0 或具名测试 fail——
+**不是一行警告**。今天实测：`check-structure` 对未登记导出的 28 条提示 `exit 0`，
+所以「屏幕上出现了字」不能当证据（`DF-031`：静默跳过与通过同形）。逐条动作，都真做一次回退：
+
+1. 把 `claim-ledger` 的根改回 `resolve(HERE,'..')` → #10 必须红（今天就是这样写进框架根的）。
+2. 删掉阶梯第 3 级（`payload.cwd`）→ **只有** #11 的第 3 条用例红，其余 4 条不红（证明五级是五条独立路径，不是一条分支的别名）。
+3. 把 #4 的 `readonlyOf(frontmatter)` 换回 `name.includes('review')` → #4、#5 同时红。
+4. 改一个角色 id 的一个字符 → #6 哈希红，且 #3 的文件数变多（漏改一处就红）。
+5. 往 `scripts/data/roles.json` 塞 12 个角色名 → #7 **仍必须红**，否则 D1 只是被搬了家。
+6. 删掉 `AGENTS_EXPECTED` 常量 → 无 git 路径下 `launch --verify` 必须报「无法验证」，不得报「全部对上」。
+7. 把 `runsDirFor` 的环境变量优先级降到配置文件之后 → #10/#13 必须红（`DF-041` 的形态：隔离有时生效有时静默失效）。
+
+## 用户视角：最少几个文件
+
+**3 个文件，0 行框架源码**：`.claude/agents/qa.md`（一个角色）、`overwatch.config.json`（前缀 / roster / `paths.runs`）、
+`tasks/runs/t1/task-graph.json`（一张图）。判定：在全新目录只写这三个文件，依次跑
+`validate-run` → `compose-agent-prompt` → `claim-ledger declare/verify` → `render-plan`，
+全部 `exit 0` 且框架仓零改动。多于 3 个文件、或需要 `--root` 才能跑，判不通过（那还是「本仓自己」不是「任何项目」）。
+
+## 我认为最可能翻车的地方
+
+1. **根解析的「P1 过渡回落」**。工作区里的 `project-root.mjs` 已经写了五级阶梯并声称「第 5 级不许回落」，
+   但实测在无根目录下它 `exit 0` 并回落到框架仓、真往 `D:\…\Overwatch\tasks\runs\x` 写了台账，
+   stderr 还自认「这是本次修复前的行为」。**这正是本次要修的形态**，只是被包了一层说明文字。
+   验法：#12 的 `exit 2` 判定 + #10 的「框架仓零新增」必须同时成立；只跑一条 happy path 测不出来。
+2. **D1 被「搬家」通过**。把 12 个角色名从 `launch.mjs` / `question-audit.mjs` / `render-plan.mjs`
+   挪进 `scripts/data/*.json`，grep 立刻干净，但机制源码仍然内置用户产物名。验法：#7 的计数范围含 `scripts/**`，
+   且 #8 要求换前缀跑通全链——只搬不读配置的项目会在这条上红。
+3. **硬门的 `ROOT = process.cwd()` 被顺手改掉**。`check-structure.mjs:19` 用 cwd 是对的（它在仓库里跑），
+   一旦改成 `projectRoot()`，在 `scripts/` 子目录或异项目里跑就会炸：实测从 `scripts/` 跑出 **105 条违规**（`exit 1`）。
+   验法：#13 的第 ① 条只要求 hook 用 payload `cwd`，同时用 #2 保证「从仓库根跑硬门仍 exit 0」；
+   并在 #15 的异项目里明确**不**要求硬门通过（它守的是框架仓自己的结构）。
+
+---
+
+---
+
+### DF-044 [fixed] 同一个角色有三个名字空间：`--role oversight-acceptor` 拼出 `oversight-oversight-acceptor.md`
+
+- **发现于**：主线程复现（2026-11-21），来自「加一个角色要改几个文件」这一问
+- **位置**：
+  - `scripts/compose-agent-prompt.mjs:937`（原）`join(assetRoot, '.claude', 'agents', \`oversight-${role}.md\`)`
+  - `scripts/compose-agent-prompt.mjs:585`（原）L0 指针同一处拼装
+  - `scripts/question-audit.mjs:108` `KNOWN_ROLES` 12 个字面量
+  - `scripts/launch.mjs:102` `AGENTS_EXPECTED` 同一份 12 个字面量
+  - `scripts/validate-run.mjs:42` `CAPABILITIES` 第三份 12 个字面量
+  - `scripts/render-plan.mjs:153` `CAPABILITY_LABEL` 手写中文表
+  - `scripts/check-structure.mjs:52` `READONLY_ROLES` + `:285` 的子串匹配
+- **证据（复现原文）**：
+
+  ```
+  $ node scripts/compose-agent-prompt.mjs compose --run 2026-10-30-p0 --task ST1 --role oversight-acceptor
+  没有这个角色的定义：D:\Projects\Overwatch\.claude\agents\oversight-oversight-acceptor.md
+  角色必须先存在于 .claude/agents/ —— compose 不发明岗位。
+  ```
+
+  同一个角色三个写法：目录里是 `oversight-acceptor.md`，`overwatch.config.json` 的 roster 里是
+  `"oversight-acceptor"`，`task-graph.json` 里是 `capability: "acceptor"`。
+  按配置里的写法调用产品自己的命令，就报「不存在」。
+
+  第二段证据是 `check-structure.mjs:285` 的子串匹配：
+
+  ```js
+  const isReadonly = READONLY_ROLES.some((r) => name.toLowerCase().includes(r));
+  ```
+
+  建 `.claude/agents/my-review-helper.md`（`tools: Read, Write, Edit, Bash`，正文不写「只能写报告」），
+  硬门报 `只读角色 "my-review-helper" 拥有写工具` —— 而那份文件的 frontmatter 里从没写过它是只读的。
+  **误检且说不清**：用户拿到一句话，不知道改哪里。
+- **影响**：加一个角色要同时改 9 处（12 份 md + 6 份脚本里的清单 + 配置 + SKILL.md + planner 的角色表）。
+  九份清单没有一份是从别的来源派生的，漏一处不会红在当场 —— 只会让新角色在某个分支上
+  「明明配了却不存在」，而屏幕上看不出是漏了哪一处。
+- **修复**：
+  - 新增 `scripts/roles.mjs`：`discoverRoles(agentsDir)` 扫 `.claude/agents/*.md`，从 frontmatter 得
+    `{ id, file, tools, readonly, forbiddenContext, display, name }`。
+    `id` = frontmatter 的 `id:`，否则 `name` 去 `agentPrefix`（配置项，默认 `"oversight-"`）。
+    现有 12 份 `name: oversight-acceptor` 去前缀正好得 `acceptor`，与任务图的 `capability` 逐字相同。
+    `parseFrontmatter` 也搬到这里（原本 compose 与 check-structure 各一份拷贝）。
+  - 6 处委托：`KNOWN_ROLES` → 注册表投影；`AGENTS_EXPECTED` 常量删除 → `fallbackAgents()`；
+    `CAPABILITIES` → id 集合；`CAPABILITY_LABEL` → frontmatter 的 `display`（缺省回落 id）；
+    `READONLY_ROLES` → frontmatter 的 `readonly`；compose 两处文件名拼装 → `resolveRole()`。
+  - 只读判据改成数据：12 份 `.md` 各加 `readonly:` 与 `display:` 两行，除此之外零改动。
+    **缺这一行本身报错**——否则「忘了写」的失效方式是静默放行，比误检更坏。
+  - `--role` 严格放宽：先全名、后 id、再加前缀试一次。`acceptor` 与 `oversight-acceptor` 都可用。
+- **为什么 `display` 也进了 frontmatter**：`CAPABILITY_LABEL` 换成「读 display」之后，
+  没写 `display` 的角色会在 PLAN 里显示英文 id，而英文 id 也算「能看」——
+  于是一份中英混排的 PLAN 不会有任何东西变红。补 12 行 `display:` 是为了让「换掉那张手写表」
+  这个改动在输出上**零变化**（实测 12 个标签逐字相同）。
+- **负向验证（都真做了一次回退）**：
+  - 删 `oversight-probe.md`：git 主路的期望仍有 12 个（差异暴露），无 git 的兜底变 11 个（代价可见）。
+    两条都写进了 `launch-negatives.test.mjs`，`assert.equal(expAfter.length, 12)` 钉住前者。
+  - `my-review-helper`（`readonly: false` + 写工具）→ 硬门 `exit 0`；
+    同一条测试在实参里还断言 `discoverRoles` 给出 `readonly === false`。
+  - `readonly: true` + `Edit/Bash` → 硬门 `exit 1` 且点名该文件；删掉 `readonly:` 行 → `exit 1`，消息是「缺少必填字段」。
+  - 只加一份 `.claude/agents/oversight-auditor.md` 跑全链 → `validate-run` 的 `CAPABILITIES` 自动含 `auditor`、
+    `compose --role auditor` 通过、PLAN 能取到 `display`。验证完已删。
+- **代价（如实记）**：
+  1. `expectedAgents()` 的**兜底支不再是独立来源**（它和 `readdirSync` 读同一批 .md）。
+     主路（`git ls-files`）仍独立；兜底是降级，测试把这个方向钉住了，不假装。
+  2. `CAPABILITIES` 与 `KNOWN_ROLES` 现在依赖 `.claude/agents/` 存在。干净 clone 上它在
+     （`.gitignore` 专门没有排除 `.claude/`，见 `checkGitignoreSanity`），所以配置校验仍然可跑。
+  3. 新增角色仍要在 `SKILL.md` 里出现一次——那是 `checkAgentReachability()`（DF-015）在守
+     「定义了却从不被派发」，与这份清单无关，不该被这次重构顺手关掉。
+- **回归测试**：`scripts/roles.test.mjs`（19 条）+ `launch-negatives.test.mjs` 的删角色用例
+  + `question-audit.test.mjs` 的防漂钉子（改成钉「配置声明的 roster ⊆ 目录」+「目录 ⊆ KNOWN_ROLES」）。
+
+---
+
+

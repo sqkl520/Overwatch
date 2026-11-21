@@ -8,6 +8,8 @@ description: |
   - 交付物已产出，需要质量评分
   - 需要知道「如果只改一处，改哪里」
 tools: Read, Grep, Glob, Write
+readonly: true
+display: 评审
 model: inherit
 color: magenta
 maxTurns: 30

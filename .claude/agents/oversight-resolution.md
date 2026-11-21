@@ -8,6 +8,8 @@ description: |
   - Phase C 冲突登记发现实质性分歧
   - 两个 Agent 对同一事实给出相反结论
 tools: Read, Grep, Glob, Write
+readonly: false
+display: 裁决
 model: inherit
 color: yellow
 maxTurns: 25

@@ -8,6 +8,8 @@ description: |
   - 交付物已产出，需要在验收前做对抗测试
   - 一个结论被多个 Agent 认同，需要有人试图推翻它
 tools: Read, Grep, Glob, Write
+readonly: true
+display: 红队
 model: inherit
 color: red
 maxTurns: 40

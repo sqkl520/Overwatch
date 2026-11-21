@@ -7,6 +7,8 @@ description: |
   - 验收判不通过
   - 锐评分低于阈值且用户要求改进
 tools: Read, Write, Edit, Bash, Glob, Grep
+readonly: false
+display: 修复
 model: inherit
 color: yellow
 maxTurns: 50

@@ -100,8 +100,24 @@ node scripts/scan-sessions.mjs --days 3
 **拿到产物先校验，再派发：**
 
 ```bash
-node scripts/validate-run.mjs tasks/runs/<run-id>/task-graph.json
+node scripts/validate-run.mjs --complex tasks/runs/<run-id>/task-graph.json
+# 或：node scripts/validate-run.mjs --simple tasks/runs/<run-id>/task-graph.json
 ```
+
+`--complex` / `--simple` **不是可选的修饰**，它决定 CLAUDE.md 硬约束 2
+（≥5 个独立 Agent，含锐评 / 验收 / 修复）**执不执行**。不给声明时那几条检查
+不会跑，脚本会在输出第一行印「复杂度声明：未声明 —— 硬约束 2 没有执行」——
+看到这行就说明本轮没检查，别把它当成通过。
+
+> 这个开关是 2026-11-21 补的（DF-042）。在此之前 CLI 从不把 `requireComplex`
+> 传给 `validateGraph`，那三条角色检查**在命令行上一次都没执行过**；
+> 唯一触发它的是 `validate-run.test.mjs` 里手动传参的那条用例。
+> 也就是说：文档里写着「至少 5 个 Agent」，而唯一的执行点在测试里。
+
+判据怎么选：本轮任务是不是「一次给到需求就要一次做完」的复合任务？
+是 → `--complex`；确实是一次小改动 → `--simple`，并在拆解图里写清为什么。
+声明 `--simple` 但图上 ≥5 个子树或已含锐评/验收/修复之一时，脚本会警告——
+那是自相矛盾的信号，复核它，不要无视。
 
 不通过就退回 planner 重做，**不要自己补字段**——补出来的预算和依赖关系是编的，
 下游 Agent 会当真。这个校验器把 `planner.md` 里的 schema 变成可执行的检查；
@@ -122,9 +138,53 @@ node scripts/validate-run.mjs tasks/runs/<run-id>/task-graph.json
 
 **独立性**：每个 Agent 只收到「原始任务 + 验收标准 + 产出形态声明」，不读同级输出。靠**不提供路径**实现，不靠 prompt 里写「请不要读」。
 
+**每个子树的提示词用 `compose-agent-prompt` 拼，不手写：**
+
+```bash
+node scripts/compose-agent-prompt.mjs compose --run <run-id> --task ST1 \
+  --graph tasks/runs/<run-id>/task-graph.json --role <角色> \
+  --stop "<可判定的停机条件>" \
+  --gate "node scripts/check-structure.mjs=tasks/runs/<run-id>/gate-structure.txt" \
+  --out tasks/runs/<run-id>/ST1-<角色>.prompt.md
+```
+
+`--role` 收**两种写法**：id（`acceptor`）与全名（`oversight-acceptor`）都能用 ——
+解析走 `.claude/agents/` 的注册表（`scripts/roles.mjs`），不必记住哪个名字空间该写哪种形状。
+写错时会报「现有角色：…」，照那个列表改。
+
+它把四层拼起来：L0 身份（只放指针，正文留在 `.claude/agents/`）、L1 协议
+（`templates/dispatch.md` 逐字）、L2 本次任务（取自拆解图 + 你的 `--stop`/`--constraint`）、
+L3 机器注入（测试命令、nonce、产出路径、硬门输出）。**检查不过就 exit 1 且不落文件**——
+一份检查不过的提示词发出去，子 agent 会照着错的做，而主线程不会知道。
+
+**为什么必须用它而不是照模板手填**（每条都是实测过的，不是风格偏好）：
+
+- `<nonce>` / `<paths>` 是占位符。手填漏一个，`claim-ledger observe` 就归属不到
+  transcript，而归属失败是**静默的**——`verify` 只会说「0 份能归属」，看起来像「没有产出」。
+- 验收项的「怎么核实」要和角色的工具白名单相容。`acceptor` 的 tools 是
+  `Read, Grep, Glob, Write`，它**物理上跑不了** `check-structure.mjs`；
+  手写 prompt 会让它唯一能给的诚实结论变成「不通过」。`--gate` 把主线程跑过的
+  结果注入进去，验收才从「跑命令」变成「读输出核对」。
+- 停机条件是唯一被实测证明能提高完成率的干预，而它必须可判定；
+  只有形容词的（「尽可能全面」）会被拒绝派发。
+
+**`--context-from` 是给某个角色补材料的唯一入口。** 它是一个 JSON 对象，
+里面的内容会**先过独立性检查再渲染进提示词**：给 `review` 喂执行者的自我评价
+（`self_assessment`）、给 `acceptor` 喂锐评分数（`review_score`）都会被拒。
+**主线程不要用别的方式把执行者的自评塞进锐评的 prompt**——锚定无法用 prompt 撤销，
+只能靠不提供（`docs/spec/dispatch-contract.md` §3）。
+
+> 2026-11-21（DF-042）：这个脚本此前在 `.claude/` / `templates/` / `docs/` 里
+> **零引用**，且 CLI 两处硬传 `context: {}`，所以它的 `FORBIDDEN_CONTEXT` 检查
+> 在真实调用中恒真。接线的改动就是这一节 + `--context-from`。
+
 **派发前对每个子树跑一次 `claim-ledger declare`**（见 §4.5），把它打印的 nonce 拼进该 Agent 的
 prompt。这一步是 §4.5 对账能工作的前提——nonce 没进 prompt，收活时 `observe` 就无法把
 transcript 归属到任务，`verify` 只能看到「期望没落地」。
+
+> `compose-agent-prompt` 会自己生成 nonce 并把它写进提示词，然后打印出配套的
+> `claim-ledger declare` 命令（nonce 与提示词里的是同一个）。**照抄那条命令**，
+> 不要另外手写 nonce——两处手写就有两处抄错的机会，而它们坑的是同一件事。
 
 ## 4. Phase C：冲突登记
 

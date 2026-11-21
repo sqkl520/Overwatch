@@ -472,11 +472,25 @@ test('每次判定都记一行，含断言原文 / 判定档位 / reason / 第�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('默认日志路径在 tasks/runs/stop-hook/ 下（gitignored），不污染可发布区', () => {
+test('默认路径在宿主机状态目录里，**不落框架仓库**（2026-11-21 修）', () => {
+  // 修前默认是 `join(REPO_ROOT,'tasks','runs',...)` —— 锚在脚本位置。
+  // 这个 hook 被挂进的是**用户项目**，于是每跑一次就往框架仓库写一行日志。
+  // 闸门记账是**机器状态**（这台机器上的闸门跑过什么），不是项目内容，
+  // 所以它该住 `state-dir.mjs` 管的状态目录，与 asked-history / 守护进程见证同处。
+  //
+  // 断言方式：不用「等于某个绝对路径」（那会把测试绑死在本机），而是断言
+  // 「落在状态根下」且「不含框架仓库路径」。后者是这次修复的判据本身。
   const p = logPathFor({}, Date.UTC(2026, 10, 12, 3, 0, 0));
-  assert.ok(p.includes(join('tasks', 'runs', 'stop-hook')), p);
-  assert.ok(p.endsWith('2026-11-12.jsonl'), p);
-  assert.ok(statePathFor({}).includes(join('tasks', 'runs', 'stop-hook')));
+  assert.ok(p.endsWith(join('stop-hook', '2026-11-12.jsonl')), p);
+  assert.doesNotMatch(p.replace(/\\/g, '/'), /\/Projects\/Overwatch\/tasks\/runs\//,
+    `观测日志不许落进框架仓库：${p}`);
+  assert.ok(statePathFor({}).endsWith(join('stop-hook', 'state.json')), statePathFor({}));
+  assert.doesNotMatch(statePathFor({}).replace(/\\/g, '/'), /\/Projects\/Overwatch\/tasks\/runs\//,
+    statePathFor({}));
+  // 三个路径必须**同根**：分布在两个状态目录里会让「清一次就干净」变成假的
+  const rootOf = (x) => x.replace(/\\/g, '/').replace(/\/(stop-hook\/[^/]+|stop-hook-samples\.jsonl)$/, '');
+  assert.equal(rootOf(p), rootOf(statePathFor({})));
+  assert.equal(rootOf(p), rootOf(samplePathFor({})));
 });
 
 test('OVERWATCH_STATE_DIR 必须能隔离三个落盘路径 —— 与 pre-write-gate 行为一致', () => {
@@ -503,8 +517,10 @@ test('OVERWATCH_STATE_DIR 必须能隔离三个落盘路径 —— 与 pre-write
     '/explicit/s.jsonl',
   );
 
-  // 都没设时必须回到仓库默认路径，不能被上一行探针污染成「到处都写临时目录」。
-  assert.ok(logPathFor({}, at).includes(join('tasks', 'runs', 'stop-hook')));
+  // 都没设时必须回到**状态目录**的默认路径，不能被上一行探针污染成「到处都写临时目录」。
+  // 且这个默认值不许落进框架仓库（2026-11-21 修：锚在脚本位置会让 hook 写脏框架目录）。
+  assert.ok(logPathFor({}, at).endsWith(join('stop-hook', '2026-11-18.jsonl')));
+  assert.doesNotMatch(logPathFor({}, at).replace(/\\/g, '/'), /\/Projects\/Overwatch\/tasks\/runs\//);
 });
 
 // ── 8. 项目命令探测 ─────────────────────────────────────────────────
@@ -797,10 +813,11 @@ test('--no-sample-log 通过 runHook 的 sampleLog 参数生效（不改判定�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('默认样本路径在 tasks/runs/ 下（gitignored），不污染可发布区', () => {
+test('默认样本路径在宿主机状态目录里，**不落框架仓库**（2026-11-21 修）', () => {
   const p = samplePathFor({});
-  assert.ok(p.includes(join('tasks', 'runs')), p);
   assert.ok(p.endsWith('stop-hook-samples.jsonl'), p);
+  assert.doesNotMatch(p.replace(/\\/g, '/'), /\/Projects\/Overwatch\/tasks\/runs\//,
+    `样本文件不许落进框架仓库：${p}`);
   assert.equal(samplePathFor({ OVERWATCH_STOP_VERIFY_SAMPLES: '/tmp/x.jsonl' }), '/tmp/x.jsonl');
 });
 

@@ -21,7 +21,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync, readFileSync, appendFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { scanSession as auditScanSession } from '../scripts/question-audit.mjs';
@@ -35,6 +35,7 @@ import {
   readPathsOfToolUse, pathKeyOf,
   readTranscriptActivity, minQuestionsBeforeWriteOf, reasonForQuestions,
 } from '../scripts/pre-write-gate.mjs';
+import { ledgerRoot } from '../scripts/stop-verify-hook.mjs';
 
 // ── 装置 ──────────────────────────────────────────────────────────────
 
@@ -1000,6 +1001,17 @@ test('appendLog / logPathFor 的路径与覆盖', () => {
     assert.equal(logPathFor({ OW_PRE_WRITE_GATE_LOG: custom }), custom);
     const dflt = logPathFor({}, Date.parse('2026-11-14T12:00:00Z'));
     assert.match(dflt, /pre-write-gate[\\/]2026-11-14\.jsonl$/);
+    // 2026-11-21：默认落点从 `REPO_ROOT/tasks/runs/`（脚本位置）改成宿主机状态目录。
+    // 闸门被挂进的是**用户项目**，锚在脚本位置等于每判一次写就往框架仓库追加一行。
+    // 这条断言是那次修复的判据本身：路径里不许出现框架仓库的 `tasks/runs/`。
+    assert.doesNotMatch(dflt.replace(/\\/g, '/'), /\/Projects\/Overwatch\/tasks\/runs\//,
+      `闸门记账不许落进框架仓库：${dflt}`);
+    // 与 stop hook 那三处**同根**：分布在两个状态目录里会让「清一次就干净」变成假的
+    assert.equal(dirname(dirname(dflt)), ledgerRoot({}), '闸门记账与 hook 台账必须同一个状态根');
+    // STATE_DIR 仍然优先（本仓统一的隔离约定）
+    const iso = join(dir, 'iso');
+    assert.equal(logPathFor({ OVERWATCH_STATE_DIR: iso }, Date.parse('2026-11-14T12:00:00Z')),
+      join(iso, 'pre-write-gate', '2026-11-14.jsonl'));
     assert.equal(appendLog({ a: 1 }, { OW_PRE_WRITE_GATE_LOG: custom }), true);
     assert.equal(appendLog({ a: 2 }, { OW_PRE_WRITE_GATE_LOG: custom }), true);
     assert.equal(readFileSync(custom, 'utf8').trim().split('\n').length, 2);
@@ -1420,7 +1432,7 @@ test('e2e：OW_ASK_MIN_QUESTIONS=2 时 hook 真的输出 deny，且 continue:fal
 
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { resolve } from 'node:path';
 
 const SCRIPT = resolve(dirname(fileURLToPath(import.meta.url)), 'pre-write-gate.mjs');
 

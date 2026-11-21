@@ -24,6 +24,7 @@ import {
   strongSuspectOf, summarize, formatReport, topSuspects, defaultSamplesPath,
   COLON_COMPLETION_RE, COMPLETION_ANY_RE,
 } from '../scripts/analyze-hook-samples.mjs';
+import { samplePathFor } from '../scripts/stop-verify-hook.mjs';
 
 // 实验里三组的原话。P4 / P5 是「已+动词+冒号」，P6 同族；它们是被判
 // no-checkable-claim 放行的那三条。
@@ -212,8 +213,14 @@ test('topSuspects 按「最像真漏检」排序，并遵守 limit', () => {
 });
 
 test('默认样本路径与分析对象一致（不一致会让分析对着空文件说「没问题」）', () => {
+  // 与 `stop-verify-hook.samplePathFor` 同源：两边都调 `ledgerRoot()`（宿主机状态目录）。
+  // 修前两边各自写死 `join(REPO_ROOT,'tasks','runs',...)`，那是「同一概念两份判据」，
+  // 而且两处都会把文件写进框架仓库 —— 2026-11-21 一并改到状态目录。
   const p = defaultSamplesPath({});
-  assert.ok(p.includes(join('tasks', 'runs')), p);
   assert.ok(p.endsWith('stop-hook-samples.jsonl'), p);
+  assert.doesNotMatch(p.replace(/\\/g, '/'), /\/Projects\/Overwatch\/tasks\/runs\//,
+    `样本文件不许落进框架仓库：${p}`);
+  // 真正的「一致」判据：与 stop hook 那个解析器给出同一个值
+  assert.equal(p, samplePathFor({}), '分析器与记录器必须指向同一个文件');
   assert.equal(defaultSamplesPath({ OVERWATCH_STOP_VERIFY_SAMPLES: '/tmp/x.jsonl' }), '/tmp/x.jsonl');
 });

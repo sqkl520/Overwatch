@@ -8,6 +8,8 @@ description: |
   - 任何交付物进入 Phase E
   - 修复后的重新验收（必须走完整流程，不是抽查）
 tools: Read, Grep, Glob, Write
+readonly: true
+display: 验收
 model: inherit
 color: red
 maxTurns: 25

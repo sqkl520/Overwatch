@@ -8,6 +8,8 @@ description: |
   - 拆解图已产出，需要检验它的前提
   - 多个 Agent 给出相同结论，需要有人找反面证据
 tools: Read, Grep, Glob, Write
+readonly: true
+display: 锐评
 model: inherit
 color: yellow
 maxTurns: 30

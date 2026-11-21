@@ -8,6 +8,8 @@ description: |
   - scan-sessions.mjs 判定触发接力条件
   - 用户说「给那个会话写条接力消息」
 tools: Read, Grep, Glob, Write
+readonly: false
+display: 接力
 model: inherit
 color: blue
 maxTurns: 20

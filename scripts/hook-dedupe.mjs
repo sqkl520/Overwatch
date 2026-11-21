@@ -63,11 +63,9 @@ import {
   appendFileSync, closeSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync, writeSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(HERE, '..');
+import { resolveStateDir } from './state-dir.mjs';
 
 /** 认领文件的存活时间。超过它，同一个键会被当成「上一次的残留」重新认领。
  *
@@ -84,7 +82,7 @@ export const CLAIM_TTL_MS = 10 * 60 * 1000;
  *  会话永远到不了这个阈值（一回合几十次调用量级），长期跑才会。 */
 export const SWEEP_AT = 512;
 
-/** 认领根目录名。默认在 `tasks/runs/hook-dedupe/`（gitignored）。 */
+/** 认领根目录名。默认在 `<状态目录>/hook-dedupe/`。 */
 export const DEDUPE_DIR_NAME = 'hook-dedupe';
 
 /** 被跳过的重复调用记在这里（只记条数，不参与任何判定）。 */
@@ -94,15 +92,27 @@ export const SKIPPED_FILE = 'skipped.jsonl';
  *
  *  优先级与本仓其它隔离变量**刻意一致**：
  *  `OVERWATCH_HOOK_DEDUPE_DIR`（显式覆盖）→ `OVERWATCH_STATE_DIR`（本仓统一的临时区
- *  变量，两个 hook 都认）→ 仓库默认 `tasks/runs/hook-dedupe`。
+ *  变量，两个 hook 都认）→ **宿主机状态目录**的 `hook-dedupe/`。
  *  中间那一层必须有：测试与结构门的探针都靠它把副作用关进临时目录；漏了它，
- *  「我已经隔离了」这句话就对这个文件无效。 */
+ *  「我已经隔离了」这句话就对这个文件无效。
+ *
+ *  ## 最后一级为什么不再是 `REPO_ROOT/tasks/runs/`（2026-11-21 修）
+ *
+ *  与 `stop-verify-hook.mjs` 的三处台账、`pre-write-gate.mjs` 的闸门记账**同一个病根**：
+ *  锚在脚本位置，而 hook 被挂进的是**用户项目**。认领文件是**机器状态**
+ *  （「这台机器上这次调用已经被认领过」），换项目也该是同一条历史 —— 它不该住在
+ *  任何一个仓库里。目录解析复用 `state-dir.mjs`（带 `Overwatch` → `UntilDone` 的迁移规则），
+ *  不再写第三份。
+ *
+ *  仍然不变的一点：它必须是**本地盘**（`O_EXCL` 在 NFS/SMB 上不保证原子，见文件头 §1）。
+ *  这样一处消歧：`OVERWATCH_HOOK_DEDUPE_DIR` 仍然可以把认领文件指到网络盘上，那种配置下
+ *  的后果照旧是「退回修之前的行为」，不是新的失效方向。 */
 export function dedupeRoot({ env = process.env } = {}) {
   const explicit = String((env && env.OVERWATCH_HOOK_DEDUPE_DIR) || '').trim();
   if (explicit) return explicit;
   const stateDir = String((env && env.OVERWATCH_STATE_DIR) || '').trim();
   if (stateDir) return join(stateDir, DEDUPE_DIR_NAME);
-  return join(REPO_ROOT, 'tasks', 'runs', DEDUPE_DIR_NAME);
+  return join(resolveStateDir(env), DEDUPE_DIR_NAME);
 }
 
 /** 某个 hook 的认领目录。按 hook 分目录，不同 hook 的同名键不会互相挡住。 */

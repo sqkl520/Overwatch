@@ -54,16 +54,24 @@
  */
 
 import { existsSync, readdirSync, readFileSync, statSync, realpathSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { probeDisk, reconcile, readLedger } from './claim-ledger.mjs';
 import { readPromptLedger } from './compose-agent-prompt.mjs';
 import { truncateDisplay } from './tui-theme.mjs';
 import { checkDependencyCycles } from './validate-run.mjs';
+import { labelOf, defaultRoles, nameOf } from './roles.mjs';
+import { frameworkRoot, projectRoot, runsDirInfo } from './project-root.mjs';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolve(HERE, '..');
+/** 框架根 = 资产位置。**不是**用户项目根。
+ *
+ *  修前这个常量叫 `ROOT` 并被当成「仓库根」同时用于两件事：`displayPath()` 的相对基准，
+ *  以及 CLI 的 `tasks/runs` 落点。后半件是错的（在别人项目里跑会去读框架仓库的 run）。
+ *  现在 CLI 走 `projectRoot()`；本常量只留作**纯函数默认值** ——
+ *  `buildPlan()` / `displayPath()` 被单独调用时有个确定的基准，且不读盘。 */
+const FRAMEWORK_ROOT = frameworkRoot();
+const ROOT = FRAMEWORK_ROOT;
 
 // ── 常量 ──────────────────────────────────────────────────────────────
 
@@ -149,12 +157,12 @@ const DEP_FAILED = Object.freeze(['FAILED', 'STUCK', 'UPSTREAM_FAILED']);
  *  没有它，一个不相关的失败前置会把整条研究线永久冻在 `UPSTREAM_FAILED` 上。 */
 export const ON_DEP_FAILED_MODES = Object.freeze(['block', 'degrade']);
 
-/** 台账里出现即算「这个子树被派过」的行类型。`consume` 也是 —— 有人认领过它。 */
-const CAPABILITY_LABEL = Object.freeze({
-  executor: 'exec', research: '研究', critic: '锐评', redteam: '红队', review: '评审',
-  acceptor: '验收', relay: '接力', probe: '探针', planner: '规划', repair: '修复',
-  resolution: '裁决', safety: '红线',
-});
+/** PLAN 每行的「这是什么岗位」用的是角色 frontmatter 的 `display:`（缺省回落 id），
+ *  不在这里另立一张中文表。
+ *
+ *  原先那张表（`executor: 'exec'`、`acceptor: '验收'`…）是一份**手工同步的第二真源**：
+ *  加一个角色时它不会变红，只会让新角色在 PLAN 里显示成英文 id ——
+ *  而英文 id 也算「能看」，所以没人会发现表漏了一行。 */
 
 // ── 读盘 ──────────────────────────────────────────────────────────────
 
@@ -544,7 +552,7 @@ function emptyReasonText(reason, ctx) {
   if (reason === 'no-graph') {
     return [
       `任务图不存在：${ctx.path}`,
-      '这不是「计划为空」——是「还没规划」。派 oversight-planner 产出 task-graph.json，再用 validate-run.mjs 校验。',
+      `这不是「计划为空」——是「还没规划」。派 ${nameOf(defaultRoles(), 'planner')} 产出 task-graph.json，再用 validate-run.mjs 校验。`,
     ];
   }
   if (reason === 'empty-graph') {
@@ -564,7 +572,7 @@ function emptyReasonText(reason, ctx) {
     const tail = ctx.checked ? `（扫了 ${ctx.checked} 个 run 目录，没有一个带 task-graph.json）` : '（tasks/runs 下没有 run 目录）';
     return [
       '没有任何可渲染的 plan' + tail + '。',
-      '这不是「计划为空」——是「还没跑过一次规划」。先派 oversight-planner。',
+      `这不是「计划为空」——是「还没跑过一次规划」。先派 ${nameOf(defaultRoles(), 'planner')}。`,
     ];
   }
   return ['没有可渲染的 plan。', '这不是「计划为空」——是「没有输入」。'];
@@ -614,7 +622,7 @@ export function formatPlan(plan) {
   const idw = Math.max(2, ...rows.map((r) => r.id.length));
   const rowLine = (r) => truncateDisplay(
     `  ${r.mark} ${r.id.padEnd(idw)}  ${truncateDisplay(r.goal, GOAL_WIDTH)}  `
-    + `${CAPABILITY_LABEL[r.capability] || r.capability || '—'} · ${r.note}`,
+    + `${labelOf(defaultRoles(), r.capability)} · ${r.note}`,
     ROW_WIDTH,
   );
   const detailLinesOf = (r) => {
@@ -848,8 +856,26 @@ function parseArgv(argv) {
 export function main(argv) {
   const args = parseArgv(argv);
   if (args.help) { console.log(HELP); return 0; }
-  const runsDir = resolve(String(args['runs-dir'] || join(ROOT, 'tasks', 'runs')));
-  const root = resolve(String(args.root || ROOT));
+
+  // 两个根（见 `project-root.mjs` 文件头）：
+  //   · `root`     —— `--root` 明说就用它，否则走阶梯（--root > UNTILDONE_ROOT > cwd 向上找）。
+  //                  第 5 级时**回落到框架仓库并打印警告**（P1 过渡；修前就是这个行为）。
+  //   · `runsDir`  —— `--runs-dir` 明说就用它（相对 cwd，与修前逐字相同）；否则按
+  //                  `paths.runs` / `.untildone/runs` 从 root 派生。
+  //
+  // 为什么不再默认 `join(ROOT,'tasks','runs')`：那让「在别人项目里跑 plan」永远显示
+  // 框架仓库的 run（通常是空的），于是用户以为「我没有 run」，而他的 run 就在自己项目里。
+  const explicitRoot = args.root !== undefined ? resolve(String(args.root)) : null;
+  const root = explicitRoot || projectRoot({ argv });
+  if (!root) {
+    console.error('[render-plan] 找不到用户项目根（阶梯第 5 级），已停止 —— 不猜、不回落脚本位置。');
+    console.error(`  给 --root <dir>、设 UNTILDONE_ROOT，或在项目里建 .untildone/ 或 .git/。`);
+    return 2;
+  }
+  const runsDir = args['runs-dir'] !== undefined
+    ? resolve(String(args['runs-dir']))
+    : runsDirInfo(root).dir;
+  console.error(`[render-plan] root → ${root}（${explicitRoot ? '--root' : '阶梯'}）· runs → ${runsDir}`);
   const run = args.run && args.run !== true ? String(args.run) : null;
   const { plan, lines } = renderPlan({ runsDir, run, root });
 

@@ -595,3 +595,149 @@ test('设计文档存在并说明分层（否则这份代码没有可读的动�
     assert.ok(t.includes(k), `设计报告缺 ${k}`);
   }
 });
+
+
+// ── --context-from：FORBIDDEN_CONTEXT 的唯一入口（DF-042 缺陷 B）─────────
+//
+// 这一组守的**不是**独立性判据本身（本文件上面已有：「给 review 注入执行者的
+// 自我评价必须拒绝」），而是一件更基础的事：**命令行有没有一条路能真的喂到它。**
+//
+// 2026-11-21 审计实测：CLI 两处硬传 `context: {}`（spec 与 composePrompt），
+// 于是那条判据在真实调用中恒真——不是因为通过了，而是因为没人能往里放东西。
+// 只测 `checkPromptSpec({ context: {...} })` 的话，把 CLI 改回 `{}` 它照样绿。
+// 所以下面的 CLI 用例必须 spawn 真进程。
+
+/** 造一份合法的硬门输出文件，供 --gate 使用（不可达会 exit 2，那是另一种失败）。 */
+function writeGate(dir) {
+  const p = join(dir, 'gate.txt');
+  writeFileSync(p, '结构检查全部通过\n');
+  return p;
+}
+
+test('CLI：给 acceptor 喂执行者自评 → exit 1，且不落文件（缺陷 B 的回归）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-ctx-'));
+  try {
+    const graph = makeGraph(dir);
+    const ctx = join(dir, 'ctx.json');
+    writeFileSync(ctx, JSON.stringify({ self_assessment: '我做了 90%，剩下的是小事' }), 'utf8');
+    const out = join(dir, 'p.md');
+    const r = runCli(['compose', '--run', 'r1', '--task', 'ST1', '--graph', graph, '--role', 'acceptor',
+      '--stop', '每项 AC 必带 file:line，25 分钟内返回', '--context-from', ctx,
+      '--gate', `node scripts/check-structure.mjs=${writeGate(dir)}`, '--gate-exit', '0', '--out', out]);
+    assert.equal(r.status, 1, `应当拒绝派发：${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, /independence/, r.stdout);
+    assert.match(r.stdout, /self_assessment/, r.stdout);
+    assert.equal(existsSync(out), false, '独立性检查不过还落了文件 —— 自评会原样发进下游的 prompt');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI：acceptor 拿到锐评分数 → 也拒绝（不能变成一个人的左右手）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-ctx-'));
+  try {
+    const graph = makeGraph(dir);
+    const ctx = join(dir, 'ctx.json');
+    writeFileSync(ctx, JSON.stringify({ review_score: 8 }), 'utf8');
+    const r = runCli(['compose', '--run', 'r1', '--task', 'ST1', '--graph', graph, '--role', 'acceptor',
+      '--stop', '每项 AC 必带 file:line，25 分钟内返回', '--context-from', ctx,
+      '--gate', `node scripts/check-structure.mjs=${writeGate(dir)}`, '--gate-exit', '0', '--dry-run']);
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /review_score/, r.stdout);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI 对照组：合法的 context 通过，且内容真的被渲染进提示词（不是只检查不发送）', () => {
+  // 没有这一条，把 --context-from 改成「永远拒绝」也能让上面两条变绿。
+  const dir = mkdtempSync(join(tmpdir(), 'ow-ctx-'));
+  try {
+    const graph = makeGraph(dir);
+    const ctx = join(dir, 'ctx.json');
+    writeFileSync(ctx, JSON.stringify({ prior_context: 'scripts/x.mjs:12 有一个未使用的 import' }), 'utf8');
+    const out = join(dir, 'p.md');
+    const r = runCli(['compose', '--run', 'r1', '--task', 'ST1', '--graph', graph, '--role', 'acceptor',
+      '--stop', '每项 AC 必带 file:line，25 分钟内返回', '--context-from', ctx,
+      '--gate', `node scripts/check-structure.mjs=${writeGate(dir)}`, '--gate-exit', '0', '--out', out]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    const md = readFileSync(out, 'utf8');
+    assert.match(md, /### 2\.4 主线程补充的上下文/);
+    assert.match(md, /scripts\/x\.mjs:12 有一个未使用的 import/, '内容没被渲染 —— 那么「检查通过」只说明键名合法');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI：--context-from 不是合法 JSON → exit 2，不静默当成「没给」', () => {
+  // 回落成 {} 的后果是「独立性输入被静默丢掉」，而那正是这条检查要防的失效形态。
+  const dir = mkdtempSync(join(tmpdir(), 'ow-ctx-'));
+  try {
+    const graph = makeGraph(dir);
+    const ctx = join(dir, 'ctx.json');
+    writeFileSync(ctx, '{not json', 'utf8');
+    const r = runCli(['compose', '--run', 'r1', '--task', 'ST1', '--graph', graph, '--role', 'acceptor',
+      '--stop', 'x 25 分钟内返回', '--context-from', ctx, '--dry-run']);
+    assert.equal(r.status, 2, r.stdout + r.stderr);
+    assert.match(r.stderr + r.stdout, /不是合法 JSON/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI：--context-from 文件不存在 / 不是对象 → 都 exit 2', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-ctx-'));
+  try {
+    const graph = makeGraph(dir);
+    const missing = runCli(['compose', '--run', 'r1', '--task', 'ST1', '--graph', graph, '--role', 'acceptor',
+      '--stop', 'x 25 分钟内返回', '--context-from', join(dir, 'nope.json'), '--dry-run']);
+    assert.equal(missing.status, 2, missing.stdout + missing.stderr);
+    assert.match(missing.stderr + missing.stdout, /读不到/);
+
+    const arr = join(dir, 'arr.json');
+    writeFileSync(arr, '["a"]', 'utf8');
+    const notObj = runCli(['compose', '--run', 'r1', '--task', 'ST1', '--graph', graph, '--role', 'acceptor',
+      '--stop', 'x 25 分钟内返回', '--context-from', arr, '--dry-run']);
+    assert.equal(notObj.status, 2, notObj.stdout + notObj.stderr);
+    assert.match(notObj.stderr + notObj.stdout, /JSON 对象/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('渲染：没有 context 时不出现 §2.4（空节会让人以为「本来就没有材料」）', () => {
+  const { markdown } = composePrompt({
+    role: 'executor', task: '做事', acceptance: [ac()], shape: 'artifact', outputs: ['a'],
+    stopCondition: '10 分钟', nonce: 'a1b2c3d4', context: {},
+  });
+  assert.doesNotMatch(markdown, /### 2\.4/);
+});
+
+test('渲染：非字符串 context 值走 JSON 代码块（多行材料不会被压成一行）', () => {
+  const { markdown } = composePrompt({
+    role: 'executor', task: '做事', acceptance: [ac()], shape: 'artifact', outputs: ['a'],
+    stopCondition: '10 分钟', nonce: 'a1b2c3d4',
+    context: { prior_facts: { a: 1 } },
+  });
+  assert.match(markdown, /### 2\.4/);
+  assert.match(markdown, /```json/);
+});
+
+test('负向：把 CLI 的 context 改回硬编码 {}，拒绝用例必须失效（证明它守的是这一行）', () => {
+  // 回退的形态取缺陷原来的样子。跑的是**变异后的副本**，不碰真实脚本。
+  const dir = mkdtempSync(join(tmpdir(), 'ow-ctx-neg-'));
+  try {
+    const src = readFileSync(join(ROOT, 'scripts', 'compose-agent-prompt.mjs'), 'utf8');
+    const find = 'stopCondition, nonce, injected, context,';
+    assert.equal(src.split(find).length - 1, 1, '源码片段应当唯一');
+    const mutated = src.replace(find, 'stopCondition, nonce, injected, context: {}, // 回退');
+    // 副本必须落在 scripts/ 下：本文件 import './project-commands.mjs' 用的是相对路径，
+    // 放到临时目录会 ERR_MODULE_NOT_FOUND —— 那测的就不是回退了。
+    const target = join(ROOT, 'scripts', `.neg-compose-${process.pid}.mjs`);
+    writeFileSync(target, mutated, 'utf8');
+    try {
+      const graph = makeGraph(dir);
+      const ctx = join(dir, 'ctx.json');
+      writeFileSync(ctx, JSON.stringify({ self_assessment: '我做了 90%' }), 'utf8');
+      const r = spawnSync(process.execPath, [target, 'compose', '--run', 'r1', '--task', 'ST1',
+        '--graph', graph, '--role', 'acceptor', '--stop', '每项 AC 必带 file:line，25 分钟内返回',
+        '--context-from', ctx, '--gate', `node scripts/check-structure.mjs=${writeGate(dir)}`,
+        '--gate-exit', '0', '--dry-run', '--root', ROOT], { encoding: 'utf8' });
+      assert.equal(r.status, 0,
+        `回退后必须放行（exit 0）——说明拒绝是「传 context」这一行给的：${r.stdout}${r.stderr}`);
+      // 匹配的是**报错句式**而不是键名：通过时也有一行「independence — 未注入 self_assessment」，
+      // 按键名断言会把「未注入」当成「注入了」。
+      assert.doesNotMatch(r.stdout, /注入了不该给/, r.stdout);
+    } finally { rmSync(target, { force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

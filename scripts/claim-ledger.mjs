@@ -51,6 +51,12 @@
  *
  * 退出码：0 = 全部 COMPLETE 且已认领；1 = 有缺陷；2 = 用法错误 / run 不存在。
  *
+ * ── 台账落在哪（2026-11-21 修）──────────────────────────────────────
+ *
+ * 落在**用户项目**里。修前锚在脚本位置，于是在别人项目里跑会把台账写进框架仓库
+ * （实测复现见 `scripts/project-root.mjs` 文件头）。解析规则、五级阶梯与
+ * 「每次打印用了哪一级」都在那一个文件里，本文件不另写一份。
+ *
  * 零依赖，只读（除 `declare` / `claim` / `consume` / `observe` 追加台账本身）。
  */
 
@@ -64,9 +70,33 @@ import { join, resolve, dirname, basename, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { readTailRecords } from './verify-claims.mjs';
+import { projectRoot, runsDirInfo } from './project-root.mjs';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolve(HERE, '..');
+/**
+ * 本模块导出的纯函数（`resolvePath` / `pathKey` / `probeDisk` / `foldRows` / `reconcile`）
+ *  的 `base` 默认值。
+ *
+ *  **它只能是一个确定的、与调用者 cwd 无关的值** —— 这是 `resolvePath` 那段注释的原始理由：
+ *  台账里记的路径要可复算，而子 agent 的 cwd 是任意的。但「确定」不等于「框架目录」：
+ *  修前它锚在**脚本位置**（`resolve(HERE, '..')`），于是从用户项目跑时所有相对路径都被
+ *  解析到框架仓库里去了 —— 那是本次修复的那个事故的另一半。
+ *
+ *  现在的取值：走 `project-root.mjs` 的阶梯（`UNTILDONE_ROOT` → cwd 向上找项目根）；
+ *  第 5 级时退回 `process.cwd()`。**不回落框架根**：纯函数被调用时没有 CLI 上下文，
+ *  一个确定的「用户当前目录」比一个确定的「框架目录」更接近真实。
+ *  CLI 路径一律显式传 `base`（见 `main()`），不依赖这里。
+ *
+ *  缓存一次：`reconcile` 会对每个任务、每个路径调 `pathKey`，而每次解析都要走一遍
+ *  文件系统向上查找 —— 不缓存就是几百次重复 stat。
+ */
+let _baseCache;
+function defaultBase() {
+  if (_baseCache !== undefined) return _baseCache;
+  // 纯函数被单独 import 时（测试、其它脚本）第 5 级是正常的 —— 用 cwd 作基准，
+  // 但**不打印**（会在测试输出里刷屏），也**不声称**它是项目根。
+  _baseCache = projectRoot({ quiet: true }) || resolve(process.cwd());
+  return _baseCache;
+}
 
 // ── 常量 ──────────────────────────────────────────────────────────────
 
@@ -234,7 +264,7 @@ export function sha256File(path, { maxBytes = HASH_MAX_BYTES } = {}) {
  *  用 cwd 会让同一份台账在两次对账里指向不同文件——那是「看起来精确、实际不可复算」。
  *
  *  绝对路径不重写：台账里已经是绝对路径时，基准无从谈起，也不该被改写。 */
-export function resolvePath(p, base = ROOT) {
+export function resolvePath(p, base = defaultBase()) {
   const s = String(p);
   // 用 `resolve` 而不是 `join`：`join` 只做字符串拼接，不带盘符的绝对路径
   // （Windows 上的 `/x/y`）拼出来仍是 `/x/y`，比出来与真正 stat 的路径不一致。
@@ -253,7 +283,7 @@ export function resolvePath(p, base = ROOT) {
  *
  *  规则：相对路径按 base 展开 → 反斜杠转正斜杠 → Windows 下小写（NTFS 大小写不敏感）。
  *  **只在比较时用**。台账里保存原样，报告里打印原样 —— 否则人就认不出自己给的路径了。 */
-export function pathKey(p, base = ROOT) {
+export function pathKey(p, base = defaultBase()) {
   let s = resolvePath(p, base).replace(/\\/g, '/');
   // 折叠 `/./` 与重复斜杠，去掉末尾斜杠（目录形式不该与文件形式相等，但这里只做无害规整）
   s = s.replace(/\/{2,}/g, '/').replace(/\/\.\//g, '/');
@@ -270,7 +300,7 @@ function isDirectory(path) {
 
 /** 对账用的默认探测器。返回形状固定，测试可以整只替换掉。
  *  `path` 可以是绝对路径 —— 台账里记的路径就是派发时给的路径，本函数不猜基准目录。 */
-export function probeDisk(path, base = ROOT) {
+export function probeDisk(path, base = defaultBase()) {
   const target = resolvePath(path, base);
   let st;
   try { st = statSync(target); } catch { return { exists: false }; }
@@ -842,7 +872,11 @@ export function nonceOwners(tasks) {
  *
  *  路径一律按 `pathKey` 归一化后再作 map 的键 —— 见 pathKey 的注释。
  *  行里保留原样的 `path`，报告打印的是人给出的那个字符串，不是归一化后的。 */
-export function foldRows(rows, { base = ROOT } = {}) {
+export function foldRows(rows, { base = null } = {}) {
+  // `null` = 调用方没给基准。**在这里算一次**，而不是在默认参数里：默认参数里调
+  // `defaultBase()` 会在每次调用时重新走一遍阶梯（含一次 `searchUp` 的文件系统遍历），
+  // 而 `reconcile` 对每个任务都会调 `foldRows`/`pathKey` —— 那是几百次重复 stat。
+  const b = base || defaultBase();
   const tasks = new Map();
   const claimsByTask = new Map();
   const observesByTask = new Map();
@@ -862,23 +896,23 @@ export function foldRows(rows, { base = ROOT } = {}) {
       if (r.nonce) e.nonce = r.nonce;
       if (Number.isFinite(r.timeoutMin)) e.timeoutMin = r.timeoutMin;
       for (const p of r.paths || []) {
-        if (!e.paths.some((x) => pathKey(x, base) === pathKey(p, base))) e.paths.push(p);
+        if (!e.paths.some((x) => pathKey(x, b) === pathKey(p, b))) e.paths.push(p);
       }
       if (!e.firstAt || r.ts < e.firstAt) e.firstAt = r.ts;
     } else if (r.kind === 'claim') {
       const m = claimsByTask.get(t) || new Map();
-      m.set(pathKey(r.path, base), r);
+      m.set(pathKey(r.path, b), r);
       claimsByTask.set(t, m);
     } else if (r.kind === 'observe') {
       const m = observesByTask.get(t) || new Map();
-      const k = pathKey(r.path, base);
+      const k = pathKey(r.path, b);
       const prev = m.get(k);
       // 只要有一条成功记录就算「有这个痕迹」；失败记录单独留作证据
       if (!prev || prev.failed) m.set(k, r);
       observesByTask.set(t, m);
     } else if (r.kind === 'consume') {
       const s = consumeByTask.get(t) || new Set();
-      s.add(r.path == null ? '*' : pathKey(r.path, base));
+      s.add(r.path == null ? '*' : pathKey(r.path, b));
       consumeByTask.set(t, s);
     }
   }
@@ -922,15 +956,18 @@ export function compareClaim(claim, disk) {
  *    4. 全部 ABSENT → `EMPTY`（没开工，和干到一半不是一回事）
  *    5. 有 OK 也有非 OK → `PARTIAL`（干到一半就停了）
  *    6. 其余按 MISSING > DRIFTED > UNREPORTED 取最坏 */
-export function reconcile({ rows, probe = probeDisk, nowMs = Date.now(), base = ROOT } = {}) {
+export function reconcile({ rows, probe = probeDisk, nowMs = Date.now(), base = null } = {}) {
   const { tasks, claimsByTask, observesByTask, consumeByTask } = foldRows(rows, { base });
+  // foldRows 里算过一次（给了 `null` 就是它自己算的）；这里再取一次是零成本的，
+  // 只为了下面 `pathKey(p, b)` 那几处不要再各算一遍。
+  const b = base || defaultBase();
 
   // 路径 → 声明过它的任务集合。用于发现「两个 agent 写同一个文件」。
   // 键是 pathKey（归一化后的），值里保留原样路径供报告使用。
   const declaredBy = new Map();
   const display = new Map();
   const note = (p, task) => {
-    const k = pathKey(p, base);
+    const k = pathKey(p, b);
     const s = declaredBy.get(k) || new Set();
     s.add(task);
     declaredBy.set(k, s);
@@ -955,7 +992,7 @@ export function reconcile({ rows, probe = probeDisk, nowMs = Date.now(), base = 
 
     const items = [];
     for (const p of e.paths) {
-      const k = pathKey(p, base);
+      const k = pathKey(p, b);
       const claim = claims.get(k) || null;
       const observed = observes.get(k) || null;
       const disk = probe(p);
@@ -989,7 +1026,7 @@ export function reconcile({ rows, probe = probeDisk, nowMs = Date.now(), base = 
 
     // transcript 里写过、但既不在期望里也没人自述的路径 —— 信息项。
     for (const [k, observed] of observes) {
-      if (e.paths.some((p) => pathKey(p, base) === k) || claims.has(k)) continue;
+      if (e.paths.some((p) => pathKey(p, b) === k) || claims.has(k)) continue;
       extras.push({
         task: e.task, path: observed.path, observedAt: observed.ts,
         evidence: observed.evidence, source: observed.source || 'write-tool',
@@ -1009,7 +1046,7 @@ export function reconcile({ rows, probe = probeDisk, nowMs = Date.now(), base = 
 
     // 「已认领」：每个期望路径都有一条 consume（或整任务的 `*`）。
     const allConsumed = e.paths.length > 0
-      && (consumed.has('*') || e.paths.every((p) => consumed.has(pathKey(p, base))));
+      && (consumed.has('*') || e.paths.every((p) => consumed.has(pathKey(p, b))));
 
     // 最后一条产出证据的时间。**只用于展示静默时长**，不参与判定。
     const stamps = [
@@ -1134,17 +1171,63 @@ const HELP = `claim-ledger — 产出对账
   verify   四方对账：期望 / 自述 / 磁盘 / transcript。
   adopt    列出「有产出但未被认领」的任务，供主线程崩溃重启后恢复。
 
+台账落在**用户项目**里，不在框架仓库里：
+  优先级：--runs-dir <dir> > UNTILDONE_RUNS_DIR > overwatch.config.json 的 paths.runs
+          > <项目根>/.untildone/runs
+  项目根：--root <dir> > UNTILDONE_ROOT > 从 cwd 向上找 .untildone/ 或 .git/
+  **每次都会打印用了哪一级** —— 否则「写对了」和「写错地方」在屏幕上是同一个样子。
+
 退出码：0 通过 / 1 有缺陷 / 2 用法错误。
 `;
 
 function main(argv) {
   const args = parseArgs(argv);
   const cmd = args._[0] || 'help';
-  const runsDir = resolve(String(args['runs-dir'] || join(ROOT, 'tasks', 'runs')));
-  const base = resolve(String(args.root || ROOT));
   const run = args.run ? String(args.run) : null;
 
   if (cmd === 'help' || args.help) { console.log(HELP); return 0; }
+
+  // ── 两个根：这里是 P1 之后唯一的解析点 ──────────────────────────────
+  //
+  // 修前：`runsDir` 与 `base` 都默认成 `resolve(HERE, '..')`（脚本位置的上一级），
+  // 于是从用户项目跑时台账写进框架仓库（见 `project-root.mjs` 文件头的事故复现）。
+  //
+  // 修后：
+  //   · `--runs-dir` 给了 → 用它（**相对 process.cwd()**，与修前逐字相同）
+  //   · 否则 → `projectRoot()` 的阶梯 + 配置的 `paths.runs`
+  //   · `--root` 给了 → 用它做路径基准（相对路径的解析基准，与修前相同）
+  //   · 否则 → 同一个 `projectRoot()`
+  //
+  // **第 5 级 = exit 2，不回落到脚本位置。**
+  //
+  //  派单原写的是「第 5 级临时回落脚本位置并打印警告，这样现有测试路径不变」。
+  //  实测推翻了那个前提：把回落去掉之后 `node --test scripts/` 的 1861 条**全绿**
+  //  （2026-11-21 实测，含 claim-ledger / compose / render-plan / validate-run 四份
+  //  端到端用例）—— 也就是说没有任何一条既有测试依赖那个回落。既然代价是零，
+  //  就没有理由保留一个「静默写进框架目录」的逃生口：那正是本次要修的形态。
+  //  `project-root.mjs` 里仍留 `fallback: 'framework'` 这个**显式**参数（有测试覆盖），
+  //  但它必须由调用方主动传，不会在没人要求时发生。
+  const root = projectRoot({ argv, quiet: false });
+  if (!root) {
+    console.error('[claim-ledger] 找不到用户项目根（阶梯第 5 级），已停止 —— 不猜、不回落。');
+    console.error(`  给 --root <dir>、设 UNTILDONE_ROOT，或在项目里建 .untildone/ 或 .git/。`);
+    return 2;
+  }
+
+  // 路径基准：`--root` 明说用哪个就用哪个；否则跟项目根（同一个解析结果，
+  // 不再各算一次 —— 修前这里是两个独立的 `resolve(..., ROOT)`）。
+  const base = args.root !== undefined ? resolve(String(args.root)) : root;
+
+  let runsDir;
+  if (args['runs-dir'] !== undefined) {
+    // **相对 process.cwd()**，与修前逐字相同：`--runs-dir runs` 一直是相对命令执行处。
+    runsDir = resolve(String(args['runs-dir']));
+    console.error(`[claim-ledger] runs 来自 --runs-dir → ${runsDir}`);
+  } else {
+    const info = runsDirInfo(base);
+    runsDir = info.dir;
+    console.error(`[claim-ledger] runs 来自 ${info.source} → ${runsDir}`);
+  }
   if (!run) { console.error('缺少 --run <id>'); console.error(HELP); return 2; }
   const file = ledgerPath(runsDir, run);
 

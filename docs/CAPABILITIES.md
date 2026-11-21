@@ -34,7 +34,7 @@
 | 「问了没答」的会话（不依赖宿主） | `node scripts/asked.mjs --hours 1` | 问了具体问题、人还没回的会话 |
 | 人工介入基线：把「介入变少」变成可证伪的数字 | `node scripts/measure-interventions.mjs --days 7` | 介入总数、按类型/按可避免性分级、每会话分布 |
 | 人工介入基线的机器可读版 | `node scripts/measure-interventions.mjs --json` | `totals` / `distribution` / `rates` |
-| Stop hook 验证闸：AI 想收工时替你把关 | `node scripts/stop-verify-hook.mjs`（由宿主调用，见 §3） | 判定写进 `tasks/runs/stop-hook/<日期>.jsonl` |
+| Stop hook 验证闸：AI 想收工时替你把关 | `node scripts/stop-verify-hook.mjs`（由宿主调用，见 §3） | 判定写进 `<状态目录>/stop-hook/<日期>.jsonl`（`%LOCALAPPDATA%/UntilDone/`，不在你的项目里） |
 | 看 Stop hook 放行样本的分布 | `node scripts/analyze-hook-samples.mjs` | 含完成语义但一次测试都没跑的候选 |
 | 后台守护进程的健康度 | `node scripts/watch.mjs --health` | 各轮询层「多久没扫过」，判断是活着还是在空转 |
 | 通知的可追溯率（生产指标） | `node scripts/watch.mjs --trace` | 每条通知能不能追到一次真实事件 |
@@ -42,6 +42,11 @@
 | 结构硬门（改动后必跑） | `node scripts/check-structure.mjs` | 0 违规才绿；含测试数对账、文档路径、能力清单 |
 | 产出对账：子 agent 说产出的东西，磁盘上在不在 | `node scripts/claim-ledger.mjs verify --run <run-id>` | `COMPLETE` / `PARTIAL` / `MISSING` / `CONFLICT` 等逐任务结论 |
 | 从 transcript 抽子 agent 的写入痕迹（不需要它配合） | `node scripts/claim-ledger.mjs observe --run <run-id> --session <会话目录>` | 每条写文件的调用（`Write`/`Edit` + 路径可确定解析的 Bash 写入），含失败的调用，并打印「判不出」的逐类计数 |
+| 校验派发图，并声明本轮是不是复杂任务（硬约束 2 的执行点） | `node scripts/validate-run.mjs --complex tasks/runs/<run-id>/task-graph.json` | 第一行印「复杂度声明」。`--complex` 才执行「≥5 个子任务 + 锐评/验收/修复」；不给声明时那几项不跑，输出会写明「未声明」 |
+| 声明「这次不是复杂任务」，并对自相矛盾的声明发警告 | `node scripts/validate-run.mjs --simple tasks/runs/<run-id>/task-graph.json` | 图上 ≥5 个子树或已含锐评/验收/修复时仍会警告——那是复核信号，不是通过 |
+| 拼一个子 agent 的提示词（四层：身份/协议/现写/注入） | `node scripts/compose-agent-prompt.mjs compose --run <run-id> --task ST1 --role <角色> --stop "<可判定停机条件>"` | 逐项检查（含独立性），**不过就 exit 1 且不落文件**；打印配套的 `claim-ledger declare` 命令（nonce 与提示词里是同一个） |
+| 给某个角色补材料，同时拦住不该给它的东西 | `node scripts/compose-agent-prompt.mjs compose --run <run-id> --task ST1 --role review --context-from <context.json>` | 给锐评喂执行者自评、给验收喂锐评分数等一律拒绝派发；JSON 解析不了时 exit 2，不回落成「没给」 |
+| 收活时确认子 agent 收到的是不是台账里那一份 | `node scripts/compose-agent-prompt.mjs verify --run <run-id> --session <会话目录>` | 逐任务 `match: true/false/null`；`null` 是「看不到」，不是「通过」 |
 | 全量回归测试 | `node --test scripts/` | 全绿；条数以命令输出为准 |
 | 文档相对链接不悬空 | `node scripts/check-links.mjs` | 断链数，非 0 即失败。范围是 `git ls-files '*.md'`（实测 170 份，含根级与 `templates/`），判据在 `scripts/link-check.mjs`：文件在不在、锚点在不在、目标会不会被 gitignore 掉 |
 | 生成仓库社交预览图（1280×640） | `node scripts/make-social-preview.mjs --out docs/assets/social-preview.png` | 一张 PNG；GitHub 的 social preview 没有 API，要人工上传 |
@@ -70,7 +75,7 @@
 | 步骤 | 做什么 |
 |---|---|
 | 1. 注册 hook | 把 `templates/stop-verify-hook.settings.json` 合并进 `.claude/settings.local.json`（本机私有），把 `command` 换成你机器上本仓库的绝对路径 |
-| 2. 观测模式（默认） | 不设环境变量。跑几次后看 `tasks/runs/stop-hook/<日期>.jsonl`，确认它对你的用法没误判 |
+| 2. 观测模式（默认） | 不设环境变量。跑几次后看 `<状态目录>/stop-hook/<日期>.jsonl`，确认它对你的用法没误判 |
 | 3. 开启拦截 | 见下方「怎么开才对」——**桌面版必须写进 `settings.local.json` 的 `env` 块**，shell 环境变量传不到 |
 | 4. 看效果 | `node scripts/analyze-hook-samples.mjs` 看放行样本；`jsonl` 里 `outcome=blocked` 是拦住的那几次 |
 
@@ -201,6 +206,50 @@ node scripts/pre-write-gate.mjs status --cwd D:\你的项目    # 看 minQuestio
   不回扫的话这些会话在 `brake=halt` 下**无解**。
 - 走 `mark` 逃生口（或标记已存在）的会话不受这条约束 —— 逃生口的意义就是「我知道我在干什么」。
 - **子 agent 直接放行。** 见 §3.5 开头的理由；日志 `questions` 记 `"subagent-exempt"`。
+
+## 3.6 run 台账落在**哪个项目**：`projectRoot()` 与 `paths.runs`
+
+**这块不是可配的，是「你的项目 vs 框架仓库」的边界。** 2026-11-21 之前
+`claim-ledger` / `compose-agent-prompt` / `validate-run` / `render-plan` 把台账写进**框架仓库**
+（因为路径锚在脚本位置）。实测：在 `/tmp` 的空项目里跑 `claim-ledger declare`，台账落在框架仓库的
+`tasks/runs/` 下，用户项目里什么都没有。修法见 `DF-043`。
+
+现在每个命令都会**在 stderr 打印用了哪一级**，所以「写对了」与「写错地方」不再同形：
+
+```
+[project-root] 第 4 级（向上找 .untildone / .git） → /home/you/my-project
+[claim-ledger] runs 来自 默认 .untildone/runs → /home/you/my-project/.untildone/runs
+```
+
+**项目根的五级阶梯**（任何一级都不回落到脚本位置）：
+
+| 级 | 来源 | 什么时候用 |
+|---|---|---|
+| 1 | `--root <dir>` | 你明说 |
+| 2 | `UNTILDONE_ROOT` | CI / 试跑。**不改配置就能改落点** |
+| 3 | 宿主 payload 的 `cwd` | 仅 hook 路径（宿主自己会填） |
+| 4 | 从 `cwd` 向上找 `.untildone/`，再退 `.git/` | 日常。**在项目里建 `.untildone/` 或 `git init` 就够** |
+| 5 | 失败 | `exit 2`，并打印上面四级各试了什么 |
+
+**runs 目录**（`paths.runs`）：
+
+| 优先级 | 来源 | 例子 |
+|---|---|---|
+| 1 | `--runs-dir <dir>` | 相对 `process.cwd()` |
+| 2 | `UNTILDONE_RUNS_DIR` | 相对**项目根**（不是 cwd） |
+| 3 | `overwatch.config.json` 的 `paths.runs` | `"paths": { "runs": "tasks/runs" }` |
+| 4 | 默认 | `<项目根>/.untildone/runs` |
+
+> **环境变量压过配置文件**是有意的：本仓库所有「我已经隔离了」的既有约定
+> （`OVERWATCH_STATE_DIR`、`OW_PRE_WRITE_GATE_LOG`…）都是环境变量优先。反过来会让
+> `UNTILDONE_RUNS_DIR=...` **静默失效**，于是那句话有时真、有时假（`DF-041` 的形态）。
+
+**本仓库自己**写 `"paths": { "runs": "tasks/runs" }`，所以它升级后行为**逐字节不变**。
+
+**hook 的台账不在这里。** `stop-verify-hook` / `pre-write-gate` / `hook-dedupe` 的观测记录
+是**机器状态**（这台机器上的闸门跑过什么），不是项目内容 —— 它们住宿主机状态目录
+`%LOCALAPPDATA%/UntilDone/`（POSIX：`$XDG_STATE_HOME/untildone/`），换项目也是同一条历史。
+`OVERWATCH_STATE_DIR` 可以把它们整体重定向到临时目录（测试与探针靠这个隔离）。
 
 ## 4. 断言族：`verify-claims.mjs` 认哪些「完成声明」
 

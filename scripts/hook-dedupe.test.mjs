@@ -23,7 +23,7 @@ import {
   utimesSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
@@ -31,6 +31,7 @@ import {
   recordSkipped, sweepIfCrowded,
   CLAIM_TTL_MS, SWEEP_AT, SKIPPED_FILE, DEDUPE_DIR_NAME,
 } from '../scripts/hook-dedupe.mjs';
+import { resolveStateDir } from '../scripts/state-dir.mjs';
 
 const sandbox = () => mkdtempSync(join(tmpdir(), 'ow-dedupe-'));
 /** 隔离 env：**只能整体给**，理由同两个 hook 的测试（漏一个就写进仓库）。 */
@@ -305,13 +306,19 @@ test('recordSkipped 写不进去返回 null，不抛', () => {
 
 // ── 8. 目录解析：三层优先级，与两个 hook 的既有约定一致 ──────────────
 
-test('dedupeRoot 的三层优先级：显式覆盖 → OVERWATCH_STATE_DIR → 仓库默认', () => {
+test('dedupeRoot 的三层优先级：显式覆盖 → OVERWATCH_STATE_DIR → 宿主机状态目录', () => {
   assert.equal(dedupeRoot({ env: { OVERWATCH_HOOK_DEDUPE_DIR: '/tmp/x' } }), '/tmp/x');
   assert.equal(dedupeRoot({ env: { OVERWATCH_STATE_DIR: '/tmp/state', OVERWATCH_HOOK_DEDUPE_DIR: '' } }),
     join('/tmp/state', DEDUPE_DIR_NAME));
   const dflt = dedupeRoot({ env: {} });
-  assert.match(dflt.replace(/\\/g, '/'), /\/tasks\/runs\/hook-dedupe$/,
-    '默认必须落在 gitignored 的 tasks/runs/ 下');
+  // 2026-11-21：默认落点从 `REPO_ROOT/tasks/runs/`（脚本位置）改成宿主机状态目录。
+  // 认领文件是**机器状态**（「这台机器上这次调用已认领」），不是项目内容；
+  // 锚在脚本位置等于 hook 每判一次就往框架仓库写一个文件。
+  assert.match(dflt.replace(/\\/g, '/'), new RegExp(`/${DEDUPE_DIR_NAME}$`), dflt);
+  assert.doesNotMatch(dflt.replace(/\\/g, '/'), /\/Projects\/Overwatch\/tasks\/runs\//,
+    `认领目录不许落进框架仓库：${dflt}`);
+  // 与两个 hook 的台账**同根**：分布在两个状态目录里会让「清一次就干净」变成假的
+  assert.equal(dirname(dflt), resolveStateDir({}), '认领目录必须与 hook 台账同一个状态根');
   // 空白串不等于设置（否则一次 `FOO= node ...` 就会写到奇怪的地方）
   assert.equal(dedupeRoot({ env: { OVERWATCH_HOOK_DEDUPE_DIR: '   ' } }), dflt);
 });

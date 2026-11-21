@@ -65,6 +65,7 @@ import { questionsOfAsk, normalizeText } from './question-form.mjs';
 // `dedupeForks()` 判的是「前 N 条调用序列是否逐字相同」；
 // `broadReadsOf()` 是「结构性探索（ls/find/grep/Glob）也算了解项目」那一档。
 import { dedupeForks, broadReadsOf } from './observe-reality-check.mjs';
+import { discoverRoles } from './roles.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -99,17 +100,18 @@ export const ASK_MODES = Object.freeze(['always', 'never', 'auto']);
 export const AUTO_COMPLEX_FILES = 3;
 export const AUTO_COMPLEX_TOOLCALLS = 15;
 
-/** `.claude/agents/` 里现存的角色名。`agent.roster` 只接受这些值（外加 `executor` 单跑合法）。
+/** `.claude/agents/` 里现存的角色名。`agent.roster` 只接受这些值。
  *
- *  为什么写死在这里而不是每次读目录：配置**校验**必须在干净 clone 上也能跑，
- *  而 `.claude/agents/` 是真的在产品本体里（不会被 gitignore），所以读目录也行——
- *  但那样一来「角色名打错」会随目录变化而时过时不过，校验结果不稳定。
- *  写死 + 由 `question-audit.test.mjs` 断言「这份清单与目录一致」，两边不会漂。 */
-export const KNOWN_ROLES = Object.freeze([
-  'oversight-acceptor', 'oversight-critic', 'oversight-executor', 'oversight-planner',
-  'oversight-probe', 'oversight-redteam', 'oversight-relay', 'oversight-repair',
-  'oversight-research', 'oversight-resolution', 'oversight-review', 'oversight-safety',
-]);
+ *  **不再写死。** 它原先是一份 12 个字面量的数组，靠一条测试钉住「与目录一致」。
+ *  那条测试防的是「清单漂了」，可它漂的根因就是**清单存在**：`scripts/roles.mjs` 之外，
+ *  同一个角色名在本仓还有 9 个落点（DF-044）。现在这里只是注册表的一个投影。
+ *
+ *  校验仍然可以用它：`.claude/agents/` 在产品本体里（不会被 gitignore），
+ *  干净 clone 上也在；而「角色名打错」这件事的判据本来就该是**目录里到底有没有它**。
+ *
+ *  取的是 `name`（全名 `oversight-planner`），因为 `agent.roster` 一直用全名，
+ *  配置里那三个值不该因为本文件改实现而失效。 */
+export const KNOWN_ROLES = Object.freeze(discoverRoles().map((r) => r.name));
 
 /** 默认配置。**问是默认，不问要显式关掉**（用户拍板第 2 条）。 */
 export function defaultConfig() {
@@ -134,6 +136,11 @@ export function defaultConfig() {
     },
     agent: {
       roster: ['oversight-planner', 'oversight-executor', 'oversight-acceptor'],
+      /** 角色文件名的前缀，用于「frontmatter 没写 `id:` 时怎么取 id」。
+       *  默认 `"oversight-"`：现有 12 份 `name: oversight-acceptor` 去前缀正好得到
+       *  `acceptor`，与任务图里的 `capability` 逐字相同（DF-044）。
+       *  本库被当模板复用时，对方的角色可以叫别的，改这一行即可，不必改代码。 */
+      agentPrefix: 'oversight-',
     },
   };
 }
@@ -161,7 +168,16 @@ export function validateConfig(raw) {
   }
 
   // 顶层键白名单。`$schema` 允许存在但不参与判定（编辑器提示用）。
-  const TOP = new Set(['$schema', 'version', 'ask', 'agent']);
+  //
+  // `paths` 是 2026-11-21 加的（「两个根」拆分）：它声明用户项目里那些**运行台账**
+  // 落在哪个子目录。执行侧在 `scripts/project-root.mjs` 的 `runsDirFor()`，
+  // 与 `ask.minQuestionsBeforeWrite` 同一种分工 —— 本文件只管它合法，不管它生效。
+  //
+  // **不加这个键的代价是刚性的**：未知键 = 错误 = `config: null`，于是
+  // `launch` 的 roster 与 `question-audit` 的判据全部停摆。而本仓库自己要写
+  // `"paths": { "runs": "tasks/runs" }` 来保持逐字节不变 ——
+  // 一个不改行为的新键把无关功能带塌，正是 `minQuestionsBeforeWrite` 那次踩过的形态。
+  const TOP = new Set(['$schema', 'version', 'ask', 'agent', 'paths']);
   for (const k of Object.keys(raw)) {
     if (!TOP.has(k)) err('unknown-key', k, `未知的顶层键 "${k}"（拼错了？允许：${[...TOP].join(' / ')}）`);
   }
@@ -241,9 +257,20 @@ export function validateConfig(raw) {
   } else if (ag === null || typeof ag !== 'object' || Array.isArray(ag)) {
     err('bad-type', 'agent', 'agent 必须是对象');
   } else {
-    const AG_KEYS = new Set(['roster']);
+    const AG_KEYS = new Set(['roster', 'agentPrefix']);
     for (const k of Object.keys(ag)) {
       if (!AG_KEYS.has(k)) err('unknown-key', `agent.${k}`, `未知键 "agent.${k}"（允许：${[...AG_KEYS].join(' / ')}）`);
+    }
+    if (ag.agentPrefix !== undefined) {
+      if (typeof ag.agentPrefix !== 'string' || !ag.agentPrefix.trim()) {
+        err('bad-type', 'agent.agentPrefix', `agent.agentPrefix 必须是非空字符串（当前：${JSON.stringify(ag.agentPrefix)}）`);
+      } else if (/[\\/]/.test(ag.agentPrefix)) {
+        // 前缀会被直接拼进文件名。带分隔符的值意味着有人以为它能指一个目录，
+        // 而这里只改「name 去前缀」，不改路径 —— 静默接受会让 id 变成一段路径。
+        err('bad-value', 'agent.agentPrefix', `agent.agentPrefix 不能含路径分隔符（当前：${JSON.stringify(ag.agentPrefix)}）`);
+      } else {
+        cfg.agent.agentPrefix = ag.agentPrefix.trim();
+      }
     }
     const roster = ag.roster;
     if (!Array.isArray(roster)) {
@@ -267,7 +294,46 @@ export function validateConfig(raw) {
     }
   }
 
+  const paths = validatePathsSection(raw.paths, err);
+  if (paths) cfg.paths = paths;
+
   return { ok: errors.length === 0, config: errors.length === 0 ? cfg : null, errors };
+}
+
+/** `paths` 段的校验。返回合法值（可能为空对象），非法返回 `null` 并往 `err` 里记账。
+ *  抽出来是因为这段有 5 条分支，塞在 `validateConfig` 里会把它推过可读上限。 */
+function validatePathsSection(paths, err) {
+  if (paths === undefined) return null;
+  if (paths === null || typeof paths !== 'object' || Array.isArray(paths)) {
+    err('bad-type', 'paths', 'paths 必须是对象');
+    return null;
+  }
+  const out = {};
+  const PATH_KEYS = new Set(['runs']);
+  for (const k of Object.keys(paths)) {
+    if (!PATH_KEYS.has(k)) err('unknown-key', `paths.${k}`, `未知键 "paths.${k}"（允许：${[...PATH_KEYS].join(' / ')}）`);
+  }
+  const runs = paths.runs;
+  if (runs === undefined) {
+    // 缺省 = 用默认目录。与 `ask.minQuestionsBeforeWrite` 同处置：不凭空要求新键。
+    return out;
+  }
+  if (typeof runs !== 'string' || !runs.trim()) {
+    err('bad-type', 'paths.runs', `paths.runs 必须是非空字符串（当前：${JSON.stringify(runs)}）`);
+    return out;
+  }
+  const v = runs.trim();
+  // 只允许项目相对路径：绝对路径会让同一个配置在别人机器上指向不存在的地方，
+  // 而错误表现是「台账不见了」。覆盖盘符（`<盘符>:\…` 与 `<盘符>:/…`）、
+  // UNC（`\\<主机>\…`）、POSIX 绝对（`/…`）。
+  if (/^[A-Za-z]:[\\/]/.test(v) || v.startsWith('/') || v.startsWith('\\\\')) {
+    err('bad-range', 'paths.runs',
+      `paths.runs 必须是**项目相对**路径（当前：${JSON.stringify(runs)}）。`
+      + '写绝对路径会让这份配置在别人的机器上指向不存在的地方，而错误表现是「台账不见了」');
+    return out;
+  }
+  out.runs = v;
+  return out;
 }
 
 /** 读配置文件。**文件不存在 = 用默认值**（这是唯一的回落）；

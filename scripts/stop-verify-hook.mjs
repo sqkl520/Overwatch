@@ -58,12 +58,14 @@ import {
   familyName,
 } from './verify-claims.mjs';
 import { detectProjectCommands, commandHint } from './project-commands.mjs';
-import { stateRoot, STATE_DIR_NAME, LEGACY_DIR_NAME } from './state-dir.mjs';
+import { stateRoot, STATE_DIR_NAME, LEGACY_DIR_NAME, resolveStateDir } from './state-dir.mjs';
 import { createHash } from 'node:crypto';
 import { claimOnce, claimKeyOf, recordSkipped } from './hook-dedupe.mjs';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(HERE, '..');
+/** 修前这里还有 `const HERE = ...` 与 `const REPO_ROOT = resolve(HERE, '..')`，
+ *  只被三处**台账默认路径**用。三处都已改到 `ledgerRoot()`（状态目录），
+ *  所以两个常量连同它们的用途一起消失了 —— 留着只会让下一个人以为
+ *  「框架根是这个 hook 的正当落点」。 */
 
 /** 判定会拦的档位。UNKNOWN / UNCHECKABLE 刻意不在此列（见文件头 §4）。 */
 export const BLOCKING_STATUS = Object.freeze(['NO_EVIDENCE', 'STALE_ONLY', 'FAILED_ONLY']);
@@ -153,7 +155,7 @@ export function pausePathsFor(env = process.env) {
     const root = stateRoot(env);
     out.push(join(root, STATE_DIR_NAME[plat], PAUSE_FILE_NAME));
     out.push(join(root, LEGACY_DIR_NAME[plat], PAUSE_FILE_NAME));
-  } catch { /* 连状态根都算不出来：至少保留上面那条显式路径 */ }
+  } catch { /* 连状态根都算不出来：只剩上面那条 `OVERWATCH_STATE_DIR` 候选 */ }
 
   // 去重（`OVERWATCH_STATE_DIR` 恰好指到状态目录本身时会出现重复项）。
   return [...new Set(out)];
@@ -166,7 +168,15 @@ export function pausePathsFor(env = process.env) {
  *  `pausedPathOf()` 的全量候选，否则旧路径上的文件会被这条主路径挡住。 */
 export function pausePathFor(env = process.env) {
   const all = pausePathsFor(env);
-  return all[0] || join(stateRoot(env), STATE_DIR_NAME.posix, PAUSE_FILE_NAME);
+  if (all.length) return all[0];
+  // 候选为空只可能发生在 `stateRoot()` 抛了、且没设 `OVERWATCH_STATE_DIR`。
+  // `pausePathFor()` 是给人和日志看的名字，不能让调用方拿到 `undefined`；
+  // 判定不受影响（`pausedPathOf()` 对空候选返回 null，即「没暂停」）。
+  try {
+    return join(stateRoot(env), STATE_DIR_NAME[process.platform === 'win32' ? 'win32' : 'posix'], PAUSE_FILE_NAME);
+  } catch {
+    return PAUSE_FILE_NAME;
+  }
 }
 
 /** L1：返回**命中的那条**路径；没命中返回 null。
@@ -501,24 +511,42 @@ export function buildReason({ blocking = [], project = null, blockCount = 0, mod
   return out.length > 4000 ? out.slice(0, 3980) + '\n…（已截断）' : out;
 }
 
-/** 观测记录路径。默认 `tasks/runs/stop-hook/YYYY-MM-DD.jsonl`（gitignored）。
+/** 观测记录的**兜底根**：宿主机状态目录。
  *
- *  优先级与 `pre-write-gate.mjs` 的 `logPathFor` **刻意保持一致**：
- *  `OVERWATCH_STOP_VERIFY_LOG`（显式覆盖）→ `OVERWATCH_STATE_DIR`（本仓脚本统一的
- *  临时区变量）→ 仓库默认路径。
+ *  ## 为什么不再落到 `REPO_ROOT/tasks/runs/`（2026-11-21 修）
  *
- *  中间那一层是 2026-11-18 补的（`DF-031`）。此前只有 `pre-write-gate` 认
- *  `OVERWATCH_STATE_DIR`，本文件不认 —— 于是任何沿用「设 `OVERWATCH_STATE_DIR` 隔离」
- *  这个既有约定的测试/探针，在这个 hook 上都会**静默失效并写进生产台账**。
- *  同一个仓库里两个 hook 对同一个环境变量给出不同答案，比两个都不认更糟：
- *  它让「我已经隔离了」这句话变成有时真、有时假。 */
+ *  修前三处台账（观测日志 / 拦截计数 / 放行样本）的默认路径都是
+ *  `join(REPO_ROOT, 'tasks', 'runs', ...)` —— 锚在**脚本位置**。而本 hook 被挂进的是
+ *  **用户的项目**（模板里 `CLAUDE_PROJECT_DIR` 是当前项目），于是它每跑一次就往
+ *  **框架仓库**里写一行日志。在别人机器上那是「框架目录被写脏」；在本机那是
+ *  「用户项目的观测数据全进了另一个仓库」。
+ *
+ *  hook 的观测记录是**机器状态**，不是项目内容 —— 它描述的是「这台机器上的闸门跑过什么」，
+ *  换一个项目也该是同一条历史。所以它该住在 `state-dir.mjs` 管的宿主机状态目录里
+ *  （`%LOCALAPPDATA%/UntilDone/`），与 `asked-history.json`、守护进程的见证文件同一处。
+ *  那里已经带着改名迁移规则（`Overwatch` → `UntilDone`），复用它就不会有第三份目录名。
+ *
+ *  **本函数只是 `resolveStateDir` 的别名**，不是第二份判据 —— 存在的原因是
+ *  `pre-write-gate.mjs` 也要用同一个根，而「谁来提供这个根」必须只有一个答案。
+ *  别名比复制一份 `join(env.X || ...)` 好：复制的那份一定会在下一次改名时漏掉。
+ *  `OVERWATCH_STATE_DIR` 的优先级由 `resolveStateDir` 自己处理（它认这个变量），
+ *  所以这里不再重判一次。 */
+export function ledgerRoot(env = process.env) {
+  return resolveStateDir(env);
+}
+
+/** 观测记录路径。默认 `<状态目录>/stop-hook/YYYY-MM-DD.jsonl`。
+ *
+ *  中间两层（`OVERWATCH_STOP_VERIFY_LOG` / `OVERWATCH_STATE_DIR`）的理由是 `DF-031`：
+ *  此前只有 `pre-write-gate` 认 `OVERWATCH_STATE_DIR`，本文件不认 —— 于是任何沿用
+ *  「设 `OVERWATCH_STATE_DIR` 隔离」这个既有约定的测试/探针，在这个 hook 上都会
+ *  **静默失效并写进生产台账**。同一个仓库里两个 hook 对同一个环境变量给出不同答案，
+ *  比两个都不认更糟：它让「我已经隔离了」这句话变成有时真、有时假。 */
 export function logPathFor(env = process.env, nowMs = Date.now()) {
   if (env.OVERWATCH_STOP_VERIFY_LOG) return env.OVERWATCH_STOP_VERIFY_LOG;
   const d = new Date(nowMs);
   const day = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
-  const stateDir = String(env.OVERWATCH_STATE_DIR || '').trim();
-  if (stateDir) return join(stateDir, 'stop-hook', day + '.jsonl');
-  return join(REPO_ROOT, 'tasks', 'runs', 'stop-hook', day + '.jsonl');
+  return join(ledgerRoot(env), 'stop-hook', day + '.jsonl');
 }
 
 /** 追加一行观测记录。**永不抛** —— 记账失败不能影响判定。 */
@@ -569,7 +597,7 @@ export function statePathFor(env = process.env) {
   if (env.OVERWATCH_STOP_VERIFY_STATE) return env.OVERWATCH_STOP_VERIFY_STATE;
   const stateDir = String(env.OVERWATCH_STATE_DIR || '').trim();
   if (stateDir) return join(stateDir, 'stop-hook', 'state.json');
-  return join(REPO_ROOT, 'tasks', 'runs', 'stop-hook', 'state.json');
+  return join(ledgerRoot(env), 'stop-hook', 'state.json');
 }
 
 export function bumpBlockCount(sessionId, { env = process.env, nowMs = Date.now() } = {}) {
@@ -661,13 +689,11 @@ export function loadSubagentRecords(transcriptPath) {
 /** 只记前 500 字。完整对话不进日志 —— 这是隐私边界，不是性能取舍。 */
 export const SAMPLE_TEXT_LIMIT = 500;
 
-/** 样本文件路径。默认 `tasks/runs/stop-hook-samples.jsonl`（gitignored）。
- *  可用 `OVERWATCH_STOP_VERIFY_SAMPLES` 覆盖（测试用）。 */
+/** 样本文件路径。默认 `<状态目录>/stop-hook-samples.jsonl`（**不再写进框架仓库**，
+ *  理由见 `ledgerRoot()` 的注释）。可用 `OVERWATCH_STOP_VERIFY_SAMPLES` 覆盖（测试用）。 */
 export function samplePathFor(env = process.env) {
   if (env.OVERWATCH_STOP_VERIFY_SAMPLES) return env.OVERWATCH_STOP_VERIFY_SAMPLES;
-  const stateDir = String(env.OVERWATCH_STATE_DIR || '').trim();
-  if (stateDir) return join(stateDir, 'stop-hook-samples.jsonl');
-  return join(REPO_ROOT, 'tasks', 'runs', 'stop-hook-samples.jsonl');
+  return join(ledgerRoot(env), 'stop-hook-samples.jsonl');
 }
 
 /** 样本记录开关。默认**开**（只是写日志，无副作用）。

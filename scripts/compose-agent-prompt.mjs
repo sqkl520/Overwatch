@@ -12,7 +12,7 @@
  *   · 验收标准写着「判定前必须逐条跑 `check-structure.mjs`」，
  *     而 `acceptor` 的 tools 是 `Read, Grep, Glob, Write` —— **物理上跑不了**，
  *     它唯一能给的诚实结论是「不通过」。更硬的是：这道矛盾是**硬门强制**的，
- *     `check-structure.mjs` 的 READONLY_ROLES 明令只读角色不得含 Bash。
+ *     `check-structure.mjs` 对 frontmatter 写了 `readonly: true` 的角色明令不得含 Bash。
  *   · 「这个项目用 mvn 不是 npm」这类事实，本来 `scripts/project-commands.mjs` 能读出来，
  *     却要靠主线程记得手写；写错一次，子 agent 就照着错的做。
  *
@@ -72,9 +72,21 @@ import { join, resolve, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { detectProjectCommands } from './project-commands.mjs';
+import { frameworkRoot, projectRoot, runsDirInfo } from './project-root.mjs';
+import { discoverRoles, resolveRole, defaultRoles, parseFrontmatter as roleParseFrontmatter } from './roles.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolve(HERE, '..');
+
+/** **框架根**：`.claude/agents/` 与 `templates/` 住在这里，它们是随包发布的资产。
+ *
+ *  修前这个常量叫 `ROOT` 并同时被当成「用户项目根」用（`join(root,'tasks','runs',...)`），
+ *  于是从用户项目跑时 compose 会去**框架仓库**里找 task-graph。现在两个用途分开：
+ *  本常量只管资产，用户项目的位置由 `projectRoot()` 给（见 `main()`）。 */
+const ASSET_ROOT = frameworkRoot();
+
+/** `deriveInjected()` 的 `root` 默认值 —— 它读的是**目标项目**的构建/测试命令
+ *  （`detectProjectCommands`），所以默认也该是框架仓库（本仓自用时就是它）。 */
+const ROOT = ASSET_ROOT;
 
 export const PROMPT_LEDGER_VERSION = 1;
 
@@ -155,15 +167,14 @@ export const REQUIRED_PLACEHOLDERS = Object.freeze(['<run-id>', '<task-id>', '<n
  *  依据 `docs/spec/dispatch-contract.md` §3 与各角色定义里「不要读…」那几句。
  *
  *  为什么由 compose 拦而不是在 prompt 里写「请不要读」：契约 §3 的原话是
- *  「不靠 prompt 里写请不要读，靠不提供路径」。compose 是唯一知道「提供了什么」的地方。 */
-export const FORBIDDEN_CONTEXT = Object.freeze({
-  review: ['self_assessment', 'execution_log', 'weak_points'],
-  acceptor: ['self_assessment', 'execution_log', 'weak_points', 'review_score'],
-  redteam: ['self_assessment', 'weak_points'],
-  critic: ['executor_output', 'review_score'],
-  probe: ['reasoning_text'],
-  safety: ['relay_rationale'],
-});
+ *  「不靠 prompt 里写请不要读，靠不提供路径」。compose 是唯一知道「提供了什么」的地方。
+ *
+ *  这张表**已经不在这里**（2026-11-21，DF-044）：它是「角色是什么」的一部分，
+ *  和工具白名单、只读标记住在同一个地方 —— `scripts/roles.mjs`。
+ *  留在这里的话，下一个要读角色的脚本又得抄一份，而抄的那份永远是最早过期的。
+ *  这里只转出，不复制。 */
+export { FORBIDDEN_CONTEXT } from './roles.mjs';
+import { FORBIDDEN_CONTEXT as FORBIDDEN_BY_ID } from './roles.mjs';
 
 /** 提示词必须有的元素。**每一条都是可机械判定的**——判不了的规则不配进这张表，
  *  否则它又会退化成一句「请务必包含」。
@@ -190,35 +201,19 @@ const VAGUE_STOP = /尽可能|尽量|全面|彻底|充分|深入|酌情|视情�
 
 // ── frontmatter / 角色工具集 ──────────────────────────────────────────
 
-/** 极简 frontmatter 解析：支持 `key: value` 与 `key: |` 块。足够读 `tools:`。 */
-export function parseFrontmatter(text) {
-  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(String(text || ''));
-  if (!m) return null;
-  const out = {};
-  const lines = m[1].split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const kv = /^([A-Za-z_][\w-]*)\s*:\s*(.*)$/.exec(lines[i]);
-    if (!kv) continue;
-    const [, key, inline] = kv;
-    if (inline === '|' || inline === '>' || inline === '|-') {
-      const block = [];
-      let j = i + 1;
-      while (j < lines.length && (/^\s+\S/.test(lines[j]) || lines[j].trim() === '')) { block.push(lines[j].trim()); j++; }
-      out[key] = block.join(' ').trim();
-      i = j - 1;
-    } else {
-      out[key] = inline.trim();
-    }
-  }
-  return out;
-}
+/** frontmatter 解析的**唯一实现**在 `scripts/roles.mjs`，这里只转出。
+ *
+ *  原先本文件与 `check-structure.mjs` 各有一份拷贝。两份当时行为一致，但
+ *  「角色是不是只读」现在两边都要读，而那条判据就在 frontmatter 里 ——
+ *  一个解析差异就会让硬门放行、compose 拦下，同一份 .md 两个结论。 */
+export { parseFrontmatter } from './roles.mjs';
 
 /** 一个角色定义 → 它的工具白名单。
  *
  *  `tools` 整行缺失时宿主语义是「继承全部工具」。这比写错更危险——白名单静默变成全开，
  *  所以 `inheritAll: true` 必须被 compose 当成「无法判定」而不是「什么都能干」。 */
 export function roleTools(agentText) {
-  const fm = parseFrontmatter(agentText);
+  const fm = roleParseFrontmatter(agentText);
   if (!fm) return { tools: [], inheritAll: false, missingFrontmatter: true };
   if (fm.tools === undefined) return { tools: [], inheritAll: true, missingFrontmatter: false };
   const tools = String(fm.tools).split(',').map((s) => s.trim()).filter(Boolean);
@@ -434,7 +429,15 @@ export function checkPromptSpec({
   }
 
   // 9) 独立性
-  const forbidden = FORBIDDEN_CONTEXT[role] || [];
+  //
+  //  查表的键**先按传入的名字，再按 id**。原来只按 `role` 查，于是
+  //  `--role oversight-acceptor` 拿到的是空清单 —— 「不该给的东西」照样被放行，
+  //  而检查结果写着「该角色无额外禁止项」。名字的两种写法必须落到同一条记录上。
+  const roleId = (() => {
+    const hit = resolveRole(defaultRoles(), role);
+    return hit ? hit.id : String(role || '');
+  })();
+  const forbidden = FORBIDDEN_BY_ID[roleId] || FORBIDDEN_BY_ID[role] || [];
   const present = forbidden.filter((k) => context && Object.prototype.hasOwnProperty.call(context, k));
   mark('independence', present.length === 0,
     `注入了不该给 ${role} 的内容：${present.join(', ')}——锚定无法用 prompt 撤销（契约 §3）`,
@@ -582,7 +585,15 @@ export function composePrompt({
   // L0
   lines.push('## 0. 身份（L0）');
   lines.push('');
-  lines.push(`你以 \`${roleSource || `.claude/agents/oversight-${role}.md`}\` 定义的身份工作。`
+  // L0 的身份指针必须是**这份角色真的在哪**，不是把 `role` 拼进一个模板。
+  // 原来这里写死 `oversight-${role}.md`：传全名的人拿到 `oversight-oversight-acceptor.md`，
+  // 一份不存在的文件被打印成「你以它定义的身份工作」—— 子 agent 读不到，而提示词看起来完整。
+  // 现在先查注册表；查不到（例如别人的角色目录）才回落成「按传入的名字原样拼」。
+  const source = roleSource || (() => {
+    const hit = resolveRole(defaultRoles(), role);
+    return `.claude/agents/${hit ? hit.name : role}.md`;
+  })();
+  lines.push(`你以 \`${source}\` 定义的身份工作。`
     + '**不要**按本文重设身份；那一份是冻结点，本文只补它在「这一次任务」里缺的东西。');
   lines.push('');
 
@@ -637,6 +648,32 @@ export function composePrompt({
   lines.push('');
   lines.push(String(stopCondition || '').trim() || '(缺失)');
   lines.push('');
+
+  // 2.4 补充上下文
+  //
+  //  **这一节存在的唯一理由是让 `checkPromptSpec` 的独立性判据有对象。**
+  //  在这一节之前，`context` 参数只被第 9 项检查读过、从不被渲染——于是「注入了
+  //  不该给这个角色的内容」这件事只能靠检查拒绝，而检查又因为 CLI 恒传 `{}`
+  //  永远拒绝不了任何东西（缺陷 B）。
+  //
+  //  渲染它带来一个**必须说清的副作用**：一份 `context` 若通过了检查，它的内容
+  //  会真的出现在子 agent 的提示词里。这是对的——`FORBIDDEN_CONTEXT` 只覆盖
+  //  一部分角色（executor 之类本来就不在表里），而「显而易见地没坏处」的内容
+  //  本来就该送到。但调用方要明白：**给了就等于发了**。
+  const ctxEntries = Object.entries(context || {}).filter(([, v]) => v !== undefined && v !== null && v !== '');
+  if (ctxEntries.length) {
+    lines.push('### 2.4 主线程补充的上下文（L2）');
+    lines.push('');
+    lines.push('> 这些是主线程手上已有的材料，**不是结论**。它们可能过时或与任务无关，');
+    lines.push('> 与本文件 §3 的机器注入事实冲突时，以 §3 为准。');
+    lines.push('');
+    for (const [k, v] of ctxEntries) {
+      lines.push(`#### ${k}`);
+      lines.push('');
+      lines.push(typeof v === 'string' ? v.trim() : '```json\n' + JSON.stringify(v, null, 2) + '\n```');
+      lines.push('');
+    }
+  }
 
   // L3
   lines.push('## 3. 本项目事实（L3 · 机器注入，不要手抄，也不要改）');
@@ -829,9 +866,10 @@ const HELP = `compose-agent-prompt — 分层拼装子 agent 提示词
 
 用法：
   node scripts/compose-agent-prompt.mjs compose --run <id> --task ST1 \\
-    --graph tasks/runs/<id>/task-graph.json --role <role> \\
+    --graph tasks/runs/<id>/task-graph.json --role <角色 id 或全名> \\
     [--stop "<停机条件>"] [--constraint "<约束>" ...] \\
     [--gate "<命令>=<输出文件>" ...] [--gate-exit N] [--prior-failure "<上次失败模式>"] \\
+    [--context-from <context.json>] \\
     [--nonce <8位hex>] [--out <文件>] [--dry-run] [--json]
 
   node scripts/compose-agent-prompt.mjs verify --run <id> --session <会话目录> [--task ST1] [--json]
@@ -840,10 +878,29 @@ const HELP = `compose-agent-prompt — 分层拼装子 agent 提示词
   compose  从 task-graph.json 取该子树的 goal / acceptance / shape / outputs，
            L2 现写段由 --stop / --constraint 补齐，L3 由仓库状态自动注入。
            **检查不过就不落文件**——这是「acceptance 为空就拒绝派发」的一般形态。
+
+           --context-from 是「主线程补充上下文」的唯一入口（一个 JSON 对象）。
+           它会同时被**检查**（FORBIDDEN_CONTEXT：锐评不得拿到执行者的自我评价等）
+           和**渲染**（§2.4）。给 review / acceptor / redteam / critic / probe /
+           safety 喂了禁止项时拒绝派发（exit 1）；JSON 解析不了则 exit 2，
+           不回落成「当作没给」。
+
+           --role 收**两种写法**：id（acceptor）与全名（oversight-acceptor）都行。
+           解析走 .claude/agents/ 的注册表（scripts/roles.mjs），先全名、再 id、
+           再加 agentPrefix 试一次 —— 三个名字空间的写法不必由人来记住（DF-044）。
+           找不到时报错并列出**现有角色**，不发明岗位。
   verify   收活时核对：子 agent 实际收到的首条消息，是否就是 compose 记下的那一份。
 
 分四层：L0 身份（冻结，只放指针）/ L1 协议（templates/dispatch.md 逐字）/
         L2 现写（主线程写）/ L3 注入（机器从仓库状态派生）。
+
+两个根（不合成一个值，因为有两种合法语义）：
+  --root <dir>      换「资产与路径基准」。默认走阶梯：--root > UNTILDONE_ROOT
+                    > 从 cwd 向上找 .untildone/ 或 .git/。找不到时 P1 过渡期回落到
+                    框架仓库并打印警告。
+  runs 落点          --graph 指到哪，台账就在哪（与 task-graph.json 同目录）；
+                    不给 --graph 时按 overwatch.config.json 的 paths.runs 找。
+  **每次都会打印用了哪一级** —— 否则「写对了」和「写错地方」在屏幕上是同一个样子。
 
 退出码：0 通过 / 1 检查不过或对不上 / 2 用法错误。
 `;
@@ -875,7 +932,31 @@ function main(argv) {
   const cmd = args._[0] || 'help';
   if (cmd === 'help' || args.help) { console.log(HELP); return 0; }
 
-  const root = resolve(String(args.root || ROOT));
+  // ── 两个根（见 `project-root.mjs` 文件头）─────────────────────────
+  //
+  // 修前这里是 `resolve(args.root || ROOT)`，一个值同时承担两件事：
+  //   ① 去**用户项目**里找 run（`join(root,'tasks','runs',run,'task-graph.json')`）
+  //   ② 去**框架仓库**里找资产（`.claude/agents/oversight-*.md`、`templates/dispatch.md`）
+  // 这两件事的正确答案不同，用一个值必然有一方错：不给 `--root` 时 ① 错（去找框架仓库
+  // 的 run），给了 `--root <用户项目>` 时 ② 错（用户项目里没有那份角色定义）。
+  //
+  // 修后：
+  //   · `root`      = 路径基准（`--out` / `--gate` / `--context-from` / 默认 graph 位置）
+  //                   = `--root` 给了就用它，否则走 `projectRoot()` 的阶梯
+  //   · `assetRoot` = 资产根（角色定义 + dispatch 模板）
+  //                   = `--root` 给了就用它（**保留旧行为**：测试拿它指仓库），
+  //                     否则就是框架仓库 —— 资产随框架发布，不随用户项目
+  const explicitRoot = args.root !== undefined ? resolve(String(args.root)) : null;
+  const root = explicitRoot || projectRoot({ argv });
+  if (!root) {
+    console.error('[compose] 找不到用户项目根（阶梯第 5 级），已停止 —— 不猜、不回落脚本位置。');
+    console.error(`  给 --root <dir>、设 UNTILDONE_ROOT，或在项目里建 .untildone/ 或 .git/。`);
+    return 2;
+  }
+  const assetRoot = explicitRoot || ASSET_ROOT;
+  const runsDir = runsDirInfo(root).dir;
+  console.error(`[compose] 路径基准 → ${root}（${explicitRoot ? '--root' : 'projectRoot 阶梯'}）`);
+  console.error(`[compose] runs 目录 → ${runsDir}`);
   const run = args.run ? String(args.run) : null;
 
   if (cmd === 'compose') {
@@ -883,7 +964,7 @@ function main(argv) {
     const taskId = args.task ? String(args.task) : null;
     const role = args.role ? String(args.role) : null;
     if (!taskId || !role) { console.error('缺少 --task / --role'); return 2; }
-    const graphPath = args.graph ? resolve(String(args.graph)) : join(root, 'tasks', 'runs', run, 'task-graph.json');
+    const graphPath = args.graph ? resolve(String(args.graph)) : join(runsDir, run, 'task-graph.json');
     const graphText = readText(graphPath);
     if (graphText == null) { console.error(`读不到 task-graph：${graphPath}`); return 2; }
     let graph;
@@ -901,11 +982,19 @@ function main(argv) {
 
     const acceptance = Array.isArray(st.acceptance) ? st.acceptance : [];
     const outputs = Array.isArray(st.outputs) ? st.outputs : [];
-    const roleFile = join(root, '.claude', 'agents', `oversight-${role}.md`);
-    const roleText = readText(roleFile);
+    // 角色文件路径**不拼字符串**。原实现是 `oversight-${role}.md`，于是
+    // `--role oversight-acceptor`（配置 roster 里的写法）拼出
+    // `oversight-oversight-acceptor.md`，报「没有这个角色的定义」—— 实测（DF-044）。
+    // 现在走注册表，`--role acceptor` 与 `--role oversight-acceptor` 解析到同一份文件。
+    const agentsDir = join(assetRoot, '.claude', 'agents');
+    const roles = discoverRoles(agentsDir);
+    const found = resolveRole(roles, role);
+    const roleFile = found ? found.file : join(agentsDir, `${role}.md`);
+    const roleText = found ? readText(found.file) : null;
     if (roleText == null) {
       console.error(`没有这个角色的定义：${roleFile}`);
-      console.error('角色必须先存在于 .claude/agents/ —— compose 不发明岗位。');
+      console.error('角色必须先存在于 .claude/agents/ —— compose 不发明岗位。'
+        + (roles.length ? `\n现有角色：${roles.map((r) => r.id).join(' / ')}` : ''));
       return 2;
     }
 
@@ -936,14 +1025,49 @@ function main(argv) {
     const constraints = asArray(args.constraint).filter((x) => typeof x === 'string');
     const stopCondition = args.stop ? String(args.stop) : null;
 
+    // L2 的「补充上下文」：**这是 FORBIDDEN_CONTEXT 唯一可能被喂饱的入口。**
+    //
+    //  在这个参数出现之前，CLI 两处写死 `context: {}`（缺陷 B 的原形），于是
+    //  `checkPromptSpec` 的第 9 项（独立性）在真实调用中恒真——不是因为它通过了，
+    //  而是因为**没人能往里放东西**。测试里手动传 `{ self_assessment: ... }`
+    //  才碰得到那条判据，而那正是「代码写好了、调用方从不传参」的标准形态。
+    //
+    //  为什么是文件而不是 `--context key=value`：这个参数的用途是「主线程把手上
+    //  已有的材料交给某个角色」，材料本身是文本（执行者的返回、上一轮的日志、
+    //  别的 agent 的输出）。做成 key=value 会逼调用方把多行内容压成一行命令行，
+    //  而那一步必然走样。JSON 文件还能保留「这段材料到底是什么」的结构。
+    //
+    //  解析失败不回落成 `{}`：回落等于「你给的独立性输入被静默丢掉」，
+    //  而后果正是这条检查要防的那个——**检查看起来跑了，其实没跑**。
+    let context = {};
+    if (args['context-from'] != null) {
+      const cf = resolve(root, String(args['context-from']));
+      const cfText = readText(cf);
+      if (cfText == null) {
+        console.error(`--context-from 读不到：${cf}`);
+        return 2;
+      }
+      let parsed;
+      try { parsed = JSON.parse(cfText); } catch (e) {
+        console.error(`--context-from 不是合法 JSON：${e.message}`);
+        console.error('不给这个参数就是「没有补充上下文」；给了却解析不了，不能当成没给。');
+        return 2;
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        console.error('--context-from 必须是一个 JSON 对象（键名即 FORBIDDEN_CONTEXT 里那几个）');
+        return 2;
+      }
+      context = parsed;
+    }
+
     const spec = {
       role, roleText, task: st.goal, acceptance, shape: st.shape, outputs,
-      stopCondition, nonce, injected, context: {},
+      stopCondition, nonce, injected, context,
     };
     const check = checkPromptSpec(spec);
 
     // L1：模板必须填得掉
-    const tplPath = join(root, 'templates', 'dispatch.md');
+    const tplPath = join(assetRoot, 'templates', 'dispatch.md');
     const tplText = readText(tplPath);
     let tpl = { text: '', missing: [] };
     if (tplText == null) {
@@ -962,8 +1086,11 @@ function main(argv) {
     });
     const { markdown } = composePrompt({
       role, task: st.goal, acceptance, shape: st.shape, outputs,
-      stopCondition, nonce, constraints, context: {},
+      stopCondition, nonce, constraints, context,
       injectedFacts: facts, dispatchTemplate: tpl.text, run, taskId,
+      // L0 指针用**相对路径**：提示词会被落盘、会进 transcript、会贴进 issue。
+      // 绝对路径在这里等于把本机目录结构发出去（`checkAbsolutePaths` 守的就是这条）。
+      roleSource: `.claude/agents/${found ? found.name : role}.md`,
     });
 
     const ok = check.errors.length === 0;
@@ -1028,7 +1155,7 @@ function main(argv) {
     if (!session) { console.error('缺少 --session <会话目录或主 transcript>'); return 2; }
     // 与 compose 同一条定位规则：--graph 指到哪个目录，台账就在哪个目录。
     // 不给 --graph 时退回 tasks/runs/<run>/，那是本仓的既有落点。
-    const runDir = args.graph ? dirname(resolve(String(args.graph))) : join(root, 'tasks', 'runs', run);
+    const runDir = args.graph ? dirname(resolve(String(args.graph))) : join(runsDir, run);
     const ledger = join(runDir, PROMPT_LEDGER_FILE);
     const { rows } = readPromptLedger(ledger);
     if (!rows.length) {

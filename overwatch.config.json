@@ -1,6 +1,9 @@
 {
   "$schema": "https://example.invalid/overwatch.config.schema.json",
   "version": 1,
+  "paths": {
+    "runs": "tasks/runs"
+  },
   "ask": {
     "mode": "always",
     "maxQuestions": 5,
@@ -9,6 +12,7 @@
     "minQuestionsBeforeWrite": 0
   },
   "agent": {
+    "agentPrefix": "oversight-",
     "roster": [
       "oversight-planner",
       "oversight-executor",

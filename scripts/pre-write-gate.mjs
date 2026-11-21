@@ -119,7 +119,7 @@ import { claimOnce, claimKeyOf, recordSkipped } from './hook-dedupe.mjs';
 // 直接 TDZ ReferenceError。见 `question-form.mjs` 文件头。
 import { questionsOfAsk, normalizeText } from './question-form.mjs';
 // 叫停路径（L1 文件闸）。**复用，不新造**：见 §叫停（`pausePathFor` 的注释）。
-import { pausePathFor, pausedPathOf, pausePathsFor } from './stop-verify-hook.mjs';
+import { pausePathFor, pausedPathOf, pausePathsFor, ledgerRoot } from './stop-verify-hook.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..');
@@ -1806,17 +1806,25 @@ export function decide(input, state = {}) {
  *  优先级：`OW_PRE_WRITE_GATE_LOG`（显式覆盖，测试与试跑用它）→
  *  `OVERWATCH_STATE_DIR`（本仓脚本统一的临时区变量，硬门的探针会设它 ——
  *  否则「调用一次 export 看它炸不炸」就会真的往仓库里写一行日志）→
- *  仓库默认的 `tasks/runs/pre-write-gate/<日期>.jsonl`。
+ *  **宿主机状态目录**的 `pre-write-gate/<日期>.jsonl`。
  *
- *  最后一条是这台机器上的**本机会话**记账，`tasks/runs/` 本来就是 gitignored，
- *  里面允许出现会话 ID。 */
+ *  ## 最后一级为什么不再是 `REPO_ROOT/tasks/runs/`（2026-11-21 修）
+ *
+ *  那个默认值锚在**脚本位置**。而本闸被挂进的是**用户的项目**（模板里
+ *  `CLAUDE_PROJECT_DIR` 是当前项目），于是它每次判一次写就往**框架仓库**里追加一行。
+ *  在别人机器上那是把框架目录写脏；在本机那是用户项目的观测数据全进了另一个仓库。
+ *
+ *  闸门记账和 stop hook 的三处台账是同一类东西：**机器状态，不是项目内容**。
+ *  它描述「这台机器上的闸门跑过什么」，换项目也该是同一条历史，所以住
+ *  `state-dir.mjs` 管的状态目录（`%LOCALAPPDATA%/UntilDone/`）。
+ *  目录解析**复用** `stop-verify-hook.mjs` 的 `ledgerRoot()`：同一个文件里两份
+ *  「状态目录在哪」的判据必然漂移 —— 本仓为此付过账（`fmtDur`、宽度表、
+ *  `readTailRecords`）。 */
 export function logPathFor(env = {}, nowMs = Date.now()) {
   const override = String(env.OW_PRE_WRITE_GATE_LOG || '').trim();
   if (override) return override;
   const d = new Date(nowMs).toISOString().slice(0, 10);
-  const stateDir = String(env.OVERWATCH_STATE_DIR || '').trim();
-  if (stateDir) return join(stateDir, 'pre-write-gate', `${d}.jsonl`);
-  return join(REPO_ROOT, 'tasks', 'runs', 'pre-write-gate', `${d}.jsonl`);
+  return join(ledgerRoot(env), 'pre-write-gate', `${d}.jsonl`);
 }
 
 export function appendLog(record, env = {}, nowMs = Date.now()) {

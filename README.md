@@ -12,7 +12,7 @@
 ![CI](https://github.com/sqkl520/UntilDone/actions/workflows/validate.yml/badge.svg)
 ![Node](https://img.shields.io/badge/node-%E2%89%A518.20.4%20%C2%B7%20tests%2020.16%2B-blue?style=flat-square)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square)
-![Tests](https://img.shields.io/badge/regression%20tests-1792%20passing-brightgreen?style=flat-square)
+![Tests](https://img.shields.io/badge/regression%20tests-1860%20passing-brightgreen?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 **零依赖** · **不用安装** · **不登录也能核对证据** —— `git clone` 之后 `node scripts/overwatch.mjs` 就行
@@ -141,7 +141,7 @@
 |---|---|
 | 我按旧文档在 `Overwatch` 目录放了叫停文件，现在不改目录名也生效吗？ | 生效，两个都认。`%LOCALAPPDATA%/UntilDone/stop-hook.PAUSE` 是主路径，旧名 `Overwatch` 那条**故意保留**（`DF-041`）。想知道自己放对没有：`node scripts/pre-write-gate.mjs status --cwd .` 会把正在检查的每条路径列出来并标出命中的那条 |
 | 我明明在 shell 里 `export` 了 `OVERWATCH_STOP_VERIFY=block`，闸还是没拦 | 桌面版 hook 的环境变量继承**宿主进程**，不是你的终端。要写进 `.claude/settings.local.json` 的 `env` 块。这个失效方向最坏：你以为闸开了，其实一直是观测模式，而没有任何东西会提示你 |
-| 装了写前闸，怎么一点感觉都没有？ | 两件事都默认关：`OW_PRE_WRITE_GATE` 不设 = `observe`（只记账），`ask.minQuestionsBeforeWrite` 默认 `0`（判据不存在）。先跑几天看 `tasks/runs/pre-write-gate/<日期>.jsonl` 里的 `would-deny`，再决定开不开 |
+| 装了写前闸，怎么一点感觉都没有？ | 两件事都默认关：`OW_PRE_WRITE_GATE` 不设 = `observe`（只记账），`ask.minQuestionsBeforeWrite` 默认 `0`（判据不存在）。先跑几天看 `<状态目录>/pre-write-gate/<日期>.jsonl` 里的 `would-deny`，再决定开不开 |
 | `--days 30` 为什么这么慢？ | 它按**文件**扫，不按天。耗时随语料增长而变，不随天数线性变：每个会话最多读 4 MB 尾部、最多展开 100 个子 agent。日常用 `--days 3`。**不要相信任何写死的秒数**，包括本 README 里没有写的那些 |
 | 扫描会不会影响正在跑的会话？ | 不会。只读 `~/.claude/projects/` 的 `.jsonl` 和 `~/.claude/jobs/` 的 `state.json`，不写文件、不加锁、不发信号 |
 | 面板能不能改会话状态？ | 不能。状态是**算出来的**，不是存起来的 —— 没有「状态字段」可改。面板只渲染 `scan-sessions.mjs --json` 的返回，不提供假按钮 |
@@ -158,7 +158,7 @@
 ```
 你的会话（宿主 claude）
    │  每个回合起止各回调一次，没有常驻进程
-   ├─ PreToolUse ──► scripts/pre-write-gate.mjs ──► tasks/runs/pre-write-gate/<日期>.jsonl
+   ├─ PreToolUse ──► scripts/pre-write-gate.mjs ──► <状态目录>/pre-write-gate/<日期>.jsonl
    │                   判据：读没读过项目 / 问没问够 N 个问题
    └─ Stop ────────► scripts/stop-verify-hook.mjs ─┐
                                                     │ 复用同一套判定
@@ -177,7 +177,7 @@
 | 层 | 用了什么 |
 |---|---|
 | 运行时 | Node（工具 ≥ 18.20.4，测试 ≥ 20.16.0），**无 `package.json`、无 `node_modules`** |
-| 代码量 | 54 个生产脚本 + 43 个测试文件（1792 条 `test(`，硬门数源码对账） |
+| 代码量 | 56 个生产脚本 + 45 个测试文件（1860 条 `test(`，硬门数源码对账） |
 | 接口面 | 宿主 hooks（`PreToolUse` / `Stop`）+ 命令行 + 纯文本 / JSON 输出 |
 | 角色 | `.claude/agents/` 12 份 markdown 定义 + 1 个调度 skill（宿主直接加载） |
 | 存储 | 宿主 transcript 只读；自己的状态落在 `tasks/runs/`（gitignored）与用户状态目录 |
@@ -364,7 +364,7 @@ UNCHECKABLE   155   80.7%   ← 八成判不了
 ```bash
 node scripts/check-structure.mjs     # 结构硬门：23 项检查，0 违规才绿
 node scripts/check-links.mjs         # 文档相对链接不悬空（170 份 .md，0 断链）
-node --test scripts/                 # 全量回归：43 个文件、1792 条
+node --test scripts/                 # 全量回归：45 个文件、1860 条
 ```
 
 `check-structure.mjs` 与全量测试**都必须绿才能提交**。两条命令都在一秒到半分钟量级，
@@ -389,7 +389,7 @@ CI 上跑的是同一套（[`validate.yml`](.github/workflows/validate.yml)）�
   它只说事实，正好是排查需要的那一份。
 - **想改代码请先开个 Issue 说一声**，避免白写。
 - **安全报告**：**不要开公开 issue**，见 [`SECURITY.md`](SECURITY.md)。
-- **跑测试**：`node --test scripts/`（1792 条回归测试；**这个数字由硬门数源码 `test(` 调用对账，写错即红**，
+- **跑测试**：`node --test scripts/`（1860 条回归测试；**这个数字由硬门数源码 `test(` 调用对账，写错即红**，
   所以照抄即可、不必手工数。实跑报告会比它多几条 —— 子测试会被单独计数）。
 
 > **贡献者名单和 Star 曲线这里目前都没有。** star 数是 0，star-history 会画出一张空图；

@@ -192,6 +192,7 @@ C3a（会话内近似重复）是同一类噪声的**可判定**那一半：两�
     "minReads": 3
   },
   "agent": {
+    "agentPrefix": "oversight-",
     "roster": ["oversight-planner", "oversight-executor", "oversight-acceptor"]
   }
 }
@@ -204,7 +205,8 @@ C3a（会话内近似重复）是同一类噪声的**可判定**那一半：两�
 | `ask.requireReadFirst` | 布尔 | `true` | 「问之前必须读过项目」可关，但默认开 |
 | `ask.minReads` | 0..50 整数 | `3` | 「读过项目」要几个**不同**文件（与写前闸同口径） |
 | `ask.minQuestionsBeforeWrite` | 0..20 整数 | `0` | 第一次写文件之前必须已经问过几个**去重后的**问题。`0` = 这条判据不启用。**执行侧是 `pre-write-gate.mjs`，不是本脚本**（本脚本只负责让它通过校验，见 §6.3） |
-| `agent.roster` | 已知角色名数组 | planner+executor+acceptor | 启用哪些岗位，对应 [`../design/2026-11-14-agent-roster-policy.md`](../design/2026-11-14-agent-roster-policy.md) 的意图 |
+| `agent.roster` | 已知角色名数组 | planner+executor+acceptor | 启用哪些岗位，对应 [`../design/2026-11-14-agent-roster-policy.md`](../design/2026-11-14-agent-roster-policy.md) 的意图。**合法值来自 `.claude/agents/` 目录**，不是脚本里的字面量清单（`scripts/roles.mjs`） |
+| `agent.agentPrefix` | 非空字符串，不含路径分隔符 | `oversight-` | `.claude/agents/*.md` 的 `name` 去掉这个前缀就是它的 **id**（＝任务图里的 `capability`）。frontmatter 写了 `id:` 时以 `id:` 为准。把本库当模板复用时改这一行即可，不必改代码（`DF-044`） |
 
 ### 6.1 校验：非法即报错，绝不静默回落
 
@@ -254,7 +256,7 @@ C3a（会话内近似重复）是同一类噪声的**可判定**那一半：两�
 | 口径 | `AskUserQuestion` + `ExitPlanMode`，按 `tool_use.id` 去重、按 `normalizeText()` 去重（**与写前闸 `readTranscriptActivity()` 同一份实现**：工具名判据是 `pre-write-gate.mjs` 的 `isAskToolName()`，去重键是 `question-form.mjs` 的 `normalizeText()`） |
 | 去重 vs 总数 | 审计报**两个数**：`questionsKnown` = 总问题数（同一问题问两遍算两个，用于 `too-many-questions`）；`distinctQuestions` = 去重后个数（**与写前闸的放行判据同一口径**）。两处曾经都自称「同一口径」而数字不同 —— 因为它们本来在数不同的东西，现在各有名字 |
 | 只判 | **第一次写**。transcript 里已有**真写成过**的写（有 `tool_result` 且非 error）→ 不再判（写到一半才拦会打断正在进行的活）。被闸门拒掉的写不算「写过」 |
-| 叫停 | 与 Stop 闸共用 `stop-verify-hook.mjs` 的 `isPaused()` / `pausePathFor()` |
+| 叫停 | 与 Stop 闸共用同一族 PAUSE 文件：`stop-verify-hook.mjs` 的 `pausePathsFor()` / `pausedPathOf()`（`isPaused()` 是它的布尔投影）。**任一候选存在即暂停**；旧的 `%LOCALAPPDATA%/Overwatch/` 仍生效（`DF-041`，2026-11-21 修） |
 | fail-open | transcript 读不到 / 配置是垃圾 / 越界 → 回落到 `0`（不拦） |
 | 长会话 | 尾窗口（默认 1 MB）内没有提问时**向前回扫**，上限 `OW_PRE_WRITE_GATE_TRANSCRIPT_SCAN_BYTES`（默认 8 MB，实测 75 ms）；到上限仍不够 → 放行 + `scanTruncated:true`。**不许拿「没读到」当「没问过」** |
 | 子 agent | 宿主给了 `agent_id` 的调用**不参与**这条判据（直接放行，日志 `questions:"subagent-exempt"`）。理由：多数 agent 的工具白名单里没有 `AskUserQuestion`，且它们的 `transcript_path` 指向主 transcript —— 拿主 transcript 的计数判子 agent 的第一次写，判的是别人的账 |

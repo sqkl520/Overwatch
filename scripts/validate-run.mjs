@@ -10,8 +10,14 @@
  * 这个脚本把那份 schema 变成可执行的检查。它不是"额外的文档"，是契约的执行者。
  *
  * 用法：
- *   node scripts/validate-run.mjs tasks/runs/<run-id>/task-graph.json
+ *   node scripts/validate-run.mjs --complex tasks/runs/<run-id>/task-graph.json
+ *   node scripts/validate-run.mjs --simple  tasks/runs/<run-id>/task-graph.json
  *   node scripts/validate-run.mjs --all tasks/runs
+ *
+ * `--complex` / `--simple` 是**必选的复杂度声明**（二者取一）：
+ * 硬约束 2 的「≥5 个独立 Agent，含锐评/验收/修复」只有在声明复杂时才执行，
+ * 而「是不是复杂」是规划时的判断，不是数字推断。两个都不给时脚本会明确打印
+ * 「复杂度未声明、那条检查没跑」——**不检查也是一次决定，它必须看得见**。
  *
  * 校验的字段（**全部必填**，缺一个就 exit 1）：
  *   id / goal / capability / shape / token_budget_pct / timeout_min /
@@ -31,12 +37,19 @@ import { readFileSync, existsSync, readdirSync, statSync, realpathSync } from 'n
 import { join, resolve, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-/** capability 与 shape 的合法取值。**单一真源**：改这里，
- *  同时要改 oversight-planner.md 里的同一张表——下面的 checkAgentDocSync 会查。 */
-export const CAPABILITIES = Object.freeze([
-  'executor', 'research', 'critic', 'redteam', 'review', 'acceptor',
-  'relay', 'probe', 'planner', 'repair', 'resolution', 'safety',
-]);
+import { discoverRoles } from './roles.mjs';
+
+import { projectRoot, runsDirInfo } from './project-root.mjs';
+
+/** capability 与 shape 的合法取值。
+ *
+ *  **`CAPABILITIES` 不再写死。** 它原先是一份 12 个字面量的数组，旁边写着「单一真源：
+ *  改这里，同时要改 oversight-planner.md 里的同一张表」—— 那句注释自己就承认了有两个源，
+ *  而第二个源没有任何东西去核。现在它是 `scripts/roles.mjs` 注册表的 id 集合：
+ *  角色目录里有什么，任务图的 `capability` 就允许什么，加一个角色不必改这里。
+ *
+ *  顺序稳定（按 id 排序），因为报错信息里会把这串原样打出来给人看。 */
+export const CAPABILITIES = Object.freeze(discoverRoles().map((r) => r.id).sort());
 export const SHAPES = Object.freeze(['artifact', 'exploration', 'hybrid']);
 
 /** 有产出路径要求的 shape。`artifact` 的字面含义就是「落到磁盘的交付物」，
@@ -181,7 +194,16 @@ export function checkDependencyCycles(subtrees) {
   return [...nodes.keys()].filter((id) => inCycle.has(id));
 }
 
-export function validateGraph(graph, { requireComplex = false } = {}) {
+/** 校验一张派发图。`opts.requireComplex` 是**三态**（见下方复杂度段的注释）：
+ *
+ *    true      显式声明复杂 → 硬约束 2 逐条执行（缺角色或缺数量都判 error）
+ *    false     显式声明不复杂 → 不执行，但对「看起来复杂」的声明发警告
+ *    undefined 没声明 → 不执行，且 `declared_complexity` 会如实写 'undeclared'
+ *
+ *  `declared_complexity` 是返回值的一部分，**不只在 errors 里**：调用方（CLI、
+ *  硬门、未来的渲染器）需要能区分「检查过并放行」与「压根没检查」，
+ *  而 errors 为空对这两种是同一个样子。 */
+export function validateGraph(graph, { requireComplex } = {}) {
   const errors = [];
   const warnings = [];
   const err = (p, m) => errors.push(`${p}: ${m}`);
@@ -309,19 +331,52 @@ export function validateGraph(graph, { requireComplex = false } = {}) {
   // 但那个 run 是合理的：一次小改动确实不需要 5 个 Agent。
   // 硬约束 2 说的是「复杂任务」，而「是不是复杂」是规划时的判断，不是数字推断。
   // 硬把阈值塞进校验器，只会训练人绕过它。
-  const isComplex = requireComplex === true;
-  if (isComplex) {
+  //
+  // **三态，不是两态**（2026-11-21）：
+  //   true       = 调用方声明「这是复杂任务」→ 硬约束 2 逐条执行
+  //   false      = 调用方声明「这不复杂」    → 不执行，但用数字复核这个声明
+  //   undefined  = 没声明                   → 不执行，且**必须让这件事被看见**
+  //
+  // 为什么 undefined 不能折成 false：折了之后，「我不想声明」与「我声明过、且被
+  // 机器复核过」在屏幕上同形。而这一整类缺陷的病根就是**不检查与通过同形**——
+  // 缺陷 A 的原形正是 CLI 从不传 opts，于是 requireComplex 恒为 false，
+  // 那三条角色检查一次都没跑过，而输出照样是一行 ✓。所以 CLI 必须每次印出
+  // 「复杂度声明：…」，让「没检查」出现在每一份输出里，而不是只在心里。
+  const declared = requireComplex === true ? 'complex'
+    : requireComplex === false ? 'simple' : 'undeclared';
+
+  // 数字推断**只用来复核人的声明**，不用来代替人做决定。
+  // 这是缺陷 A 的正面利用：≥5 个子树或图上已含锐评/验收/修复之一，
+  // 说明规划者自己已经把它当复杂任务在拆了。此时声明 `--simple` 是自相矛盾的。
+  const looksComplex = graph.subtrees.length >= MIN_SUBTREES
+    || REQUIRED_FOR_COMPLEX.some((r) => caps.includes(r));
+
+  if (declared === 'complex') {
     for (const need of REQUIRED_FOR_COMPLEX) {
       if (!caps.includes(need)) {
         err('subtrees', `复杂任务缺少 ${need} 角色——锐评 / 验收 / 修复不可合并也不可缺`);
       }
     }
-  }
-  if (graph.subtrees.length < MIN_SUBTREES) {
-    warn('subtrees', `只有 ${graph.subtrees.length} 个子任务；CLAUDE.md 要求复杂任务至少 ${MIN_SUBTREES} 个独立 Agent`);
+    // 子任务数在声明为复杂时是**错误**而不是提示：CLAUDE.md 硬约束 2 的原话是
+    // 「复杂任务至少 5 个独立 Agent」，两个条件同属一条约束，不能只执行一半。
+    if (graph.subtrees.length < MIN_SUBTREES) {
+      err('subtrees', `声明为复杂任务却只有 ${graph.subtrees.length} 个子任务；`
+        + `CLAUDE.md 硬约束 2 要求复杂任务至少 ${MIN_SUBTREES} 个独立 Agent。`
+        + '要么补足，要么改声明 --simple 并说明为什么这不复杂');
+    }
+  } else {
+    if (graph.subtrees.length < MIN_SUBTREES) {
+      warn('subtrees', `只有 ${graph.subtrees.length} 个子任务；CLAUDE.md 要求复杂任务至少 ${MIN_SUBTREES} 个独立 Agent`);
+    }
+    if (declared === 'simple' && looksComplex) {
+      warn('subtrees', `声明为 --simple，但图上看起来是复杂任务（${graph.subtrees.length} 个子树`
+        + `${graph.subtrees.length >= MIN_SUBTREES ? ` ≥ ${MIN_SUBTREES}` : ''}`
+        + `${REQUIRED_FOR_COMPLEX.some((r) => caps.includes(r)) ? '，且已含锐评/验收/修复角色' : ''}）。`
+        + '复核这个声明，或改成 --complex');
+    }
   }
 
-  return { ok: errors.length === 0, errors, warnings };
+  return { ok: errors.length === 0, errors, warnings, declared_complexity: declared };
 }
 
 /** 从磁盘读并校验。 */
@@ -340,12 +395,60 @@ export function validateFile(path, opts) {
 
 // ── CLI ───────────────────────────────────────────────────────────────
 
+/** CLI 的复杂度声明 → `requireComplex`。
+ *
+ *  **这一层就是缺陷 A 的修复点。** 原先 `main()` 调 `validateFile(t)` 不传 opts，
+ *  于是 `requireComplex` 恒为默认的 false，硬约束 2 的三条角色检查在命令行上
+ *  **一次都没执行过**——只有测试里手动传 `{ requireComplex: true }` 才碰得到它。
+ *
+ *  返回 `{ opts, problem }`。`problem` 非空表示声明本身有问题（两个都给 / 给错），
+ *  CLI 应当 exit 2，而不是挑一个默认值继续跑：静默选一个的方向，
+ *  两种都是错的——选 complex 会把简单任务全判死，选 simple 会静默关掉硬约束。 */
+export function complexityOpts(argv) {
+  const has = (f) => argv.includes(f);
+  if (has('--complex') && has('--simple')) {
+    return { opts: {}, problem: '--complex 与 --simple 只能给一个：复杂度是一次二选一的声明' };
+  }
+  if (has('--complex')) return { opts: { requireComplex: true }, problem: null };
+  if (has('--simple')) return { opts: { requireComplex: false }, problem: null };
+  return { opts: {}, problem: null };
+}
+
 function main(argv) {
   const all = argv.includes('--all');
+  const { opts, problem } = complexityOpts(argv);
+  if (problem) { console.error(problem); return 2; }
+  // `--complex` / `--simple` 是布尔开关，不是目标文件 —— 必须从 targets 里滤掉，
+  // 否则它们会被当成路径去 stat，报出一句「读不到 --complex」。
   const targets = argv.filter((a) => !a.startsWith('--'));
+
+  // `--all` 不给目录时的默认目标：**用户项目的 runs 目录**，不是脚本位置。
+  //
+  //  修前必须显式写 `--all tasks/runs`，否则报用法错误 —— 那一句「tasks/runs」是
+  //  **相对 cwd** 的，在别人项目里跑恰好是对的，在本仓以外跑却要靠人记得。而这条命令
+  //  最常被调度流程自动调用（SKILL.md 的校验阶段），自动调用方不该依赖 cwd 猜路径。
+  //
+  //  现在：`--all` 而不给目标 → 用 `projectRoot()` 阶梯 + `paths.runs` 算出的 runs 目录，
+  //  并把**用的是哪一个**打印出来（不然「扫了 0 个」与「扫错了地方」同形）。
+  if (all && !targets.length) {
+    const root = projectRoot({});
+    if (!root) {
+      console.error('--all 没给目录，且找不到用户项目根（第 5 级）。');
+      console.error('  给一个目录（例如 `--all .untildone/runs`），或在项目里建 .untildone/ 或 .git/。');
+      return 2;
+    }
+    const info = runsDirInfo(root);
+    console.error(`[validate-run] --all 默认目标 → ${info.dir}（来自 ${info.source}）`);
+    targets.push(info.dir);
+  }
+
   if (!targets.length) {
-    console.error('用法：node scripts/validate-run.mjs <task-graph.json> [...]');
-    console.error('      node scripts/validate-run.mjs --all tasks/runs');
+    console.error('用法：node scripts/validate-run.mjs --complex|--simple <task-graph.json> [...]');
+    console.error('      node scripts/validate-run.mjs --complex|--simple --all [<runs 目录>]');
+    console.error('');
+    console.error('--all 不给目录时扫项目根的 runs 目录（见 overwatch.config.json 的 paths.runs）。');
+    console.error('--complex 执行 CLAUDE.md 硬约束 2（≥5 个独立 Agent，含锐评/验收/修复）；');
+    console.error('--simple 声明这次不是复杂任务。不给声明时那几条检查不会跑，输出里会写明。');
     return 2;
   }
 
@@ -354,8 +457,13 @@ function main(argv) {
     for (const dir of targets) {
       if (!existsSync(dir)) continue;
       for (const sub of readdirSync(dir)) {
-        const p = join(dir, sub, 'task-graph.json');
-        if (existsSync(p)) results.push(validateFile(p));
+        // `--all` 的语义是「这个目录下每个 run 的 task-graph」。直接传文件时
+        // （`--all tasks/runs/*/task-graph.json` 很自然会被这么写）`readdirSync`
+        // 抛 ENOTDIR，脚本崩掉——那不是「没有图」，是无意义的失败。跳过非目录项。
+        const runDir = join(dir, sub);
+        try { if (!statSync(runDir).isDirectory()) continue; } catch { continue; }
+        const p = join(runDir, 'task-graph.json');
+        if (existsSync(p)) results.push(validateFile(p, opts));
       }
     }
     if (!results.length) {
@@ -364,8 +472,22 @@ function main(argv) {
       return 0;
     }
   } else {
-    results = targets.map((t) => validateFile(t));
+    // **缺陷 A 就在这里**：原先这一行是 `validateFile(t)`，opts 被丢掉。
+    results = targets.map((t) => validateFile(t, opts));
   }
+
+  // 复杂度声明必须印在**每一次**输出里，包括全部通过的那一次。
+  //
+  //  理由见 validateGraph 里 declared 那段：这一整类缺陷的病根是「没检查」与
+  //  「检查过并放行」在屏幕上同形。把声明写进输出头，是让「没检查」这件事实
+  //  每次都被看见的最小代价——它不阻塞，但它不再隐身。
+  const decl = results[0] && results[0].declared_complexity;
+  const DECL_TEXT = {
+    complex: '复杂任务（执行硬约束 2：≥5 个子任务 + 锐评/验收/修复）',
+    simple: '非复杂任务（硬约束 2 不适用）',
+    undeclared: '未声明 —— 硬约束 2 没有执行。加 --complex 或 --simple',
+  };
+  if (decl) console.log(`复杂度声明：${DECL_TEXT[decl] || decl}\n`);
 
   let bad = 0;
   for (const r of results) {

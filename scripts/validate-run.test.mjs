@@ -15,15 +15,36 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'nod
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 
 import {
   validateGraph, validateFile, CAPABILITIES, SHAPES,
   REQUIRED_FOR_COMPLEX, MIN_SUBTREES, SHAPES_REQUIRING_OUTPUTS,
   outputPathError, outputPathKey, checkDependencyCycles, ON_DEP_FAILED,
+  complexityOpts,
 } from './validate-run.mjs';
 
 const ac = (id = 'AC1') => ({ id, criterion: 'scan --json 输出含 state 字段', evidence: 'src/a.mjs:12', fail_if: '缺字段' });
 
+/** 把一份变异后的源码写进临时目录，**并把它的兄弟 import 改写成绝对 file URL**。
+ *
+ *  为什么需要这一步（2026-11-21）：`validate-run.mjs` 从「零兄弟依赖」变成了
+ *  `import { projectRoot, runsDirInfo } from './project-root.mjs'`（「两个根」拆分）。
+ *  变异体落在临时目录里，那条相对 import 就指向一个不存在的文件，
+ *  于是三条负向测试全部变成 `ERR_MODULE_NOT_FOUND`，不再是「判据失效」。
+ *
+ *  那样最坏的地方不是红，而是**红在一个与被测行为无关的原因上** ——
+ *  它看起来仍然像「回退后测试失败了」，实际上根本没有跑到判据。
+ *  所以这里把 `./x.mjs` 一律改写成真实脚本目录下的绝对路径，让变异体与原件
+ *  共享同一份兄弟模块，只有被替换的那一行不同。 */
+function writeMutant(dir, src, name = 'validate-run-mutated.mjs') {
+  const scriptsDir = import.meta.dirname.replace(/\\/g, '/');
+  const asUrl = `file:///${scriptsDir.replace(/^\/+/, '')}`;
+  const rebased = src.replace(/(from\s+['"])\.\/([^'"]+)(['"])/g, (m, a, rel, c) => `${a}${asUrl}/${rel}${c}`);
+  const target = join(dir, name);
+  writeFileSync(target, rebased, 'utf8');
+  return target;
+}
 const sub = (over = {}) => ({
   id: 'ST1', goal: '实现扫描', capability: 'executor', shape: 'artifact',
   token_budget_pct: 40, timeout_min: 8, parallel_with: [], depends_on: [],
@@ -251,8 +272,7 @@ test('负向：把 outputs 校验摘掉（checkOutputs 的结果被丢弃），�
 
   const dir = mkdtempSync(join(tmpdir(), 'ow-vr-neg-'));
   try {
-    const target = join(dir, 'validate-run-mutated.mjs');
-    writeFileSync(target, mutated, 'utf8');
+    const target = writeMutant(dir, mutated);
     const mod = await import(pathToFileURL(target).href);
 
     const noOut = graph([sub()]);
@@ -394,8 +414,7 @@ test('负向：把环检测调用摘掉，成环的图必须变合格', async ()
 
   const dir = mkdtempSync(join(tmpdir(), 'ow-vr-cycle-neg-'));
   try {
-    const target = join(dir, 'validate-run-mutated.mjs');
-    writeFileSync(target, mutated, 'utf8');
+    const target = writeMutant(dir, mutated);
     const mod = await import(pathToFileURL(target).href);
 
     const cyclicGraph = graph([
@@ -412,4 +431,148 @@ test('负向：把环检测调用摘掉，成环的图必须变合格', async ()
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── 复杂度声明走 CLI（DF-042 缺陷 A）────────────────────────────────────
+//
+// 这一组守的**不是**复杂度判据本身（上面已有），而是一件更基础的事：
+// **命令行入口有没有把 requireComplex 传下去。**
+//
+// 2026-11-21 审计实测：`main()` 里是 `targets.map((t) => validateFile(t))`，
+// opts 被丢掉，于是 `requireComplex` 恒为默认 false——硬约束 2 的三条角色检查
+// 在命令行上**一次都没执行过**，唯一触发它的是本文件里手动传参的那条用例。
+// 输出照样是一行 ✓。所以这里的测试必须**真的 spawn 一次 CLI**：
+// 只测 `validateGraph(g, { requireComplex: true })` 的话，把 CLI 改回去它照样绿，
+// 而那正是这个缺陷的形状。
+
+const CLI = join(import.meta.dirname, 'validate-run.mjs');
+const runCli = (args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
+
+/** 造一份「5 个子树但缺锐评/验收/修复」的图，落盘后返回路径。 */
+function writeGraph(dir, subs, name = 'task-graph.json') {
+  mkdirSync(dir, { recursive: true });
+  const p = join(dir, name);
+  writeFileSync(p, JSON.stringify(graph(subs)), 'utf8');
+  return p;
+}
+
+test('CLI：--complex 真的把检查跑起来了（缺陷 A 的回归）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-vr-cli-'));
+  try {
+    // 5 个 executor，缺三个必需角色
+    const subs = Array.from({ length: MIN_SUBTREES }, (_, i) =>
+      sub({ id: `ST${i}`, capability: 'executor', outputs: [`out${i}.md`] }));
+    const p = writeGraph(dir, subs);
+
+    const r = runCli(['--complex', p]);
+    assert.equal(r.status, 1, `--complex 应当 exit 1：${r.stdout}${r.stderr}`);
+    for (const need of REQUIRED_FOR_COMPLEX) {
+      assert.match(r.stdout, new RegExp(need), `--complex 的输出里应点名缺 ${need}：${r.stdout}`);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI 对照组：不加 --complex 时同一份图通过——否则上面那条只是在测「CLI 永远失败」', () => {
+  // 没有这一条，把 CLI 改成恒 exit 1 也能让上面那条变绿，而整条链什么都没验。
+  const dir = mkdtempSync(join(tmpdir(), 'ow-vr-cli-'));
+  try {
+    const subs = Array.from({ length: MIN_SUBTREES }, (_, i) =>
+      sub({ id: `ST${i}`, capability: 'executor', outputs: [`out${i}.md`] }));
+    const p = writeGraph(dir, subs);
+    const r = runCli([p]);
+    assert.equal(r.status, 0, `不加声明时应当通过：${r.stdout}${r.stderr}`);
+    assert.doesNotMatch(r.stdout, /缺少 review/, '没声明复杂时不该跑那三条角色检查');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI：--complex 补齐角色后通过（证明拒绝的是「缺角色」，不是「复杂」本身）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-vr-cli-'));
+  try {
+    const caps = ['executor', 'research', 'critic', 'review', 'acceptor', 'repair'];
+    const subs = caps.map((c, i) => sub({ id: `ST${i}`, capability: c, outputs: [`out${i}.md`] }));
+    const p = writeGraph(dir, subs);
+    const r = runCli(['--complex', p]);
+    assert.equal(r.status, 0, `补齐角色后应通过：${r.stdout}${r.stderr}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI：声明 --complex 但子任务不足 5 个 → 判 error（硬约束 2 的两半都要执行）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ow-vr-cli-'));
+  try {
+    const subs = [
+      sub({ id: 'ST1', capability: 'review', outputs: ['a.md'] }),
+      sub({ id: 'ST2', capability: 'acceptor', outputs: ['b.md'] }),
+      sub({ id: 'ST3', capability: 'repair', outputs: ['c.md'] }),
+    ];
+    const p = writeGraph(dir, subs);
+    const r = runCli(['--complex', p]);
+    assert.equal(r.status, 1, `不足 5 个应判不合格：${r.stdout}`);
+    assert.match(r.stdout, /至少 5 个独立 Agent/, r.stdout);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI：--simple 与 --complex 同时给 → exit 2，不静默挑一个', () => {
+  // 静默挑一个的两个方向都是错的：挑 complex 把简单任务全判死，挑 simple 静默关掉硬约束。
+  const dir = mkdtempSync(join(tmpdir(), 'ow-vr-cli-'));
+  try {
+    const p = writeGraph(dir, [sub()]);
+    const r = runCli(['--complex', '--simple', p]);
+    assert.equal(r.status, 2, r.stdout + r.stderr);
+    assert.match(r.stderr + r.stdout, /只能给一个/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI：两种声明互斥地映射到 requireComplex 的 true / false', () => {
+  assert.deepEqual(complexityOpts(['--complex', 'g.json']), { opts: { requireComplex: true }, problem: null });
+  assert.deepEqual(complexityOpts(['--simple', 'g.json']), { opts: { requireComplex: false }, problem: null });
+  assert.deepEqual(complexityOpts(['g.json']), { opts: {}, problem: null });
+  assert.ok(complexityOpts(['--complex', '--simple']).problem);
+});
+
+test('「没声明」必须出现在输出里，不能与「检查过并放行」同形', () => {
+  // 这是整个缺陷的病根：不检查与通过长得一样。三态里的第三态必须可观测。
+  const dir = mkdtempSync(join(tmpdir(), 'ow-vr-cli-'));
+  try {
+    const p = writeGraph(dir, [sub()]);
+    const r = runCli([p]);
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /未声明/, `输出里必须写明没检查：${r.stdout}`);
+    assert.match(r.stdout, /硬约束 2 没有执行/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('validateGraph 返回 declared_complexity，区分「检查过放行」与「没检查」', () => {
+  const g = graph([sub()]);
+  assert.equal(validateGraph(g).declared_complexity, 'undeclared');
+  assert.equal(validateGraph(g, { requireComplex: true }).declared_complexity, 'complex');
+  assert.equal(validateGraph(g, { requireComplex: false }).declared_complexity, 'simple');
+});
+
+test('--simple 但图看起来复杂 → 警告（自相矛盾的声明要被指出）', () => {
+  const subs = Array.from({ length: MIN_SUBTREES }, (_, i) =>
+    sub({ id: `ST${i}`, capability: 'executor', outputs: [`o${i}.md`] }));
+  const r = validateGraph(graph(subs), { requireComplex: false });
+  assert.equal(r.ok, true, '声明是人的判断，不阻塞');
+  assert.ok(r.warnings.some((w) => w.includes('看起来是复杂任务')), r.warnings.join('\n'));
+});
+
+test('负向：把 CLI 改回「不传 opts」，--complex 必须立刻失效（证明这些测试守的是这一行）', async () => {
+  // 与 outputs / 环检测两条负向测试同一种做法：真的做一次回退。
+  // 回退的形态取缺陷原来的样子——`validateFile(t)`，opts 被丢掉。
+  const src = readFileSync(join(import.meta.dirname, 'validate-run.mjs'), 'utf8');
+  const find = 'results = targets.map((t) => validateFile(t, opts));';
+  assert.equal(src.split(find).length - 1, 1, '源码片段应当唯一');
+  const mutated = src.replace(find, 'results = targets.map((t) => validateFile(t)); // 回退：opts 被丢掉');
+
+  const dir = mkdtempSync(join(tmpdir(), 'ow-vr-cli-neg-'));
+  try {
+    const target = writeMutant(dir, mutated);
+    const subs = Array.from({ length: MIN_SUBTREES }, (_, i) =>
+      sub({ id: `ST${i}`, capability: 'executor', outputs: [`o${i}.md`] }));
+    const g = writeGraph(dir, subs);
+    const r = spawnSync(process.execPath, [target, '--complex', g], { encoding: 'utf8' });
+    assert.equal(r.status, 0,
+      `回退后 --complex 必须失效（exit 0）——说明「CLI 传 opts」是唯一让它生效的那一行：${r.stdout}`);
+    assert.doesNotMatch(r.stdout, /缺少 review/, r.stdout);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

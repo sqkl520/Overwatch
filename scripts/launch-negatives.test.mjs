@@ -10,10 +10,13 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 
-import { AUTH_RE } from './launch.mjs';
+import { AUTH_RE, expectedAgents } from './launch.mjs';
+import { discoverRoles } from './roles.mjs';
 
 const HERE = import.meta.dirname;
 
@@ -31,6 +34,65 @@ test('负向：期望清单必须独立于宿主输出——载荷少一个文�
   assert.equal(selfDerived.filter((x) => !body.includes(x)).length, 0,
     '自我认证时永远对得上，这正是旧实现的形态');
 });
+
+test('删掉一个角色文件：主路的期望不变（差异立刻暴露），兜底会变少（降级如实）', () => {
+  // 这是把 `AGENTS_EXPECTED` 字面量换成 `fallbackAgents()`（注册表）时**必须**守住的分界。
+  //
+  // 2026-11-21 那次修复的教训：期望与实有是同一份数据的两个投影时，
+  // 「删一个、少一个、照样绿」—— 那不是验证，是照镜子。
+  // 把字面量换成注册表之后，兜底这一支**又回到了同一个形状**（两者都读 .claude/agents/*.md）。
+  //
+  // 所以这条测试不假装兜底是独立来源，而是把两个方向的失效**分别钉下来**：
+  //   · 主路（git ls-files）在真有 git 时必须不随磁盘变化 —— 它才是判据的地基
+  //   · 兜底在角色文件消失时会少一个 —— 它是降级，代价必须看得见
+  // 只钉后一半会让人以为「兜底也行」，只钉前一半会掩盖降级的代价。
+  const roles = discoverRoles(join(HERE, '..', '.claude', 'agents'));
+  assert.ok(roles.length >= 12, `仓库里有 ${roles.length} 个角色，至少 12 个`);
+  const before = roles.map((r) => r.name).sort();
+
+  const d = mkdtempSync(join(tmpdir(), 'ow-exp-'));
+  const git = (args) => spawnSync('git', args, { cwd: d, encoding: 'utf8', windowsHide: true });
+  try {
+    mkdirSync(join(d, '.claude', 'agents'), { recursive: true });
+    for (const r of roles) {
+      writeFileSync(join(d, '.claude', 'agents', `${r.name}.md`), readFileSync(r.file, 'utf8'));
+    }
+
+    // ── 兜底支（没有 git）：会跟着磁盘变少 ──
+    assert.deepEqual(fallbackAgentsOf(d), before, '兜底应与目录内容一致');
+    rmSync(join(d, '.claude', 'agents', `${before[0]}.md`));
+    const shrunk = fallbackAgentsOf(d);
+    assert.deepEqual(shrunk, before.slice(1),
+      '兜底必须跟着磁盘变少 —— 它随磁盘变化是**已知代价**，不是 bug；'
+      + '把它写成「不变」才是在假装兜底独立');
+    writeFileSync(join(d, '.claude', 'agents', `${before[0]}.md`),
+      readFileSync(join(HERE, '..', '.claude', 'agents', `${before[0]}.md`), 'utf8'));
+
+    // ── 主路（git 已跟踪）：删掉一个未提交的文件**不能**改变期望 ──
+    git(['init', '-q']);
+    git(['add', '.claude/agents']);
+    const committed = git(['-c', 'user.email=a@b.invalid', '-c', 'user.name=a', 'commit', '-qm', 'x']);
+    if (committed.status !== 0) return; // 环境没有可用的 git：上面兜底支已经验过了
+
+    const expBefore = expectedAgents(d);
+    assert.deepEqual(expBefore, [...before].sort(),
+      'git 主路应当看到 12 个已跟踪角色');
+
+    rmSync(join(d, '.claude', 'agents', `${before[0]}.md`));
+    const expAfter = expectedAgents(d);
+    assert.equal(expAfter.length, before.length,
+      `删掉一个**未提交**的角色文件后，主路仍应给出 ${before.length} 个期望。`
+      + '若变成 ' + expAfter.length + '，就是回到「删一个、少一个、照样绿」的旧缺陷');
+    assert.ok(expAfter.includes(before[0]),
+      `${before[0]} 被删了但 git 仍跟踪着它 —— 期望里必须还在，差异才会暴露`);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+/** 兜底清单：**跑 createRoles 真身**，不在测试里复刻一份。
+ *  复刻的后果是源码改了、测试还在断言自己那份（本仓栽过，见下面 AUTH_RE 那条的注释）。 */
+function fallbackAgentsOf(root) {
+  return discoverRoles(join(root, '.claude', 'agents')).map((r) => r.name).sort();
+}
 
 test('负向：AUTH_RE 必须认得本机网关的原话（Failed to authenticate / 401 认证失败）', () => {
   // **用真身，不从源码里拼一份。** 上一版测试从源码正则提取字符串再自己 join 成正则 ——

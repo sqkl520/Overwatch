@@ -15,6 +15,7 @@ import { join, relative, extname, dirname, resolve } from 'node:path';
 
 import { publishedPathViolations, findKnownIdentifiers } from './published-paths.mjs';
 import { scanLinks, KIND_TEXT } from './link-check.mjs';
+import { discoverRoles, parseFrontmatter, readonlyOf } from './roles.mjs';
 
 const ROOT = process.cwd();
 const violations = [];
@@ -48,8 +49,6 @@ const PRIVATE_PATHS = ['tasks/runs', 'local', '.claude/settings.local.json', 'CL
 const PATH_EXEMPT = /^(scripts\/.*\.test\.mjs)$/;
 
 const AGENT_REQUIRED_FIELDS = ['name', 'description'];
-/** 这些角色的 tools 不得包含 Edit / Write */
-const READONLY_ROLES = ['acceptor', 'probe', 'safety', 'review', 'redteam', 'critic'];
 const WRITE_TOOLS = ['Edit', 'Write', 'NotebookEdit', 'Bash'];
 
 // ── 工具函数 ──────────────────────────────────────────────────────────
@@ -75,29 +74,12 @@ const rel = (p) => relative(ROOT, p).replace(/\\/g, '/');
  *  函数是纯的，测试直接 import 它们做对照，所以下面照常登记。 */
 const CLI_SCRIPTS = new Set(['check-structure.mjs', 'check-links.mjs', 'verify-bugfix-negatives.mjs', 'verify-tui-negatives.mjs', 'verify-claim-fix-negatives.mjs']);
 
-/** 解析 frontmatter：支持 YAML 多行块（| 与 >），否则多行 description 会被误判为空 */
-function parseFrontmatter(fm) {
-  const out = {};
-  const lines = fm.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(/^([A-Za-z_][\w-]*)\s*:\s*(.*)$/);
-    if (!m) continue;
-    const [, key, inline] = m;
-    if (inline === '|' || inline === '>' || inline === '|-') {
-      const block = [];
-      let j = i + 1;
-      while (j < lines.length && (/^\s+\S/.test(lines[j]) || lines[j].trim() === '')) {
-        block.push(lines[j].trim());
-        j++;
-      }
-      out[key] = block.join(' ').trim();
-      i = j - 1;
-    } else {
-      out[key] = inline.trim();
-    }
-  }
-  return out;
-}
+/** 解析 frontmatter 的**唯一实现**已搬到 `scripts/roles.mjs`（2026-11-21，DF-044）。
+ *
+ *  为什么是搬走而不是在两边各留一份：本文件原先有一份拷贝，`compose-agent-prompt.mjs`
+ *  另有一份。两份对多行块的处理一致只是当时的巧合；而「角色有没有声明只读」现在
+ *  两边都要读 —— 一个解析差异就会让硬门放行、compose 拦下，同一份文件两个结论。
+ */
 
 function isGitignored(path) {
   const gi = join(ROOT, '.gitignore');
@@ -281,8 +263,22 @@ function checkAgents() {
 
     // 只读角色的工具白名单不得含写工具。
     // 例外：Write 允许存在（只读角色需要写报告），但必须在正文里声明只能写报告路径。
+    //
+    // **判据是 frontmatter 的 `readonly: true`，不是名字。** 原实现是
+    // `READONLY_ROLES.some((r) => name.toLowerCase().includes(r))` —— 子串匹配。
+    // 它的失效方式不是漏检，是**误检且说不清**：用户建一个 `my-review-helper`，
+    // 因为名字含 `review` 被当成只读角色，报错说「只读角色 my-review-helper 拥有写工具」，
+    // 而这个角色的正文里从没写过它是只读的 —— 用户拿到一句话，不知道改哪里。
+    // 申明改成数据之后，「为什么它被当成只读」永远只有一个答案：那份 .md 里写了 readonly: true。
+    //
+    // 代价（如实记下）：没写 `readonly:` 的文件不再被检查。所以缺这一行本身要报错 ——
+    // 否则「忘了写」的失效方式是**静默放行**，比误检更坏。12 份现有定义已全部补齐。
     const name = parsed.name || f.replace(/\.md$/, '');
-    const isReadonly = READONLY_ROLES.some((r) => name.toLowerCase().includes(r));
+    if (parsed.readonly === undefined || parsed.readonly === '') {
+      fail(rel(p), 'frontmatter 缺少必填字段 "readonly"（true = 该角色不得修改交付物）。'
+        + '写不出这一行就说明没人想过这个角色该不该有写权限');
+    }
+    const isReadonly = readonlyOf(parsed);
     if (isReadonly && parsed.tools) {
       const tools = parsed.tools.split(',').map((t) => t.trim());
       const bad = tools.filter((t) => WRITE_TOOLS.includes(t));
@@ -587,6 +583,14 @@ const PROBE_ARGS = {
   // 是它们的正常分支，正好顺带验一遍空而不炸。main 以外的副作用只有 appendFileSync，
   // 而它只在 CLI 的 compose 分支里被调用，结构门不会走到。
   parseFrontmatter: '""', roleTools: '""',
+  // roles.mjs（2026-11-21，DF-044）：角色注册表。判定层全是纯函数，
+  // 探针参数取最小可构造输入；读盘的三个（`discoverRoles` / `agentPrefixFrom` /
+  // `defaultRoles`）用不存在的路径 —— 「目录不在」是它们的正常分支，
+  // 正好顺带验一遍「空注册表不炸」。
+  discoverRoles: '["/nonexistent-ow-agents"]',
+  agentPrefixFrom: '["/nonexistent-ow-root"]',
+  idFromName: '"x"', truthyFlag: '""', readonlyOf: '[{}]',
+  resolveRole: '[[]]', roleIndex: '[[]]', labelOf: '[[]]', nameOf: '[[]]',
   extractCommands: '""', classifyRequirement: '""', requiredTools: '[[]]',
   stopConditionProblem: '""',
   checkPromptSpec: '[{}]',
@@ -598,6 +602,22 @@ const PROBE_ARGS = {
   renderSessionBlock: '[{}]', attemptTime: '[{}, 0]', renderMarkdown: '[[]]',
   exitCodeFor: '[{}]', renderSummary: '[{}]', renderDetail: '[{}, { claim: {} }]',
   parseArgs: '[[]]', resolveSession: '["/nonexistent", "abc"]', flattenResults: '[[]]',
+  // project-root.mjs（2026-11-21，「两个根」拆分）：判定层全部纯函数。
+  // 探针参数一律**喂空 env + 不可达 cwd**，于是它们走到第 5 级 ——
+  // 「找不到就返回 null」是它们的正常分支，正好顺带验一遍不抛、不回落脚本位置。
+  // `frameworkRoot` 只读 `import.meta.url`，零参数调用即可。
+  // `levelText` 喂一个越界层级，验它「如实说未知」而不是编一个来源。
+  frameworkRoot: '[]',
+  resolveProjectRoot: '[{ env: {}, cwd: "/nonexistent-ow-probe" }]',
+  projectRoot: '[{ quiet: true, env: {}, cwd: "/nonexistent-ow-probe" }]',
+  rootFromArgv: '[[]]', searchUp: '["/nonexistent-ow-probe"]',
+  levelText: '[99]', formatTried: '[[{ level: 1, at: "/x", ok: false, why: "未给" }]]',
+  readPathsConfig: '["/nonexistent-ow-probe"]',
+  runsDirInfo: '["/nonexistent-ow-probe", { config: null, env: {} }]',
+  runsDirFor: '["/nonexistent-ow-probe", { config: null, env: {} }]',
+  // stop-verify-hook.mjs 的 `ledgerRoot` 是 `resolveStateDir` 的别名（同一份判据，不是第二个）。
+  // 空 env 必须安全返回一个**非空**路径 —— 返回空串会让 join 塌成相对路径。
+  ledgerRoot: '[{}]',
   // measure-execution-phase.mjs（2026-11-14 执行期中断测量）：全部纯函数。
   // 参数一律取最小可构造输入（空对象 / 空串 / 空数组），让「导出但调用即炸」
   // 在结构门暴露。analyzeFile 用不存在的路径——它会抛，由 checkImportable 吞掉
@@ -709,6 +729,10 @@ const PROBE_ARGS = {
   // 「把校验改成恒真，结构门却照样绿」。
   checkOutputs: '[{ shape: "artifact", outputs: ["docs/a.md"] }]',
   outputPathError: '"docs/a.md"', outputPathKey: '"docs/a.md"',
+  // 复杂度声明解析：三种输入覆盖三条分支（complex / simple / 未声明）。
+  // 「两个都给」的冲突分支由 `--complex --simple` 的 CLI 用例覆盖 —— 探针只求
+  // 「导出的函数真能被调起来」，不求在这里覆盖全部分支。
+  complexityOpts: '[["--complex"]]',
   makeExpect: '[{ run: "r", task: "T", paths: ["a"] }]',
   makeClaim: '[{ run: "r", task: "T", path: "a" }]',
   makeObserve: '[{ run: "r", task: "T", path: "a" }]',
@@ -1058,6 +1082,9 @@ function checkUnregisteredExports() {
     // 两个冻结表是数据，不是函数。
     'computeDelta', 'summarizeDelta', 'deltaSlotsOf', 'changeSetOf', 'lastHumanIndex',
     'resolveStateDir', 'stateRoot',
+    // project-root.mjs（2026-11-21）的常量与两个环境变量名：不是函数，checkArgs 调不动。
+    // 行为由 project-root.test.mjs 的 27 条用例守。
+    'LEVELS', 'PROJECT_MARKERS', 'DEFAULT_RUNS_REL', 'ROOT_ENV', 'RUNS_DIR_ENV',
     'isHumanMessage', 'errorOf', 'lastErrorIndex',
     'DELTA_VERDICTS', 'SLOT_STATES',
     'signatureOf', 'normalizeBash', 'heartbeatThreshold', 'isPersistentChange', 'parseJsonl', 'SUBAGENT_READ_BYTES',
@@ -1112,6 +1139,11 @@ function checkUnregisteredExports() {
     'listSessions', 'readPeerToken', 'canConnect', 'buildFrame', 'sendFrame', 'interpretReply',
     // validate-run.mjs
     'validateGraph', 'validateFile', 'CAPABILITIES', 'SHAPES', 'REQUIRED_FOR_COMPLEX', 'MIN_SUBTREES',
+    // validate-run.mjs 的复杂度声明解析（DF-042，2026-11-21）：CLI 的
+    // `--complex` / `--simple` → `requireComplex`。**这就是缺陷 A 的修复点**——
+    // 在它存在之前 CLI 从不传 opts，硬约束 2 的三条检查在命令行上永不执行。
+    // 已进 PROBE_ARGS 实际调用（覆盖「两个都给」那条冲突分支）。
+    'complexityOpts',
     // validate-run.mjs 的 outputs 判据（2026-11-13）：每个子树必须声明「磁盘上会多出什么」。
     // checkOutputs 走 PROBE_ARGS 真实调用一次（登记在下面）；另外两个是它内部的纯判据，
     // 由 validate-run.test.mjs 的合法/非法两组用例覆盖，这里按数据登记。
@@ -1490,6 +1522,19 @@ function checkUnregisteredExports() {
   ];
   for (const k of LINK_CHECK_FNS) REGISTERED.add(k);
 
+  // roles.mjs（2026-11-21，DF-044）：角色注册表 —— 「有哪些角色」的唯一实现。
+  // 纯函数与读盘函数都进了 PROBE_ARGS 实际调用；这里显式登记以免被「未登记导出」刷屏。
+  // `defaultRoles` 不参加探针：它按模块顶层标志缓存，探一次之后结构门再 import
+  // 拿到的就是那份缓存 —— 用缓存去证明「它能跑」是自证。它由 roles.test.mjs 的
+  // 「12 份 id 逐字相同」那条用例真实调用（那条必须拿到真注册表）。
+  // 三个路径常量是数据，不是函数。
+  const ROLES_FNS = [
+    'AGENTS_DIR', 'DEFAULT_AGENT_PREFIX', 'REPO_ROOT',
+    'defaultRoles', 'discoverRoles', 'parseFrontmatter', 'truthyFlag', 'readonlyOf',
+    'idFromName', 'resolveRole', 'roleIndex', 'labelOf', 'nameOf', 'agentPrefixFrom', 'FORBIDDEN_CONTEXT',
+  ];
+  for (const k of ROLES_FNS) REGISTERED.add(k);
+
   // compose-agent-prompt.mjs（2026-11-14 提示词分层拼装）：判定层纯函数已进 PROBE_ARGS
   // 实际调用，这里显式登记免得被「未登记导出」刷屏。main 是 CLI 入口，
   // 由 compose-agent-prompt.test.mjs 的端到端用例覆盖。
@@ -1542,6 +1587,21 @@ function checkUnregisteredExports() {
     'syntheticCases', 'probe', 'formatProbe', 'main',
   ];
   for (const k of PROBE_DIVERGENCE_FNS) REGISTERED.add(k);
+
+  // project-root.mjs（2026-11-21，「两个根」拆分）：判定层全部纯函数，已进 PROBE_ARGS
+  // 实际调用（喂空 env + 不可达 cwd，走到第 5 级 —— 「找不到就返回 null」是正常分支）。
+  // 两个常量是数据（`LEVELS` / `PROJECT_MARKERS`），checkArgs 调不动，一并登记。
+  // 正确性由 `project-root.test.mjs` 的 27 条用例覆盖，其中两条是端到端（真起子进程）。
+  const PROJECT_ROOT_FNS = [
+    'frameworkRoot', 'resolveProjectRoot', 'projectRoot', 'rootFromArgv', 'searchUp',
+    'levelText', 'formatTried', 'readPathsConfig', 'runsDirInfo', 'runsDirFor', 'main',
+    'LEVELS', 'PROJECT_MARKERS', 'DEFAULT_RUNS_REL', 'ROOT_ENV', 'RUNS_DIR_ENV',
+  ];
+  for (const k of PROJECT_ROOT_FNS) REGISTERED.add(k);
+
+  // stop-verify-hook.mjs 的 `ledgerRoot`：`resolveStateDir` 的别名（同一份判据，不是第二个），
+  // 已进 PROBE_ARGS 用空 env 真调一次。行为由 stop-verify-hook.test.mjs 的三条默认路径断言守。
+  REGISTERED.add('ledgerRoot');
 
   const files = readdirSync(dir).filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs') && !CLI_SCRIPTS.has(f));
   if (!files.length) return;
@@ -1900,6 +1960,50 @@ function checkInboxWiring() {
   }
 }
 
+/** DF-042：SKILL.md 必须引用 `compose-agent-prompt`。
+ *
+ *  与 `checkInboxWiring()` 同一个模式，理由也相同：`compose-agent-prompt.mjs` 的
+ *  `FORBIDDEN_CONTEXT`（锐评不得拿到执行者的自我评价）与 `REQUIRED_ELEMENTS`
+ *  都写好了、也测过了，但 2026-11-21 实测它在 `.claude/` / `templates/` / `docs/`
+ *  里**零引用**，且 CLI 两处硬传 `context: {}`——于是那条检查在真实调用中恒真。
+ *  「定义里写得再对，没人调用等于不存在」（DF-015 的原话）。
+ *
+ *  守三件事，缺一件这条链就是断的：
+ *    1. `.claude/skills/oversight/SKILL.md` 的 Phase B 提到 `compose-agent-prompt`
+ *    2. 它提到 `--context-from`（否则「补充上下文」这条路又缩回「谁都不许给」）
+ *    3. 脚本侧真的实现了这个参数（文档承诺不能跑在代码前面）
+ *
+ *  **不检查 `--gate` / `--stop`**：那两个在 SKILL.md 里是示例的一部分，
+ *  而 Gate 判断「有没有写进示例」对「参数存不存在」没有增量信息——
+ *  `checkCapabilities()` 已经在守「文档里的参数必须被脚本支持」。 */
+function checkPromptWiring() {
+  const skill = join(ROOT, '.claude', 'skills', 'oversight', 'SKILL.md');
+  if (existsSync(skill)) {
+    let t = '';
+    try { t = readFileSync(skill, 'utf8'); } catch { /* ignore */ }
+    if (!t.includes('compose-agent-prompt')) {
+      fail('.claude/skills/oversight/SKILL.md',
+        '派发阶段没有引用 compose-agent-prompt.mjs —— 提示词又回到手填，'
+        + 'FORBIDDEN_CONTEXT 与 REQUIRED_ELEMENTS 两项检查在真实调用中永不生效（DF-042）');
+    }
+    if (!t.includes('--context-from')) {
+      fail('.claude/skills/oversight/SKILL.md',
+        '没有引用 --context-from —— 「给某个角色补材料」只剩 CLI 私下的路，'
+        + '而 FORBIDDEN_CONTEXT 只有这一条入口会被喂到（DF-042）');
+    }
+  }
+  // 文档承诺必须落在代码上：SKILL.md 说支持，脚本事得真有
+  const c = join(ROOT, 'scripts', 'compose-agent-prompt.mjs');
+  if (existsSync(c)) {
+    let t = '';
+    try { t = readFileSync(c, 'utf8'); } catch { /* ignore */ }
+    if (!t.includes("args['context-from']")) {
+      fail('scripts/compose-agent-prompt.mjs',
+        'SKILL.md 在教人用 --context-from，但脚本没有实现它');
+    }
+  }
+}
+
 /** DF-016：设计文档必须标明「未实现」，且索引必须覆盖每一份。
  *
  *  970 行设计文档描述的能力一行代码都没有，而在此之前**没有任何入口指向它们**——
@@ -2209,6 +2313,7 @@ checkStopHookKillSwitch();
 checkLedger();
 checkLauncherPlacement();
 checkInboxWiring();
+checkPromptWiring();
 checkDesignIndex();
 checkAgentReachability();
 checkDocReferences();

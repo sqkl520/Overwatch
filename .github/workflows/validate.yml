@@ -28,7 +28,7 @@ jobs:
       - name: Payload layout
         run: node scripts/build-payload.mjs --verify-self
 
-      # 硬门：全部回归测试（1792 条，含状态判定、TUI 视觉、键位路由）。
+      # 硬门：全部回归测试（1860 条，含状态判定、TUI 视觉、键位路由）。
       # 数字由 check-structure.mjs 对账，与 README / CLAUDE / GUIDE 同源。
       #
       # `scripts/` 目录形式而不是 `scripts/*.test.mjs`：Node 22 之前**不展开 glob**，

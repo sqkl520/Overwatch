@@ -12,6 +12,8 @@ description: |
   注意：STALLED 实测命中率 0.018%（56,809 个滑窗里 10 次），末态从未出现。
   不要指望靠它触发——真正的触发源是收件箱里的 WAITING。
 tools: Read, Grep, Glob
+readonly: true
+display: 探针
 model: haiku
 maxTurns: 15
 color: cyan

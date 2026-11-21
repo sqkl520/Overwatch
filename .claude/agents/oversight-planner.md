@@ -9,6 +9,8 @@ description: |
   - 用户给出一个复杂任务，需要先分区再派发
   - 需要回头重新拆解（L4 换策略）
 tools: Read, Write, Glob, Grep
+readonly: false
+display: 规划
 model: inherit
 color: blue
 maxTurns: 40
@@ -47,7 +49,7 @@ maxTurns: 40
     {
       "id": "ST1",
       "goal": "",
-      "capability": "executor|research|critic|redteam|review|acceptor",
+      "capability": "<.claude/agents/ 下某个角色的 id，见下>",
       "shape": "artifact|exploration|hybrid",
       "token_budget_pct": 40,
       "timeout_min": 8,
@@ -69,6 +71,13 @@ maxTurns: 40
 一条 AC 可能不需要新文件（「不加依赖」），一个 output 可能不对应任何 AC（「顺手写的日志」）。
 `shape` 为 `artifact` 时不得为空数组；`exploration` 可以空（它按定义不承诺文件）。
 不得写绝对路径，不得含 `..`。
+
+`capability` 的合法值**不在这份文件里，也不在任何脚本的字面量里** —— 它是
+`.claude/agents/` 下每个角色 `.md` 的 `name` 去掉 `agentPrefix`（默认 `oversight-`）。
+要知道现在有哪些，看目录：`ls .claude/agents/`。写一个目录里没有的值，
+`validate-run.mjs` 会连**合法值清单一起**打出来，照那个改。
+（这条以前是一张手写表 `executor|research|critic|…`，加一个角色就得改一处，
+而漏改的那处不会红在当场。见 `DF-044`。）
 
 ## 禁止
 

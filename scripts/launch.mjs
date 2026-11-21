@@ -68,6 +68,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 import { verifyPluginRoot } from './build-payload.mjs';
+import { discoverRoles } from './roles.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
@@ -93,17 +94,25 @@ const VERIFY_TIMEOUT_MS = 60000;
  *  `timedOut` 分支、只是**从来没有人传过它**（唯一调用点写死 `false`，那条分支不可达）。 */
 const PRINT_TIMEOUT_MS = Number(process.env.OVERWATCH_PRINT_TIMEOUT_MS) || 15 * 60 * 1000;
 
-/** 期望的 agent 清单的**兜底常量**（只在 git 不可用时用，见 `expectedAgents()`）。
+/** 期望的 agent 清单的**兜底来源**（只在 git 不可用时用，见 `expectedAgents()`）。
  *
- *  它必须与 `.claude/agents/` 里已跟踪的 12 份角色定义一致。
- *  **改角色定义时忘了改这里，`--verify` 会红** —— 那是提醒，不是噪音：
- *  期望清单是验证的地基，地基变了就该有人看一眼。
+ *  **它原来是一份 12 个字面量的数组。** 删掉它换成一个返回注册表的函数，是因为
+ *  那份数组随时会和 `.claude/agents/` 漂，而漂的方向只有一个：数组里有的、目录里没了。
+ *  那时 `--verify` 报「宿主少挂了 X」，而 X 其实已经被删了 —— 一条永远修不好的红。
+ *
+ *  ⚠ **这里有一个不能重犯的坑，2026-11-21 修过一次（`:284`）**：`--verify` 原来拿
+ *  `readdirSync(.claude/agents/)` 当期望，于是「应有」与「实有」是同一份数据的两个投影，
+ *  挪走两个 agent 期望也变成 10，照样 exit 0。所以这个兜底必须与 `payloadInfo()` 读的
+ *  **不是同一个来源**：`payloadInfo()` 读的是**磁盘当前内容**（`readdirSync`），
+ *  而这里读的是 `git ls-files`（主路）或**注册表的解析结果**（兜底）。
+ *  注册表兜底与磁盘读盘仍然共用一份 .md 文件，这是降级后的已知代价，
+ *  写在 `docs/spec/2026-11-14-launch.md` 的「来源分级」里，不假装它是独立来源。
  */
-const AGENTS_EXPECTED = Object.freeze([
-  'oversight-acceptor', 'oversight-critic', 'oversight-executor', 'oversight-planner',
-  'oversight-probe', 'oversight-redteam', 'oversight-relay', 'oversight-repair',
-  'oversight-research', 'oversight-resolution', 'oversight-review', 'oversight-safety',
-]);
+function fallbackAgents(root) {
+  try {
+    return discoverRoles(join(root, '.claude', 'agents')).map((r) => r.name).sort();
+  } catch { return []; }
+}
 
 /** 两条随仓库发布的 hook。它们**默认都是观测模式**（不设环境变量时只记账、不拦），
  *  所以默认挂上是安全的；`--no-hooks` 或下面的环境变量可以关掉。
@@ -291,7 +300,7 @@ function payloadInfo(root) {
  *  现在的来源分级（**逐级降级，每级都写明来源，不假装**）：
  *    1. `git ls-files .claude/agents/*.md` —— **已跟踪的文件**，独立于磁盘当前状态。
  *       挪走一个未提交的文件，这份清单不变，差异立刻暴露。这是主路。
- *    2. git 不可用（发布包 / 没有 .git）时，退到 `AGENTS_EXPECTED` 常量。
+ *    2. git 不可用（发布包 / 没有 .git）时，退到**角色注册表**（`roles.mjs` 的 discoverRoles）。
  *    3. 两者都拿不到 → 返回 `null`，调用方必须**判为不可验证**（exit 非 0），
  *       绝不允许「没有期望」被当成「全都对上了」。
  *
@@ -312,9 +321,14 @@ function expectedAgents(root) {
     }
   } catch { /* 没有 git，走下一级 */ }
 
-  // 2) 常量兜底。**只在没有 git 时用**，且它必须与仓库里的 12 份角色定义一致 ——
-  //    改角色定义时忘了改这里，`--verify` 会红，那是提醒，不是噪音。
-  if (AGENTS_EXPECTED.length) return [...AGENTS_EXPECTED].sort();
+  // 2) 注册表兜底。**只在没有 git 时用**（发布包 / 没有 .git）。
+  //
+  //    ⚠ 这一支与「磁盘当前内容」共用同一批 .md，所以它**不是**独立来源 ——
+  //    删一个未提交的角色文件，这一支会跟着少一个，与 §上面那段「照镜子」是同一个形状。
+  //    这里的取舍是诚实的降级：主路（git）独立，兜底不独立，且 `--verify` 的输出
+  //    不声称兜底是独立来源。两路都拿不到就判「无法验证」。
+  const fallback = fallbackAgents(root);
+  if (fallback.length) return fallback;
 
   // 3) 什么都没有 —— 如实说「无法验证」，不许当成通过
   return null;

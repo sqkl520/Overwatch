@@ -21,11 +21,12 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 
+import { discoverRoles, labelOf } from './roles.mjs';
 import {
   buildPlan, formatPlan, renderPlan, loadRun, findLatestRun, displayPath,
   MAX_LINES, ROW_WIDTH, PLAN_VERSION, VERIFIED_GLYPHS,
@@ -34,6 +35,8 @@ import {
 // ── 夹具 ──────────────────────────────────────────────────────────────
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'ow-plan-'));
+/** 仓库根： 的真源在 .claude/agents 下，测试要读真身。 */
+const REPO = join(import.meta.dirname, '..');
 
 const ac = (id = 'AC1') => ({
   id, criterion: '渲染出这一行', evidence: 'scripts/render-plan.mjs:1', fail_if: '缺行',
@@ -149,6 +152,39 @@ test('每行都带 goal 与 capability —— 用户要看到「在做什么」�
   const st2 = lines.find((l) => l.includes('ST2'));
   assert.match(st2, /写测试/);
   assert.match(st2, /exec/);
+});
+
+test('显示名来自角色 frontmatter 的 display，不是渲染器里的一张手写表（DF-044）', () => {
+  // 这张表原来写死在 `render-plan.mjs`（`CAPABILITY_LABEL`），是一份**手工同步的第二真源**：
+  // 加一个角色它不会变红，只会让新角色在 PLAN 里显示成英文 id ——
+  // 而英文 id 也算「能看」，所以没人会发现漏了一行。
+  //
+  // 现在判据只有一处：`.claude/agents/*.md` 的 `display:`。
+  // 这里钉两件事：渲染出来的确实是那 12 个标签；且**它真的跟着 frontmatter 走**。
+  const roles = discoverRoles(join(REPO, '.claude', 'agents'));
+  assert.ok(roles.length >= 12, '至少 12 份角色定义（新增的也要能拿到 display）');
+
+  const { g, rows, probe } = scenarioFive();
+  const plan = buildPlan({ graph: g, claimRows: rows, nowMs: NOW, probe, root: '/r' });
+  const text = formatPlan(plan).join('\n');
+  for (const r of roles) {
+    // 只对图上真出现的 capability 断言标签——没出现的不该强行出现在屏幕上
+    if (!plan.subtrees.some((s) => s.capability === r.id)) continue;
+    assert.ok(text.includes(r.display), `${r.id} 的 display「${r.display}」没出现在 PLAN 里：\n${text}`);
+  }
+
+  // 反向：把一张手写表塞回去会让「改 frontmatter 就变」这条失效。
+  // 判据是**真的改一份 frontmatter**，看渲染是否跟着变。
+  const d = mkdtempSync(join(tmpdir(), 'ow-label-'));
+  try {
+    mkdirSync(join(d, 'agents'), { recursive: true });
+    const src = readFileSync(join(REPO, '.claude', 'agents', 'oversight-executor.md'), 'utf8');
+    writeFileSync(join(d, 'agents', 'oversight-executor.md'),
+      src.replace(/^display:.*$/m, 'display: 换个名字'));
+    const renamed = discoverRoles(join(d, 'agents'));
+    assert.equal(renamed[0].display, '换个名字', 'display 必须从 frontmatter 读出来');
+    assert.equal(labelOf(renamed, 'executor'), '换个名字', 'labelOf 必须跟着 frontmatter 变——否则它读的是别的表');
+  } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
 // ── 组 2：空状态必须诚实 ──────────────────────────────────────────────

@@ -7,6 +7,8 @@ description: |
   触发场景：
   - relay Agent 产出草稿后
 tools: Read, Grep, Glob
+readonly: true
+display: 红线
 model: haiku
 maxTurns: 12
 color: red

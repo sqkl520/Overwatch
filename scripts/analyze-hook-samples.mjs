@@ -41,19 +41,20 @@
  */
 
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { displayWidth } from './tui-theme.mjs';
+import { ledgerRoot } from './stop-verify-hook.mjs';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(HERE, '..');
-
-/** 默认样本文件。与 `stop-verify-hook.mjs` 的 `samplePathFor` 必须一致 ——
- *  不一致的话分析命令会对着一个永远空的文件说「没有样本」，而那看起来像「没问题」。 */
+/** 默认样本文件。**与 `stop-verify-hook.mjs` 的 `samplePathFor` 同源**（都调 `ledgerRoot()`）——
+ *  不一致的话分析命令会对着一个永远空的文件说「没有样本」，而那看起来像「没问题」。
+ *
+ *  修前这里也写死了 `join(REPO_ROOT,'tasks','runs',...)`，与另三处一起锚在脚本位置；
+ *  2026-11-21 后四处统一到宿主机状态目录（理由见 `stop-verify-hook.mjs` 的 `ledgerRoot()`）。 */
 export function defaultSamplesPath(env = process.env) {
   if (env.OVERWATCH_STOP_VERIFY_SAMPLES) return env.OVERWATCH_STOP_VERIFY_SAMPLES;
-  return join(REPO_ROOT, 'tasks', 'runs', 'stop-hook-samples.jsonl');
+  return join(ledgerRoot(env), 'stop-hook-samples.jsonl');
 }
 
 /**

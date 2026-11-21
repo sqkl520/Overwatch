@@ -624,7 +624,7 @@ function mutateLaunch(dir, replacements) {
     assert.ok(text.includes(from), `变异目标不在源码里，替换不会生效：${from.slice(0, 70)}`);
     text = text.split(from).join(to);
   }
-  for (const rel of ['build-payload.mjs', 'question-audit.mjs']) {
+  for (const rel of ['build-payload.mjs', 'question-audit.mjs', 'roles.mjs']) {
     text = text.split(`from './${rel}'`).join(`from 'file:///${join(HERE, rel).split('\\').join('/')}'`);
     text = text.split(`import('./${rel}')`).join(`import('file:///${join(HERE, rel).split('\\').join('/')}')`);
   }

@@ -8,6 +8,8 @@ description: |
   - "查一下 X 的官方行为是什么"
   - 需要外部证据支撑或推翻一个结论
 tools: Read, Grep, Glob, WebSearch, WebFetch
+readonly: false
+display: 研究
 model: inherit
 color: cyan
 maxTurns: 40
