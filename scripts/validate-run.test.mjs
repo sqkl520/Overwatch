@@ -18,11 +18,18 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 
 import {
-  validateGraph, validateFile, CAPABILITIES, SHAPES,
+  validateGraph, validateFile, SHAPES,
   REQUIRED_FOR_COMPLEX, MIN_SUBTREES, SHAPES_REQUIRING_OUTPUTS,
   outputPathError, outputPathKey, checkDependencyCycles, ON_DEP_FAILED,
   complexityOpts,
 } from './validate-run.mjs';
+import { capabilitiesFor } from './roles.mjs';
+
+/** 仓库自己的合法 capability 全集。**不再是 `CAPABILITIES` 常量** ——
+ *  那个常量 2026-11-21 被删掉了（它在模块加载时求值，永远只读框架角色目录，
+ *  于是别人项目里的角色一律被判非法，而项目里不存在的角色被判合法）。
+ *  合法值现在按根求值：`capabilitiesFor(root)`。这里用框架根，与「框架校验自己」同义。 */
+const CAPABILITIES = Object.freeze(capabilitiesFor(null));
 
 const ac = (id = 'AC1') => ({ id, criterion: 'scan --json 输出含 state 字段', evidence: 'src/a.mjs:12', fail_if: '缺字段' });
 
@@ -559,8 +566,12 @@ test('--simple 但图看起来复杂 → 警告（自相矛盾的声明要被指
 test('负向：把 CLI 改回「不传 opts」，--complex 必须立刻失效（证明这些测试守的是这一行）', async () => {
   // 与 outputs / 环检测两条负向测试同一种做法：真的做一次回退。
   // 回退的形态取缺陷原来的样子——`validateFile(t)`，opts 被丢掉。
+  //
+  // 2026-11-21：唯一的变量名从 `opts` 变成 `roleOpts`（它现在还带按项目求值的
+  // capability 全集）。**这条断言没有变松**，只是跟着改名——判据仍是「这一行被回退
+  // 之后 `--complex` 立刻失效」。
   const src = readFileSync(join(import.meta.dirname, 'validate-run.mjs'), 'utf8');
-  const find = 'results = targets.map((t) => validateFile(t, opts));';
+  const find = 'results = targets.map((t) => validateFile(t, roleOpts));';
   assert.equal(src.split(find).length - 1, 1, '源码片段应当唯一');
   const mutated = src.replace(find, 'results = targets.map((t) => validateFile(t)); // 回退：opts 被丢掉');
 

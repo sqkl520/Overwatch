@@ -73,7 +73,7 @@ import { fileURLToPath } from 'node:url';
 
 import { detectProjectCommands } from './project-commands.mjs';
 import { frameworkRoot, projectRoot, runsDirInfo } from './project-root.mjs';
-import { discoverRoles, resolveRole, defaultRoles, parseFrontmatter as roleParseFrontmatter } from './roles.mjs';
+import { rolesFor, sourceText, resolveRole, defaultRoles, parseFrontmatter as roleParseFrontmatter } from './roles.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -450,8 +450,8 @@ export function checkPromptSpec({
   for (const ac of acs) {
     const c = classifyRequirement(ac && ac.criterion);
     if (c.kind === 'decision' && !/不通过|不存在|未暴露|未出现|无/.test(String(ac && (ac.criterion || '')))) {
-      warnings.push(`${ac && ac.id ? ac.id : '?'}: 判据既不含命令也不含文件，且未给出「什么情况算失败」的具体形态——'
-        + '验收 Agent 可能给出主观判定`);
+      warnings.push(`${ac && ac.id ? ac.id : '?'}: 判据既不含命令也不含文件，且未给出「什么情况算失败」的具体形态——`
+        + '验收 Agent 可能给出主观判定`');
     }
   }
   const needToolsNow = requiredTools(acs);
@@ -895,9 +895,12 @@ const HELP = `compose-agent-prompt — 分层拼装子 agent 提示词
         L2 现写（主线程写）/ L3 注入（机器从仓库状态派生）。
 
 两个根（不合成一个值，因为有两种合法语义）：
-  --root <dir>      换「资产与路径基准」。默认走阶梯：--root > UNTILDONE_ROOT
-                    > 从 cwd 向上找 .untildone/ 或 .git/。找不到时 P1 过渡期回落到
-                    框架仓库并打印警告。
+  --root <dir>      换「路径基准」。默认走阶梯：--root > UNTILDONE_ROOT
+                    > 从 cwd 向上找 .untildone/ 或 .git/。第 5 级 exit 2，不回落脚本位置。
+                    它**不换成「资产根」**：角色与模板各有各的来源（见下两行）。
+  角色目录          **用户的** <root>/.claude/agents/（角色是项目资源；项目里没有才用框架的，
+                    并且每次都在 stderr 打印用的是哪一份 + 前缀）
+  模板              **框架的** templates/dispatch.md（随包发布的资产，跨项目逐字相同）
   runs 落点          --graph 指到哪，台账就在哪（与 task-graph.json 同目录）；
                     不给 --graph 时按 overwatch.config.json 的 paths.runs 找。
   **每次都会打印用了哪一级** —— 否则「写对了」和「写错地方」在屏幕上是同一个样子。
@@ -940,12 +943,18 @@ function main(argv) {
   // 这两件事的正确答案不同，用一个值必然有一方错：不给 `--root` 时 ① 错（去找框架仓库
   // 的 run），给了 `--root <用户项目>` 时 ② 错（用户项目里没有那份角色定义）。
   //
-  // 修后：
-  //   · `root`      = 路径基准（`--out` / `--gate` / `--context-from` / 默认 graph 位置）
-  //                   = `--root` 给了就用它，否则走 `projectRoot()` 的阶梯
-  //   · `assetRoot` = 资产根（角色定义 + dispatch 模板）
-  //                   = `--root` 给了就用它（**保留旧行为**：测试拿它指仓库），
-  //                     否则就是框架仓库 —— 资产随框架发布，不随用户项目
+  // 修后三个根，**各管一件事**：
+  //   · `root`        = 路径基准（`--out` / `--gate` / `--context-from` / 默认 graph 位置）
+  //                     = `--root` 给了就用它，否则走 `projectRoot()` 的阶梯
+  //   · `agentsDir`   = **用户项目**的 `.claude/agents/`（角色是项目资源，见下）
+  //   · `templateDir` = **框架**的 `templates/`（模板是随包发布的资产）
+  //
+  // 为什么角色走项目根而不是资产根：一个项目的角色是**它自己的岗位设置**，
+  // 换个项目就该换一批。修前它们绑在一起，于是
+  //   `compose --role qa`（项目里真有 qa.md）→「没有这个角色的定义」，
+  // 唯一的绕法是 `--root .` —— 而那会连带要求项目里自带 `templates/dispatch.md`，
+  // 于是同一份 `--root` 又在 L1 上 exit 1（实测，2026-11-21）。
+  // 两个根本来就没有理由相等。
   const explicitRoot = args.root !== undefined ? resolve(String(args.root)) : null;
   const root = explicitRoot || projectRoot({ argv });
   if (!root) {
@@ -953,7 +962,7 @@ function main(argv) {
     console.error(`  给 --root <dir>、设 UNTILDONE_ROOT，或在项目里建 .untildone/ 或 .git/。`);
     return 2;
   }
-  const assetRoot = explicitRoot || ASSET_ROOT;
+  const templateDir = join(ASSET_ROOT, 'templates');
   const runsDir = runsDirInfo(root).dir;
   console.error(`[compose] 路径基准 → ${root}（${explicitRoot ? '--root' : 'projectRoot 阶梯'}）`);
   console.error(`[compose] runs 目录 → ${runsDir}`);
@@ -986,10 +995,18 @@ function main(argv) {
     // `--role oversight-acceptor`（配置 roster 里的写法）拼出
     // `oversight-oversight-acceptor.md`，报「没有这个角色的定义」—— 实测（DF-044）。
     // 现在走注册表，`--role acceptor` 与 `--role oversight-acceptor` 解析到同一份文件。
-    const agentsDir = join(assetRoot, '.claude', 'agents');
-    const roles = discoverRoles(agentsDir);
-    const found = resolveRole(roles, role);
-    const roleFile = found ? found.file : join(agentsDir, `${role}.md`);
+    //
+    // 前缀**取项目自己的配置**（`agent.agentPrefix`）。修前这里调
+    // `discoverRoles(agentsDir)` 不传 agentPrefix → 用默认的 `oversight-`，
+    // 于是配了 `agentPrefix: "ow-"` + `ow-qa.md` 的项目，`--role qa` 解析不到，
+    // 报「现有角色：ow-qa」—— 而文档还说「改这一行即可，不必改代码」。
+    const roleset = rolesFor(root);
+    const roles = roleset.roles;
+    const prefix = roleset.agentPrefix;
+    const agentsDir = roleset.dir;
+    console.error(`[compose] 角色表 → ${sourceText(roleset, root)}（前缀 "${prefix}"）`);
+    const found = resolveRole(roles, role, { agentPrefix: prefix });
+    const roleFile = found ? found.file : join(agentsDir || '', `${role}.md`);
     const roleText = found ? readText(found.file) : null;
     if (roleText == null) {
       console.error(`没有这个角色的定义：${roleFile}`);
@@ -1067,7 +1084,12 @@ function main(argv) {
     const check = checkPromptSpec(spec);
 
     // L1：模板必须填得掉
-    const tplPath = join(assetRoot, 'templates', 'dispatch.md');
+    //
+    //  路径**走框架的 `templates/`，不走项目根**。模板是「四输入 / 证据纪律 / 返回四元组」
+    //  那段公共协议，它随框架发布、跨项目逐字相同 —— 它不是项目资产。
+    //  修前这里和角色目录共用 `assetRoot`，于是 `--root <项目>` 会要求项目自带一份
+    //  `templates/dispatch.md`，而它没有，L1 直接 exit 1（实测，2026-11-21）。
+    const tplPath = join(templateDir, 'dispatch.md');
     const tplText = readText(tplPath);
     let tpl = { text: '', missing: [] };
     if (tplText == null) {
@@ -1099,9 +1121,42 @@ function main(argv) {
     } else {
       console.log(`compose · task ${taskId} · role ${role}`);
       for (const c of check.checks) console.log(`  ${c.ok ? '✓' : '✗'} ${c.id}${c.detail ? ` — ${c.detail}` : ''}`);
+      // `check.errors` **必须逐条打印**，否则「哪一项不过」只在 --json 里。
+      //
+      //  修前这里只印 `checks` 与 `warnings`，而 `errors` 有两组来源：
+      //    ① `checkPromptSpec` 的 `mark()` —— 它同时 push 进 `checks`（打 ✗）与 `errors`；
+      //    ② CLI 自己 push 的 L1 项（`templates/dispatch.md` 读不到 / 占位符没填掉），
+      //       **完全不进 `checks`**。
+      //  于是 L1 失败时屏幕上只有「9 项全 ✓」然后「✗ 拒绝派发：1 项」，
+      //  看不到是哪一项 —— 实测（2026-11-21，`%TEMP%` 下的项目）：
+      //
+      //      ✓ independence — …
+      //      ✗ 拒绝派发：3 项          ← 三行错误只在 --json 的 errors[] 里
+      //
+      //  去重：① 类已经在 `checks` 里以 ✗ 出现，再印一遍会让人以为有两处不过。
+      //  判据是「这条 error 是不是某条不过的 check 的完整文案」—— `mark()` 往
+      //  `errors` 里 push 的是 `${id}: ${failDetail}`，而 `checks[].detail` 只有
+      //  `failDetail`，所以比较键要把 id 拼回去。字符串**相等**，不是前缀匹配：
+      //  前缀匹配会让「task: 短」把「task: 短，且没有停机条件」也吞掉。
+      const shownByChecks = new Set(check.checks
+        .filter((c) => !c.ok)
+        .map((c) => `${c.id}: ${String(c.detail || '')}`));
+      const extraErrors = check.errors.filter((e) => !shownByChecks.has(String(e)));
+      if (extraErrors.length) {
+        console.log('');
+        console.log('  以下错误没有对应的检查项（由 CLI 在检查之后追加）：');
+        for (const e of extraErrors) console.log(`  ✗ ${e}`);
+      }
       for (const w of check.warnings) console.log(`  ⚠ ${w}`);
       console.log('');
       console.log(ok ? `✓ 通过（${Buffer.byteLength(markdown)} 字节）` : `✗ 拒绝派发：${check.errors.length} 项`);
+      if (!ok) {
+        // 逐条列全 —— 上面那条「没有对应检查项」只覆盖 ② 类。
+        // ① 类散在 checks 的 ✗ 行里，但屏幕很短时人只看到最后那句「3 项」。
+        // 这里按「`check.id` 前缀」把它们压成一行，保证「3 项」这三个字找得到三个对象。
+        const ids = check.checks.filter((c) => !c.ok).map((c) => c.id);
+        if (ids.length) console.log(`  不过的检查项：${ids.join('、')}`);
+      }
     }
     if (!ok) {
       if (!args.json) {

@@ -205,8 +205,8 @@ C3a（会话内近似重复）是同一类噪声的**可判定**那一半：两�
 | `ask.requireReadFirst` | 布尔 | `true` | 「问之前必须读过项目」可关，但默认开 |
 | `ask.minReads` | 0..50 整数 | `3` | 「读过项目」要几个**不同**文件（与写前闸同口径） |
 | `ask.minQuestionsBeforeWrite` | 0..20 整数 | `0` | 第一次写文件之前必须已经问过几个**去重后的**问题。`0` = 这条判据不启用。**执行侧是 `pre-write-gate.mjs`，不是本脚本**（本脚本只负责让它通过校验，见 §6.3） |
-| `agent.roster` | 已知角色名数组 | planner+executor+acceptor | 启用哪些岗位，对应 [`../design/2026-11-14-agent-roster-policy.md`](../design/2026-11-14-agent-roster-policy.md) 的意图。**合法值来自 `.claude/agents/` 目录**，不是脚本里的字面量清单（`scripts/roles.mjs`） |
-| `agent.agentPrefix` | 非空字符串，不含路径分隔符 | `oversight-` | `.claude/agents/*.md` 的 `name` 去掉这个前缀就是它的 **id**（＝任务图里的 `capability`）。frontmatter 写了 `id:` 时以 `id:` 为准。把本库当模板复用时改这一行即可，不必改代码（`DF-044`） |
+| `agent.roster` | 已知角色名数组 | planner+executor+acceptor | 启用哪些岗位，对应 [`../design/2026-11-14-agent-roster-policy.md`](../design/2026-11-14-agent-roster-policy.md) 的意图。**合法值来自 `.claude/agents/` 目录**，不是脚本里的字面量清单（`scripts/roles.mjs` 的 `rolesFor(root)`）。判的是**这份配置文件所在目录**的角色表；项目里没有 `.claude/agents/` 时才回落框架的 12 个，且回落会以 `roles-fallback` 打出来（`DF-045`） |
+| `agent.agentPrefix` | 非空字符串，不含路径分隔符 | `oversight-` | `.claude/agents/*.md` 的 `name` 去掉这个前缀就是它的 **id**（＝任务图里的 `capability`）。frontmatter 写了 `id:` 时以 `id:` 为准。把本库当模板复用时改这一行即可，不必改代码（`DF-044`）。**它取的是项目自己的那份配置**：`compose` / `validate-run` / `render-plan` 都按 `rolesFor(root)` 读，前缀随注册表一起返回（`DF-045`——修前 `compose` 调 `discoverRoles()` 不传前缀，配了 `ow-` 的项目报「现有角色：ow-qa」） |
 
 ### 6.1 校验：非法即报错，绝不静默回落
 

@@ -72,12 +72,14 @@ maxTurns: 40
 `shape` 为 `artifact` 时不得为空数组；`exploration` 可以空（它按定义不承诺文件）。
 不得写绝对路径，不得含 `..`。
 
-`capability` 的合法值**不在这份文件里，也不在任何脚本的字面量里** —— 它是
-`.claude/agents/` 下每个角色 `.md` 的 `name` 去掉 `agentPrefix`（默认 `oversight-`）。
-要知道现在有哪些，看目录：`ls .claude/agents/`。写一个目录里没有的值，
-`validate-run.mjs` 会连**合法值清单一起**打出来，照那个改。
+`capability` 的合法值**不在这份文件里，也不在任何脚本的字面量里** —— 它是**你这个项目**的
+`.claude/agents/` 下每个角色 `.md` 的 `name` 去掉 `agentPrefix`（默认 `oversight-`，
+取你项目自己的 `overwatch.config.json`）。要知道现在有哪些，看目录：`ls .claude/agents/`。
+项目里没有 `.claude/agents/` 时才回落到框架的那 12 个 —— 而「回落到框架」这件事
+`validate-run.mjs` 会打印在**每一次**输出的第一行，不会让你以为是按项目判的。
+写一个目录里没有的值，`validate-run.mjs` 会连**合法值清单一起**打出来，照那个改。
 （这条以前是一张手写表 `executor|research|critic|…`，加一个角色就得改一处，
-而漏改的那处不会红在当场。见 `DF-044`。）
+而漏改的那处不会红在当场。见 `DF-044` / `DF-045`。）
 
 ## 禁止
 

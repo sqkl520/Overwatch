@@ -298,6 +298,29 @@ test('validateConfig 负向：未知角色名必须报错', () => {
   assert.ok(r.errors.some((e) => e.code === 'unknown-role'));
 });
 
+test('validateConfig：合法角色名按**调用方给的根**求值，不是模块级常量（2026-11-21）', () => {
+  // 与 `validate-run.mjs` 的 `CAPABILITIES` 同一个根因：`KNOWN_ROLES` 是
+  // `discoverRoles()` 在模块加载时求值的结果，永远读**框架**的 `.claude/agents/`。
+  // 实测（`%TEMP%` 下一个只有 qa.md 的项目，配置 `{"agent":{"roster":["qa"]}}`）：
+  //   agent.roster [unknown-role] 未知角色 "qa"（允许：oversight-acceptor, …）
+  // 而 `launch.mjs` 的 roster 走 `loadConfig()`，于是那个项目的 launch 直接停摆。
+  const c = good();
+  c.agent.roster = ['qa'];
+  // 不给 knownRoles：回落框架 → qa 非法，**且必须有一条回落说明**
+  const fallback = validateConfig(c);
+  assert.ok(fallback.errors.some((e) => e.code === 'unknown-role'),
+    '不按项目给角色表时，项目角色被接受 —— 那说明它没有回落，而是用了别的来源');
+  assert.ok(fallback.warnings.some((w) => w.code === 'roles-fallback'),
+    `回落必须可见：${JSON.stringify(fallback.warnings)}`);
+  // 按项目给：qa 合法
+  const scoped = validateConfig(c, { knownRoles: ['qa'] });
+  assert.equal(scoped.ok, true, scoped.errors.join(','));
+  // **反向**：给了项目的角色表之后，项目里没有的框架角色必须被拒
+  const other = good(); other.agent.roster = ['oversight-executor'];
+  assert.ok(validateConfig(other, { knownRoles: ['qa'] }).errors.some((e) => e.code === 'unknown-role'),
+    '给了项目的角色表，却仍然接受框架的角色 —— 那是逐 id 合并，本次要修的就是它');
+});
+
 test('validateConfig 负向：空 roster 与重复角色都拒绝', () => {
   const e = good(); e.agent.roster = [];
   assert.ok(validateConfig(e).errors.some((x) => x.code === 'bad-roster'));

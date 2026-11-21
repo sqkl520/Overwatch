@@ -106,11 +106,22 @@ export const AUTO_COMPLEX_TOOLCALLS = 15;
  *  那条测试防的是「清单漂了」，可它漂的根因就是**清单存在**：`scripts/roles.mjs` 之外，
  *  同一个角色名在本仓还有 9 个落点（DF-044）。现在这里只是注册表的一个投影。
  *
- *  校验仍然可以用它：`.claude/agents/` 在产品本体里（不会被 gitignore），
- *  干净 clone 上也在；而「角色名打错」这件事的判据本来就该是**目录里到底有没有它**。
+ *  取的是 `name`（全名 `oversight-planner`），因为 `agent.roster` 一直用全名。
  *
- *  取的是 `name`（全名 `oversight-planner`），因为 `agent.roster` 一直用全名，
- *  配置里那三个值不该因为本文件改实现而失效。 */
+ *  ## 2026-11-21：它也是一个「模块加载时求值」的常量，也修了
+ *
+ *  与 `validate-run.mjs` 的 `CAPABILITIES` 同一个根因：`discoverRoles()` 不带参数
+ *  → 永远读框架自己的 `.claude/agents/`。实测（`%TEMP%` 下一个只有 `qa.md` 的项目，
+ *  配置 `{"agent":{"roster":["qa"]}}`）：
+ *
+ *      agent.roster [unknown-role] 未知角色 "qa"（允许：oversight-acceptor, …）
+ *
+ *  而 `launch.mjs` 的 roster 正走 `loadConfig()`，于是**那个项目的 `launch` 直接停摆**。
+ *  与 `CAPABILITIES` 的处理不同，这里保留常量（它仍被 `check-structure` 的导出登记
+ *  与既有测试引用，且**默认值的语义就是「框架自己的角色」**），但校验路径
+ *  **不再用它**：`validateConfig(raw, { knownRoles })` 由调用方按根给。
+ *  不给时回落到框架并**在 errors 之外**说明（`warnings` 字段）——
+ *  「这份配置是按哪个目录的角色表判的」必须可见。 */
 export const KNOWN_ROLES = Object.freeze(discoverRoles().map((r) => r.name));
 
 /** 默认配置。**问是默认，不问要显式关掉**（用户拍板第 2 条）。 */
@@ -156,11 +167,24 @@ export function defaultConfig() {
  *    · 类型不对 = 错误（`bad-type`），不做 `Number('')===0` 那类隐式转换。
  *    · 语义矛盾 = 错误（`contradiction`），形态沿用 `question-protocol.md` §2.7。
  *
- *  @returns {{ok:boolean, config:object|null, errors:Array<{code:string,path:string,msg:string}>}}
+ *  @returns {{ok:boolean, config:object|null, errors:Array<{code:string,path:string,msg:string}>,
+ *             warnings:Array<{code:string,path:string,msg:string}>}}
+ *    `warnings` 只有一条来源：**没有按项目给角色表**时的回落说明。它不是错误
+ *    （框架自校验、库调用方都是合法用法），但必须能被打出来。
  */
-export function validateConfig(raw) {
+export function validateConfig(raw, { knownRoles = null } = {}) {
   const errors = [];
+  const warnings = [];
   const err = (code, path, msg) => errors.push({ code, path, msg });
+  // 合法角色名：调用方给了就用它的（**唯一正确的路**）；没给回落框架注册表并记一条 warning。
+  const roleNames = Array.isArray(knownRoles) && knownRoles.length ? knownRoles : KNOWN_ROLES;
+  if (!(Array.isArray(knownRoles) && knownRoles.length)) {
+    warnings.push({
+      code: 'roles-fallback',
+      path: 'agent.roster',
+      msg: `没有按项目给角色表，回落到框架注册表（${roleNames.length} 个）—— agent.roster 不是按你项目的 .claude/agents/ 判的`,
+    });
+  }
 
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     err('bad-root', '', '配置根必须是 JSON 对象');
@@ -284,8 +308,8 @@ export function validateConfig(raw) {
           err('bad-type', 'agent.roster', `agent.roster 的每一项必须是字符串（当前：${JSON.stringify(r)}）`);
           continue;
         }
-        if (!KNOWN_ROLES.includes(r)) {
-          err('unknown-role', 'agent.roster', `未知角色 "${r}"（允许：${KNOWN_ROLES.join(', ')}）`);
+        if (!roleNames.includes(r)) {
+          err('unknown-role', 'agent.roster', `未知角色 "${r}"（允许：${roleNames.join(', ')}）`);
         }
         if (seen.has(r)) err('duplicate-role', 'agent.roster', `角色 "${r}" 重复出现`);
         seen.add(r);
@@ -297,7 +321,12 @@ export function validateConfig(raw) {
   const paths = validatePathsSection(raw.paths, err);
   if (paths) cfg.paths = paths;
 
-  return { ok: errors.length === 0, config: errors.length === 0 ? cfg : null, errors };
+  return {
+    ok: errors.length === 0,
+    config: errors.length === 0 ? cfg : null,
+    errors,
+    warnings,
+  };
 }
 
 /** `paths` 段的校验。返回合法值（可能为空对象），非法返回 `null` 并往 `err` 里记账。
@@ -339,27 +368,31 @@ function validatePathsSection(paths, err) {
 /** 读配置文件。**文件不存在 = 用默认值**（这是唯一的回落）；
  *  文件存在但读不了/解析不了/校验不过 = **错误，返回 null 配置**，调用方必须停。
  *
- *  @returns {{found:boolean, path:string, config:object|null, errors:Array}}
+ *  `knownRoles` 由调用方按**项目根**给出（`rolesFor(root).roles.map(r => r.name)`）。
+ *  不给就回落框架注册表并带一条 warning —— 修前这里是模块级常量，于是
+ *  `launch` 在别人的项目里永远按框架的 12 个名字判 roster（实测，2026-11-21）。
+ *
+ *  @returns {{found:boolean, path:string, config:object|null, errors:Array, warnings:Array}}
  */
-export function loadConfig(file = join(ROOT, CONFIG_FILE)) {
+export function loadConfig(file = join(ROOT, CONFIG_FILE), { knownRoles = null } = {}) {
   const p = String(file || '');
   if (!p || !existsSync(p)) {
-    return { found: false, path: p, config: defaultConfig(), errors: [] };
+    return { found: false, path: p, config: defaultConfig(), errors: [], warnings: [] };
   }
   let text;
   try {
     text = readFileSync(p, 'utf8');
   } catch (e) {
-    return { found: true, path: p, config: null, errors: [{ code: 'unreadable', path: p, msg: `读不了配置文件：${e.message}` }] };
+    return { found: true, path: p, config: null, errors: [{ code: 'unreadable', path: p, msg: `读不了配置文件：${e.message}` }], warnings: [] };
   }
   let raw;
   try {
     raw = JSON.parse(text);
   } catch (e) {
-    return { found: true, path: p, config: null, errors: [{ code: 'bad-json', path: p, msg: `JSON 解析失败：${e.message}` }] };
+    return { found: true, path: p, config: null, errors: [{ code: 'bad-json', path: p, msg: `JSON 解析失败：${e.message}` }], warnings: [] };
   }
-  const v = validateConfig(raw);
-  return { found: true, path: p, config: v.config, errors: v.errors };
+  const v = validateConfig(raw, { knownRoles });
+  return { found: true, path: p, config: v.config, errors: v.errors, warnings: v.warnings || [] };
 }
 
 // ── transcript 解析 ───────────────────────────────────────────────────
@@ -1117,12 +1150,22 @@ export function cli(argv = process.argv.slice(2)) {
     return 2;
   }
 
-  const loaded = loadConfig(args.config || join(ROOT, CONFIG_FILE));
+  // 合法角色名取**这份配置文件所在目录**的 `.claude/agents/`。
+  // 为什么按配置文件而不是按 `--root`：`--root` 是**语料**根（transcript 在哪），
+  // 与「这份配置声明了哪些岗位」无关。配置文件在哪，它约束的就是哪里的岗位。
+  // 修前这里用的是模块级 `KNOWN_ROLES`（框架的 12 个），于是
+  // `--config <别人项目>/overwatch.config.json` 一定判 `unknown-role`。
+  const cfgPath = args.config || join(ROOT, CONFIG_FILE);
+  const cfgRoot = dirname(resolve(String(cfgPath)));
+  const knownRoles = discoverRoles(join(cfgRoot, '.claude', 'agents')).map((r) => r.name);
+  const loaded = loadConfig(cfgPath, { knownRoles });
   if (!loaded.config) {
     console.error('[question-audit] 配置非法，已停止（不回落默认值）：');
     for (const e of loaded.errors) console.error(`  · ${e.path || '(根)'} [${e.code}] ${e.msg}`);
     return 2;
   }
+  // 回落说明必须打出来，但不能算失败 —— 它说的是「这一项不是按你的项目判的」。
+  for (const w of loaded.warnings || []) console.error(`[question-audit] ⚠ ${w.path} [${w.code}] ${w.msg}`);
 
   const result = scanCorpus({
     root: args.root,

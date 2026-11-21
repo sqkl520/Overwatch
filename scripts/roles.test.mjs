@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import {
   discoverRoles, resolveRole, roleIndex, labelOf, parseFrontmatter, readonlyOf,
   idFromName, truthyFlag, agentPrefixFrom, AGENTS_DIR, DEFAULT_AGENT_PREFIX,
+  rolesFor, capabilitiesFor, rolesDirFor, sourceText,
 } from './roles.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -308,4 +309,162 @@ test('parseFrontmatter 支持多行块（否则多行 description 会被误判�
   const fm = parseFrontmatter('---\nname: a\ndescription: |\n  第一行\n  第二行\ntools: Read\n---\n');
   assert.equal(fm.description, '第一行 第二行');
   assert.equal(fm.tools, 'Read');
+});
+
+// ── 5. 按根求值：项目角色必须被看见（2026-11-21，D2 验证的根因）─────────
+//
+// 这一组的每一条都在守同一件事：**「有哪些角色」不是常量，是按根求值的结果。**
+// 修前 `validate-run.mjs` 是 `export const CAPABILITIES = discoverRoles()`，
+// 模块加载时执行 → 永远读框架自己的目录。实测（`%TEMP%` 下一个只有 qa/reviewer 的项目）：
+//   capability: "qa"       → exit 1「不在合法取值内」
+//   capability: "executor" → exit 0（项目里根本没这个角色）
+// 后半句比修前更糟。所以下面**既钉「项目角色被看见」，也钉「项目里不存在的被拒」**。
+
+/** 造一个「真项目」：`.claude/agents/` + 可选配置。`git init` 只为了让
+ *  `projectRoot()` 的阶梯在子进程里也能认出它（端到端用例需要）。 */
+function makeProject({ agents = {}, config = null } = {}) {
+  const d = tmp();
+  const dir = join(d, '.claude', 'agents');
+  mkdirSync(dir, { recursive: true });
+  for (const [file, spec] of Object.entries(agents)) {
+    writeFileSync(join(dir, `${file}.md`), agentMd(spec));
+  }
+  if (config) writeFileSync(join(d, 'overwatch.config.json'), JSON.stringify(config));
+  return d;
+}
+
+test('rolesFor：项目有角色目录 → 只认项目，不并入框架', () => {
+  const d = makeProject({ agents: { qa: { name: 'qa', display: '质量' } } });
+  try {
+    const set = rolesFor(d);
+    assert.equal(set.source, 'project');
+    assert.deepEqual(set.roles.map((r) => r.id), ['qa'],
+      '项目里的角色表被并入了框架的 12 个 —— 那样「项目里不存在的 capability」会照样合法');
+    assert.equal(set.dir, join(d, '.claude', 'agents'), 'dir 必须是项目的绝对路径（调用方要直接读它）');
+    assert.equal(set.roles[0].display, '质量');
+    assert.equal(capabilitiesFor(d).join(','), 'qa');
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('rolesFor：项目没有角色目录 → 框架兜底，并如实标 source', () => {
+  const d = tmp(); // 空目录，没有 .claude/agents
+  try {
+    const set = rolesFor(d);
+    assert.equal(set.source, 'framework');
+    assert.ok(set.roles.length >= 12, `框架兜底应当拿到全部角色，实际 ${set.roles.length}`);
+    assert.equal(set.dir, AGENTS_DIR);
+    // `null` = 只认框架，不需要任何项目在盘上
+    assert.equal(rolesFor(null).source, 'framework');
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('rolesFor：空目录也算「没有」—— 空注册表会让下游「一个角色都不合法」', () => {
+  const d = makeProject({ agents: {} }); // 目录在，但一份 .md 都没有
+  try {
+    assert.equal(rolesFor(d).source, 'framework', '空目录不该被当成「这个项目没有角色」，那等于全拒');
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('rolesFor：前缀取**项目自己的配置**，不是框架的 oversight-', () => {
+  const d = makeProject({
+    agents: { 'ow-qa': { name: 'ow-qa', display: '质量' } },
+    config: { agent: { agentPrefix: 'ow-' } },
+  });
+  try {
+    const set = rolesFor(d);
+    assert.equal(set.agentPrefix, 'ow-');
+    assert.deepEqual(set.roles.map((r) => r.id), ['qa'],
+      '项目配了 ow- 前缀却没生效 —— 这是缺陷 3：compose --role qa 会报「现有角色：ow-qa」');
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('sourceText：必须说清「这份注册表来自哪」', () => {
+  const d = makeProject({ agents: { qa: { name: 'qa' } } });
+  try {
+    const proj = sourceText(rolesFor(d), d);
+    assert.match(proj, /项目角色目录/);
+    assert.match(proj, /1 个/);
+    assert.ok(!proj.includes(d), `打印了绝对路径（含本机目录）：${proj}`);
+    const fw = sourceText(rolesFor(null));
+    assert.match(fw, /框架角色目录/);
+    assert.match(fw, /用户项目里没有/);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('rolesDirFor：纯路径拼接，空根返回 null（不拼出相对路径）', () => {
+  assert.equal(rolesDirFor('/p'), join('/p', '.claude', 'agents'));
+  assert.equal(rolesDirFor(''), null);
+  assert.equal(rolesDirFor(null), null);
+});
+
+test('端到端：validate-run 在别人的项目里按**项目的**角色表判', () => {
+  // 这一条是 D2 场景的最小复现，必须跑真子进程 —— 缺陷的形态就是
+  // 「模块加载时求值」，在任何进程内调用里都看不出来（import 发生在 --root 之前）。
+  const d = makeProject({ agents: { qa: { name: 'qa' }, reviewer: { name: 'reviewer' } } });
+  try {
+    // .git 让 projectRoot 的阶梯第 4 级认得出它
+    spawnSync('git', ['init', '-q', '.'], { cwd: d, encoding: 'utf8' });
+    const g = (cap) => join(d, `g-${cap}.json`);
+    const mk = (cap) => {
+      writeFileSync(g(cap), JSON.stringify({
+        run_id: 'r1', root_goal: '目标', constraints: [],
+        subtrees: [{
+          id: 'ST1', goal: '做点事', capability: cap, shape: 'artifact',
+          token_budget_pct: 20, timeout_min: 10, parallel_with: [], depends_on: [],
+          acceptance: [{ id: 'AC1', criterion: 'a.md:1 有东西', evidence: 'a.md:1', fail_if: '没有' }],
+          outputs: ['a.md'], why_this_layer: 'w',
+        }],
+      }), 'utf8');
+      return g(cap);
+    };
+
+    const cli = join(REPO, 'scripts', 'validate-run.mjs');
+    const run = (cap) => spawnSync(process.execPath, [cli, '--simple', mk(cap)], { encoding: 'utf8' });
+
+    const ok = run('qa');
+    assert.equal(ok.status, 0, `项目里真有 qa，却判非法（缺陷 1 的原形）：\n${ok.stdout}${ok.stderr}`);
+    assert.match(ok.stderr, /角色表 → 项目角色目录/, `没有打印角色表来源：\n${ok.stderr}`);
+
+    // **反向**：项目里不存在的角色必须被拒。修前这一条 exit 0（框架有 executor），
+    // 于是「校验通过」不再意味着「这个角色在项目里存在」—— 比不校验更糟。
+    const bad = run('executor');
+    assert.equal(bad.status, 1, `项目里没有 executor，却放行了：\n${bad.stdout}${bad.stderr}`);
+    assert.match(bad.stdout, /executor" 不在合法取值内（qa \/ reviewer）/, bad.stdout);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('端到端：compose 用项目的角色 + 项目的 agentPrefix，模板仍走框架', () => {
+  // 三个缺陷一次性验完：角色根（2）、前缀（3）、模板根（2 的后半）。
+  // 修前：不给 --root → 读框架角色 → 「没有这个角色的定义」；
+  //       给 --root . → 角色对了，但项目里没有 templates/dispatch.md → L1 exit 1。
+  const d = makeProject({
+    agents: { 'ow-qa': { name: 'ow-qa', display: '质量', tools: 'Read, Write, Bash', readonly: false } },
+    config: { agent: { agentPrefix: 'ow-' } },
+  });
+  try {
+    spawnSync('git', ['init', '-q', '.'], { cwd: d, encoding: 'utf8' });
+    const runDir = join(d, '.untildone', 'runs', 'r1');
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, 'task-graph.json'), JSON.stringify({
+      run_id: 'r1', root_goal: '目标', constraints: [],
+      subtrees: [{
+        id: 'ST1', goal: '对交付物逐项判定，按预声明标准给出通过或不通过与证据引用',
+        capability: 'qa', shape: 'artifact', token_budget_pct: 20, timeout_min: 10,
+        parallel_with: [], depends_on: [],
+        acceptance: [{ id: 'AC1', criterion: '`node scripts/x.mjs` 全绿', evidence: '命令输出', fail_if: 'exit!=0' }],
+        outputs: ['a.md'], why_this_layer: 'w',
+      }],
+    }), 'utf8');
+
+    const cli = join(REPO, 'scripts', 'compose-agent-prompt.mjs');
+    const r = spawnSync(process.execPath, [cli, 'compose', '--run', 'r1', '--task', 'ST1',
+      '--role', 'qa', '--stop', '10 分钟内返回', '--dry-run'], { cwd: d, encoding: 'utf8' });
+    const out = `${r.stdout}${r.stderr}`;
+    assert.ok(!/没有这个角色的定义/.test(out), `项目里的 qa 仍然解析不到：\n${out}`);
+    assert.match(out, /前缀 "ow-"/, `没有用项目的 agentPrefix：\n${out}`);
+    // L1 模板来自框架：项目里没有 templates/，但不应因此报错
+    assert.ok(!/L1: 读不到 templates\/dispatch\.md/.test(out),
+      `模板仍然走项目根（缺陷 2 的后半）：\n${out}`);
+    assert.equal(r.status, 0, out);
+  } finally { rmSync(d, { recursive: true, force: true }); }
 });

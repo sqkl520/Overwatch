@@ -341,7 +341,15 @@ async function configInfo(root) {
   const file = join(root, CONFIG_FILE);
   try {
     const mod = await import('./question-audit.mjs');
-    const r = mod.loadConfig(file);
+    // **按这个根的 .claude/agents/ 判 roster**，不用 `question-audit.mjs` 的
+    // `KNOWN_ROLES` 常量 —— 那个常量在模块加载时求值，永远只读框架的角色目录，
+    // 于是别人项目里配 `roster: ["qa"]` 会被判 `unknown-role` 并把整份配置变成 null
+    // （实测，2026-11-21）。`root` 在这里是框架根（本仓自用），但对
+    // `--cwd <别的项目>` 的情形也一样要对 —— 判据取 `root` 的目录，不是写死的框架。
+    const knownRoles = (() => {
+      try { return discoverRoles(join(root, '.claude', 'agents')).map((r) => r.name); } catch { return null; }
+    })();
+    const r = mod.loadConfig(file, { knownRoles });
     const roster = (r.config && r.config.agent && Array.isArray(r.config.agent.roster))
       ? r.config.agent.roster.slice()
       : [];

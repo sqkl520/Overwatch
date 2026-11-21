@@ -565,6 +565,85 @@ test('CLI：没有任何一项检查不过时，同一份输入必须通过—�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+// ── 缺陷 4：文本模式必须打印 check.errors ─────────────────────────────
+//
+// 修前 `:1104` 只印 `checks` 与 `warnings`。`errors` 有两组来源：
+//   ① `checkPromptSpec` 的 `mark()` —— 同时 push 进 `checks`（打 ✗）与 `errors`；
+//   ② CLI 在后面 push 的 L1 项（模板读不到 / 占位符没填掉）—— **完全不进 `checks`**。
+// 于是 L1 失败时屏幕上只有「9 项全 ✓」然后「✗ 拒绝派发：1 项」，看不到是哪一项。
+// 实测（2026-11-21，`%TEMP%` 下一个没有 templates/ 的真项目）：
+//
+//     ✓ independence — 该角色无额外禁止项
+//     ✗ 拒绝派发：3 项          ← 三行错误只在 --json 的 errors[] 里
+//
+// 这一组守两件事：L1 那类错误必须出现在 stdout；① 类不许被重复打印。
+
+test('CLI：L1 的失败原因必须出现在人读输出里（不能只在 --json）', () => {
+  // L1 的 error 是 CLI 自己 push 的，**不进 `checks`** —— 修前它只存在于 `--json`。
+  //
+  // 复现原始现象的办法：把 `templateDir` 指到一个不存在的目录（跑**变异副本**，不碰真身）。
+  // 这不是「造一个假分支」：`templates/dispatch.md` 读不到时走的就是这一条真实分支
+  // （发布包漏了 templates/、或 `--root` 指错时，用户遇到的就是它）。
+  const dir = mkdtempSync(join(tmpdir(), 'ow-cli-l1-'));
+  try {
+    const src = readFileSync(join(ROOT, 'scripts', 'compose-agent-prompt.mjs'), 'utf8');
+    const find = "const templateDir = join(ASSET_ROOT, 'templates');";
+    assert.equal(src.split(find).length - 1, 1, '源码片段应当唯一');
+    const mutated = src.replace(find,
+      "const templateDir = join(ASSET_ROOT, 'no-such-templates-dir'); // 回退：模板根指错");
+    const target = join(ROOT, 'scripts', `.neg-compose-l1-${process.pid}.mjs`);
+    writeFileSync(target, mutated, 'utf8');
+    try {
+      const graph = makeGraph(dir);
+      const gate = join(dir, 'gate.txt');
+      writeFileSync(gate, 'ok\n');
+      const r = spawnSync(process.execPath, [target, 'compose', '--run', 'r1', '--task', 'ST1',
+        '--graph', graph, '--role', 'acceptor', '--stop', '每项 AC 必带 file:line，25 分钟内返回',
+        '--gate', `node scripts/check-structure.mjs=${gate}`, '--gate-exit', '0', '--dry-run'],
+      { encoding: 'utf8' });
+      assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+      // 现象的原形：所有检查项都 ✓，然后「拒绝派发：1 项」，原因不可见。
+      // 只数「追加段之前」的检查行 —— 追加段里的 `✗ L1: …` 正是修复后新印出来的那一条。
+      const beforeAppend = r.stdout.split('以下错误没有对应的检查项')[0];
+      const checkLines = beforeAppend.split('\n').filter((l) => /^  [✓✗] /.test(l));
+      assert.ok(checkLines.length >= 5, `没读到检查项：\n${r.stdout}`);
+      assert.ok(checkLines.every((l) => l.includes('✓')), `这段本该全是 ✓：\n${r.stdout}`);
+      // 修复点：原因必须打出来
+      assert.match(r.stdout, /读不到 templates\/dispatch\.md/, `L1 的原因没打印：\n${r.stdout}`);
+      assert.match(r.stdout, /以下错误没有对应的检查项/, r.stdout);
+    } finally { rmSync(target, { force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI：CLI 追加的 error（不在 checks 里）必须逐条打印，且 ① 类不许重复', () => {
+  // 判据取自真实来源：`check.errors` 与 `check.checks` 的差集。
+  // 用 `--json` 拿到真值，再拿人读输出核对 —— 两路必须说同一件事。
+  const dir = mkdtempSync(join(tmpdir(), 'ow-cli-err-'));
+  try {
+    const graph = makeGraph(dir);
+    const args = ['compose', '--run', 'r1', '--task', 'ST1', '--graph', graph, '--role', 'acceptor',
+      '--stop', '缺', '--dry-run'];
+    const human = runCli(args);
+    const json = runCli([...args, '--json']);
+    const parsed = JSON.parse(json.stdout);
+    assert.ok(parsed.errors.length >= 1, json.stdout);
+    const shown = new Set(parsed.checks.filter((c) => !c.ok).map((c) => `${c.id}: ${c.detail}`));
+    // ① 类（`mark()` 加的）不许在「没有对应检查项」那一段里再出现一遍
+    const idx = human.stdout.indexOf('以下错误没有对应的检查项');
+    for (const e of parsed.errors) {
+      if (!shown.has(e)) continue;
+      if (idx >= 0) assert.ok(!human.stdout.slice(idx).includes(e),
+        `「${e}」已经被 ✗ 那行印过了，却又在追加段里印了一遍：\n${human.stdout}`);
+    }
+    // 「不过的检查项」汇总行必须点名 —— 否则「拒绝派发：N 项」里的 N 无从核对
+    const m = /不过的检查项：(.+)/.exec(human.stdout);
+    assert.ok(m, `没有点名不过的检查项：\n${human.stdout}`);
+    for (const c of parsed.checks.filter((x) => !x.ok)) {
+      assert.ok(m[1].includes(c.id), `「${c.id}」不过却没被点名：${m[1]}`);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('CLI verify：没有台账时报「从没记过」，不是「全部对得上」', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ow-cli-'));
   try {

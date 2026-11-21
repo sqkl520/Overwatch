@@ -187,6 +187,46 @@ test('显示名来自角色 frontmatter 的 display，不是渲染器里的一�
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
+// ── 缺陷 5：PLAN 行用**项目的** display，不是框架的 ──────────────────────
+//
+// 上面那条钉的是「display 来自 frontmatter」。但修前 `formatPlan` 调的是
+// `labelOf(defaultRoles(), …)` —— `defaultRoles()` 是锚在**框架仓库**的一份缓存，
+// 于是给别人项目渲染时，项目里 `display: 质量` 被忽略，屏幕上显示英文 id `qa`
+//（实测，2026-11-21，`%TEMP%` 下一个只有 qa.md 的项目）。判据不是「有没有 label」，
+// 是「用的是**哪个目录**的 frontmatter」——所以必须用一个真项目来验。
+
+test('PLAN 行用项目自己的 display（不是框架那份缓存）', () => {
+  const d = mkdtempSync(join(tmpdir(), 'ow-plan-label-'));
+  try {
+    mkdirSync(join(d, '.claude', 'agents'), { recursive: true });
+    writeFileSync(join(d, '.claude', 'agents', 'qa.md'),
+      ['---', 'name: qa', 'display: 质量', 'tools: Read', 'readonly: true', '---', '', '正文。', ''].join('\n'));
+    const g = graph([sub({ id: 'ST1', capability: 'qa' })]);
+    // 不给 `roles`：`buildPlan` 必须自己按 `root` 求值
+    const plan = buildPlan({ graph: g, claimRows: [], nowMs: NOW, probe: probeOf({}), root: d });
+    const text = formatPlan(plan).join('\n');
+    assert.match(text, /质量/, `项目的 display 被忽略了，PLAN 行还是英文 id：\n${text}`);
+    assert.doesNotMatch(text, /\bqa · /, `PLAN 行仍然显示 id 而不是 display：\n${text}`);
+
+    // **反向**：同一个渲染器对框架仓库仍然用框架的 display（不是把两边混成一份）
+    const fw = formatPlan(buildPlan({
+      graph: graph([sub({ id: 'ST1', capability: 'executor' })]),
+      claimRows: [], nowMs: NOW, probe: probeOf({}), root: REPO,
+    })).join('\n');
+    assert.match(fw, /exec/, `框架自己的 display 丢了：\n${fw}`);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+
+test('plan.roles 是投影：只带 id / name / display，不带角色的绝对路径', () => {
+  // `--json` 会原样打出去。`role.file` 是本机绝对路径，多带一个字段就是多一处泄漏面。
+  const plan = buildPlan({ graph: graph([sub({})]), claimRows: [], nowMs: NOW, probe: probeOf({}), root: REPO });
+  assert.ok(Array.isArray(plan.roles) && plan.roles.length, 'plan 上应当带注册表');
+  for (const r of plan.roles) {
+    assert.deepEqual(Object.keys(r).sort(), ['display', 'id', 'name']);
+  }
+  assert.ok(!JSON.stringify(plan.roles).includes(REPO), 'plan.roles 里出现了本机绝对路径');
+});
+
 // ── 组 2：空状态必须诚实 ──────────────────────────────────────────────
 
 test('没有 task-graph.json → 明说「还没规划」，不假装有一份空计划', () => {

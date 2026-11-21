@@ -589,6 +589,10 @@ const PROBE_ARGS = {
   // 正好顺带验一遍「空注册表不炸」。
   discoverRoles: '["/nonexistent-ow-agents"]',
   agentPrefixFrom: '["/nonexistent-ow-root"]',
+  // 按根求值的注册表（2026-11-21）：`null` = 「只认框架」，不需要任何项目在盘上；
+  // 这也是它最该验的分支（框架兜底），项目分支由 roles.test.mjs 端到端覆盖。
+  rolesFor: '[null]', capabilitiesFor: '[null]', rolesDirFor: '"/nonexistent-ow-root"',
+  sourceText: '[{ source: "framework", dir: "/nonexistent-ow-agents", roles: [] }]',
   idFromName: '"x"', truthyFlag: '""', readonlyOf: '[{}]',
   resolveRole: '[[]]', roleIndex: '[[]]', labelOf: '[[]]', nameOf: '[[]]',
   extractCommands: '""', classifyRequirement: '""', requiredTools: '[[]]',
@@ -1532,6 +1536,11 @@ function checkUnregisteredExports() {
     'AGENTS_DIR', 'DEFAULT_AGENT_PREFIX', 'REPO_ROOT',
     'defaultRoles', 'discoverRoles', 'parseFrontmatter', 'truthyFlag', 'readonlyOf',
     'idFromName', 'resolveRole', 'roleIndex', 'labelOf', 'nameOf', 'agentPrefixFrom', 'FORBIDDEN_CONTEXT',
+    // 2026-11-21（D2 验证）：按根求值的四个。`rolesFor` / `capabilitiesFor` 各进
+    // PROBE_ARGS 真调一次（`rolesFor` 喂 null = 「只认框架」，`capabilitiesFor` 同）；
+    // `rolesDirFor` 是纯路径拼接；`sourceText` 吃一份最小的注册表对象。
+    // 它们的存在理由见 `roles.mjs` 的 `rolesFor`：常量在模块加载时求值 = 只认框架角色。
+    'rolesFor', 'capabilitiesFor', 'rolesDirFor', 'sourceText',
   ];
   for (const k of ROLES_FNS) REGISTERED.add(k);
 
@@ -1943,7 +1952,10 @@ function checkInboxWiring() {
       try { return readFileSync(join(agentDir, f), 'utf8').includes('--inbox'); } catch { return false; }
     });
     if (files.length && !refs.length) {
-      fail('.claude/agents/', `12 个角色定义里没有一个引用 --inbox —— 监控与调度脱节（DF-015）`);
+      // 数字**不写死**：`12 个角色定义` 是收敛前的快照，加一个角色它就变成假话，
+      // 而它是**报错文案里**的一句 —— 假话报错比不报还糟（读者会去数，然后不再相信这个门）。
+      // 实际个数从刚数出来的 `files` 取。
+      fail('.claude/agents/', `${files.length} 个角色定义里没有一个引用 --inbox —— 监控与调度脱节（DF-015）`);
     }
   }
   // 脚本侧必须真的实现了这个命令

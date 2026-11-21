@@ -34,22 +34,35 @@
  */
 
 import { readFileSync, existsSync, readdirSync, statSync, realpathSync } from 'node:fs';
-import { join, resolve, basename } from 'node:path';
+import { join, resolve, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { discoverRoles } from './roles.mjs';
+import { capabilitiesFor, rolesFor, sourceText } from './roles.mjs';
 
-import { projectRoot, runsDirInfo } from './project-root.mjs';
+import { projectRoot, runsDirInfo, resolveProjectRoot, levelText } from './project-root.mjs';
 
 /** capability 与 shape 的合法取值。
  *
- *  **`CAPABILITIES` 不再写死。** 它原先是一份 12 个字面量的数组，旁边写着「单一真源：
- *  改这里，同时要改 oversight-planner.md 里的同一张表」—— 那句注释自己就承认了有两个源，
- *  而第二个源没有任何东西去核。现在它是 `scripts/roles.mjs` 注册表的 id 集合：
- *  角色目录里有什么，任务图的 `capability` 就允许什么，加一个角色不必改这里。
+ *  **`CAPABILITIES` 常量已经删掉了（2026-11-21）。** 它原先是一份 12 个字面量的数组，
+ *  旁边写着「单一真源：改这里，同时要改 oversight-planner.md 里的同一张表」—— 那句注释
+ *  自己就承认了有两个源，而第二个源没有任何东西去核。上一版把它改成
  *
- *  顺序稳定（按 id 排序），因为报错信息里会把这串原样打出来给人看。 */
-export const CAPABILITIES = Object.freeze(discoverRoles().map((r) => r.id).sort());
+ *      export const CAPABILITIES = Object.freeze(discoverRoles().map((r) => r.id).sort());
+ *
+ *  —— 那仍然是个**模块加载时**求值的常量：它在任何 `--root` 解析之前就执行，
+ *  而 `discoverRoles()` 不带参数 → 永远读**框架自己**的 `.claude/agents/`。
+ *  实测（`%TEMP%` 下一个只有 `qa.md` / `reviewer.md` 的项目）：
+ *
+ *      capability: "qa"       → exit 1「不在合法取值内」
+ *      capability: "executor" → exit 0（项目里根本没有这个角色）
+ *
+ *  后半句比修前更糟：**校验通过**不再意味着「这个角色在项目里存在」。
+ *  求值时机是根因，所以合法值只能**按根求值**（`capabilitiesFor(root)`，见 `roles.mjs`），
+ *  由调用方放进 `validateGraph(graph, { capabilities })`。
+ *
+ *  不给 `capabilities` 时回落到框架注册表，并在结果里加一条 warning ——
+ *  回落本身是必要的（库调用方与「框架校验自己」都用得上），但**它必须看得见**：
+ *  静默回落正是这个缺陷的形态。 */
 export const SHAPES = Object.freeze(['artifact', 'exploration', 'hybrid']);
 
 /** 有产出路径要求的 shape。`artifact` 的字面含义就是「落到磁盘的交付物」，
@@ -200,17 +213,38 @@ export function checkDependencyCycles(subtrees) {
  *    false     显式声明不复杂 → 不执行，但对「看起来复杂」的声明发警告
  *    undefined 没声明 → 不执行，且 `declared_complexity` 会如实写 'undeclared'
  *
+ *  `opts.capabilities` 是合法 capability 全集，**必须由调用方按根给出**
+ *  （CLI 用 `capabilitiesFor(projectRoot())`）。不给时回落到框架注册表并**发警告** ——
+ *  「你用的是什么角色表」必须出现在输出里，否则「不知道从哪来的一个清单放行了 / 拒绝了」
+ *  与「按你的项目判的」在屏幕上是同一个样子。回落只影响 `capability` 一项，
+ *  其余判据与它无关。
+ *
  *  `declared_complexity` 是返回值的一部分，**不只在 errors 里**：调用方（CLI、
  *  硬门、未来的渲染器）需要能区分「检查过并放行」与「压根没检查」，
  *  而 errors 为空对这两种是同一个样子。 */
-export function validateGraph(graph, { requireComplex } = {}) {
+export function validateGraph(graph, { requireComplex, capabilities = null } = {}) {
   const errors = [];
   const warnings = [];
   const err = (p, m) => errors.push(`${p}: ${m}`);
   const warn = (p, m) => warnings.push(`${p}: ${m}`);
 
+  // 合法 capability 全集：调用方给了就用它的（**唯一正确的路**）；
+  // 没给就回落框架注册表，并把这件事说成一句给用户看的话。
+  //
+  // 变量名刻意不叫 `caps`：下面「复杂度约束」那一段用 `caps` 表示**图上实际出现的
+  // capability**，两者混用会让 `REQUIRED_FOR_COMPLEX.some(...)` 静默变成
+  // 「12 个角色表里有没有 review」——恒真。
+  const capUniverse = Array.isArray(capabilities) && capabilities.length
+    ? [...capabilities].sort()
+    : null;
+  const capList = capUniverse || capabilitiesFor(null);
+  if (!capUniverse) {
+    warn('capability', `没有按项目给角色表，回落到框架注册表（${capList.length} 个：${capList.join(' / ')}）`
+      + ' —— 这一项不是按你项目的 .claude/agents/ 判的');
+  }
+
   if (!graph || typeof graph !== 'object' || Array.isArray(graph)) {
-    return { ok: false, errors: ['根：必须是一个对象'], warnings: [] };
+    return { ok: false, errors: ['根：必须是一个对象'], warnings };
   }
   for (const k of ['run_id', 'root_goal']) {
     if (typeof graph[k] !== 'string' || !graph[k].trim()) err(k, '必须是非空字符串');
@@ -232,8 +266,8 @@ export function validateGraph(graph, { requireComplex } = {}) {
 
     if (typeof st.goal !== 'string' || !st.goal.trim()) err(`${p}.goal`, '必须是非空字符串');
 
-    if (!CAPABILITIES.includes(st.capability)) {
-      err(`${p}.capability`, `"${st.capability}" 不在合法取值内（${CAPABILITIES.join(' / ')}）`);
+    if (!capList.includes(st.capability)) {
+      err(`${p}.capability`, `"${st.capability}" 不在合法取值内（${capList.join(' / ')}）`);
     }
     if (!SHAPES.includes(st.shape)) {
       // CLAUDE.md 硬约束 8：未声明产出形态视为规划缺陷
@@ -420,7 +454,36 @@ function main(argv) {
   if (problem) { console.error(problem); return 2; }
   // `--complex` / `--simple` 是布尔开关，不是目标文件 —— 必须从 targets 里滤掉，
   // 否则它们会被当成路径去 stat，报出一句「读不到 --complex」。
-  const targets = argv.filter((a) => !a.startsWith('--'));
+  //
+  // `--root <dir>` 的**值**同样要滤掉：`--root .` 里的 `.` 不带 `--` 前缀，
+  // 而它会落在 targets 里被当成一个 task-graph 去读，报「读不到 .」。
+  const targets = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = String(argv[i]);
+    if (a === '--root') { i++; continue; }        // 吃掉它的值
+    if (a.startsWith('--root=')) continue;
+    if (a.startsWith('--')) continue;
+    targets.push(a);
+  }
+
+  // ── 合法 capability 全集：**按项目根求值**，不是模块加载时的常量 ──────
+  //
+  //  这是缺陷 1 的修复点。修前 `CAPABILITIES` 是 `export const ... = discoverRoles()`，
+  //  在任何 `--root` 解析之前就执行 → 永远读框架自己的角色目录。实测：
+  //  项目里 `capability: "qa"` 被拒，而项目里**不存在**的 `capability: "executor"` 被放行。
+  //
+  //  根按五级阶梯解析；显式给了目标时，第 4 级从**那个目标**向上找，而不是从 cwd ——
+  //  「在仓库里跑、校验另一个项目的图」是很自然的用法，而从 cwd 向上会得到仓库根，
+  //  于是又按框架的角色表判一次。目标是目录（`--all <dir>`）时用它本身，是文件时用它的目录。
+  const firstTarget = targets.length ? resolve(String(targets[0])) : null;
+  const probeFrom = firstTarget
+    ? (existsSync(firstTarget) && statSync(firstTarget).isDirectory() ? firstTarget : dirname(firstTarget))
+    : null;
+  const rootInfo = resolveProjectRoot({ argv, cwd: probeFrom });
+  const roleset = rolesFor(rootInfo.ok ? rootInfo.root : null);
+  const roleOpts = { ...opts, capabilities: roleset.roles.map((r) => r.id).sort() };
+  console.error(`[validate-run] 角色表 → ${sourceText(roleset, rootInfo.ok ? rootInfo.root : null)}`
+    + `（${rootInfo.ok ? levelText(rootInfo.level) : '第 5 级：没有项目根，按框架注册表判'}）`);
 
   // `--all` 不给目录时的默认目标：**用户项目的 runs 目录**，不是脚本位置。
   //
@@ -463,7 +526,7 @@ function main(argv) {
         const runDir = join(dir, sub);
         try { if (!statSync(runDir).isDirectory()) continue; } catch { continue; }
         const p = join(runDir, 'task-graph.json');
-        if (existsSync(p)) results.push(validateFile(p, opts));
+        if (existsSync(p)) results.push(validateFile(p, roleOpts));
       }
     }
     if (!results.length) {
@@ -473,7 +536,7 @@ function main(argv) {
     }
   } else {
     // **缺陷 A 就在这里**：原先这一行是 `validateFile(t)`，opts 被丢掉。
-    results = targets.map((t) => validateFile(t, opts));
+    results = targets.map((t) => validateFile(t, roleOpts));
   }
 
   // 复杂度声明必须印在**每一次**输出里，包括全部通过的那一次。

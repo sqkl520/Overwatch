@@ -38,7 +38,7 @@
  */
 
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
-import { join, dirname, resolve, basename } from 'node:path';
+import { join, dirname, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -223,6 +223,99 @@ export function labelOf(roles, capability) {
 export function nameOf(roles, id, { agentPrefix = DEFAULT_AGENT_PREFIX } = {}) {
   const hit = (Array.isArray(roles) ? roles : []).find((r) => r.id === id || r.name === id);
   return hit ? hit.name : `${agentPrefix || ''}${id}`;
+}
+
+// ── 按根求值：项目角色 vs 框架角色 ─────────────────────────────────
+
+/** 一个根的角色目录。`root/.claude/agents`（**不判断存在性**，由 `rolesFor` 判）。 */
+export function rolesDirFor(root) {
+  const r = String(root || '').trim();
+  return r ? join(r, '.claude', 'agents') : null;
+}
+
+/**
+ * 按**根**取角色注册表。这是「有哪些角色」唯一的对外入口。
+ *
+ * ## 为什么不能是模块加载时的常量
+ *
+ * 修前 `validate-run.mjs:52` 是
+ *
+ *     export const CAPABILITIES = Object.freeze(discoverRoles().map((r) => r.id).sort());
+ *
+ * 模块级 `const` 在任何 `--root` 解析之前就执行，而 `discoverRoles()` 不带参数
+ * → 永远读**框架自己**的 `.claude/agents/`。实测（2026-11-21，`%TEMP%` 下一个
+ * 只有 `qa.md` / `reviewer.md` 的真项目）：
+ *
+ *     capability: "qa"       → exit 1「不在合法取值内」
+ *     capability: "executor" → exit 0（项目里根本没有这个角色）
+ *
+ * 后半句比修前更糟：它让「校验通过」不再意味着「这个角色在项目里存在」。
+ * 求值时机是根因，所以修法只能是**按根求值**，不能是「再加一份清单」。
+ *
+ * ## 合并规则：项目有角色目录 → **只**认项目；没有 → 框架兜底
+ *
+ * 派单里写的是「项目角色优先，框架兜底」。如果兜底是**逐 id 合并**，那么一个
+ * 只有 `qa` 的项目里写 `capability: "executor"` 仍然合法 —— 因为框架有 executor。
+ * 那正是本次要修的那半句假话，只是换了个来源。所以这里的兜底是**整份**的：
+ *
+ *   · `<root>/.claude/agents/` 存在且至少有一个可解析的 `.md` → 用它，**不并入框架**；
+ *   · 否则（没有目录 / 空目录 / 不是项目）→ 用框架仓库的注册表。
+ *
+ * 两种情形都**必须打印来源**：同一句「合法角色：a / b / c」可能来自两个目录，
+ * 而「写错角色名」与「看错了哪个项目」在屏幕上是同一个样子。
+ *
+ * 项目的角色名前缀取项目自己的 `overwatch.config.json`（`agent.agentPrefix`）；
+ * 框架兜底时取框架的。**不是同一个值**：本仓是 `oversight-`，别人的项目可能是 `ow-`。
+ *
+ * @param {string|null} root 用户项目根（`projectRoot()` 的结果）。`null` = 只认框架
+ * @param {{agentPrefix?:string}} [opts] 显式前缀（不给就按各自根读配置）
+ * @returns {{roles:Array<object>, source:'project'|'framework', dir:string|null, agentPrefix:string}}
+ *   每条 role 额外带 `source`，调用方不必记住整份来自哪。
+ */
+export function rolesFor(root, { agentPrefix = null } = {}) {
+  const dir = rolesDirFor(root);
+  const projectPrefix = agentPrefix != null ? String(agentPrefix) : agentPrefixFrom(root);
+  if (dir) {
+    const list = discoverRoles(dir, { agentPrefix: projectPrefix });
+    if (list.length) {
+      return {
+        roles: list.map((r) => ({ ...r, source: 'project' })),
+        source: 'project',
+        dir,
+        agentPrefix: projectPrefix,
+      };
+    }
+  }
+  const fwPrefix = agentPrefix != null ? String(agentPrefix) : agentPrefixFrom(REPO_ROOT);
+  return {
+    roles: discoverRoles(AGENTS_DIR, { agentPrefix: fwPrefix }).map((r) => ({ ...r, source: 'framework' })),
+    source: 'framework',
+    dir: AGENTS_DIR,
+    agentPrefix: fwPrefix,
+  };
+}
+
+/** `rolesFor()` 的 id 投影，顺序稳定（报错信息会原样打给人看）。
+ *
+ *  这是 `CAPABILITIES` 那个常量的替代品：**同样的数据，但按根求值**。 */
+export function capabilitiesFor(root, opts) {
+  return rolesFor(root, opts).roles.map((r) => r.id).sort();
+}
+
+/** 一句话说清「这份注册表来自哪」。**每次都要打印** —— 理由见 `rolesFor` 注释。
+ *
+ *  路径**相对 `root` 打印**：提示词与日志会被落盘、会进 transcript，绝对路径
+ *  等于把本机目录结构发出去（`checkAbsolutePaths` 守的就是这条）。 */
+export function sourceText(set, root = null) {
+  const s = set && typeof set === 'object' ? set : { source: '?', dir: null, roles: [] };
+  const n = Array.isArray(s.roles) ? s.roles.length : 0;
+  let where = s.dir ? String(s.dir) : '(无)';
+  if (root && s.dir) {
+    const abs = resolve(String(root)) + sep;
+    if (where.startsWith(abs)) where = '.' + sep + where.slice(abs.length);
+  }
+  if (s.source === 'project') return `项目角色目录 ${where}（${n} 个）`;
+  return `框架角色目录 ${where}（${n} 个；用户项目里没有 .claude/agents/）`;
 }
 
 let _default = null;

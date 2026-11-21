@@ -2169,3 +2169,90 @@ const LIVING_DOCS = [
 ---
 
 
+### DF-045 [fixed] 角色注册表在**模块加载时**求值：外项目的角色一律被判非法，而外项目里不存在的角色被判合法
+
+- **发现于**：D2 判据验证（2026-11-21），在 `%TEMP%` 建了一个真项目（角色叫 `qa` / `reviewer`，
+  无 `oversight-` 前缀），按「台账落点 / 角色表 / compose / render-plan」四项分别验。
+  **结论是半真半假**：台账落点全部正确（DF-043 那轮修的），角色表那三项全错。
+- **位置**（同一个根因的六个落点，全部是「模块级 `const` 在 `--root` 解析之前求值」）：
+  - `scripts/validate-run.mjs:52` `export const CAPABILITIES = Object.freeze(discoverRoles().map(...))`
+  - `scripts/compose-agent-prompt.mjs:989` `assetRoot = explicitRoot || 框架根`（角色根与资产根混用）
+  - `scripts/compose-agent-prompt.mjs:990` `discoverRoles(agentsDir)` **不传 `agentPrefix`**
+  - `scripts/compose-agent-prompt.mjs:1104` 文本模式只印 `checks` / `warnings`，`errors` 无人渲染
+  - `scripts/render-plan.mjs:625` `labelOf(defaultRoles(), …)` —— `defaultRoles()` 锚在框架仓库
+  - `scripts/question-audit.mjs:114` `KNOWN_ROLES`（同一个形态；`launch` 的 roster 走它）
+- **证据（复现原文，2026-11-21）**：
+
+  ```
+  $ cd /tmp/d2proj && node <fw>/scripts/validate-run.mjs --simple g-qa.json      # capability: "qa"
+  ✗ subtrees[0].capability: "qa" 不在合法取值内（acceptor / critic / executor / …）  exit 1
+  $ node <fw>/scripts/validate-run.mjs --simple g-exec.json                      # capability: "executor"
+  ✓ g-exec.json                                                                      exit 0
+  ```
+
+  第二行是这次最该记住的一句：**修前它是「项目里没这个角色，但校验说合法」。**
+  上一轮（DF-044）把字面量清单换成注册表投影，投影**方向**对了，**时机**没对 ——
+  于是缺陷从「清单漂了」变成「清单永远只属于框架」。换了个位置复发，比原来更难看出来：
+  屏幕上有「合法值清单」，看起来像是按目录判的。
+
+  compose 的两条（同一个 `--root` 两个用途）：
+
+  ```
+  $ node compose … --role qa                 → 没有这个角色的定义：<fw>/.claude/agents/qa.md
+  $ node compose … --role qa --root .        → 角色对了，但 L1: 读不到 templates/dispatch.md  exit 1
+  ```
+
+  前缀不生效（项目 B：`agentPrefix: "ow-"` + `ow-qa.md`）：
+
+  ```
+  没有这个角色的定义：…/.claude/agents/qa.md
+  现有角色：ow-qa / reviewer
+  ```
+
+  L1 错误被藏起来（屏幕上「9 项全 ✓」+「拒绝派发：3 项」，原因只在 `--json`）：
+
+  ```
+    ✓ independence — 该角色无额外禁止项
+  ✗ 拒绝派发：3 项            ← errors[] 里的三行一个字都没印
+  ```
+
+- **修复**：
+  - `roles.mjs` 新增 `rolesFor(root)` / `capabilitiesFor(root)` / `rolesDirFor(root)` / `sourceText()`。
+    合并规则：项目有非空 `.claude/agents/` → **整份只认项目**（不逐 id 并入框架 ——
+    逐 id 合并会让「项目里没有 executor」照样合法，正是要修的那半句假话）；否则框架兜底。
+    **两种情形都打印来源**，路径相对 root（不打印本机绝对路径）。
+  - `validate-run.mjs`：删 `CAPABILITIES` 常量 → `validateGraph(graph, { capabilities })`。
+    CLI 的根按五级阶梯解析；目标显式给出时从**那个目标**向上找（不是 cwd）。
+    `--root <dir>` 的值也从 targets 里滤掉（否则 `--root .` 的 `.` 会被当成 task-graph 去读）。
+  - `compose-agent-prompt.mjs`：三个根各管一件事 —— `root`（路径基准）/ `agentsDir`（项目）/
+    `templateDir`（框架）。前缀随 `rolesFor()` 一起拿。文本模式打印 `errors`（两类分别去重）。
+  - `render-plan.mjs`：`buildPlan` 按 root 求值，`plan.roles` 放**投影**（id/name/display，
+    **不带 `file`** —— `--json` 会原样打出去）。
+  - `question-audit.mjs`：`validateConfig(raw, { knownRoles })` / `loadConfig(file, { knownRoles })`；
+    `launch.configInfo()` 与 CLI 按各自根给。回落带 `roles-fallback` warning。
+  - `check-structure.mjs:1946` 的「12 个角色定义」→ `${files.length} 个`（报错文案里的假话更坏）。
+- **`CAPABILITIES` 怎么处理的（权衡记在这里）**：**删常量，改成按根求值的函数**。
+  派单指出「保留常量就是保留 bug，改成函数会破坏所有 import 它的地方」。实测 grep：
+  生产代码 **0 个** import（只有 `validate-run.mjs` 自己用），测试 **1 个**。
+  所以「破坏面」其实只有一处测试 import —— 保留常量的代价（缺陷仍在）远大于改名成本。
+- **负向验证**：
+  - D2 场景重跑（`%TEMP%/d2final`，角色 `qa`/`reviewer`）：`qa` → exit 0；
+    `executor` → exit 1 且打印「不在合法取值内（qa / reviewer）」。**两条方向都验了**。
+  - 回仓库自己：`validate-run --simple --all` 仍按框架的 12 个判（逐字节不变）。
+  - 第 5 级（无项目根）：打印「框架角色目录 …（12 个；用户项目里没有 .claude/agents/）」。
+  - compose 的 L1 可见性有一条**真做回退**的用例：把 `templateDir` 指向不存在的目录，
+    断言「读不到 templates/dispatch.md」必须出现在 stdout。
+  - 合并规则的反向：给了项目的角色表之后，框架独有的 `executor` 必须被判非法
+    （`question-audit.test.mjs` 的「按调用方给的根求值」那条）。
+- **代价（不假装）**：
+  1. 项目里若有一份**空**的 `.claude/agents/`，会回落框架（不是「一个角色都不合法」）。
+     取舍：空目录比「目录缺失」更可能是「建了一半」。这条有测试钉住，方向是明确的。
+  2. `KNOWN_ROLES` 常量保留（`defaultConfig()` 的默认值语义仍需要它），
+     但**校验路径不再用它** —— 它只作为「框架自己的角色」的默认值存在。
+     这条意味着「用 `validateConfig(raw)` 而不传 `knownRoles` 的调用方」仍按框架判；
+     为此加了 `roles-fallback` warning，不再静默。
+- **回归测试**：`roles.test.mjs` +9（含两条端到端真子进程）、`compose-agent-prompt.test.mjs` +2、
+  `render-plan.test.mjs` +2、`question-audit.test.mjs` +1。测试总数 1860 → 1873。
+
+---
+

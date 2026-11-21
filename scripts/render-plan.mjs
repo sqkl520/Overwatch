@@ -61,7 +61,7 @@ import { probeDisk, reconcile, readLedger } from './claim-ledger.mjs';
 import { readPromptLedger } from './compose-agent-prompt.mjs';
 import { truncateDisplay } from './tui-theme.mjs';
 import { checkDependencyCycles } from './validate-run.mjs';
-import { labelOf, defaultRoles, nameOf } from './roles.mjs';
+import { labelOf, defaultRoles, nameOf, rolesFor } from './roles.mjs';
 import { frameworkRoot, projectRoot, runsDirInfo } from './project-root.mjs';
 
 /** 框架根 = 资产位置。**不是**用户项目根。
@@ -544,15 +544,21 @@ function localStateOf({ sub, task, disp, nowMs, probe }) {
 
 // ── 组装 ──────────────────────────────────────────────────────────────
 
-/** 空状态的四种成因，各有一句不同的话。**不许合并** —— 「没规划」和「读不懂」的处置完全不同。 */
-function emptyReasonText(reason, ctx) {
+/** 空状态的四种成因，各有一句不同的话。**不许合并** —— 「没规划」和「读不懂」的处置完全不同。
+ *
+ *  `roles` 是**按项目根求值**的注册表（`rolesFor(root).roles`）。修前这里调
+ *  `defaultRoles()` —— 那份缓存锚在框架仓库，于是给别人项目渲染时，
+ *  建议里点名的角色可能根本不在那个项目里（`nameOf` 会拼一个不存在的名字出来）。
+ *  调用方不给就用框架的，与 `formatPlan` 同一个默认。 */
+function emptyReasonText(reason, ctx, roles = null) {
+  const roleSet = roles || defaultRoles();
   if (reason === 'no-run-dir') {
     return [`run 目录不存在：${ctx.path}`, '这不是「计划为空」——是「这个 run 还没建目录」。'];
   }
   if (reason === 'no-graph') {
     return [
       `任务图不存在：${ctx.path}`,
-      `这不是「计划为空」——是「还没规划」。派 ${nameOf(defaultRoles(), 'planner')} 产出 task-graph.json，再用 validate-run.mjs 校验。`,
+      `这不是「计划为空」——是「还没规划」。派 ${nameOf(roleSet, 'planner')} 产出 task-graph.json，再用 validate-run.mjs 校验。`,
     ];
   }
   if (reason === 'empty-graph') {
@@ -572,7 +578,7 @@ function emptyReasonText(reason, ctx) {
     const tail = ctx.checked ? `（扫了 ${ctx.checked} 个 run 目录，没有一个带 task-graph.json）` : '（tasks/runs 下没有 run 目录）';
     return [
       '没有任何可渲染的 plan' + tail + '。',
-      `这不是「计划为空」——是「还没跑过一次规划」。先派 ${nameOf(defaultRoles(), 'planner')}。`,
+      `这不是「计划为空」——是「还没跑过一次规划」。先派 ${nameOf(roleSet, 'planner')}。`,
     ];
   }
   return ['没有可渲染的 plan。', '这不是「计划为空」——是「没有输入」。'];
@@ -607,6 +613,12 @@ function summaryLine(plan) {
  * 挤掉的细节**明说**被挤掉了，不静默截断。
  */
 export function formatPlan(plan) {
+  // 显示名与角色全名取自**这份 plan 自带的注册表**（`buildPlan` 的 `roles`），
+  // 缺省才回落框架。修前这里写死 `defaultRoles()` —— 那个缓存锚在框架仓库，
+  // 于是给别人项目渲染时 `display: 质量` 被忽略、屏幕上显示英文 id `qa`（实测，2026-11-21）。
+  // 把注册表**放在 plan 上**而不是让 formatPlan 去读盘：`formatPlan(plan)` 是公开入口，
+  // 它若自己按某个根求值，「用哪个根」就又变成一处只有调用方知道的事。
+  const roles = plan.roles || defaultRoles();
   if (plan.empty) {
     const head = [`PLAN · 无可渲染的计划`];
     const notes = (plan.notes || []).map((n) => truncateDisplay(`  ⚠ ${n}`, ROW_WIDTH));
@@ -622,7 +634,7 @@ export function formatPlan(plan) {
   const idw = Math.max(2, ...rows.map((r) => r.id.length));
   const rowLine = (r) => truncateDisplay(
     `  ${r.mark} ${r.id.padEnd(idw)}  ${truncateDisplay(r.goal, GOAL_WIDTH)}  `
-    + `${labelOf(defaultRoles(), r.capability)} · ${r.note}`,
+    + `${labelOf(roles, r.capability)} · ${r.note}`,
     ROW_WIDTH,
   );
   const detailLinesOf = (r) => {
@@ -705,8 +717,18 @@ export function buildPlan({
   graph = null, graphError = null, graphErrorMsg = null,
   claimRows = [], claimBadLines = [], promptRows = [], promptBadLines = [],
   run = null, path = null, nowMs = Date.now(), probe = null, root = ROOT, checked = 0,
+  roles = null,
 } = {}) {
   const probeFn = probe || defaultProbe(root);
+  // 角色注册表：不给就**按 root 求值**（不是 `defaultRoles()` 那份框架缓存）。
+  //  `root` 是 `/r` 这类不存在的位置时 `rolesFor` 会回落到框架 —— 这是对的：
+  //  「这个根上没有角色目录」的正确处置就是用框架的，并（在 CLI 里）打印来源。
+  //
+  //  放进 plan 的是**投影**（id / name / display），不是整条记录：真实的
+  //  `role.file` 是绝对路径，而 `--json` 会原样打出去。渲染只需要这三个字段
+  //  （`labelOf` 找 display、`nameOf` 找 name），多带一个字段就是多一处泄漏面。
+  const roleSet = (roles || rolesFor(root).roles)
+    .map((r) => ({ id: r.id, name: r.name, display: r.display }));
   const notes = [];
   if (claimBadLines.length) notes.push(`claims.jsonl 有 ${claimBadLines.length} 行读不懂（已跳过，对账可能少算）`);
   if (promptBadLines.length) notes.push(`prompts.jsonl 有 ${promptBadLines.length} 行读不懂（已跳过）`);
@@ -716,7 +738,7 @@ export function buildPlan({
     // 若把它当正常图画出来，摘要会是「进度 0/0 完成」—— 那是一种假装。
     const reason = graphError || (graph && Array.isArray(graph.subtrees) ? 'empty-graph' : 'invalid-json');
     const ctx = { path: path ? displayPath(path, root) : '(未知)', msg: graphErrorMsg, checked };
-    const empty_lines = emptyReasonText(reason, ctx);
+    const empty_lines = emptyReasonText(reason, ctx, roleSet);
     return {
       v: PLAN_VERSION,
       run,
@@ -725,6 +747,7 @@ export function buildPlan({
       reason,
       empty_lines,
       subtrees: [],
+      roles: roleSet,
       totals: { total: 0, done: 0, landed_unclaimed: 0, failed: 0, upstream_failed: 0, stuck: 0, defect: 0, overdue: 0, running: 0, waiting_on: 0, pending: 0 },
       budget_pct: 0,
       max_timeout_min: null,
@@ -779,6 +802,7 @@ export function buildPlan({
     empty_lines: [],
     generated_at: new Date(nowMs).toISOString(),
     subtrees,
+    roles: roleSet,
     totals,
     budget_pct: budget,
     max_timeout_min: timeouts.length ? Math.max(...timeouts) : null,

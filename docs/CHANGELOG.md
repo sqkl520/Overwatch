@@ -21,6 +21,101 @@
 
 ---
 
+## [Unreleased] - 2026-11-21 注册表「模块加载时求值」→「按根求值」（DF-045）
+
+上一轮（DF-044）把 9 处硬编码收敛成 `scripts/roles.mjs`，但留下了**同一个根因的 6 个落点**：
+`discoverRoles()` 在**模块加载时**求值、且不带参数 → 永远读**框架自己**的 `.claude/agents/`。
+D2 判据验证（`%TEMP%` 下一个真项目，角色叫 `qa` / `reviewer`）判出半真半假：
+台账落点全部正确，但**角色注册表在外项目仍是常量**。
+
+### Fixed
+
+1. **`validate-run.mjs` 的 `CAPABILITIES` 是 `export const ... = discoverRoles()`**（`:52`），
+   在任何 `--root` 解析之前就执行。实测（`%TEMP%/d2proj`，项目里只有 `qa.md` / `reviewer.md`）：
+
+   ```
+   $ node scripts/validate-run.mjs --simple g-qa.json      # capability: "qa"
+   ✗ subtrees[0].capability: "qa" 不在合法取值内（acceptor / critic / executor / …）  exit 1
+   $ node scripts/validate-run.mjs --simple g-exec.json    # capability: "executor"（项目里没有）
+   ✓ g-exec.json                                                                       exit 0
+   ```
+
+   后半句比修前更糟：**校验通过**不再意味着「这个角色在项目里存在」。
+   改法：删掉常量，合法值**按根求值**（`roles.mjs` 新增 `rolesFor(root)` / `capabilitiesFor(root)`），
+   由 `validateGraph(graph, { capabilities })` 接收；不给就回落框架注册表**并发一条 warning**。
+   CLI 的根按五级阶梯解析，显式给了目标时从**那个目标**向上找（不是从 cwd），
+   每次都在 stderr 第一行打印「角色表 → 项目角色目录 …（N 个）（第 4 级）」。
+
+   **合并规则是「整份」不是「逐 id」**：项目的 `.claude/agents/` 存在且非空 → **只**认项目，
+   不并入框架。逐 id 合并会让「项目里没有 executor」照样合法 —— 那正是要修的那半句假话。
+
+2. **`compose` 的资产根与角色根混在一起**（`:989` `assetRoot = explicitRoot || 框架根`）。
+   不给 `--root` → 只用框架角色目录，报「没有这个角色的定义」；给 `--root .` → 角色对了，
+   但 L1 要求项目自带 `templates/dispatch.md`，否则 `exit 1`。实测两条都复现（2026-11-21）。
+   改法：`agentsDir` 走 `projectRoot()`，`templates/` 独立走 `frameworkRoot()`。**三个根各管一件事。**
+
+3. **项目的 `agentPrefix` 在 compose 里无效**。`roles.mjs:236` 早就有 `agentPrefixFrom(root)`，
+   但 compose 调 `discoverRoles(agentsDir)` 时**不传 `agentPrefix`**。实测（项目 B：
+   `agentPrefix: "ow-"` + `ow-qa.md`）`compose --role qa` → 「现有角色：ow-qa」，
+   而 `docs/spec/2026-11-14-question-audit.md:209` 宣称「改这一行即可，不必改代码」。
+   改法：`rolesFor(root)` 读项目自己的 `overwatch.config.json`，前缀随注册表一起返回。
+
+4. **`compose` 文本模式隐藏 L1 错误原因**（`:1104` 只印 `checks` / `warnings`）。
+   `:1074` / `:1078` 的 `errors.push` 无人渲染，于是屏幕显示「9 项全 ✓」然后
+   「✗ 拒绝派发：3 项」，看不到是哪一项 —— 原因只在 `--json` 里。实测复现。
+   改法：文本模式逐条打印 `check.errors`。① 类（`mark()` 同时 push 进 `checks` 与 `errors`）
+   按 `${id}: ${detail}` 去重，不重复打印；② 类（CLI 追加的 L1 项）单独一段列全；
+   另加一行「不过的检查项：…」，让「N 项」里的 N 找得到 N 个对象。
+
+5. **`render-plan` 用框架的 `display` 而非项目的**（`:625` `labelOf(defaultRoles(), …)`）。
+   实测项目里 `display: 质量` 被忽略，显示英文 id `qa`。改法：`buildPlan` 按 `root` 求值注册表
+   （`rolesFor(root)`），把**投影**（id / name / display，不带 `file` 绝对路径）放进 `plan.roles`，
+   `formatPlan` 从中取。`plan.roles` 不带 `file` 是因为 `--json` 会原样打出去。
+
+6. **`question-audit.mjs` 的 `KNOWN_ROLES` 是同一个根因的第六处**（不在派单的五条里，
+   但它在 D2 的路径上）。实测（`%TEMP%/d4` 一个只有 `qa.md` 的项目，配置 `roster: ["qa"]`）：
+
+   ```
+   agent.roster [unknown-role] 未知角色 "qa"（允许：oversight-acceptor, …）
+   ```
+
+   `launch.mjs` 的 roster 走 `loadConfig()`，于是**那个项目的 launch 直接停摆**。
+   改法：`validateConfig(raw, { knownRoles })` / `loadConfig(file, { knownRoles })`，
+   由 `launch.configInfo()` 与 `question-audit` 的 CLI 按各自根给（CLI 按**配置文件所在目录**，
+   `--root` 是语料根，与岗位无关）。常量保留（默认值语义是「框架自己的角色」、仍被
+   导出登记与既有测试引用），但校验路径**不再用它**；回落时带一条 `roles-fallback` warning。
+
+### 顺带修复（与上面同类的硬编码残留）
+
+- `check-structure.mjs:1946` 的「12 个角色定义里没有一个引用 `--inbox`」→ `${files.length} 个`。
+  它是**报错文案**里的一句：加一个角色它就变成假话，而假话报错比不报更糟（读者会去数，然后不再相信这道门）。
+
+### Tests
+
+- 新增 9 条：`rolesFor` ×4（项目 / 框架兜底 / 空目录 / 项目前缀）、`sourceText`、`rolesDirFor`、
+  `validate-run` 端到端 ×1、`compose` 端到端 ×1（三个缺陷一次验完）、
+  `question-audit` 的按根求值 ×1；另加 `compose` 的 L1 错误可见性 ×2（含一条**真做回退**的负向用例：
+  把 `templateDir` 指到不存在的目录，断言原因必须打印出来）、`render-plan` 的项目 display ×2。
+- 测试条数 1860 → 1873。四处声明已同步（`README.md` 三处 / `CLAUDE.md` / `docs/GUIDE.md` / CI）。
+
+### 需要说明的两处测试改动
+
+- `validate-run.test.mjs` 不再 `import { CAPABILITIES }`（常量已删），改为
+  `const CAPABILITIES = Object.freeze(capabilitiesFor(null))` —— **同一个集合，按框架根求值**，
+  `for (const c of CAPABILITIES)` 那条循环逐条不受影响。
+- 同文件那条负向测试的被替换片段从 `validateFile(t, opts)` 改成 `validateFile(t, roleOpts)`
+  （变量改名，它现在多带按项目求值的 `capability` 全集）。**断言没有变松**，判据仍是
+  「这一行被回退之后 `--complex` 立刻失效」。
+
+### 负向验证
+
+- D2 场景重跑（`%TEMP%/d2final`，角色 `qa` / `reviewer`）：`capability: "qa"` → `exit 0`；
+  `capability: "executor"` → `exit 1` 且打印「不在合法取值内（qa / reviewer）」。
+- 回到仓库自己：`node scripts/validate-run.mjs --simple --all` 仍按框架的 12 个角色判（逐字节不变）。
+- 第 5 级（没有项目根）：`[validate-run] 角色表 → 框架角色目录 …（12 个；用户项目里没有 .claude/agents/）`。
+
+---
+
 ## [Unreleased] - 2026-11-21 「两个根」拆分：台账不再写进框架仓库（DF-043·B）
 
 ### Fixed
